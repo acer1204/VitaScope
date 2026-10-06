@@ -155,6 +155,12 @@ impl Inner {
                 if let Err(e) = render.render(target.fbo.0.get(), w, h, true) {
                     eprintln!("[vitascope] mpv 渲染失敗：{e}");
                 }
+                if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+                    let error = gl.get_error();
+                    if error != glow::NO_ERROR {
+                        eprintln!("[vitascope] mpv 渲染後有 GL 錯誤 0x{error:x}");
+                    }
+                }
             }
 
             // 回到 egui 的 framebuffer，把影片貼圖畫到指定的矩形

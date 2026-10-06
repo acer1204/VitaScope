@@ -244,9 +244,14 @@ impl Player {
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
-        // VITASCOPE_DEBUG=1：把 mpv 的警告與錯誤印到 stderr（排查顯示卡、驅動之類的問題）
-        let debug = std::env::var_os("VITASCOPE_DEBUG").is_some();
-        mpv.request_log_messages(if debug { "warn" } else { "error" })?;
+        // VITASCOPE_DEBUG=1：把 mpv 的警告與錯誤印到 stderr（排查顯示卡、驅動之類的問題）；
+        // 也可以指定 mpv 的記錄等級，例如 VITASCOPE_DEBUG=v
+        let level = match std::env::var("VITASCOPE_DEBUG") {
+            Ok(v) if v == "1" || v.is_empty() => "warn".to_owned(),
+            Ok(v) => v,
+            Err(_) => "error".to_owned(),
+        };
+        mpv.request_log_messages(&level)?;
         for (i, (name, format)) in OBSERVED.iter().enumerate() {
             mpv.observe(i as u64 + 1, name, *format)?;
         }
