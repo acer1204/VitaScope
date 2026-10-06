@@ -16,6 +16,10 @@ pub struct Settings {
     pub muted: bool,
     /// 上次的視窗位置大小（一般模式下的；全螢幕不記）
     pub window: Option<WindowGeometry>,
+    /// 播完自動播放同資料夾的下一個檔案
+    pub auto_next: bool,
+    /// 再次開啟時從上次看到的地方繼續播放
+    pub resume: bool,
 }
 
 impl Default for Settings {
@@ -24,6 +28,8 @@ impl Default for Settings {
             volume: 100.0,
             muted: false,
             window: None,
+            auto_next: true,
+            resume: true,
         }
     }
 }
@@ -63,7 +69,8 @@ impl Settings {
     }
 }
 
-fn config_dir() -> Option<PathBuf> {
+/// 設定與播放紀錄的資料夾
+pub(crate) fn config_dir() -> Option<PathBuf> {
     let home = || std::env::var_os("HOME").map(PathBuf::from);
     if cfg!(target_os = "windows") {
         std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("Vitascope"))
@@ -88,5 +95,6 @@ mod tests {
         assert_eq!(s.volume, 42.0);
         assert!(!s.muted);
         assert!(s.window.is_none());
+        assert!(s.auto_next && s.resume, "新功能預設開啟");
     }
 }

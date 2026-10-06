@@ -135,6 +135,15 @@ impl Track {
     }
 }
 
+/// `chapter-list` 裡的一個章節。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Chapter {
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 開始時間（秒）
+    pub time: f64,
+}
+
 /// 介面需要的播放狀態，由 mpv 的屬性變化事件即時更新。
 #[derive(Debug, Clone, Default)]
 pub struct State {
@@ -158,6 +167,13 @@ pub struct State {
     pub hwdec: Option<String>,
     /// 最近一次開檔失敗的原因（中文）
     pub last_error: Option<String>,
+    /// 播放速度（1.0 = 正常）
+    pub speed: f64,
+    pub chapters: Vec<Chapter>,
+    /// 目前的章節（從 0 開始）；None = 沒有章節，或還沒到第一章
+    pub chapter: Option<usize>,
+    /// A-B 重播的起點、終點（秒）
+    pub ab_loop: [Option<f64>; 2],
 }
 
 impl State {
@@ -172,6 +188,12 @@ impl State {
     /// 有實際影像（不是只有專輯封面）
     pub fn has_video(&self) -> bool {
         self.tracks_of(TrackKind::Video).any(|t| !t.albumart)
+    }
+
+    /// 某個時間點所在的章節（從 0 開始）。跳到章節後顯示的影格時間常常比章節時間早一點點
+    /// （MKV 的時間只到毫秒），所以留一點誤差
+    pub fn chapter_at(&self, time: f64) -> Option<usize> {
+        self.chapters.iter().rposition(|c| c.time <= time + 0.005)
     }
 }
 
@@ -201,6 +223,12 @@ const OBSERVED: &[(&str, Format)] = &[
     ("hwdec-current", Format::String),
     // 不用 dwidth/dheight：GPU 負責旋轉時（GUI 的情況），它們是旋轉前的尺寸
     ("video-out-params", Format::String),
+    ("speed", Format::Double),
+    ("chapter-list", Format::String),
+    ("chapter", Format::Int64),
+    // 沒設定時是 "no"，所以用字串讀
+    ("ab-loop-a", Format::String),
+    ("ab-loop-b", Format::String),
 ];
 
 /// VITASCOPE_DEBUG 的值 → 要 mpv 送出的記錄等級。
@@ -213,6 +241,9 @@ fn debug_log_level(value: Option<&str>) -> &'static str {
         Some(v) => LEVELS.into_iter().find(|level| *level == v).unwrap_or("warn"),
     }
 }
+
+pub const MIN_SPEED: f64 = 0.25;
+pub const MAX_SPEED: f64 = 4.0;
 
 /// 字幕語言偏好：繁中優先，其次中文，再來英文
 const SUB_LANGS: &str = "zh-TW,zh-Hant,cht,tc,zht,zh-HK,zh,chi,zho,en,eng";
@@ -266,6 +297,7 @@ impl Player {
             mpv: Arc::new(mpv),
             state: State {
                 volume: 100.0,
+                speed: 1.0,
                 ..Default::default()
             },
             recent_errors: Vec::new(),
@@ -325,6 +357,43 @@ impl Player {
 
     pub fn set_mute(&self, muted: bool) -> mpv::Result<()> {
         self.mpv.set_property("mute", muted)
+    }
+
+    /// 播放速度，限制在 0.25×–4×（mpv 預設會保持音調）
+    pub fn set_speed(&self, speed: f64) -> mpv::Result<()> {
+        self.mpv.set_property("speed", speed.clamp(MIN_SPEED, MAX_SPEED))
+    }
+
+    /// 逐格前進 / 後退（會暫停播放）
+    pub fn frame_step(&self, forward: bool) -> mpv::Result<()> {
+        self.mpv
+            .command(&[if forward { "frame-step" } else { "frame-back-step" }])
+    }
+
+    /// A-B 重播：第一次設起點、第二次設終點、第三次取消
+    pub fn cycle_ab_loop(&self) -> mpv::Result<()> {
+        self.mpv.command(&["ab-loop"])
+    }
+
+    /// 取消 A-B 重播（mpv 換檔時會沿用，所以開新檔時要清掉）
+    pub fn clear_ab_loop(&self) -> mpv::Result<()> {
+        self.mpv.set_property("ab-loop-a", "no")?;
+        self.mpv.set_property("ab-loop-b", "no")
+    }
+
+    /// 跳到前 / 後幾個章節
+    pub fn add_chapter(&self, delta: i64) -> mpv::Result<()> {
+        self.mpv.command(&["add", "chapter", &delta.to_string()])
+    }
+
+    /// 跳到第 `index` 個章節（從 0 開始）
+    pub fn seek_chapter(&self, index: usize) -> mpv::Result<()> {
+        self.mpv.set_property("chapter", index as i64)
+    }
+
+    /// 目前的章節，直接問 mpv（剛跳完章節時也是新的值，連按才會累加）；-1 = 第一章之前
+    pub fn current_chapter(&self) -> Option<i64> {
+        self.mpv.get_property::<i64>("chapter").ok()
     }
 
     /// 選擇軌道；`None` = 關閉這類軌道（例如關字幕）
@@ -552,6 +621,16 @@ impl Player {
             "seekable" => s.seekable = value.as_bool().unwrap_or(false),
             "hwdec-current" => s.hwdec = value.as_str().map(str::to_owned),
             "video-out-params" => s.video_size = value.as_str().and_then(display_size),
+            "speed" => s.speed = value.as_f64().unwrap_or(1.0),
+            "chapter-list" => {
+                s.chapters = value
+                    .as_str()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or_default();
+            }
+            "chapter" => s.chapter = value.as_i64().and_then(|c| usize::try_from(c).ok()),
+            "ab-loop-a" => s.ab_loop[0] = value.as_str().and_then(|v| v.parse().ok()),
+            "ab-loop-b" => s.ab_loop[1] = value.as_str().and_then(|v| v.parse().ok()),
             _ => {}
         }
     }

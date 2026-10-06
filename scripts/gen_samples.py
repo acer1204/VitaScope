@@ -193,6 +193,18 @@ def samples() -> list[Sample]:
               "-metadata:s:s:0", "language=chi", "-metadata:s:s:0", "title=繁體中文",
               "-metadata:s:s:1", "language=eng", "-metadata:s:s:1", "title=English",
           ]),
+        # 章節：介面測試用來測章節選單、跳章節、進度條上的刻度
+        S("mkv_chapters", "common", "mkv", X264, AAC, "h264", "aac", dur=12, note="三個章節（片頭、本篇、片尾）",
+          custom=[
+              "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24:duration=12",
+              "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=12",
+              "-i", "{chapters}",
+              "-map", "0:v", "-map", "1:a", "-map_chapters", "2",
+              *X264, *AAC,
+          ]),
+        # 一分半的小檔案：續播只記一分鐘以上的檔案，介面測試用它測續播
+        S("mp4_long", "common", "mp4", X264, AAC, "h264", "aac", size="160x90", rate="10", dur=90,
+          note="90 秒（續播測試）"),
 
         # ───────────── 通用 ─────────────
         S("ts_h264_aac", "general", "ts", X264, AAC, "h264", "aac", fmt=["-f", "mpegts"]),
@@ -296,6 +308,16 @@ def _ts(t: float, sep: str = ",") -> str:
     m, rem = divmod(rem, 60_000)
     s, ms = divmod(rem, 1000)
     return f"{h:02}:{m:02}:{s:02}{sep}{ms:03}"
+
+
+def chapters_text() -> str:
+    """FFmpeg 的 metadata 檔：三個章節，約 4 秒一章。
+    時間刻意不對齊影格（跟藍光、mkvmerge 做的檔案一樣到奈秒）：跳到章節後畫面的時間會比章節時間早一點點"""
+    starts = [0, 4_037_366_667, 8_041_366_667, 12_000_000_000]
+    lines = [";FFMETADATA1"]
+    for i, title in enumerate(["片頭", "本篇", "片尾"]):
+        lines += ["[CHAPTER]", "TIMEBASE=1/1000000000", f"START={starts[i]}", f"END={starts[i + 1]}", f"title={title}"]
+    return "\n".join(lines) + "\n"
 
 
 def srt_text(cues=SUB_CUES) -> str:
@@ -407,7 +429,9 @@ def find_font() -> Path | None:
 def build_cmd(s: Sample, out: Path, sub_src: dict[str, Path], font: Path | None) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
     if s.custom:
-        return cmd + [str(sub_src["srt"]) if a == "{srt}" else a for a in s.custom] + [str(out)]
+        # {srt}、{chapters} 之類的換成事先產生的來源檔
+        src = {f"{{{k}}}": str(v) for k, v in sub_src.items()}
+        return cmd + [src.get(a, a) for a in s.custom] + [str(out)]
     maps: list[str] = []
     idx = 0
     if s.v is not None:
@@ -510,9 +534,10 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        sub_src = {"srt": tmp / "src.srt", "ass": tmp / "src.ass"}
+        sub_src = {"srt": tmp / "src.srt", "ass": tmp / "src.ass", "chapters": tmp / "chapters.txt"}
         sub_src["srt"].write_text(srt_text(), encoding="utf-8")
         sub_src["ass"].write_text(ass_text(), encoding="utf-8")
+        sub_src["chapters"].write_text(chapters_text(), encoding="utf-8")
 
         for s in todo:
             if s.path.exists() and not args.force:

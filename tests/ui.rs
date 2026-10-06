@@ -27,7 +27,19 @@ fn sample(rel: &str) -> PathBuf {
 }
 
 fn harness(file: Option<PathBuf>) -> Harness<'static, VitascopeApp> {
-    // 跟真正的播放器一樣播完停在最後一格，只是不出畫面、不出聲音
+    // 樣本資料夾裡有很多檔案，播完自動接下一個會讓測試換到別的檔案；需要的測試再自己打開
+    harness_with(
+        file,
+        Settings {
+            auto_next: false,
+            ..Settings::default()
+        },
+    )
+}
+
+fn harness_with(file: Option<PathBuf>, settings: Settings) -> Harness<'static, VitascopeApp> {
+    // 跟真正的播放器一樣播完停在最後一格，只是不出畫面、不出聲音。
+    // 播放紀錄只放在記憶體（Launch 的預設），不會碰到使用者真正的紀錄
     let player = Player::new(Options {
         keep_open: true,
         ..Options::headless()
@@ -37,7 +49,7 @@ fn harness(file: Option<PathBuf>) -> Harness<'static, VitascopeApp> {
         VitascopeApp::new(
             cc,
             player,
-            Settings::default(),
+            settings,
             Launch {
                 file,
                 ..Default::default()
@@ -439,4 +451,523 @@ fn play_button_toggles_pause() {
     step_until(&mut h, "按鈕暫停", |s| s.paused);
     h.get_by_label("▶").click();
     step_until(&mut h, "按鈕播放", |s| !s.paused);
+}
+
+// ───────────── L2：播放控制 ─────────────
+
+/// 每個測試自己的暫存資料夾（測試會平行執行）。測試失敗時也會刪掉；
+/// 要宣告在 Harness 之前，才會在播放器關掉檔案之後才刪
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("vitascope-ui-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    /// 放一份 3 秒的樣本，取名為 `name`
+    fn clip(&self, name: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::copy(sample("common/mp4_h264_aac.mp4"), &path).unwrap();
+        path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn playing(s: &State, name: &str) -> bool {
+    s.loaded && s.path.as_deref().is_some_and(|p| p.ends_with(name))
+}
+
+/// 等到等到條件成立（看的是整個播放器，例如背景掃描完的播放清單）
+fn step_until_app(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&VitascopeApp) -> bool) {
+    let start = Instant::now();
+    while !cond(h.state()) {
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn playlist_len(app: &VitascopeApp) -> usize {
+    app.playlist().map_or(0, |l| l.len())
+}
+
+/// 等到視窗配合影片尺寸調整完（之後才能用座標點按鈕、開右鍵選單）
+fn settle(h: &mut Harness<'_, VitascopeApp>, name: &str) {
+    step_until(h, "開始播放、知道影片尺寸", |s| {
+        playing(s, name) && s.video_size.is_some()
+    });
+    h.run_steps(5);
+}
+
+fn opened(file: PathBuf) -> Harness<'static, VitascopeApp> {
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let mut h = harness(Some(file));
+    settle(&mut h, &name);
+    h
+}
+
+/// 實際經過一段時間（播放器在背景播放），期間一直更新介面
+fn wait_real(h: &mut Harness<'_, VitascopeApp>, seconds: f64) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs_f64(seconds) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn plays_next_file_in_folder_and_page_keys_switch() {
+    let dir = TempDir::new("playlist");
+    for name in ["第1集.mp4", "第2集.mp4", "第10集.mp4", "第1集.srt", ".第3集.mp4"] {
+        dir.clip(name);
+    }
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), Settings::default());
+    step_until(&mut h, "播放第1集", |s| playing(s, "第1集.mp4"));
+    // 同資料夾的檔案在背景掃描；字幕檔、隱藏檔不算
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    // 播完自動接下一個；檔名照數字排（第2集在第10集前面）
+    step_until(&mut h, "播完自動播放第2集", |s| playing(s, "第2集.mp4"));
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "PgDn → 第10集", |s| playing(s, "第10集.mp4"));
+    h.key_press(egui::Key::PageUp);
+    step_until(&mut h, "PgUp → 第2集", |s| playing(s, "第2集.mp4"));
+    let list = h.state().playlist().unwrap();
+    assert_eq!((list.position(), list.len()), (2, 3));
+    // 控制列的「上一個」按鈕
+    settle(&mut h, "第2集.mp4");
+    h.get_by_label("⏮").click();
+    step_until(&mut h, "⏮ → 第1集", |s| playing(s, "第1集.mp4"));
+}
+
+#[test]
+fn auto_next_can_be_turned_off() {
+    let dir = TempDir::new("no-auto-next");
+    let a = dir.clip("a.mp4");
+    dir.clip("b.mp4");
+    let mut h = harness(Some(a)); // auto_next = false
+    step_until_app(&mut h, "掃描到兩個檔案", |app| playlist_len(app) == 2);
+    step_until(&mut h, "播完停在最後一格", |s| playing(s, "a.mp4") && s.eof);
+    // 換檔是同步的（open 會立刻更新清單位置），這裡馬上就看得出來有沒有自動換檔
+    assert_eq!(h.state().playlist().unwrap().position(), 1);
+    wait_real(&mut h, 1.0);
+    assert_eq!(h.state().playlist().unwrap().position(), 1);
+    assert!(
+        playing(&h.state().player().state, "a.mp4"),
+        "關掉自動播放就停在這個檔案"
+    );
+}
+
+#[test]
+fn dropping_several_files_makes_a_sorted_playlist() {
+    let dir = TempDir::new("dropped-list");
+    let files = [dir.clip("第10集.mp4"), dir.clip("第2集.mp4")];
+    let mut h = harness(None);
+    h.step();
+    // Windows 拖放時，滑鼠抓著的檔案會排在最前面；清單還是照檔名排
+    for f in &files {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(&mut h, "從第2集開始播", |s| playing(s, "第2集.mp4"));
+    let list = h.state().playlist().unwrap();
+    assert_eq!((list.position(), list.len()), (1, 2));
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "下一個是第10集", |s| playing(s, "第10集.mp4"));
+}
+
+#[test]
+fn dropping_video_with_subtitle_opens_the_video() {
+    let dir = TempDir::new("mixed-drop");
+    let srt = dir.0.join("a.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:02,000\n測試\n").unwrap();
+    let video = dir.clip("a.mp4");
+    let mut h = harness(None);
+    h.step();
+    for f in [&srt, &video] {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(&mut h, "打開影片（不是字幕檔）", |s| playing(s, "a.mp4"));
+}
+
+#[test]
+fn holding_a_drag_at_the_end_does_not_run_through_the_playlist() {
+    let dir = TempDir::new("drag-end");
+    let a = dir.clip("a.mp4");
+    dir.clip("b.mp4");
+    dir.clip("c.mp4");
+    let mut h = harness_with(Some(a), Settings::default());
+    settle(&mut h, "a.mp4");
+    step_until_app(&mut h, "掃描到三個檔案", |app| playlist_len(app) == 3);
+
+    // 按住進度條、拖到最右邊，不放開
+    let bar = h.get_by_label("進度").rect();
+    let start = egui::pos2(bar.center().x, bar.center().y);
+    let end = egui::pos2(bar.right() - 1.0, bar.center().y);
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(egui::Event::PointerMoved(start));
+    h.event(button(start, true));
+    h.step();
+    for i in 1..=10 {
+        h.event(egui::Event::PointerMoved(start.lerp(end, i as f32 / 10.0)));
+        h.step();
+    }
+    // 樣本只有開頭一個關鍵影格，拖曳中的快速跳轉會落在開頭，再自己播到結尾（3 秒）
+    let held = Instant::now();
+    while held.elapsed() < Duration::from_secs(4) {
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        playing(&h.state().player().state, "a.mp4"),
+        "還按著進度條時不換檔：{:?}",
+        h.state().player().state.path
+    );
+    // 放開：播到結尾，接下一個；下一個檔案從頭播，不會被剛才的拖曳拉到結尾
+    h.event(button(end, false));
+    step_until(&mut h, "放開後播下一個", |s| playing(s, "b.mp4"));
+    wait_real(&mut h, 1.0);
+    let st = &h.state().player().state;
+    assert!(
+        playing(st, "b.mp4") && st.time_pos < 2.5,
+        "{:?} {}",
+        st.path,
+        st.time_pos
+    );
+}
+
+#[test]
+fn resumes_where_it_left_off() {
+    let long = sample("common/mp4_long.mp4"); // 90 秒
+    let mut h = harness(Some(long.clone()));
+    step_until(&mut h, "開始播放", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+
+    // 換到別的檔案時記下看到哪裡
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "換檔", |s| playing(s, "mp4_h264_aac.mp4"));
+    let history = h.state().history();
+    let saved = history.positions.first().expect("應該記下續播位置");
+    assert!(saved.path.ends_with("mp4_long.mp4") && saved.time >= 29.0, "{saved:?}");
+    assert!(history.recent[0].ends_with("mp4_h264_aac.mp4"), "{:?}", history.recent);
+    assert!(history.recent[1].ends_with("mp4_long.mp4"), "{:?}", history.recent);
+
+    // 再開回來：從上次的位置繼續
+    drop_file(&mut h, long);
+    step_until(&mut h, "從上次的位置繼續", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos >= 28.0
+    });
+    // Home 從頭播放
+    h.key_press(egui::Key::Home);
+    step_until(&mut h, "Home 回到開頭", |s| s.time_pos < 5.0 && !s.paused);
+}
+
+#[test]
+fn resume_can_be_turned_off() {
+    let long = sample("common/mp4_long.mp4");
+    let settings = Settings {
+        resume: false,
+        auto_next: false,
+        ..Settings::default()
+    };
+    let mut h = harness_with(Some(long.clone()), settings);
+    step_until(&mut h, "開始播放", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "換檔", |s| playing(s, "mp4_h264_aac.mp4"));
+    drop_file(&mut h, long);
+    step_until(&mut h, "再開回來", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    wait_real(&mut h, 0.5);
+    let t = h.state().player().state.time_pos;
+    assert!(t < 5.0, "關掉續播就從頭開始：{t}");
+}
+
+#[test]
+fn stop_remembers_position_and_start_screen_resumes() {
+    let mut h = opened(sample("common/mp4_long.mp4"));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+    h.get_by_label("⏹").click();
+    step_until(&mut h, "停止", |s| !s.loaded && !s.loading);
+    h.run_steps(2);
+    h.get_by_label_contains("最近開啟");
+    h.get_by_label("mp4_long.mp4").click();
+    step_until(&mut h, "從最近開啟的清單再開，接著上次的位置", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos >= 28.0
+    });
+}
+
+#[test]
+fn double_clicking_a_recent_file_just_opens_it() {
+    let mut h = opened(sample("common/mp4_h264_aac.mp4"));
+    h.get_by_label("⏹").click();
+    step_until(&mut h, "停止", |s| !s.loaded && !s.loading);
+    h.run_steps(2);
+    // 起始畫面上雙擊：第一下打開檔案，第二下落在已經開始播放的畫面上，不應該變成暫停 + 全螢幕
+    let pos = h.get_by_label("mp4_h264_aac.mp4").rect().center();
+    let click = |h: &mut Harness<'_, VitascopeApp>| {
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    };
+    // 自己控制 egui 的時間：兩下要在雙擊的時間內（0.3 秒），每一幀只前進 0.02 秒
+    let mut now = h.ctx.input(|i| i.time) + 1.0;
+    let mut step = |h: &mut Harness<'_, VitascopeApp>| {
+        h.input_mut().time = Some(now);
+        h.step();
+        now += 0.02;
+    };
+    h.event(egui::Event::PointerMoved(pos));
+    click(&mut h);
+    step(&mut h);
+    // 等 mpv 開始載入（起始畫面消失）
+    for _ in 0..10 {
+        std::thread::sleep(Duration::from_millis(50));
+        step(&mut h);
+        if h.state().player().state.loading || h.state().player().state.loaded {
+            break;
+        }
+    }
+    assert!(h.query_by_label("mp4_h264_aac.mp4").is_none(), "起始畫面應該已經消失");
+    click(&mut h);
+    step(&mut h);
+    let cmds = h
+        .output()
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|v| v.commands.clone())
+        .unwrap_or_default();
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "{cmds:?}"
+    );
+    step_until(&mut h, "播放中", |s| {
+        playing(s, "mp4_h264_aac.mp4") && s.time_pos > 0.0
+    });
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused, "第二下不應該暫停");
+}
+
+#[test]
+fn clicking_to_close_the_context_menu_does_not_pause() {
+    let mut h = playing_multitrack();
+    let video = h.get_by_label("影片畫面").rect();
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("播放速度");
+    // 點選單外面（畫面左上角）關掉選單
+    let outside = video.left_top() + egui::vec2(20.0, 20.0);
+    h.event(egui::Event::PointerMoved(outside));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: outside,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("播放速度").is_none(), "選單應該關掉");
+    wait_real(&mut h, 0.4);
+    assert!(!h.state().player().state.paused, "關選單的那一下不算暫停");
+}
+
+fn close_to(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+#[test]
+fn speed_keys() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::C);
+    step_until(&mut h, "C 加快到 1.1×", |s| close_to(s.speed, 1.1));
+    h.key_press(egui::Key::C);
+    step_until(&mut h, "C 加快到 1.2×", |s| close_to(s.speed, 1.2));
+    for _ in 0..3 {
+        h.key_press(egui::Key::X);
+    }
+    step_until(&mut h, "X 按三次減慢到 0.9×", |s| close_to(s.speed, 0.9));
+    h.key_press(egui::Key::Z);
+    step_until(&mut h, "Z 恢復正常速度", |s| close_to(s.speed, 1.0));
+    for _ in 0..40 {
+        h.key_press(egui::Key::X);
+    }
+    step_until(&mut h, "最慢 0.25×", |s| close_to(s.speed, 0.25));
+}
+
+#[test]
+fn context_menu_sets_speed() {
+    let mut h = playing_multitrack();
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("播放速度").click();
+    h.run_steps(2);
+    h.get_by_label("2×").click();
+    step_until(&mut h, "右鍵選單選 2×", |s| close_to(s.speed, 2.0));
+}
+
+#[test]
+fn frame_step_keys() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t0 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::Period);
+    step_until(&mut h, ". 逐格前進", |s| s.paused && s.time_pos > t0 + 0.01);
+    let t1 = h.state().player().state.time_pos;
+    assert!(t1 - t0 < 0.2, "只前進一格（24 fps 約 0.04 秒）：{t0} → {t1}");
+    h.key_press(egui::Key::Comma);
+    step_until(&mut h, ", 逐格後退", |s| s.paused && s.time_pos < t1 - 0.01);
+}
+
+#[test]
+fn ab_loop_key_cycles_and_new_file_clears_it() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 設定起點", |s| {
+        s.ab_loop[0].is_some() && s.ab_loop[1].is_none()
+    });
+    let a = h.state().player().state.ab_loop[0].unwrap();
+    step_until(&mut h, "播放一秒", |s| s.time_pos > a + 1.0);
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 設定終點", |s| s.ab_loop[1].is_some());
+    let b = h.state().player().state.ab_loop[1].unwrap();
+    // 播到終點會回到起點：等一段比區段還長的時間，時間都不會超出區段
+    let start = Instant::now();
+    let mut looped = false;
+    let mut last = h.state().player().state.time_pos;
+    while start.elapsed() < Duration::from_secs_f64(b - a + 1.5) {
+        h.step();
+        let t = h.state().player().state.time_pos;
+        assert!(t <= b + 0.5, "時間 {t} 超過終點 {b}");
+        looped |= t < last - 0.3;
+        last = t;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(looped, "應該從終點 {b} 跳回起點 {a}");
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 第三次取消", |s| s.ab_loop == [None, None]);
+
+    // mpv 換檔時會沿用 A-B 設定；開新檔要清掉
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "再設一次起點", |s| s.ab_loop[0].is_some());
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "開新檔後取消 A-B 重播", |s| {
+        playing(s, "mp4_h264_aac.mp4") && s.ab_loop == [None, None]
+    });
+}
+
+#[test]
+fn chapters_keys_and_menu() {
+    // 章節在 0、4.037、8.041 秒（不對齊影格）：片頭、本篇、片尾
+    let mut h = opened(sample("common/mkv_chapters.mkv"));
+    step_until(&mut h, "讀到三個章節", |s| s.chapters.len() == 3);
+    let titles: Vec<_> = h
+        .state()
+        .player()
+        .state
+        .chapters
+        .iter()
+        .map(|c| c.title.clone())
+        .collect();
+    assert_eq!(titles, [Some("片頭".into()), Some("本篇".into()), Some("片尾".into())]);
+    // 暫停：時間不會自己往前走，下面的檢查才真的是跳章節的結果
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+
+    let chapter_key = |h: &mut Harness<'_, VitascopeApp>, key| {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, key);
+    };
+    chapter_key(&mut h, egui::Key::PageDown);
+    step_until(&mut h, "下一章：本篇", |s| {
+        s.chapter == Some(1) && (3.9..4.6).contains(&s.time_pos)
+    });
+    // 跳過去之後畫面的時間比章節時間早一點點，下一章還是要能繼續往後
+    chapter_key(&mut h, egui::Key::PageDown);
+    step_until(&mut h, "下一章：片尾", |s| {
+        s.chapter == Some(2) && (7.9..8.6).contains(&s.time_pos)
+    });
+    chapter_key(&mut h, egui::Key::PageDown);
+    h.run_steps(5);
+    assert_eq!(
+        h.state().player().state.chapter,
+        Some(2),
+        "最後一章再往後不動（不會跳到片尾、換檔）"
+    );
+    // 才進入片尾沒多久：往回跳到上一章
+    chapter_key(&mut h, egui::Key::PageUp);
+    step_until(&mut h, "上一章：本篇", |s| {
+        s.chapter == Some(1) && (3.9..4.6).contains(&s.time_pos)
+    });
+
+    // 右鍵選單 → 章節 → 片頭
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("章節").click();
+    h.run_steps(2);
+    h.get_by_label_contains("片頭").click();
+    step_until(&mut h, "選單跳到片頭", |s| {
+        s.chapter == Some(0) && s.time_pos < 1.0
+    });
+}
+
+#[test]
+fn wheel_over_video_changes_volume() {
+    let mut h = playing_multitrack();
+    step_until(&mut h, "音量 100", |s| s.volume == 100.0);
+    h.get_by_label("影片畫面").hover();
+    h.run_steps(1);
+    let wheel = |y: f32| egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, y),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    };
+    h.event(wheel(-1.0));
+    step_until(&mut h, "滾輪往下一格：音量 95", |s| s.volume == 95.0);
+    h.event(wheel(-2.0));
+    step_until(&mut h, "再兩格：音量 85", |s| s.volume == 85.0);
+    h.event(wheel(1.0));
+    step_until(&mut h, "往上一格：音量 90", |s| s.volume == 90.0);
+    // 觸控板：連續的小量捲動，累積滿一格才算
+    for _ in 0..4 {
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 15.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    }
+    step_until(&mut h, "觸控板 60 點：音量 95", |s| s.volume == 95.0);
 }

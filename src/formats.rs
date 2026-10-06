@@ -35,3 +35,21 @@ pub fn is_subtitle(path: &std::path::Path) -> bool {
 pub fn all_media() -> Vec<&'static str> {
     VIDEO.iter().chain(VIDEO_RARE).chain(AUDIO).copied().collect()
 }
+
+/// 影片或純音訊（同資料夾播放清單只收同一類的檔案）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Video,
+    Audio,
+}
+
+pub fn media_kind(path: &std::path::Path) -> Option<MediaKind> {
+    let ext = ext_of(path)?;
+    if VIDEO.contains(&ext.as_str()) || VIDEO_RARE.contains(&ext.as_str()) {
+        Some(MediaKind::Video)
+    } else if AUDIO.contains(&ext.as_str()) {
+        Some(MediaKind::Audio)
+    } else {
+        None
+    }
+}

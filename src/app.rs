@@ -2,7 +2,9 @@
 
 use crate::autoshot::AutoShot;
 use crate::formats;
-use crate::player::{Player, PlayerEvent, TrackKind};
+use crate::history::History;
+use crate::player::{MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
+use crate::playlist::Playlist;
 use crate::settings::{Settings, WindowGeometry};
 use crate::update::{self, UpdateStatus};
 use crate::video::VideoView;
@@ -12,6 +14,7 @@ use eframe::egui::{
 };
 use eframe::glow;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,9 +22,19 @@ pub const APP_NAME: &str = "影戲 VitaScope";
 /// 全螢幕時，滑鼠多久沒動就隱藏控制列
 const HIDE_AFTER: Duration = Duration::from_secs(2);
 const OSD_DURATION: Duration = Duration::from_millis(1500);
-/// 控制列完整顯示需要的寬度
-const MIN_WINDOW_WIDTH: f32 = 560.0;
+/// 控制列完整顯示需要的寬度（也是視窗的最小寬度）
+pub const MIN_WINDOW_WIDTH: f32 = 640.0;
+/// 播放中每隔多久把續播位置存起來（當機、關機時才不會整段遺失）
+const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
+/// 右鍵選單的播放速度選項
+const SPEED_PRESETS: [f64; 10] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0];
 const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x9d, 0xff);
+/// A-B 重播在進度條上的顏色
+const AB_COLOR: Color32 = Color32::from_rgb(0xff, 0xc1, 0x07);
+/// 起始畫面列出幾個最近開啟的檔案
+const RECENT_ON_START: usize = 6;
+/// 右鍵選單列出幾個最近開啟的檔案
+const RECENT_IN_MENU: usize = 10;
 
 /// 鍵盤或按鈕觸發的操作
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +48,19 @@ enum Action {
     ExitFullscreen,
     Open,
     About,
+    /// 播放清單的上一個 / 下一個檔案
+    PrevFile,
+    NextFile,
+    /// 播放速度加快（+1）或減慢（-1）0.1 倍
+    SpeedStep(i32),
+    SpeedReset,
+    /// 逐格：true = 前進
+    FrameStep(bool),
+    AbLoop,
+    /// 跳到前 / 後幾個章節
+    Chapter(i64),
+    /// 回到開頭
+    Restart,
 }
 
 pub struct VitascopeApp {
@@ -75,6 +101,31 @@ pub struct VitascopeApp {
     update_status: Option<Arc<Mutex<UpdateStatus>>>,
     /// 「關於」裡顯示的播放引擎版本
     engine_versions: String,
+    /// 最近開啟的檔案、續播位置
+    history: History,
+    /// 同資料夾的播放清單（開網址時沒有）
+    playlist: Option<Playlist>,
+    /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
+    was_eof: bool,
+    /// 滑鼠滾輪還沒湊滿一格的量（觸控板的捲動是連續的）
+    wheel: f32,
+    /// 控制列右側（音量、選單、按鈕）上一幀的寬度，用來判斷左側還放不放得下速度標示
+    right_controls_width: f32,
+    egui_ctx: egui::Context,
+    /// 背景掃描資料夾的結果（網路磁碟上的大資料夾要掃一陣子，不能卡住畫面）
+    playlist_scan: Option<Receiver<Playlist>>,
+    /// 上一幀是否正在播放（暫停中逐格、跳轉到結尾不算「播完」，不自動接下一個）
+    was_playing: bool,
+    /// 上一幀是否暫停（剛暫停時順便存續播位置）
+    was_paused: bool,
+    last_autosave: Instant,
+    /// 開檔的次數；拖曳進度條時記下是哪個檔案開始拖的，換檔後就不再跟著拖曳跳轉
+    file_gen: u64,
+    drag_gen: Option<u64>,
+    /// 上一次單擊影片畫面的時間（egui 的時間），雙擊要兩下都點在畫面上才算
+    video_click_time: Option<f64>,
+    /// 拖曳進度條期間播到結尾（mpv 會自動暫停）：放開後要繼續播，才會接著播下一個檔案
+    resume_after_drag: bool,
 }
 
 /// 啟動參數
@@ -83,6 +134,8 @@ pub struct Launch {
     pub file: Option<PathBuf>,
     pub fullscreen: bool,
     pub autoshot: Option<AutoShot>,
+    /// 播放紀錄；預設只放在記憶體（自動測試用），播放器用 `History::load()`
+    pub history: History,
 }
 
 impl VitascopeApp {
@@ -144,6 +197,20 @@ impl VitascopeApp {
             about_open: false,
             update_status: None,
             engine_versions: String::new(),
+            history: launch.history,
+            playlist: None,
+            was_eof: false,
+            wheel: 0.0,
+            right_controls_width: 0.0,
+            egui_ctx: cc.egui_ctx.clone(),
+            playlist_scan: None,
+            was_playing: false,
+            was_paused: false,
+            last_autosave: Instant::now(),
+            file_gen: 0,
+            drag_gen: None,
+            video_click_time: None,
+            resume_after_drag: false,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -166,13 +233,144 @@ impl VitascopeApp {
         &self.player
     }
 
+    /// 播放紀錄（介面測試用）
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// 目前的播放清單（介面測試用）
+    pub fn playlist(&self) -> Option<&Playlist> {
+        self.playlist.as_ref()
+    }
+
+    /// 目前的設定（介面測試用）
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
     // ───────────── 操作 ─────────────
 
     fn open(&mut self, path: &Path) {
-        // 開新檔一律從播放開始（mpv 會沿用上一個檔案的暫停狀態）
+        // 先記下目前的檔案看到哪裡
+        self.remember_position();
+        let path = if is_url(&path.to_string_lossy()) {
+            path.to_path_buf()
+        } else {
+            // 續播紀錄、播放清單都用完整路徑比對（命令列可能給相對路徑）
+            std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+        };
+        // 同一份清單裡的檔案只移動位置；其他檔案先自己成一份清單，背景再掃描同資料夾的檔案
+        let in_list = self.playlist.as_mut().is_some_and(|list| list.select(&path));
+        if !in_list {
+            self.playlist_scan = None;
+            self.playlist = None;
+            if !is_url(&path.to_string_lossy()) {
+                self.playlist = Some(Playlist::from_files(vec![path.clone()]));
+                let (tx, rx) = mpsc::channel();
+                let (scan_path, ctx) = (path.clone(), self.egui_ctx.clone());
+                std::thread::spawn(move || {
+                    if tx.send(Playlist::for_file(&scan_path)).is_ok() {
+                        ctx.request_repaint();
+                    }
+                });
+                self.playlist_scan = Some(rx);
+            }
+        }
+        self.video_click_time = None;
+        // 開新檔一律從播放開始（mpv 會沿用上一個檔案的暫停狀態）；A-B 重播也會沿用，要清掉
         let _ = self.player.set_pause(false);
+        let _ = self.player.clear_ab_loop();
         if let Err(e) = self.player.open(&path.to_string_lossy()) {
             self.player.state.last_error = Some(format!("無法開啟：{e}"));
+        }
+    }
+
+    /// 打開最近開啟清單裡的檔案。不先檢查檔案在不在：網路磁碟暫時連不上時檢查會卡住畫面，
+    /// 也分不出是「刪掉了」還是「暫時連不上」；打不開時 mpv 會回報原因
+    fn open_recent(&mut self, path: &str) {
+        self.open(Path::new(path));
+    }
+
+    /// 背景掃描完同資料夾的檔案：換成完整的清單（掃描期間已經換到別的資料夾就不理）
+    fn poll_playlist_scan(&mut self) {
+        let Some(rx) = &self.playlist_scan else { return };
+        match rx.try_recv() {
+            Ok(mut list) => {
+                self.playlist_scan = None;
+                let current = self.playlist.as_ref().and_then(|l| l.current()).map(Path::to_path_buf);
+                if let Some(current) = current
+                    && list.select(&current)
+                {
+                    self.playlist = Some(list);
+                }
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.playlist_scan = None,
+        }
+    }
+
+    /// 記下目前的檔案看到哪裡（換檔、停止、關閉時）
+    fn remember_position(&mut self) {
+        let st = &self.player.state;
+        if !st.loaded {
+            return;
+        }
+        let (Some(path), Some(duration)) = (st.path.clone(), st.duration) else {
+            return;
+        };
+        if is_url(&path) {
+            return;
+        }
+        let time = st.time_pos;
+        self.update_history(|h| h.remember(&path, time, duration));
+        self.last_autosave = Instant::now();
+    }
+
+    /// 修改播放紀錄並存檔
+    fn update_history(&mut self, change: impl FnOnce(&mut History)) {
+        if let Err(e) = self.history.update(change) {
+            eprintln!("[vitascope] 無法儲存播放紀錄：{e}");
+        }
+    }
+
+    fn save_settings(&mut self) {
+        self.settings.volume = self.player.state.volume;
+        self.settings.muted = self.player.state.muted;
+        if let Err(e) = self.settings.save() {
+            eprintln!("[vitascope] 無法儲存設定：{e}");
+        }
+    }
+
+    /// 播放中定時、以及剛暫停時，存一下續播位置（當機、關機時才不會整段遺失）
+    fn autosave(&mut self) {
+        let st = &self.player.state;
+        let paused_now = st.loaded && st.paused;
+        let just_paused = paused_now && !self.was_paused;
+        self.was_paused = paused_now;
+        let playing = st.loaded && !st.paused;
+        if just_paused || (playing && self.last_autosave.elapsed() >= AUTOSAVE_EVERY) {
+            self.remember_position();
+        }
+    }
+
+    /// 播放清單的上一個 / 下一個檔案
+    fn step_file(&mut self, forward: bool) {
+        let target = self
+            .playlist
+            .as_ref()
+            .and_then(|l| if forward { l.next() } else { l.prev() });
+        match target.map(Path::to_path_buf) {
+            Some(path) => {
+                self.open(&path);
+                let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
+                let dir = if forward { "下一個" } else { "上一個" };
+                self.osd(format!("{dir}（{pos}/{len}）：{}", file_name(&path)));
+            }
+            None => self.osd(if forward {
+                "已經是最後一個檔案"
+            } else {
+                "已經是第一個檔案"
+            }),
         }
     }
 
@@ -203,6 +401,7 @@ impl VitascopeApp {
                 self.osd(msg);
             }
             Action::Stop if loaded => {
+                self.remember_position();
                 let _ = self.player.stop();
             }
             Action::Seek(delta) if loaded && st.seekable => {
@@ -218,7 +417,9 @@ impl VitascopeApp {
                 ));
             }
             Action::Volume(delta) => {
-                let v = (st.volume + delta).clamp(0.0, 100.0);
+                // 直接問 mpv 目前的音量：連續捲動滾輪時，屬性變化的通知可能還沒送到
+                let current = self.player.get_f64("volume").unwrap_or(st.volume);
+                let v = (current + delta).clamp(0.0, 100.0);
                 let _ = self.player.set_volume(v);
                 if st.muted {
                     let _ = self.player.set_mute(false);
@@ -237,8 +438,74 @@ impl VitascopeApp {
             Action::ExitFullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false)),
             Action::Open => self.open_dialog(),
             Action::About => self.about_open = true,
+            Action::PrevFile => self.step_file(false),
+            Action::NextFile => self.step_file(true),
+            Action::SpeedStep(dir) => {
+                let current = self.player.get_f64("speed").unwrap_or(st.speed);
+                let speed = ((current + 0.1 * f64::from(dir)) * 100.0).round() / 100.0;
+                self.set_speed(speed);
+            }
+            Action::SpeedReset => self.set_speed(1.0),
+            Action::FrameStep(forward) if loaded => {
+                let _ = self.player.frame_step(forward);
+                self.osd(if forward {
+                    "逐格前進 ▶"
+                } else {
+                    "◀ 逐格後退"
+                });
+            }
+            Action::AbLoop if loaded => {
+                let msg = match st.ab_loop {
+                    [None, _] => format!("A-B 重播：起點 {}", fmt_time(st.time_pos)),
+                    [Some(a), None] => format!("A-B 重播：{} → {}", fmt_time(a), fmt_time(st.time_pos)),
+                    [Some(_), Some(_)] => "取消 A-B 重播".to_owned(),
+                };
+                let _ = self.player.cycle_ab_loop();
+                self.osd(msg);
+            }
+            Action::Chapter(delta) if loaded => self.step_chapter(delta),
+            Action::Restart if loaded && st.seekable => {
+                let _ = self.player.seek_to(0.0, true);
+                // 播完停在最後一格（暫停中）時也要開始播
+                let _ = self.player.set_pause(false);
+                self.osd("從頭播放");
+            }
             _ => {}
         }
+    }
+
+    fn set_speed(&mut self, speed: f64) {
+        let speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        let _ = self.player.set_speed(speed);
+        self.osd(format!("速度 {}×", fmt_speed(speed)));
+    }
+
+    /// 跳到前 / 後幾個章節，OSD 顯示章節名稱。目前在哪一章交給 mpv 判斷：
+    /// 跳完章節後畫面的時間常常比章節時間早一點點，自己用時間算會卡在同一章；
+    /// mpv 也會處理「進入本章超過幾秒，往回跳先回到本章開頭」
+    fn step_chapter(&mut self, delta: i64) {
+        let total = self.player.state.chapters.len() as i64;
+        if total == 0 {
+            self.osd("這個檔案沒有章節");
+            return;
+        }
+        let current = self.player.current_chapter().unwrap_or(-1);
+        // 最後一章再往後，mpv 會跳到片尾（然後自動播下一個檔案），這裡先擋下來
+        if delta > 0 && current + delta >= total {
+            self.osd("已經是最後一章");
+            return;
+        }
+        let _ = self.player.add_chapter(delta);
+        let now = self.player.current_chapter().unwrap_or(current + delta);
+        let msg = match usize::try_from(now) {
+            Ok(i) => format!(
+                "章節 {}/{total}：{}",
+                i + 1,
+                chapter_label(&self.player.state.chapters, i)
+            ),
+            Err(_) => "回到開頭".to_owned(),
+        };
+        self.osd(msg);
     }
 
     fn select_track(&mut self, kind: TrackKind, id: Option<i64>) {
@@ -257,7 +524,12 @@ impl VitascopeApp {
             PlayerEvent::StartFile => {
                 self.fit_window_pending = !std::mem::take(&mut self.skip_next_fit);
                 self.video_reconfigured = false;
+                self.was_eof = false;
+                self.was_playing = false;
+                self.resume_after_drag = false;
+                self.file_gen += 1;
             }
+            PlayerEvent::FileLoaded => self.on_file_loaded(),
             // 新檔案的影像設定好了，尺寸才是新的
             PlayerEvent::VideoReconfig => self.video_reconfigured = true,
             PlayerEvent::PlaybackRestart => {
@@ -282,6 +554,57 @@ impl VitascopeApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 檔案載入完成：加進最近開啟，有上次的位置就從那裡繼續
+    fn on_file_loaded(&mut self) {
+        let Ok(path) = self.player.get_string("path") else {
+            return;
+        };
+        if is_url(&path) {
+            return;
+        }
+        self.update_history(|h| h.add_recent(&path));
+        // 自動截圖要固定的畫面，不續播
+        if self.settings.resume
+            && self.autoshot.is_none()
+            && let Some(t) = self.history.resume_point(&path)
+        {
+            // 同名檔案可能被換成較短的版本：位置已經不合理就不跳（會直接播完、跳下一個檔案）
+            let duration = self.player.get_f64("duration").ok();
+            if duration.is_none_or(|d| crate::history::worth_resuming(t, d)) {
+                let _ = self.player.seek_to(t, true);
+                self.osd(format!("從 {} 繼續播放（Home 從頭播放）", fmt_time(t)));
+            } else {
+                self.update_history(|h| h.forget(&path));
+            }
+        }
+    }
+
+    /// 播完時自動播放清單的下一個檔案。只算「播放中播到結尾」：
+    /// 暫停中逐格、跳轉到結尾不算；拖曳進度條期間也先不動，放開後再說
+    fn auto_next(&mut self) {
+        if self.seek_drag.is_some() || self.drag_gen.is_some() {
+            let st = &self.player.state;
+            if st.loaded && st.eof && self.was_playing {
+                self.resume_after_drag = true;
+            }
+            return;
+        }
+        let st = &self.player.state;
+        let eof = st.loaded && st.eof;
+        let just_ended = eof && !self.was_eof && self.was_playing;
+        self.was_eof = eof;
+        // mpv 播到結尾時會同時設定暫停，所以看的是上一幀還在播放
+        self.was_playing = st.loaded && !st.paused && !st.eof;
+        if !just_ended || !self.settings.auto_next {
+            return;
+        }
+        if let Some(next) = self.playlist.as_ref().and_then(|l| l.next()).map(Path::to_path_buf) {
+            self.open(&next);
+            let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
+            self.osd(format!("下一個（{pos}/{len}）：{}", file_name(&next)));
         }
     }
 
@@ -318,6 +641,17 @@ impl VitascopeApp {
             key(Modifiers::COMMAND, Key::O, Action::Open);
             key(Modifiers::COMMAND, Key::ArrowLeft, Action::Seek(-30.0));
             key(Modifiers::COMMAND, Key::ArrowRight, Action::Seek(30.0));
+            key(Modifiers::COMMAND, Key::PageUp, Action::Chapter(-1));
+            key(Modifiers::COMMAND, Key::PageDown, Action::Chapter(1));
+            key(Modifiers::NONE, Key::PageUp, Action::PrevFile);
+            key(Modifiers::NONE, Key::PageDown, Action::NextFile);
+            key(Modifiers::NONE, Key::C, Action::SpeedStep(1));
+            key(Modifiers::NONE, Key::X, Action::SpeedStep(-1));
+            key(Modifiers::NONE, Key::Z, Action::SpeedReset);
+            key(Modifiers::NONE, Key::Period, Action::FrameStep(true));
+            key(Modifiers::NONE, Key::Comma, Action::FrameStep(false));
+            key(Modifiers::NONE, Key::L, Action::AbLoop);
+            key(Modifiers::NONE, Key::Home, Action::Restart);
             key(Modifiers::NONE, Key::ArrowLeft, Action::Seek(-5.0));
             key(Modifiers::NONE, Key::ArrowRight, Action::Seek(5.0));
             key(Modifiers::NONE, Key::ArrowUp, Action::Volume(5.0));
@@ -341,14 +675,31 @@ impl VitascopeApp {
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
-        let Some(first) = dropped.first() else { return };
-        if formats::is_subtitle(first) && self.player.state.loaded {
+        let Some(first) = dropped.first().cloned() else { return };
+        if formats::is_subtitle(&first) && self.player.state.loaded {
             match self.player.add_subtitle(&first.to_string_lossy()) {
-                Ok(()) => self.osd(format!("載入字幕：{}", file_name(first))),
+                Ok(()) => self.osd(format!("載入字幕：{}", file_name(&first))),
                 Err(e) => self.osd(format!("無法載入字幕：{e}")),
             }
-        } else {
-            self.open(first);
+            return;
+        }
+        // 一次拖放多個影音檔：播放清單就是這幾個檔案，依檔名排序
+        //（拖放的順序跟系統有關，Windows 會把滑鼠抓著的那個檔案放在最前面）
+        let mut media: Vec<PathBuf> = dropped
+            .into_iter()
+            .filter(|p| formats::media_kind(p).is_some())
+            .collect();
+        crate::playlist::sort_by_name(&mut media);
+        match media.len() {
+            0 => self.open(&first),
+            1 => self.open(&media[0]),
+            _ => {
+                let first = media[0].clone();
+                self.remember_position();
+                self.playlist_scan = None;
+                self.playlist = Some(Playlist::from_files(media));
+                self.open(&first);
+            }
         }
     }
 
@@ -585,6 +936,8 @@ impl VitascopeApp {
     fn video_area(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         let response = ui.allocate_rect(rect, Sense::click());
+        // 無障礙資訊：螢幕閱讀器、介面測試（例如打開右鍵選單）找得到影片畫面
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "影片畫面"));
         let st = &self.player.state;
 
         if (st.loaded || st.loading)
@@ -606,16 +959,31 @@ impl VitascopeApp {
                     .color(Color32::from_gray(200)),
             );
         }
-        if !st.loaded && !st.loading {
-            self.placeholder(ui, rect);
+        if !st.loaded
+            && !st.loading
+            && let Some(path) = self.placeholder(ui, rect)
+        {
+            self.open_recent(&path);
         }
 
-        if response.double_clicked() {
-            // 第一下單擊已經切換過暫停，這裡切回來，結果只有全螢幕改變（跟 PotPlayer 一樣）
-            self.run(ui.ctx(), Action::TogglePause);
-            self.run(ui.ctx(), Action::ToggleFullscreen);
-            self.osd = None;
+        // 選單開著時點畫面只是關掉選單，不要順便暫停
+        let menu_was_open = egui::Popup::is_any_open(ui.ctx());
+        let now = ui.ctx().input(|i| i.time);
+        let max_delay = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+        let first_click_on_video = self.video_click_time.is_some_and(|t| now - t <= max_delay);
+        if menu_was_open {
+            self.video_click_time = None;
+        } else if response.double_clicked() {
+            if first_click_on_video {
+                // 第一下單擊已經切換過暫停，這裡切回來，結果只有全螢幕改變（跟 PotPlayer 一樣）
+                self.run(ui.ctx(), Action::TogglePause);
+                self.run(ui.ctx(), Action::ToggleFullscreen);
+                self.osd = None;
+            }
+            // 第一下點在別的地方（例如起始畫面的「最近開啟」）：這一下不算
+            self.video_click_time = None;
         } else if response.clicked() {
+            self.video_click_time = Some(now);
             self.run(ui.ctx(), Action::TogglePause);
         }
 
@@ -632,17 +1000,196 @@ impl VitascopeApp {
             );
         }
 
+        // 滑鼠滾輪調音量（比照 PotPlayer）
+        let steps = self.wheel_steps(ui.ctx(), response.hovered());
+        if steps != 0 {
+            self.run(ui.ctx(), Action::Volume(5.0 * f64::from(steps)));
+        }
+        response.context_menu(|ui| self.context_menu(ui));
+
         self.paint_osd(ui, rect);
     }
 
-    /// 沒有開檔時的畫面。用一般的 label（不是直接畫字），螢幕閱讀器和介面測試才讀得到
-    fn placeholder(&self, ui: &mut egui::Ui, rect: Rect) {
+    /// 這一幀滑鼠滾輪轉了幾格（往上為正）。觸控板的捲動是連續的，累積滿一格才算
+    fn wheel_steps(&mut self, ctx: &egui::Context, over_video: bool) -> i32 {
+        let delta: f32 = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::MouseWheel {
+                        unit, delta, modifiers, ..
+                    } if modifiers.is_none() => Some(match unit {
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Page => delta.y * 3.0,
+                        egui::MouseWheelUnit::Point => delta.y / 50.0,
+                    }),
+                    _ => None,
+                })
+                .sum()
+        });
+        if !over_video {
+            self.wheel = 0.0;
+            return 0;
+        }
+        // 換方向就重新累積
+        if self.wheel != 0.0 && delta != 0.0 && delta.signum() != self.wheel.signum() {
+            self.wheel = 0.0;
+        }
+        self.wheel += delta;
+        let steps = self.wheel.trunc();
+        self.wheel -= steps;
+        steps as i32
+    }
+
+    /// 在影片上按右鍵的選單
+    fn context_menu(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let mut action = None;
+        let mut open_recent = None;
+        let mut set_speed = None;
+        let mut seek_chapter = None;
+
+        if menu_item(ui, true, "開啟檔案…", OPEN_SHORTCUT) {
+            action = Some(Action::Open);
+        }
+        let recent: Vec<String> = self.history.recent.iter().take(RECENT_IN_MENU).cloned().collect();
+        let mut clear_recent = false;
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("最近開啟的檔案", |ui| {
+                for p in &recent {
+                    if ui.button(file_name(Path::new(p))).on_hover_text(p).clicked() {
+                        open_recent = Some(p.clone());
+                    }
+                }
+                ui.separator();
+                if ui.button("清除清單").clicked() {
+                    clear_recent = true;
+                }
+            });
+        });
+        ui.separator();
+
+        let st = &self.player.state;
+        let loaded = st.loaded;
+        let (has_prev, has_next) = self
+            .playlist
+            .as_ref()
+            .map_or((false, false), |l| (l.prev().is_some(), l.next().is_some()));
+        if menu_item(ui, loaded, if loaded && !st.paused { "暫停" } else { "播放" }, "空白鍵") {
+            action = Some(Action::TogglePause);
+        }
+        if menu_item(ui, loaded, "停止", "") {
+            action = Some(Action::Stop);
+        }
+        if menu_item(ui, has_prev, "上一個檔案", "PgUp") {
+            action = Some(Action::PrevFile);
+        }
+        if menu_item(ui, has_next, "下一個檔案", "PgDn") {
+            action = Some(Action::NextFile);
+        }
+        let mut settings_changed = ui
+            .checkbox(&mut self.settings.auto_next, "播完自動播放下一個")
+            .changed();
+        settings_changed |= ui.checkbox(&mut self.settings.resume, "從上次的位置繼續播放").changed();
+        ui.separator();
+
+        let speed = st.speed;
+        ui.menu_button(format!("播放速度（{}×）", fmt_speed(speed)), |ui| {
+            for preset in SPEED_PRESETS {
+                let label = format!("{}×", fmt_speed(preset));
+                if ui.selectable_label((speed - preset).abs() < 1e-6, label).clicked() {
+                    set_speed = Some(preset);
+                }
+            }
+            ui.separator();
+            ui.weak("C 加快、X 減慢、Z 恢復正常");
+        });
+        if menu_item(ui, loaded, "逐格前進", ".") {
+            action = Some(Action::FrameStep(true));
+        }
+        if menu_item(ui, loaded, "逐格後退", ",") {
+            action = Some(Action::FrameStep(false));
+        }
+        let ab_label = match st.ab_loop {
+            [None, _] => "A-B 重播：設定起點",
+            [Some(_), None] => "A-B 重播：設定終點",
+            [Some(_), Some(_)] => "取消 A-B 重播",
+        };
+        if menu_item(ui, loaded, ab_label, "L") {
+            action = Some(Action::AbLoop);
+        }
+        if !st.chapters.is_empty() {
+            let chapters = st.chapters.clone();
+            let current = st.chapter;
+            ui.menu_button("章節", |ui| {
+                // 章節很多（例如整季合集）時選單會超出畫面，要能捲動
+                let max_height = (ui.ctx().content_rect().height() - 80.0).max(120.0);
+                egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                    for (i, c) in chapters.iter().enumerate() {
+                        let label = format!("{}  {}", fmt_time(c.time), chapter_label(&chapters, i));
+                        if ui.selectable_label(current == Some(i), label).clicked() {
+                            seek_chapter = Some(i);
+                        }
+                    }
+                });
+                ui.separator();
+                ui.weak(format!("上一章 / 下一章：{CHAPTER_SHORTCUT}"));
+            });
+        }
+        ui.separator();
+        self.track_menu(ui, TrackKind::Audio, "音軌");
+        self.track_menu(ui, TrackKind::Sub, "字幕");
+        ui.separator();
+        if menu_item(ui, true, "全螢幕", "F") {
+            action = Some(Action::ToggleFullscreen);
+        }
+        if menu_item(ui, true, "關於影戲", "F1") {
+            action = Some(Action::About);
+        }
+
+        if settings_changed {
+            self.save_settings();
+        }
+        if clear_recent {
+            self.update_history(History::clear_recent);
+        }
+        if let Some(path) = open_recent {
+            self.open_recent(&path);
+        }
+        if let Some(speed) = set_speed {
+            self.set_speed(speed);
+        }
+        if let Some(i) = seek_chapter {
+            let _ = self.player.seek_chapter(i);
+            let st = &self.player.state;
+            let msg = format!(
+                "章節 {}/{}：{}",
+                i + 1,
+                st.chapters.len(),
+                chapter_label(&st.chapters, i)
+            );
+            self.osd(msg);
+        }
+        if let Some(a) = action {
+            self.run(&ctx, a);
+        }
+    }
+
+    /// 沒有開檔時的畫面。用一般的 label（不是直接畫字），螢幕閱讀器和介面測試才讀得到。
+    /// 回傳使用者在「最近開啟」裡點選的檔案
+    fn placeholder(&self, ui: &mut egui::Ui, rect: Rect) -> Option<String> {
         let mut ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect.shrink(40.0))
                 .layout(Layout::top_down(Align::Center)),
         );
-        ui.add_space((rect.height() / 2.0 - 90.0).max(0.0));
+        let recent: Vec<&String> = self.history.recent.iter().take(RECENT_ON_START).collect();
+        let recent_height = if recent.is_empty() {
+            0.0
+        } else {
+            40.0 + 24.0 * recent.len() as f32
+        };
+        ui.add_space((rect.height() / 2.0 - 90.0 - recent_height / 2.0).max(0.0));
         ui.label(egui::RichText::new(APP_NAME).size(32.0).color(Color32::from_gray(220)));
         ui.add_space(8.0);
         ui.label(
@@ -662,6 +1209,30 @@ impl VitascopeApp {
                     .color(Color32::from_rgb(0xff, 0x8a, 0x80)),
             );
         }
+        // 最近開啟的檔案，點一下就開
+        let mut chosen = None;
+        if !recent.is_empty() {
+            ui.add_space(28.0);
+            ui.label(
+                egui::RichText::new("最近開啟")
+                    .size(14.0)
+                    .color(Color32::from_gray(150)),
+            );
+            ui.add_space(4.0);
+            for path in recent {
+                let name = egui::RichText::new(file_name(Path::new(path)))
+                    .size(14.0)
+                    .color(Color32::from_gray(200));
+                if ui
+                    .add(egui::Button::new(name).frame(false))
+                    .on_hover_text(path)
+                    .clicked()
+                {
+                    chosen = Some(path.clone());
+                }
+            }
+        }
+        chosen
     }
 
     fn paint_osd(&mut self, ui: &egui::Ui, rect: Rect) {
@@ -688,12 +1259,30 @@ impl VitascopeApp {
             let st = &self.player.state;
             let loaded = st.loaded;
             let play_icon = if !st.paused && loaded { "⏸" } else { "▶" };
+            let (has_prev, has_next) = self
+                .playlist
+                .as_ref()
+                .map_or((false, false), |l| (l.prev().is_some(), l.next().is_some()));
+            if ui
+                .add_enabled(has_prev, icon_button("⏮"))
+                .on_hover_text("上一個檔案（PgUp）")
+                .clicked()
+            {
+                self.run(ui.ctx(), Action::PrevFile);
+            }
             if ui
                 .add_enabled(loaded, icon_button(play_icon))
                 .on_hover_text("播放 / 暫停（空白鍵）")
                 .clicked()
             {
                 self.run(ui.ctx(), Action::TogglePause);
+            }
+            if ui
+                .add_enabled(has_next, icon_button("⏭"))
+                .on_hover_text("下一個檔案（PgDn）")
+                .clicked()
+            {
+                self.run(ui.ctx(), Action::NextFile);
             }
             if ui.add_enabled(loaded, icon_button("⏹")).on_hover_text("停止").clicked() {
                 self.run(ui.ctx(), Action::Stop);
@@ -706,6 +1295,17 @@ impl VitascopeApp {
                 "--:-- / --:--".to_owned()
             };
             ui.label(egui::RichText::new(time).monospace());
+            // 速度不是 1× 時顯示在時間旁邊；視窗太窄、會擠到右邊的按鈕時就不顯示（OSD 和右鍵選單還看得到）
+            if (st.speed - 1.0).abs() > 1e-6 {
+                let font = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
+                let galley = ui
+                    .painter()
+                    .layout_no_wrap(format!("{}×", fmt_speed(st.speed)), font, ACCENT);
+                let needed = galley.size().x + ui.spacing().item_spacing.x;
+                if ui.available_width() >= self.right_controls_width + needed {
+                    ui.label(galley).on_hover_text("播放速度（C 加快、X 減慢、Z 恢復正常）");
+                }
+            }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(icon_button("⛶")).on_hover_text("全螢幕（F / Enter）").clicked() {
@@ -724,18 +1324,21 @@ impl VitascopeApp {
                 self.track_menu(ui, TrackKind::Sub, "字幕");
                 self.track_menu(ui, TrackKind::Audio, "音軌");
                 self.volume_controls(ui);
+                self.right_controls_width = ui.min_rect().width();
             });
         });
     }
 
     fn volume_controls(&mut self, ui: &mut egui::Ui) {
+        // 音量條短一點，窄視窗時左邊的時間、速度才放得下（Slider 的寬度看 spacing，不看 add_sized）
+        ui.spacing_mut().slider_width = 70.0;
         let st = &self.player.state;
         let mut volume = st.volume;
         let slider = egui::Slider::new(&mut volume, 0.0..=100.0)
             .show_value(false)
             .trailing_fill(true);
         let response = ui
-            .add_sized([90.0, 20.0], slider)
+            .add_sized([70.0, 20.0], slider)
             .on_hover_text(format!("音量 {:.0}%（↑ ↓）", st.volume));
         if response.changed() {
             let _ = self.player.set_volume(volume);
@@ -789,19 +1392,35 @@ impl VitascopeApp {
         response.widget_info(|| egui::WidgetInfo::slider(can_seek, st.time_pos, "進度"));
 
         let time_at = |x: f32| ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * duration;
+        // 拖曳只對開始拖的那個檔案有效：拖到結尾、換到下一個檔案後，不要繼續把新檔案也拖到結尾
+        if response.drag_started() {
+            self.drag_gen = Some(self.file_gen);
+        }
+        let drag_is_ours = self.drag_gen == Some(self.file_gen);
+        if !response.is_pointer_button_down_on() && !response.drag_stopped() {
+            self.drag_gen = None;
+        }
         if can_seek {
             if let Some(p) = response.interact_pointer_pos() {
                 let t = time_at(p.x);
-                if response.dragged() && self.seek_drag.is_none_or(|old| (old - t).abs() > 0.05) {
+                if !drag_is_ours && (response.dragged() || response.drag_stopped()) {
+                    // 換檔前開始的拖曳：放開時也不跳轉
+                } else if response.dragged() && self.seek_drag.is_none_or(|old| (old - t).abs() > 0.05) {
                     // 拖曳中跳到關鍵影格（快），放開時再精準跳轉
                     let _ = self.player.seek_to(t, false);
                     self.seek_drag = Some(t);
                     self.seek_released = false;
                 }
-                if response.drag_stopped() || response.clicked() {
+                if (response.drag_stopped() && drag_is_ours) || response.clicked() {
                     let _ = self.player.seek_to(t, true);
+                    if std::mem::take(&mut self.resume_after_drag) {
+                        let _ = self.player.set_pause(false);
+                    }
                     self.seek_drag = Some(t);
                     self.seek_released = true;
+                }
+                if response.drag_stopped() {
+                    self.drag_gen = None;
                 }
             }
             if response.hovered() {
@@ -821,6 +1440,32 @@ impl VitascopeApp {
         };
         let played = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac, bar.max.y));
         painter.rect_filled(played, CornerRadius::same(3), ACCENT);
+        if duration > 0.0 {
+            let x_of = |t: f64| bar.left() + bar.width() * (t / duration).clamp(0.0, 1.0) as f32;
+            // A-B 重播：區段塗上顏色；只設了起點時畫一條線
+            match st.ab_loop {
+                [Some(a), Some(b)] => {
+                    let section = Rect::from_x_y_ranges(x_of(a.min(b))..=x_of(a.max(b)), bar.y_range());
+                    painter.rect_filled(section, CornerRadius::ZERO, AB_COLOR.gamma_multiply(0.6));
+                }
+                [Some(a), None] => {
+                    let x = x_of(a);
+                    painter.line_segment(
+                        [pos2(x, bar.top() - 4.0), pos2(x, bar.bottom() + 4.0)],
+                        Stroke::new(2.0, AB_COLOR),
+                    );
+                }
+                _ => {}
+            }
+            // 章節：在進度條上切出間隔
+            for c in st.chapters.iter().filter(|c| c.time > 0.0) {
+                let x = x_of(c.time);
+                painter.line_segment(
+                    [pos2(x, bar.top() - 1.0), pos2(x, bar.bottom() + 1.0)],
+                    Stroke::new(2.0, Color32::from_gray(24)),
+                );
+            }
+        }
         if active {
             painter.circle(
                 pos2(played.right(), bar.center().y),
@@ -832,7 +1477,11 @@ impl VitascopeApp {
 
         // 滑鼠停在進度條上：顯示該位置的時間
         if can_seek && let Some(hover) = response.hover_pos() {
-            let label = fmt_time(time_at(hover.x));
+            let t = time_at(hover.x);
+            let label = match st.chapter_at(t) {
+                Some(i) => format!("{} · {}", fmt_time(t), chapter_label(&st.chapters, i)),
+                None => fmt_time(t),
+            };
             let layer = egui::LayerId::new(egui::Order::Tooltip, Id::new("seek_hover"));
             let p = ui.ctx().layer_painter(layer);
             let galley = p.layout_no_wrap(label, FontId::monospace(13.0), Color32::WHITE);
@@ -856,6 +1505,9 @@ impl eframe::App for VitascopeApp {
         for ev in self.player.poll() {
             self.on_player_event(ev);
         }
+        self.poll_playlist_scan();
+        self.auto_next();
+        self.autosave();
         if ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()) {
             self.last_activity = Instant::now();
         }
@@ -936,17 +1588,50 @@ impl eframe::App for VitascopeApp {
         if let Some(video) = &self.video {
             video.destroy(gl);
         }
-        self.settings.volume = self.player.state.volume;
-        self.settings.muted = self.player.state.muted;
-        if let Err(e) = self.settings.save() {
-            eprintln!("[vitascope] 無法儲存設定：{e}");
-        }
+        self.remember_position();
+        self.save_settings();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 1.0]
     }
 }
+
+/// 網址（串流、mpv 的 av:// 之類），不是本機檔案
+fn is_url(path: &str) -> bool {
+    path.contains("://")
+}
+
+/// 1.0 → 「1」、1.25 →「1.25」、0.5 →「0.5」
+fn fmt_speed(speed: f64) -> String {
+    let s = format!("{speed:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// 章節名稱；沒有名稱就用「第 n 章」
+fn chapter_label(chapters: &[crate::player::Chapter], index: usize) -> String {
+    chapters
+        .get(index)
+        .and_then(|c| c.title.clone())
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| format!("第 {} 章", index + 1))
+}
+
+/// 選單項目：文字 + 右側的快捷鍵說明，回傳是否被點選
+fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bool {
+    let mut button = egui::Button::new(text);
+    if !shortcut.is_empty() {
+        button = button.shortcut_text(shortcut);
+    }
+    ui.add_enabled(enabled, button).clicked()
+}
+
+/// 跳章節的快捷鍵說明
+const CHAPTER_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "Cmd+PgUp / PgDn"
+} else {
+    "Ctrl+PgUp / PgDn"
+};
 
 /// 開檔快捷鍵的說明文字（macOS 用 Command 鍵）
 const OPEN_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
@@ -1008,7 +1693,7 @@ pub fn fmt_time(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_time, is_mesa_software_renderer, short_versions};
+    use super::{fmt_speed, fmt_time, is_mesa_software_renderer, short_versions};
 
     #[test]
     fn formats_time() {
@@ -1029,6 +1714,15 @@ mod tests {
             short_versions("mpv 0.37.0", "6.1.1-3ubuntu5"),
             "mpv 0.37.0 · FFmpeg 6.1.1"
         );
+    }
+
+    #[test]
+    fn formats_speed() {
+        assert_eq!(fmt_speed(1.0), "1");
+        assert_eq!(fmt_speed(1.25), "1.25");
+        assert_eq!(fmt_speed(0.5), "0.5");
+        assert_eq!(fmt_speed(1.1), "1.1");
+        assert_eq!(fmt_speed(4.0), "4");
     }
 
     #[test]

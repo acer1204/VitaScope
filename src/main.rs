@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use vitascope::app::{APP_NAME, Launch, VitascopeApp};
 use vitascope::autoshot::AutoShot;
+use vitascope::history::History;
 use vitascope::player::{Options, Player};
 use vitascope::settings::Settings;
 
@@ -46,6 +47,10 @@ fn parse_args() -> Launch {
         }
     }
     launch.autoshot = shot.map(|p| AutoShot::new(p, Duration::from_secs_f64(delay)));
+    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄：畫面才固定，也不會混進使用者的最近開啟清單
+    if launch.autoshot.is_none() {
+        launch.history = History::load();
+    }
     launch
 }
 
@@ -71,7 +76,7 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_inner_size([960.0, 600.0])
-        .with_min_inner_size([480.0, 300.0])
+        .with_min_inner_size([vitascope::app::MIN_WINDOW_WIDTH, 300.0])
         .with_drag_and_drop(true);
     if let Some(g) = settings.window {
         viewport = viewport
