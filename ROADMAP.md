@@ -383,3 +383,7 @@ GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試
 - **打包後一定要真的執行一次**：macOS 的 .app 打包成功，執行卻當掉。dylibbundler 會把每條既有的 rpath
   改寫成同一個路徑，產生重複的 LC_RPATH（新版 macOS 拒絕載入），還蓋掉 Swift 執行庫需要的 `/usr/lib/swift`。
   發佈流程現在打包後會執行 `--version`，並檢查 .app 裡沒有參照 Homebrew 路徑。
+- **Mesa 的軟體繪圖（llvmpipe）下，mpv 完整的繪圖流程時常畫出全黑的畫面**（大約一半的啟動，沒有任何 GL 錯誤）。
+  讀回貼圖的像素確認是 mpv 畫出來的內容就是黑的，不是貼到視窗的問題；改用 `gpu-dumb-mode` 每次都正常。
+  現在偵測到 llvmpipe / softpipe 時自動切換，實體顯示卡維持完整流程。這種時有時無的問題，CI 要多啟動幾次才抓得到。
+  排查時可以用 `VITASCOPE_DEBUG=1`（印出 mpv 的警告與像素取樣）和 `VITASCOPE_MPV_OPTS="名稱=值 …"`（額外指定 mpv 選項）。

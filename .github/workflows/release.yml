@@ -215,44 +215,20 @@ jobs:
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "bin=dist/$name/vitascope" >> "$GITHUB_ENV"
 
-      - name: 排查：比較 mpv 繪圖設定（Linux，暫時）
-        if: runner.os == 'Linux'
-        continue-on-error: true
-        env:
-          VITASCOPE_DEBUG: "1"
-        run: |
-          i=0
-          while IFS= read -r opts; do
-            i=$((i + 1))
-            echo "::group::設定 $i：${opts:-（預設）}"
-            VITASCOPE_MPV_OPTS="$opts" timeout 40 xvfb-run -a -s "-screen 0 1280x800x24" \
-              "$bin" "$TEST_VIDEO" --shot "shot-probe-$i.png" --shot-delay 2 < /dev/null > "probe-$i.log" 2>&1 || true
-            grep -E '像素取樣|mpv/(warn|error)|GL 錯誤' "probe-$i.log" | sort | uniq -c | sort -rn | head -15
-            echo "::endgroup::"
-            pct=$(grep -o '非黑色像素 [0-9.]*' "probe-$i.log" | awk '{print $2}')
-            echo "結果 $i：${pct:-沒有截圖}%　${opts:-（預設）}"
-          done <<'EOF'
-
-          profile=fast
-          gpu-dumb-mode=yes
-          dither-depth=no
-          fbo-format=rgba8
-          scale=bilinear cscale=bilinear dscale=bilinear sigmoid-upscaling=no correct-downscaling=no linear-downscaling=no
-          gpu-debug=yes
-          gpu-dumb-mode=yes gpu-debug=yes
-          EOF
-
       - name: 介面測試（Linux，虛擬螢幕）
         if: runner.os == 'Linux'
         env:
-          VITASCOPE_DEBUG: "v"
+          VITASCOPE_DEBUG: "1"
         run: |
-          timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" \
-            "$bin" "$TEST_VIDEO" --shot shot-linux.png --shot-delay 3 2>&1 | tee shot.log
-          pct=$(grep -o '非黑色像素 [0-9.]*' shot.log | awk '{print $2}')
-          echo "非黑色像素：${pct:-沒有截圖}%"
-          # 測試畫面是彩條，幾乎整個畫面都有顏色；全黑或只剩控制列代表影片沒畫出來
-          awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
+          # 軟體繪圖下 mpv 的黑畫面問題時有時無，所以啟動三次，每次都要畫出影片
+          for i in 1 2 3; do
+            timeout 60 xvfb-run -a -s "-screen 0 1280x800x24" \
+              "$bin" "$TEST_VIDEO" --shot "shot-linux-$i.png" --shot-delay 3 < /dev/null 2>&1 | tee "shot-$i.log"
+            pct=$(grep -o '非黑色像素 [0-9.]*' "shot-$i.log" | awk '{print $2}')
+            echo "第 $i 次：非黑色像素 ${pct:-沒有截圖}%"
+            # 測試畫面是彩條，幾乎整個畫面都有顏色；全黑或只剩控制列代表影片沒畫出來
+            awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
+          done
 
       - name: 上傳介面測試截圖
         if: always() && runner.os != 'Windows'

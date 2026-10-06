@@ -23,7 +23,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
 - **Linux**：需要有 libmpv.so.2 的發行版（例如 Ubuntu 24.04 以後）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
-  開檔對話框需要 xdg-desktop-portal 或 zenity。
+  開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
+  會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
 
 播放器的「關於」（控制列的 ℹ 或 F1）可以檢查更新，有新版本時會開啟 Releases 頁面。
 

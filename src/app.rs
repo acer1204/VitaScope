@@ -103,6 +103,12 @@ impl VitascopeApp {
                 )
             };
             eprintln!("[vitascope] OpenGL：{renderer}（{version}）");
+            // Mesa 的軟體繪圖（llvmpipe 等，常見於虛擬機、沒有顯示卡驅動的電腦）上，
+            // mpv 完整的繪圖流程畫出來是全黑的；改用簡化流程（少了高品質縮放等效果，但看得到畫面）
+            if is_mesa_software_renderer(&renderer) && !mpv_opts_override("gpu-dumb-mode") {
+                eprintln!("[vitascope] 偵測到軟體繪圖，mpv 改用簡化的繪圖流程");
+                let _ = player.mpv().set_property("gpu-dumb-mode", "yes");
+            }
         }
         let (video, fatal) = match &cc.get_proc_address {
             Some(gpa) => match VideoView::new(player.mpv().clone(), gpa.clone(), cc.egui_ctx.clone()) {
@@ -968,6 +974,20 @@ fn short_versions(mpv: &str, ffmpeg: &str) -> String {
     format!("mpv {mpv} · FFmpeg {ffmpeg}")
 }
 
+/// Mesa 的軟體繪圖器：llvmpipe、softpipe、舊的 swrast（「Software Rasterizer」）
+fn is_mesa_software_renderer(renderer: &str) -> bool {
+    let r = renderer.to_ascii_lowercase();
+    ["llvmpipe", "softpipe", "software rasterizer"]
+        .iter()
+        .any(|name| r.contains(name))
+}
+
+/// 使用者用 VITASCOPE_MPV_OPTS 自己指定了這個 mpv 選項（就不自動調整）
+fn mpv_opts_override(name: &str) -> bool {
+    std::env::var("VITASCOPE_MPV_OPTS")
+        .is_ok_and(|opts| opts.split_whitespace().any(|kv| kv.split('=').next() == Some(name)))
+}
+
 /// 秒數 → 「1:23:45」或「03:21」
 pub fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0).round() as u64;
@@ -981,7 +1001,7 @@ pub fn fmt_time(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_time, short_versions};
+    use super::{fmt_time, is_mesa_software_renderer, short_versions};
 
     #[test]
     fn formats_time() {
@@ -1002,5 +1022,16 @@ mod tests {
             short_versions("mpv 0.37.0", "6.1.1-3ubuntu5"),
             "mpv 0.37.0 · FFmpeg 6.1.1"
         );
+    }
+
+    #[test]
+    fn detects_mesa_software_renderers() {
+        assert!(is_mesa_software_renderer("llvmpipe (LLVM 20.1.2, 256 bits)"));
+        assert!(is_mesa_software_renderer("softpipe"));
+        assert!(is_mesa_software_renderer("Software Rasterizer"));
+        // 實體顯示卡、macOS 的軟體繪圖（畫面正常）都不算
+        assert!(!is_mesa_software_renderer("NVIDIA GeForce RTX 3090/PCIe/SSE2"));
+        assert!(!is_mesa_software_renderer("Mesa Intel(R) UHD Graphics 630 (CFL GT2)"));
+        assert!(!is_mesa_software_renderer("Apple Software Renderer"));
     }
 }
