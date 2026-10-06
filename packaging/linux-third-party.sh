@@ -36,6 +36,10 @@ owner() {
       dpkg -S "$path" 2>/dev/null | head -1 | cut -d: -f1 && return 0
     done
   done
+  # 放在子資料夾裡的（例如 pulseaudio/libpulsecommon-*.so）：用檔名找，路徑結尾要完全一樣
+  dpkg -S "*/$name" 2>/dev/null \
+    | awk -v n="/$name" '{ p = $NF; if (substr(p, length(p) - length(n) + 1) == n) { sub(/:.*/, "", $1); print $1; exit } }' \
+    | grep . && return 0
   return 1
 }
 
