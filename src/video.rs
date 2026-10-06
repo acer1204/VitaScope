@@ -28,6 +28,8 @@ struct Inner {
     dirty: Arc<AtomicBool>,
     /// 第一次畫面輸出時記錄 GL 狀態（排查顯示問題用）
     logged: bool,
+    /// VITASCOPE_DEBUG：已經印過幾次像素取樣
+    probes: u32,
 }
 
 struct Target {
@@ -60,6 +62,7 @@ impl VideoView {
                 quad: None,
                 dirty,
                 logged: false,
+                probes: 0,
             })),
         })
     }
@@ -148,7 +151,11 @@ impl Inner {
 
             let dirty = self.dirty.swap(false, Ordering::AcqRel);
             let has_new_frame = dirty && render.update();
-            if resized || has_new_frame {
+            let rendered = resized || has_new_frame;
+            // VITASCOPE_DEBUG：前幾次 mpv 渲染時，取樣貼圖與畫面中心的像素
+            let probe = rendered && self.probes < 30 && std::env::var_os("VITASCOPE_DEBUG").is_some();
+            let mut texture_px = None;
+            if rendered {
                 // egui 開著 scissor（裁切到 clip rect，螢幕座標），會把畫進 FBO 的內容裁掉
                 gl.disable(glow::SCISSOR_TEST);
                 gl.disable(glow::BLEND);
@@ -160,6 +167,9 @@ impl Inner {
                     if error != glow::NO_ERROR {
                         eprintln!("[vitascope] mpv 渲染後有 GL 錯誤 0x{error:x}");
                     }
+                }
+                if probe {
+                    texture_px = Some(read_center(gl, Some(target.fbo), [0, 0, w, h]));
                 }
             }
 
@@ -189,6 +199,12 @@ impl Inner {
                 }
             }
 
+            if let Some(texture_px) = texture_px {
+                self.probes += 1;
+                let screen_px = read_center(gl, screen_fbo, viewport);
+                eprintln!("[vitascope] 像素取樣 {w}×{h}：貼圖 {texture_px:?}，畫面 {screen_px:?}");
+            }
+
             if !self.logged {
                 self.logged = true;
                 let samples = gl.get_parameter_i32(glow::SAMPLES);
@@ -206,6 +222,26 @@ impl Inner {
             }
         }
     }
+}
+
+/// 排查用：讀 `fbo` 裡 `rect`（[左, 下, 寬, 高]）中心的像素，讀完綁回 `fbo`
+unsafe fn read_center(gl: &glow::Context, fbo: Option<glow::Framebuffer>, rect: [i32; 4]) -> [u8; 4] {
+    let mut px = [0u8; 4];
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, fbo);
+        gl.bind_buffer(glow::PIXEL_PACK_BUFFER, None);
+        gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+        gl.read_pixels(
+            rect[0] + rect[2] / 2,
+            rect[1] + rect[3] / 2,
+            1,
+            1,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(Some(&mut px)),
+        );
+    }
+    px
 }
 
 unsafe fn create_target(gl: &glow::Context, w: i32, h: i32) -> Result<Target, String> {
