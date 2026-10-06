@@ -115,14 +115,24 @@ jobs:
           </dict>
           </plist>
           EOF
-          # build.rs 為了開發方便加了 Homebrew 的 rpath；先刪掉，否則 dylibbundler 改寫後會出現
-          # 重複的 LC_RPATH，新版 macOS 會拒絕載入（dyld: duplicate LC_RPATH）
-          for p in /opt/homebrew/lib /usr/local/lib; do
-            install_name_tool -delete_rpath "$p" "$app/Contents/MacOS/vitascope" 2>/dev/null || true
-          done
           # 把 libmpv 及其相依函式庫複製進 .app，並把載入路徑改成 .app 內部
           dylibbundler -od -b -x "$app/Contents/MacOS/vitascope" \
             -d "$app/Contents/Frameworks" -p @executable_path/../Frameworks/
+          # 重設 rpath：dylibbundler 會把每條既有的 rpath 都改寫成同一個路徑，
+          # 產生重複的 LC_RPATH（新版 macOS 會拒絕載入），還會蓋掉 libmpv 找 Swift 執行庫要的 /usr/lib/swift
+          reset_rpaths() {
+            local file="$1"; shift
+            for _ in $(seq 30); do
+              rp=$(otool -l "$file" | awk '/cmd LC_RPATH/ { getline; getline; print $2; exit }')
+              [ -z "$rp" ] && break
+              install_name_tool -delete_rpath "$rp" "$file"
+            done
+            for rp in "$@"; do install_name_tool -add_rpath "$rp" "$file"; done
+          }
+          reset_rpaths "$app/Contents/MacOS/vitascope" "@executable_path/../Frameworks"
+          for lib in "$app"/Contents/Frameworks/*.dylib; do
+            reset_rpaths "$lib" "@loader_path" "/usr/lib/swift"
+          done
           # 改過載入路徑的執行檔要重新簽章，否則 Apple Silicon 不讓它執行（ad-hoc 簽章，未經公證）
           codesign --force --deep --sign - "$app"
           # 確認 .app 不再參照 Homebrew 的路徑（使用者電腦上沒有），而且真的能執行
