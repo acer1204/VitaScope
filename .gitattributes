@@ -1,0 +1,4 @@
+# 統一用 LF 換行（跨平台專案）
+* text=auto eol=lf
+*.png binary
+*.ico binary

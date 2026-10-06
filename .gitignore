@@ -1,0 +1,11 @@
+/target
+
+# 本機專用設定（含機器專屬的絕對路徑）
+/.cargo/config.toml
+
+# libmpv 二進位檔（用 scripts/fetch-libmpv.ps1 下載）
+/vendor/libmpv/*/
+
+# 測試樣本（用 scripts/gen-samples 產生；外部樣本不進版控）
+/samples/generated/
+/samples/external/

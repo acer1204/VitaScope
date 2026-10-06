@@ -1,0 +1,170 @@
+name: Release
+
+# 推送版本標籤（例如 v0.1.0）時：三個平台編譯、打包，建立 GitHub Release 並附上安裝檔。
+# 手動執行（Actions 頁面的 Run workflow）時：只編譯打包、上傳成 artifact，不建立 Release，用來先驗證打包流程。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 打包（${{ matrix.name }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            os: windows-latest
+          - name: macos-arm64
+            os: macos-latest
+          - name: linux-x64
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本號
+        id: version
+        shell: bash
+        run: |
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            # 標籤要跟 Cargo.toml 的版本一致，「檢查更新」才比得出正確結果
+            if [[ "$tag" != "v$cargo_version" ]]; then
+              echo "::error::標籤 $tag 跟 Cargo.toml 的版本 $cargo_version 不一致"
+              exit 1
+            fi
+          else
+            tag="v$cargo_version-dev"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: 安裝 Rust（Windows GNU）
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+      - name: 安裝 Rust
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 安裝 libmpv（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/fetch-libmpv.ps1
+      - name: 安裝 libmpv（macOS）
+        if: runner.os == 'macOS'
+        run: brew install mpv dylibbundler
+      - name: 安裝 libmpv（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv-dev
+
+      - name: 編譯
+        run: cargo build --release
+
+      # ── Windows：exe + libmpv-2.dll，解壓就能用 ──
+      - name: 打包（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "VitaScope-${{ steps.version.outputs.tag }}-windows-x64"
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/vitascope.exe $dir
+          Copy-Item vendor/libmpv/windows-x64/libmpv-2.dll $dir
+          Copy-Item LICENSE, README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+
+      # ── macOS：.app，libmpv 和相依的 dylib 都包進 Contents/Frameworks ──
+      - name: 打包（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          version="${tag#v}"
+          app="dist/VitaScope.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks"
+          cp target/release/vitascope "$app/Contents/MacOS/"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>VitaScope</string>
+            <key>CFBundleDisplayName</key><string>影戲 VitaScope</string>
+            <key>CFBundleIdentifier</key><string>io.github.acer1204.vitascope</string>
+            <key>CFBundleExecutable</key><string>vitascope</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          # 把 libmpv 及其相依函式庫複製進 .app，並把載入路徑改成 .app 內部
+          dylibbundler -od -b -x "$app/Contents/MacOS/vitascope" \
+            -d "$app/Contents/Frameworks" -p @executable_path/../Frameworks/
+          # 改過載入路徑的執行檔要重新簽章，否則 Apple Silicon 不讓它執行（ad-hoc 簽章，未經公證）
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" "dist/VitaScope-${tag}-macos-arm64.zip"
+
+      # ── Linux：執行檔，libmpv 用系統套件 ──
+      - name: 打包（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          name="VitaScope-${{ steps.version.outputs.tag }}-linux-x64"
+          mkdir -p "dist/$name"
+          cp target/release/vitascope LICENSE README.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: 建立 GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: 建立 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          ## 下載
+
+          | 平台 | 檔案 | 使用方式 |
+          |---|---|---|
+          | Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64.zip` | 解壓縮後執行 `vitascope.exe` |
+          | macOS 11 以上（Apple Silicon） | `VitaScope-*-macos-arm64.zip` | 解壓縮後把 `VitaScope.app` 拖到「應用程式」 |
+          | Linux（x64） | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `vitascope` |
+
+          **macOS**：這個版本沒有經過 Apple 公證，第一次開啟時請在 Finder 對 `VitaScope.app` 按右鍵 →「打開」，
+          或在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
+
+          完整功能與開發進度見 [ROADMAP.md](https://github.com/acer1204/VitaScope/blob/main/ROADMAP.md)。
+          EOF
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --title "影戲 VitaScope $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --generate-notes

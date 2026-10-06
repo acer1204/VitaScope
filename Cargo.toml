@@ -1,0 +1,46 @@
+[package]
+name = "vitascope"
+version = "0.1.0"
+edition = "2024"
+description = "影戲 — 跨平台影片播放器：libmpv 引擎 + egui 介面"
+authors = ["acer1204"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/acer1204/VitaScope"
+homepage = "https://github.com/acer1204/VitaScope"
+readme = "README.md"
+keywords = ["video", "player", "mpv", "media"]
+categories = ["multimedia::video"]
+
+[dependencies]
+# glow（OpenGL）後端：mpv 的 render API 只支援 OpenGL，要和 egui 共用同一個 GL context
+# 不開 persistence：設定（含視窗位置）自己存，見 src/settings.rs
+# links：「關於」視窗的超連結、檢查更新後開啟下載頁面
+eframe = { version = "0.36", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "x11",
+    "wayland",
+    "accesskit",
+    "links",
+] }
+# 只用底層綁定，安全包裝自己寫（src/mpv/）
+libmpv2-sys = "4"
+png = "0.18"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 檢查更新（查詢 GitHub Releases）
+ureq = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# 開發時讓相依套件也用最佳化編譯，介面才不會卡
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe"] }

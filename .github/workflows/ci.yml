@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 測試（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows 用 GNU 工具鏈（跟本機開發相同，直接連結 libmpv.dll.a）
+      - name: 安裝 Rust（Windows GNU）
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+      - name: 安裝 Rust
+        if: runner.os != 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # libmpv（播放引擎）+ FFmpeg（產生測試樣本）
+      - name: 安裝 libmpv 與 FFmpeg（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv-dev ffmpeg
+      - name: 安裝 libmpv 與 FFmpeg（macOS）
+        if: runner.os == 'macOS'
+        run: brew install mpv ffmpeg
+      - name: 安裝 libmpv 與 FFmpeg（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/fetch-libmpv.ps1
+          choco install ffmpeg-full -y --no-progress
+
+      - name: 版本資訊
+        shell: bash
+        run: |
+          rustc --version
+          ffmpeg -hide_banner -version | head -n 1
+
+      - name: 產生測試樣本
+        run: python scripts/gen_samples.py
+
+      # 格式矩陣、播放核心、介面測試都是 headless，不需要 GPU；
+      # 硬體解碼測試（tests/hwdec.rs）需要 GPU，只在本機跑
+      - name: 測試
+        run: cargo test --all-targets -- --nocapture
+
+      - name: 建置發佈版
+        run: cargo build --release
