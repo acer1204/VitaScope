@@ -1156,12 +1156,14 @@ impl VitascopeApp {
         match self.batch.poll(now) {
             crate::instance::BatchPoll::Idle => {}
             crate::instance::BatchPoll::Wait(d) => ctx.request_repaint_after(d),
-            crate::instance::BatchPoll::Ready(req) => {
-                if req.fullscreen {
+            crate::instance::BatchPoll::Ready { request, continues } => {
+                if request.fullscreen {
                     ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
                 }
-                if !req.paths.is_empty() {
-                    self.open_paths(req.paths, false);
+                if continues && self.player.state.path.is_some() {
+                    self.continue_burst(request.paths);
+                } else if !request.paths.is_empty() {
+                    self.open_paths(request.paths, false);
                 }
             }
         }
@@ -1177,6 +1179,28 @@ impl VitascopeApp {
                     ));
                 }
             }
+        }
+    }
+
+    /// 多選的檔案很多時，送來的檔案被切成兩批：清單換成整串，正在播的照樣播
+    fn continue_burst(&mut self, paths: Vec<PathBuf>) {
+        let mut media: Vec<PathBuf> = paths
+            .iter()
+            .map(|p| crate::playlist::absolute(p))
+            .filter(|p| formats::media_kind(p).is_some())
+            .collect();
+        crate::playlist::sort_by_name(&mut media);
+        let current = self.player.state.path.clone().map(PathBuf::from);
+        let mut list = Playlist::from_files(media).manual();
+        match current {
+            Some(c) if list.len() > 1 && list.select(&c) => {
+                self.playlist_scan = None;
+                self.playlist = Some(list);
+                self.owns_session = true;
+                self.persist_playlist();
+            }
+            // 正在播的不在這一串裡（不太可能）：當成新的一批
+            _ => self.open_paths(paths, false),
         }
     }
 
@@ -1579,6 +1603,7 @@ impl VitascopeApp {
     /// 開一組檔案（拖放、命令列、別的程式送來的）：好幾個影音檔 = 依檔名排序的播放清單；
     /// 只有字幕 = 加到正在播的影片；播放清單檔照樣開。`dropped` = 拖放進來的（播放清單開著時加到清單最後）
     pub(super) fn open_paths(&mut self, dropped: Vec<PathBuf>, from_drop: bool) {
+        let dropped: Vec<PathBuf> = dropped.iter().map(|p| crate::playlist::absolute(p)).collect();
         let Some(first) = dropped.first().cloned() else { return };
         let dropped_count = dropped.len();
         let dropped_paths = dropped.clone();
@@ -1715,9 +1740,11 @@ impl VitascopeApp {
         // 控制列是整個視窗寬（含播放清單），至少要放得下按鈕
         let width = (size.x + self.playlist_width).max(MIN_WINDOW_WIDTH);
         let target = vec2(width, size.y + self.controls_height);
-        // 播放清單開著時換了檔：關掉清單時照樣縮回去
-        if let Some((by, _)) = self.playlist_grew {
-            self.playlist_grew = Some((by, target.x));
+        // 播放清單開著時換了檔：記下這次實際為清單加了多寬（面板可能被拖寬過；當初右邊放不下沒加寬，
+        // 這次也加了），關掉清單時縮回只有影片的寬度
+        if self.settings.show_playlist && self.playlist_width > 0.0 {
+            let added = target.x - size.x.max(MIN_WINDOW_WIDTH);
+            self.playlist_grew = (added > 0.5).then_some((added, target.x));
         }
         eprintln!("[vitascope] 視窗配合影片 {w}×{h} → {:.0}×{:.0}", target.x, target.y);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
@@ -2043,7 +2070,11 @@ impl VitascopeApp {
             || self.pointer_over_playlist
             || egui::DragAndDrop::has_any_payload(ctx)
             || self.seek_drag.is_some()
-            || menu_open;
+            || menu_open
+            // 設定、字幕外觀、關於這些視窗開著時，滑鼠游標不能消失
+            || self.settings_open
+            || self.sub_style_open
+            || self.about_open;
         if visible && st.loaded && !st.paused {
             // 時間到要重繪一次，控制列才會消失
             ctx.request_repaint_after(HIDE_AFTER.saturating_sub(idle) + Duration::from_millis(50));
@@ -2489,7 +2520,16 @@ impl VitascopeApp {
             } else {
                 "--:-- / --:--".to_owned()
             };
-            ui.label(egui::RichText::new(time).monospace());
+            // 視窗窄（最小寬度、直式影片）時右邊的按鈕會蓋到總長度（英文的按鈕比較寬、一小時以上的影片時間比較長）：
+            // 放不下就只顯示目前時間，總長度放在提示裡
+            let mono = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
+            let full_width = ui.painter().layout_no_wrap(time.clone(), mono, Color32::WHITE).size().x;
+            if loaded && ui.available_width() < self.right_controls_width + full_width + ui.spacing().item_spacing.x {
+                ui.label(egui::RichText::new(fmt_time(pos)).monospace())
+                    .on_hover_text(time);
+            } else {
+                ui.label(egui::RichText::new(time).monospace());
+            }
             // 速度不是 1× 時顯示在時間旁邊；視窗太窄、會擠到右邊的按鈕時就不顯示（OSD 和右鍵選單還看得到）
             if (st.speed - 1.0).abs() > 1e-6 {
                 let font = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
@@ -3118,6 +3158,15 @@ impl eframe::App for VitascopeApp {
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
+        // 先停止接收：之後送來的檔案由下一個啟動的程式自己開（不會收了又沒開）
+        let mut leftover = Vec::new();
+        if let Some(p) = &self.instance {
+            p.stop_accepting();
+            while let Ok(req) = p.rx.try_recv() {
+                self.batch.push(req, Instant::now());
+            }
+            leftover = self.batch.take_pending();
+        }
         if let Some(video) = &self.video {
             video.destroy(gl);
         }
@@ -3127,6 +3176,13 @@ impl eframe::App for VitascopeApp {
         // 之後啟動的程式自己當主視窗
         if let Some(p) = &mut self.instance {
             p.shutdown();
+        }
+        // 剛送來、還沒開的檔案（例如雙擊影片後馬上關掉視窗）：交給新開的程式（自動測試不開）
+        if !leftover.is_empty()
+            && self.persist_playlist
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let _ = std::process::Command::new(exe).args(&leftover).spawn();
         }
     }
 

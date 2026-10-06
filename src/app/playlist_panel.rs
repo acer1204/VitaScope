@@ -328,6 +328,8 @@ impl VitascopeApp {
             return;
         }
         self.playlist_scan = None;
+        // 手動整理過的清單：關閉時要存起來（不論是用 Delete 鍵還是右鍵選單刪的）
+        self.owns_session = true;
         list.remove(i);
         let len = list.len();
         // 選取移到下一項（刪掉最後一項時是新的最後一項），可以連按 Delete
@@ -337,10 +339,7 @@ impl VitascopeApp {
 
     /// 加到清單最後；還沒有在播的話，播第一個加進來的
     pub(super) fn add_to_playlist(&mut self, files: Vec<PathBuf>) {
-        let files: Vec<PathBuf> = files
-            .into_iter()
-            .map(|p| std::path::absolute(&p).unwrap_or(p))
-            .collect();
+        let files: Vec<PathBuf> = files.iter().map(|p| crate::playlist::absolute(p)).collect();
         let Some(first) = files.first().cloned() else { return };
         self.playlist_scan = None;
         self.owns_session = true;
@@ -496,6 +495,12 @@ impl VitascopeApp {
     }
 
     /// 手動整理的清單存起來（下次開啟時還在）；同資料夾掃描出來的清單不存（存檔刪掉）
+    /// 關閉時會不會存播放清單（測試用）
+    #[doc(hidden)]
+    pub fn owns_session(&self) -> bool {
+        self.owns_session
+    }
+
     pub(super) fn persist_playlist(&self) {
         if !self.persist_playlist || !self.owns_session {
             return;

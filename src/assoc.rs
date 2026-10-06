@@ -22,9 +22,86 @@ pub fn extensions() -> Vec<(&'static str, bool)> {
 #[cfg(windows)]
 pub use win::*;
 
+/// 啟動時檔案關聯要怎麼跟登錄檔對齊
+#[derive(Debug, PartialEq, Eq)]
+pub enum OnStartup {
+    /// 登錄的就是這個執行檔（例如安裝程式勾了檔案關聯）：設定跟著打開
+    Adopt,
+    /// 重新登錄成這個執行檔
+    Register,
+    /// 不動
+    Keep,
+}
+
+/// - 登錄的是這個執行檔：設定跟著打開
+/// - 登錄的是另一個還在的執行檔（安裝版和免安裝版並存、開發中的建置）：不動，要換請在設定裡重新打開
+/// - 登錄的執行檔已經不在了（免安裝版搬家）、或什麼都沒登錄：設定是開著的就登錄成這個
+pub fn on_startup(
+    setting: bool,
+    registered: Option<&std::path::Path>,
+    current: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> OnStartup {
+    // Windows 的路徑不分大小寫
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    };
+    match registered {
+        Some(r) if same(r, current) => OnStartup::Adopt,
+        Some(r) if exists(r) => OnStartup::Keep,
+        _ if setting => OnStartup::Register,
+        _ => OnStartup::Keep,
+    }
+}
+
+/// 登錄檔裡開啟指令的執行檔路徑：`"C:\…\vitascope.exe" "%1"` → `C:\…\vitascope.exe`
+pub fn exe_of_command(command: &str) -> Option<std::path::PathBuf> {
+    let command = command.trim();
+    let exe = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next()?,
+        None => command.split(' ').next()?,
+    };
+    (!exe.is_empty()).then(|| exe.into())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::formats;
+    use std::path::Path;
+
+    #[test]
+    fn startup_only_takes_over_from_a_copy_that_is_gone() {
+        let me = Path::new(r"C:\Users\a\Downloads\VitaScope\vitascope.exe");
+        let installed = Path::new(r"C:\Users\a\AppData\Local\Programs\VitaScope\vitascope.exe");
+        let there = |_: &Path| true;
+        let gone = |_: &Path| false;
+        // 安裝程式登錄的就是這個（大小寫不同也算）
+        let upper = Path::new(r"C:\USERS\A\DOWNLOADS\VitaScope\VITASCOPE.EXE");
+        assert_eq!(on_startup(false, Some(upper), me, there), OnStartup::Adopt);
+        // 安裝版還在：免安裝版、開發中的建置都不要搶
+        assert_eq!(on_startup(true, Some(installed), me, there), OnStartup::Keep);
+        assert_eq!(on_startup(false, Some(installed), me, there), OnStartup::Keep);
+        // 原本登錄的已經不在（免安裝版搬家）：設定開著才重新登錄
+        assert_eq!(on_startup(true, Some(installed), me, gone), OnStartup::Register);
+        assert_eq!(on_startup(false, Some(installed), me, gone), OnStartup::Keep);
+        // 什麼都沒登錄
+        assert_eq!(on_startup(true, None, me, there), OnStartup::Register);
+        assert_eq!(on_startup(false, None, me, there), OnStartup::Keep);
+    }
+
+    #[test]
+    fn exe_path_from_the_open_command() {
+        assert_eq!(
+            exe_of_command(r#""C:\Program Files\影戲\vitascope.exe" "%1""#).as_deref(),
+            Some(Path::new(r"C:\Program Files\影戲\vitascope.exe"))
+        );
+        assert_eq!(
+            exe_of_command(r"C:\x\vitascope.exe %1").as_deref(),
+            Some(Path::new(r"C:\x\vitascope.exe"))
+        );
+        assert_eq!(exe_of_command(""), None);
+    }
 
     /// 安裝程式（packaging/windows/vitascope.iss）的副檔名清單要跟程式的一樣，兩邊才能互相移除
     #[test]
@@ -176,6 +253,15 @@ mod win {
 
     /// 加到「開啟檔案」選單、列在預設應用程式裡。可以重複呼叫（免安裝版搬到別的資料夾後再呼叫一次就更新路徑）
     pub fn register(exe: &Path, places: &Places) -> io::Result<()> {
+        let result = write_registration(exe, places);
+        if result.is_err() {
+            // 寫到一半失敗（例如某個副檔名的機碼被鎖住）：全部移除，不要留下只做一半、看起來像已經打開的關聯
+            unregister(places);
+        }
+        result
+    }
+
+    fn write_registration(exe: &Path, places: &Places) -> io::Result<()> {
         let command = open_command(exe);
         let icon = format!("{},0", exe.display());
         let classes = &places.classes;
@@ -183,7 +269,11 @@ mod win {
         set(&app, Some("FriendlyAppName"), "影戲 VitaScope")?;
         set(&format!(r"{app}\DefaultIcon"), None, &icon)?;
         set(&format!(r"{app}\shell\open\command"), None, &command)?;
-        for (progid, name) in [(PROGID_VIDEO, "影片檔"), (PROGID_AUDIO, "音訊檔")] {
+        // 名稱跟介面語言一致（安裝程式則依 Windows 的顯示語言）
+        for (progid, name) in [
+            (PROGID_VIDEO, crate::tr!("影片檔", "Video file")),
+            (PROGID_AUDIO, crate::tr!("音訊檔", "Audio file")),
+        ] {
             let key = format!(r"{classes}\{progid}");
             set(&key, None, name)?;
             set(&format!(r"{key}\DefaultIcon"), None, &icon)?;
@@ -199,7 +289,11 @@ mod win {
             set(&format!(r"{caps}\FileAssociations"), Some(&format!(".{ext}")), progid)?;
         }
         set(&caps, Some("ApplicationName"), "影戲 VitaScope")?;
-        set(&caps, Some("ApplicationDescription"), "以 libmpv 為引擎的影片播放器")?;
+        set(
+            &caps,
+            Some("ApplicationDescription"),
+            crate::tr!("以 libmpv 為引擎的影片播放器", "Video player powered by libmpv"),
+        )?;
         set(&caps, Some("ApplicationIcon"), &icon)?;
         set(&places.registered, Some(REGISTERED_NAME), &caps)?;
         notify_shell();
@@ -225,6 +319,12 @@ mod win {
     pub fn is_registered(exe: &Path, places: &Places) -> bool {
         let key = format!(r"{}\{PROGID_VIDEO}\shell\open\command", places.classes);
         get(&key, None).as_deref() == Some(open_command(exe).as_str())
+    }
+
+    /// 目前登錄的是哪個執行檔
+    pub fn registered_exe(places: &Places) -> Option<std::path::PathBuf> {
+        let key = format!(r"{}\{PROGID_VIDEO}\shell\open\command", places.classes);
+        super::exe_of_command(&get(&key, None)?)
     }
 
     /// 開啟「設定 → 預設應用程式」裡影戲的那一頁（Windows 11 2023 年 4 月之後；舊版開的是預設應用程式頁）
@@ -255,6 +355,7 @@ mod win {
             let exe = Path::new(r"C:\Programs\影戲\vitascope.exe");
             register(exe, &places).unwrap();
             assert!(is_registered(exe, &places));
+            assert_eq!(registered_exe(&places).as_deref(), Some(exe));
             assert!(
                 !is_registered(Path::new(r"D:\別處\vitascope.exe"), &places),
                 "搬家後要重新登錄"

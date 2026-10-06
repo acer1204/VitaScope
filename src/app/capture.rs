@@ -14,6 +14,8 @@ pub(super) struct Capture {
     seq: u64,
     /// 已經請 mpv 截圖、還沒回覆的（指令編號 → 存到哪裡、要怎麼轉正）
     pending: Vec<(u64, Target, Fixup)>,
+    /// 背景還在轉正、寫檔的截圖
+    writing: Vec<PathBuf>,
     tx: mpsc::Sender<Done>,
     rx: mpsc::Receiver<Done>,
 }
@@ -24,6 +26,7 @@ impl Default for Capture {
         Self {
             seq: 0,
             pending: Vec::new(),
+            writing: Vec::new(),
             tx,
             rx,
         }
@@ -89,7 +92,19 @@ impl VitascopeApp {
                             return;
                         }
                         let source = st.path.clone().unwrap_or_default();
-                        screenshot::unique_path(&dir, &screenshot::file_name(&source, st.time_pos))
+                        let name = screenshot::file_name(&source, st.time_pos);
+                        // 還在寫的截圖還沒出現在資料夾裡：連按（例如暫停時）檔名也不能重複
+                        let taken: Vec<PathBuf> = self
+                            .capture
+                            .pending
+                            .iter()
+                            .filter_map(|(_, t, _)| match t {
+                                Target::File { path, .. } => Some(path.clone()),
+                                Target::Clipboard { .. } => None,
+                            })
+                            .chain(self.capture.writing.iter().cloned())
+                            .collect();
+                        screenshot::unique_path_except(&dir, &name, &taken)
                     }
                 };
                 // 不用轉正：mpv 直接存到最後的位置
@@ -105,16 +120,15 @@ impl VitascopeApp {
             Target::File { tmp, .. } | Target::Clipboard { tmp } => tmp.to_string_lossy().into_owned(),
         };
         let id = SHOT_ID_BASE + n;
-        // 畫面翻轉時要把截圖翻回來，字幕也會跟著變成鏡像（畫面上的字幕不會翻）：這時不含字幕
-        let flipped = fix.hflip || fix.vflip;
-        let subtitles = self.settings.screenshot_subtitles && !flipped;
+        let wanted = self.settings.screenshot_subtitles;
+        let subtitles = fix.keeps_subtitles(wanted);
         match self.player.screenshot_to_file(id, &tmp, subtitles) {
             Ok(()) => {
                 self.capture.pending.push((id, target, fix));
-                if flipped && self.settings.screenshot_subtitles {
+                if wanted && !subtitles {
                     self.osd(crate::tr!(
-                        "畫面翻轉時，截圖不含字幕",
-                        "Screenshots of a flipped picture leave out subtitles"
+                        "畫面旋轉或翻轉時，截圖不含字幕",
+                        "Screenshots of a rotated or flipped picture leave out subtitles"
                     ));
                 }
             }
@@ -132,6 +146,9 @@ impl VitascopeApp {
             self.osd(crate::tf!("無法擷取畫面：{e}", "Cannot capture the frame: {e}"));
             return;
         }
+        if let Target::File { path, .. } = &target {
+            self.capture.writing.push(path.clone());
+        }
         let tx = self.capture.tx.clone();
         let ctx = self.egui_ctx.clone();
         let lang = crate::i18n::lang();
@@ -148,12 +165,20 @@ impl VitascopeApp {
     pub(super) fn poll_screenshots(&mut self, ctx: &egui::Context) {
         while let Ok(done) = self.capture.rx.try_recv() {
             match done {
-                Done::Saved(path) => self.osd(crate::tf!("已儲存截圖：{}", "Screenshot saved: {}", file_name(&path))),
+                Done::Saved(path) => {
+                    self.capture.writing.retain(|p| *p != path);
+                    self.osd(crate::tf!("已儲存截圖：{}", "Screenshot saved: {}", file_name(&path)));
+                }
                 Done::Copied(img) => {
                     ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba));
                     self.osd(crate::tf!("已複製畫面（{}×{}）", "Frame copied ({}×{})", img.w, img.h));
                 }
-                Done::Failed(e) => self.osd(crate::tf!("無法擷取畫面：{e}", "Cannot capture the frame: {e}")),
+                Done::Failed { path, error } => {
+                    if let Some(path) = path {
+                        self.capture.writing.retain(|p| *p != path);
+                    }
+                    self.osd(crate::tf!("無法擷取畫面：{error}", "Cannot capture the frame: {error}"));
+                }
             }
         }
     }
@@ -163,21 +188,30 @@ impl VitascopeApp {
         if !st.loaded || !st.has_video() {
             return;
         }
-        let name = screenshot::file_name(st.path.as_deref().unwrap_or_default(), st.time_pos);
-        let Some(mut path) = self
+        // 對話框開著時 mpv 照樣在播：先暫停，存的才是選「另存新檔」時的畫面（檔名的時間也一樣）
+        let was_playing = !st.paused;
+        if was_playing {
+            let _ = self.player.set_pause(true);
+        }
+        let time = self.player.get_f64("time-pos").unwrap_or(self.player.state.time_pos);
+        let name = screenshot::file_name(self.player.state.path.as_deref().unwrap_or_default(), time);
+        let chosen = self
             .file_dialog()
             .set_title(crate::tr!("另存截圖", "Save screenshot as"))
             .add_filter(crate::tr!("PNG 圖片", "PNG image"), &["png"])
             .set_directory(self.screenshot_dir())
             .set_file_name(&name)
-            .save_file()
-        else {
-            return;
-        };
-        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
-            path.set_extension("png");
+            .save_file();
+        if let Some(mut path) = chosen {
+            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+                path.set_extension("png");
+            }
+            // mpv 收到指令時就取下畫面（之後才在背景編碼），接著繼續播沒關係
+            self.take_screenshot(ShotDest::File(path));
         }
-        self.take_screenshot(ShotDest::File(path));
+        if was_playing {
+            let _ = self.player.set_pause(false);
+        }
     }
 
     pub(super) fn choose_screenshot_dir(&mut self) {

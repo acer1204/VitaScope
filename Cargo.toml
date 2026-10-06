@@ -56,6 +56,10 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 # macOS：Finder 開檔送來的 Apple Event（winit 沒有提供）
+[target.'cfg(unix)'.dependencies]
+# 單一執行個體：確認放 socket 的資料夾是自己的（geteuid）
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = [

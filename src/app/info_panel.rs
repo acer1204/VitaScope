@@ -13,6 +13,8 @@ pub(super) struct InfoCache {
     info: MediaInfo,
     live: LiveStats,
     read_at: Instant,
+    /// 讀的時候的介面語言（換語言時重讀，裡面的說明文字才會跟著換）
+    lang: crate::i18n::Lang,
 }
 
 impl VitascopeApp {
@@ -27,12 +29,19 @@ impl VitascopeApp {
 
     /// 目前檔案的資訊（面板關著時也能用，例如「複製媒體資訊」）
     pub(super) fn info_sections(&mut self) -> Vec<mediainfo::Section> {
-        let stale = self.info_cache.as_ref().is_none_or(|c| c.read_at.elapsed() >= REFRESH);
+        let lang = crate::i18n::lang();
+        let lang_changed = self.info_cache.as_ref().is_some_and(|c| c.lang != lang);
+        if lang_changed && self.audio_device.is_some() {
+            // 「預設裝置」也要換成新的語言
+            self.audio_device = mediainfo::audio_device_name(&self.player);
+        }
+        let stale = lang_changed || self.info_cache.as_ref().is_none_or(|c| c.read_at.elapsed() >= REFRESH);
         if stale {
             self.info_cache = Some(InfoCache {
                 info: mediainfo::read(&self.player, self.audio_device.clone()),
                 live: mediainfo::read_live(&self.player),
                 read_at: Instant::now(),
+                lang,
             });
         }
         let cache = self.info_cache.as_ref().expect("剛讀過");

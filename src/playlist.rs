@@ -187,23 +187,19 @@ impl Playlist {
             return;
         }
         self.manual = true;
-        let current = self.current().map(Path::to_path_buf);
         let item = self.items.remove(from);
         let to = if to > from { to - 1 } else { to };
         self.items.insert(to, item);
-        if let Some(current) = current {
-            self.select(&current);
-        } else if self.current_removed {
-            // 目前的檔案不在清單上：「下一個」跟著原本的那一項走
-            if from == self.index {
-                self.index = to;
-            } else {
-                if from < self.index {
-                    self.index -= 1;
-                }
-                if to <= self.index {
-                    self.index += 1;
-                }
+        // 目前那一項（目前的檔案已經移出清單時是「下一個」）跟著原本的那一項走。
+        // 用位置算、不用檔名找：同一個檔案在清單上出現兩次時才不會跳到另一個
+        if from == self.index {
+            self.index = to;
+        } else {
+            if from < self.index {
+                self.index -= 1;
+            }
+            if to <= self.index {
+                self.index += 1;
             }
         }
     }
@@ -225,20 +221,13 @@ impl Playlist {
     /// 依檔名自然排序，目前的檔案維持是目前的
     pub fn sort(&mut self) {
         self.manual = true;
-        let current = self.current().map(Path::to_path_buf);
-        let next = self.next().map(Path::to_path_buf);
-        sort_by_name(&mut self.items);
-        match (current, next) {
-            (Some(c), _) => {
-                self.select(&c);
-            }
-            (None, Some(n)) => {
-                if let Some(i) = self.items.iter().position(|p| same_file(p, &n)) {
-                    self.index = i;
-                }
-            }
-            (None, None) => {}
+        // 記住原本的位置再排序：目前那一項（或「下一個」）是同一項，不是第一個同名的
+        let mut tagged: Vec<(usize, PathBuf)> = std::mem::take(&mut self.items).into_iter().enumerate().collect();
+        tagged.sort_by(|(_, a), (_, b)| natural_cmp(&file_name_of(a), &file_name_of(b)));
+        if let Some(i) = tagged.iter().position(|(i, _)| *i == self.index) {
+            self.index = i;
         }
+        self.items = tagged.into_iter().map(|(_, p)| p).collect();
     }
 }
 
@@ -287,6 +276,16 @@ pub fn media_in_dir(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// 是否為同一個檔案。Windows 的檔名不分大小寫（包括中文以外的各種字母）
+/// 完整路徑（網址不動）。命令列、其他程式送來的相對路徑要在一開始就轉換：
+/// 清單、播放紀錄、存起來的清單比對的都是完整路徑
+pub fn absolute(path: &Path) -> PathBuf {
+    if crate::m3u::is_url(&path.to_string_lossy()) {
+        path.to_path_buf()
+    } else {
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 pub fn same_file(a: &Path, b: &Path) -> bool {
     if cfg!(windows) {
         a == b || a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
@@ -297,14 +296,13 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 
 /// 依檔名的自然順序排序（第 2 集在第 10 集前面）
 pub fn sort_by_name(items: &mut [PathBuf]) {
-    items.sort_by(|a, b| {
-        let name = |p: &PathBuf| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
-        natural_cmp(&name(a), &name(b))
-    });
+    items.sort_by(|a, b| natural_cmp(&file_name_of(a), &file_name_of(b)));
+}
+
+fn file_name_of(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 「自然排序」：數字部分照數值比，所以「第2集」排在「第10集」前面；其餘不分大小寫
@@ -489,6 +487,25 @@ mod tests {
         assert_eq!(list.current(), None, "還沒有在播的項目");
         assert_eq!(list.next(), Some(Path::new("x")));
         assert_eq!(list.resume_index(), Some(0));
+    }
+
+    #[test]
+    fn moving_and_sorting_keep_the_current_copy_of_a_duplicate() {
+        // a, b, a, c：正在播第二個 a
+        let mut list = Playlist::from_files(vec!["a".into(), "b".into(), "a".into(), "c".into()]);
+        list.select_index(2);
+        // 把 c 拖到最前面：c, a, b, a → 正在播的是最後一個 a
+        list.move_item(3, 0);
+        assert_eq!(list.position(), 4);
+        assert_eq!(list.next(), None, "第二個 a 是最後一項");
+        // 依檔名排序：a, a, b, c → 正在播的是第二個 a（排序是穩定的）
+        list.sort();
+        assert_eq!(list.position(), 2);
+        assert_eq!(list.next(), Some(Path::new("b")));
+        // 移動別的項目到它前面
+        list.move_item(3, 0); // c, a, a, b
+        assert_eq!(list.position(), 3);
+        assert_eq!(list.current(), Some(Path::new("a")));
     }
 
     #[test]

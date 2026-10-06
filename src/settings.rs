@@ -45,6 +45,10 @@ pub struct Settings {
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
+    /// 上次讀檔或存檔時的內容：存檔時只寫這之後改過的設定，其他的以檔案裡的為準
+    /// （好幾個視窗同時開著、或解除安裝程式改過設定時，才不會被舊的值蓋回去）
+    #[serde(skip)]
+    baseline: Option<serde_json::Value>,
 }
 
 /// 字幕外觀（文字字幕；勾選「也套用到 ASS」時連 ASS 字幕一起改）。
@@ -164,6 +168,7 @@ impl Default for Settings {
             single_instance: true,
             file_associations: false,
             path: None,
+            baseline: None,
         }
     }
 }
@@ -193,12 +198,38 @@ impl Settings {
 
     /// 從指定的檔案讀取，之後 `save()` 也寫回這個檔案
     pub fn load_from(path: PathBuf) -> Self {
-        let mut settings: Self = std::fs::read_to_string(&path)
+        let mut settings = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .map(Self::from_value_lenient)
             .unwrap_or_default();
+        settings.baseline = serde_json::to_value(&settings).ok();
         settings.path = Some(path);
         settings
+    }
+
+    /// 讀不懂的設定（例如新版加的語言、手動改錯）只有那一項用預設值，其他設定照樣讀進來
+    fn from_value_lenient(value: serde_json::Value) -> Self {
+        if let Ok(s) = serde_json::from_value(value.clone()) {
+            return s;
+        }
+        let serde_json::Value::Object(fields) = value else {
+            return Self::default();
+        };
+        let Ok(serde_json::Value::Object(mut good)) = serde_json::to_value(Self::default()) else {
+            return Self::default();
+        };
+        for (key, v) in fields {
+            let mut trial = good.clone();
+            trial.insert(key, v);
+            let trial = serde_json::Value::Object(trial);
+            if serde_json::from_value::<Self>(trial.clone()).is_ok()
+                && let serde_json::Value::Object(t) = trial
+            {
+                good = t;
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(good)).unwrap_or_default()
     }
 
     /// 只放在記憶體、不寫回檔案（`--shot` 自動截圖時用，不會改到使用者的視窗大小之類的設定）
@@ -207,16 +238,37 @@ impl Settings {
         self
     }
 
-    /// 存檔；不是從檔案讀進來的設定（例如自動測試用的預設值）不寫檔
-    pub fn save(&self) -> std::io::Result<()> {
+    /// 存檔；不是從檔案讀進來的設定（例如自動測試用的預設值）不寫檔。
+    /// 只寫上次讀檔或存檔之後改過的設定，其他的保留檔案裡現在的值（可能是另一個視窗改的）
+    pub fn save(&mut self) -> std::io::Result<()> {
         let Some(path) = self.path.clone() else { return Ok(()) };
+        let current = serde_json::to_value(&*self).map_err(std::io::Error::other)?;
+        let on_disk = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let merged = match (&current, &self.baseline, on_disk) {
+            (serde_json::Value::Object(now), Some(base), Some(serde_json::Value::Object(mut disk))) => {
+                for (key, value) in now {
+                    if base.get(key) != Some(value) || !disk.contains_key(key) {
+                        disk.insert(key.clone(), value.clone());
+                    }
+                }
+                serde_json::Value::Object(disk)
+            }
+            _ => current.clone(),
+        };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         // 先寫暫存檔再改名，中途當掉也不會留下寫一半的設定檔
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(self).map_err(std::io::Error::other)?)?;
-        std::fs::rename(tmp, path)
+        std::fs::write(
+            &tmp,
+            serde_json::to_string_pretty(&merged).map_err(std::io::Error::other)?,
+        )?;
+        std::fs::rename(tmp, path)?;
+        self.baseline = Some(current);
+        Ok(())
     }
 }
 
@@ -273,8 +325,61 @@ mod tests {
     }
 
     #[test]
+    fn two_windows_keep_each_others_changes() {
+        let dir = std::env::temp_dir().join(format!("vitascope-settings-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        // 兩個視窗都開著
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        // A 換成英文、改跳轉秒數，馬上存檔
+        a.language = crate::i18n::Lang::En;
+        a.seek_short = 10.0;
+        a.save().unwrap();
+        // B 只改了音量，關閉時存檔：A 改的不能被 B 舊的值蓋回去
+        b.volume = 30.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.language, crate::i18n::Lang::En);
+        assert_eq!(back.seek_short, 10.0);
+        assert_eq!(back.volume, 30.0);
+        // B 之後自己改的設定照樣寫得進去（A 也改過的那一項，後存的為準）
+        b.seek_short = 3.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.seek_short, 3.0);
+        assert_eq!(back.language, crate::i18n::Lang::En);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_unreadable_value_does_not_reset_the_other_settings() {
+        let dir = std::env::temp_dir().join(format!("vitascope-settings-lenient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // 新版加的語言、以後的新設定
+        std::fs::write(
+            &path,
+            r#"{ "volume": 42.0, "language": "ja", "seek_short": 7.0, "future_option": 1 }"#,
+        )
+        .unwrap();
+        let mut s = Settings::load_from(path.clone());
+        assert_eq!(s.volume, 42.0);
+        assert_eq!(s.seek_short, 7.0);
+        assert_eq!(s.language, crate::i18n::Lang::default());
+        // 存檔時保留這個版本不認得的設定
+        s.volume = 50.0;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("future_option"), "{text}");
+        assert!(text.contains(r#""ja""#), "沒改過的語言不要蓋掉（新版還讀得懂）：{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn default_settings_never_write_to_disk() {
-        let s = Settings::default();
+        let mut s = Settings::default();
         assert!(s.path.is_none());
         s.save().unwrap();
     }

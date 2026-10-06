@@ -274,6 +274,26 @@ fn set_fullscreen(h: &mut Harness<'_, VitascopeApp>, on: bool) {
     h.run_steps(2);
 }
 
+#[test]
+fn cursor_stays_visible_over_the_settings_window_in_fullscreen() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    set_fullscreen(&mut h, true);
+    let cursor = |h: &Harness<'_, VitascopeApp>| h.output().platform_output.cursor_icon;
+    // 對照：沒有開任何視窗時，2 秒不動滑鼠游標就隱藏
+    std::thread::sleep(Duration::from_millis(2300));
+    h.run_steps(3);
+    assert_eq!(cursor(&h), egui::CursorIcon::None, "全螢幕播放中，滑鼠不動就隱藏");
+    // 設定視窗開著：一直看得到游標
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    std::thread::sleep(Duration::from_millis(2300));
+    h.run_steps(3);
+    assert_ne!(cursor(&h), egui::CursorIcon::None, "設定視窗開著時游標不能消失");
+}
+
 // 手動測試抓到的 bug：Esc 被快捷鍵吃掉，選單關不掉，全螢幕也離不開
 #[test]
 fn escape_closes_menu_first_then_leaves_fullscreen() {
@@ -1724,6 +1744,49 @@ fn f6_shows_the_playlist_and_double_click_plays_an_item() {
 }
 
 #[test]
+fn closing_a_playlist_that_was_open_at_start_shrinks_the_window() {
+    // 上次關閉時清單開著：開檔時視窗配合影片 + 清單；關掉清單要縮回只有影片的寬度
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings); // 640×360
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.run_steps(5);
+    let with_list = h.ctx.content_rect().width();
+    assert!(with_list > 700.0, "影片 640 + 清單：{with_list}");
+    h.key_press(egui::Key::F6);
+    h.run_steps(5);
+    let without = h.ctx.content_rect().width();
+    assert!(
+        (without - 640.0).abs() < 2.0,
+        "關掉清單後縮回影片的寬度：{with_list} → {without}"
+    );
+}
+
+#[test]
+fn relative_paths_on_the_command_line_keep_their_playlist() {
+    // 在終端機的影片資料夾裡執行 `vitascope a.mkv b.webm`：清單就是這兩個（不是整個資料夾）
+    let rel = |name: &str| PathBuf::from("samples/generated/common").join(name);
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![rel("webm_vp9p2_opus.webm"), rel("mkv_multitrack.mkv")],
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.run_steps(5);
+    assert_eq!(
+        playlist_names(h.state()),
+        ["mkv_multitrack.mkv", "webm_vp9p2_opus.webm"]
+    );
+    let items = h.state().playlist().unwrap().items().to_vec();
+    assert!(items.iter().all(|p| p.is_absolute()), "{items:?}");
+}
+
+#[test]
 fn delete_removes_the_selected_item_but_keeps_playing() {
     let dir = three_episodes("panel-delete");
     let mut h = playlist_panel_open(&dir);
@@ -1731,10 +1794,12 @@ fn delete_removes_the_selected_item_but_keeps_playing() {
     h.get_by_label("1. 第1集.mp4").click();
     h.run_steps(2);
     assert!(playing(&h.state().player().state, "第1集.mp4"));
+    assert!(!h.state().owns_session(), "開檔時的清單是掃描資料夾來的，不存");
     // 刪掉正在播的第1集：繼續播，下一個是第2集
     h.key_press(egui::Key::Delete);
     h.run_steps(2);
     assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+    assert!(h.state().owns_session(), "用 Delete 刪過：關閉時要存起來");
     assert!(playing(&h.state().player().state, "第1集.mp4"), "正在播的不受影響");
     h.get_by_label("播放清單（2）");
     // 選取移到下一項，可以連按
@@ -1994,6 +2059,20 @@ fn ctrl_e_saves_a_screenshot_at_original_size() {
 }
 
 #[test]
+fn rapid_screenshots_of_the_same_frame_get_different_names() {
+    let dir = TempDir::new("shots-burst");
+    let mut h = harness_with_shot_dir(sample("common/mkv_multitrack.mkv"), &dir);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    // 連按：第一張還沒寫好（檔案還不存在）時就要第二張
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    wait_for_png(&mut h, &dir.0, 3);
+    assert_eq!(pngs_in(&dir.0).len(), 3);
+}
+
+#[test]
 fn screenshots_follow_rotation() {
     let dir = TempDir::new("shots-rotated");
     let mut h = harness_with_shot_dir(sample("common/mkv_multitrack.mkv"), &dir);
@@ -2154,6 +2233,23 @@ fn switching_the_language_to_english_updates_the_whole_ui() {
 }
 
 #[test]
+fn media_info_follows_a_language_switch() {
+    let mut h = playing_multitrack();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("預設裝置");
+    // 面板開著時換成英文：馬上換（不用等下一次每秒更新，也不用關掉再打開）
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("繁體中文").click();
+    h.run_steps(2);
+    h.get_by_label("English").click();
+    h.run_steps(2);
+    h.get_by_label_contains("Default device");
+    assert!(h.query_by_label_contains("預設裝置").is_none());
+}
+
+#[test]
 fn english_menus_and_messages() {
     let mut settings = Settings::default();
     settings.auto_next = false;
@@ -2174,6 +2270,31 @@ fn english_menus_and_messages() {
     h.get_by_label_contains("640×360 (16:9)");
     // 「Video」：影片畫面本身和媒體資訊的「影像」
     assert_eq!(h.query_all_by_label("Video").count(), 2);
+}
+
+#[test]
+fn english_controls_fit_a_minimum_width_window() {
+    // 直式、一小時以上的影片：視窗是最小寬度，英文的按鈕比較寬、時間比較長
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let long = PathBuf::from("av://lavfi:testsrc2=size=240x320:rate=5:duration=4000");
+    let mut h = harness_with(Some(long), settings);
+    step_until(&mut h, "開始播放", |s| s.loaded && s.video_size.is_some());
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.run_steps(5);
+    let width = h.ctx.content_rect().width();
+    assert!(
+        width <= vitascope::app::MIN_WINDOW_WIDTH + 1.0,
+        "視窗是最小寬度：{width}"
+    );
+    let mute = h.get_by_label("🔊").rect();
+    let time = h.get_by_label_contains("00:0").rect();
+    assert!(
+        time.right() <= mute.left(),
+        "時間 {time:?} 不能被右邊的按鈕 {mute:?} 蓋到"
+    );
 }
 
 #[test]
@@ -2209,6 +2330,23 @@ fn hardware_decoding_can_be_switched_in_the_settings() {
     assert_eq!(prop(&h, "hwdec"), "auto-safe");
 }
 
+#[test]
+fn single_window_can_be_switched_off_on_the_system_page() {
+    let mut h = harness(None);
+    h.step();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("系統").click();
+    h.run_steps(2);
+    // 檔案關聯的選項會寫登錄檔，測試不按；只確認它在
+    #[cfg(windows)]
+    h.get_by_label_contains("開啟檔案」選單");
+    assert!(h.state().settings().single_instance);
+    h.get_by_label("只開一個視窗").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().single_instance);
+}
+
 // ───────────── 單一執行個體 ─────────────
 
 #[test]
@@ -2218,7 +2356,9 @@ fn files_sent_by_another_launch_open_in_this_window() {
     let b = dir.clip("第2集.mp4");
     let c = dir.clip("第3集.mp4");
     let suffix = format!("-ui{}", std::process::id());
-    let ep = vitascope::instance::Endpoint::in_dir(dir.0.join("run"), &suffix).unwrap();
+    // socket 路徑有長度上限（macOS 104 位元組），macOS 的暫存資料夾本身就很長：放在短名稱的資料夾
+    let run = TempDir(std::env::temp_dir().join(format!("vts-ui-{}", std::process::id())));
+    let ep = vitascope::instance::Endpoint::in_dir(run.0.clone(), &suffix).unwrap();
     let primary = match vitascope::instance::start(
         &ep,
         &vitascope::instance::Request::default(),

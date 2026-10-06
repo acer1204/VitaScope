@@ -22,6 +22,7 @@
   #define NumVersion AppVersion
 #endif
 
+#define AppGuid     "25BEAAEA-93FA-4E38-A6D3-9AE066CD282B"
 #define AppName     "影戲 VitaScope"
 #define ExeName     "vitascope.exe"
 #define ProgIdVideo "VitaScope.Video"
@@ -29,7 +30,7 @@
 
 [Setup]
 ; AppId 一旦發佈就不能再改：升級、解除安裝都靠它找到舊版
-AppId={{25BEAAEA-93FA-4E38-A6D3-9AE066CD282B}
+AppId={{{#AppGuid}}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -50,6 +51,9 @@ ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 ; 安裝 / 解除安裝結束時通知檔案總管重新整理關聯與圖示
 ChangesAssociations=yes
+; 影戲開著時先請使用者關掉（程式啟動時建立這個 mutex，見 src/main.rs）；
+; 不然解除安裝刪不掉執行檔，開著的視窗關閉時還會把設定寫回去
+AppMutex=VitaScope.Running
 UninstallDisplayIcon={app}\{#ExeName}
 UninstallDisplayName={#AppName}
 ; 只有在找不到符合 Windows 顯示語言的翻譯時才問語言（預設 yes 會每次都問）
@@ -100,21 +104,21 @@ Root: HKA; Subkey: "Software\Classes\Applications\{#ExeName}\DefaultIcon"; Value
 Root: HKA; Subkey: "Software\Classes\Applications\{#ExeName}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""
 
 ; ProgID：影片、音訊各一個。MultiSelectModel=Player：檔案總管選超過 15 個檔案時「開啟」才不會消失
-Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}"; ValueType: string; ValueName: ""; ValueData: "{cm:VideoFile}"; Flags: uninsdeletekey; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}\shell\open"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}"; ValueType: string; ValueName: ""; ValueData: "{cm:AudioFile}"; Flags: uninsdeletekey; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}\shell\open"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Tasks: assoc
-Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: assoc
+Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}"; ValueType: string; ValueName: ""; ValueData: "{cm:VideoFile}"; Flags: uninsdeletekey; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}\shell\open"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdVideo}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}"; ValueType: string; ValueName: ""; ValueData: "{cm:AudioFile}"; Flags: uninsdeletekey; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}\shell\open"; ValueType: string; ValueName: "MultiSelectModel"; ValueData: "Player"; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\Classes\{#ProgIdAudio}\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Tasks: assoc; Check: AssocWanted
 
 ; 「設定 → 應用程式 → 預設應用程式」裡列出影戲，使用者可以自己指定（Windows 10/11 不允許程式自行設成預設）
-Root: HKA; Subkey: "Software\VitaScope"; Flags: uninsdeletekeyifempty; Tasks: assoc
-Root: HKA; Subkey: "Software\VitaScope\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#AppName}"; Flags: uninsdeletekey; Tasks: assoc
-Root: HKA; Subkey: "Software\VitaScope\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "{cm:AppDescription}"; Tasks: assoc
-Root: HKA; Subkey: "Software\VitaScope\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\{#ExeName},0"; Tasks: assoc
-Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "VitaScope"; ValueData: "Software\VitaScope\Capabilities"; Flags: uninsdeletevalue; Tasks: assoc
+Root: HKA; Subkey: "Software\VitaScope"; Flags: uninsdeletekeyifempty; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\VitaScope\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "{#AppName}"; Flags: uninsdeletekey; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\VitaScope\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "{cm:AppDescription}"; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\VitaScope\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\{#ExeName},0"; Tasks: assoc; Check: AssocWanted
+Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "VitaScope"; ValueData: "Software\VitaScope\Capabilities"; Flags: uninsdeletevalue; Tasks: assoc; Check: AssocWanted
 
 ; 每個副檔名三筆：OpenWithProgids（開啟檔案選單）、SupportedTypes、Capabilities\FileAssociations
 ; 清單必須與 src/formats.rs 的 VIDEO、AUDIO 相同（VIDEO_RARE 不關聯；測試 assoc::tests 會檢查）
@@ -125,9 +129,9 @@ Root: HKA; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueNa
 #define I 0
 
 #sub AssocExt
-Root: HKA; Subkey: "Software\Classes\.{#Ext}\OpenWithProgids"; ValueType: string; ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoc
+Root: HKA; Subkey: "Software\Classes\.{#Ext}\OpenWithProgids"; ValueType: string; ValueName: "{#ProgId}"; ValueData: ""; Flags: uninsdeletevalue; Tasks: assoc; Check: AssocWanted
 Root: HKA; Subkey: "Software\Classes\Applications\{#ExeName}\SupportedTypes"; ValueType: string; ValueName: ".{#Ext}"; ValueData: ""
-Root: HKA; Subkey: "Software\VitaScope\Capabilities\FileAssociations"; ValueType: string; ValueName: ".{#Ext}"; ValueData: "{#ProgId}"; Tasks: assoc
+Root: HKA; Subkey: "Software\VitaScope\Capabilities\FileAssociations"; ValueType: string; ValueName: ".{#Ext}"; ValueData: "{#ProgId}"; Tasks: assoc; Check: AssocWanted
 #endsub
 
 ; #sub 裡的 #define 是區域變數，AssocExt 看不到；用指定運算式改全域的 Ext / ProgId
@@ -150,7 +154,36 @@ Filename: "{app}\{#ExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flag
 Filename: "{app}\{#ExeName}"; Parameters: "--unregister-associations"; Flags: runhidden waituntilterminated; RunOnceId: "UnregisterAssociations"
 
 [UninstallDelete]
-; 只刪暫存（轉碼後的字幕、單一執行個體的鎖定檔），設定與播放紀錄（%APPDATA%\Vitascope）保留給重新安裝
-Type: filesandordirs; Name: "{localappdata}\VitaScope\subs"
-Type: files;          Name: "{localappdata}\VitaScope\instance*.lock"
-Type: dirifempty;     Name: "{localappdata}\VitaScope"
+; %LOCALAPPDATA%\VitaScope 都是暫存（轉碼後的字幕、翻轉用的著色器、單一執行個體的鎖定檔）；
+; 設定與播放紀錄（%APPDATA%\Vitascope）保留給重新安裝
+Type: filesandordirs; Name: "{localappdata}\VitaScope"
+
+[Code]
+var
+  AssocRemovedByUser: Boolean;
+
+function InitializeSetup(): Boolean;
+begin
+  // 之前裝過、後來在程式的「設定 → 系統」關掉了檔案關聯：升級時不要再自動加回去
+  //（Inno 預設沿用上次安裝時勾的工作）
+  AssocRemovedByUser :=
+    RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#AppGuid}}_is1') and
+    not RegKeyExists(HKCU, 'Software\Classes\{#ProgIdVideo}');
+  Result := True;
+end;
+
+// 有畫面的安裝：工作頁預設不勾，使用者可以自己再勾
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpSelectTasks) and AssocRemovedByUser then
+  begin
+    WizardSelectTasks('!assoc');
+    AssocRemovedByUser := False;
+  end;
+end;
+
+// 無聲安裝（沒有工作頁可以取消）：直接不寫
+function AssocWanted(): Boolean;
+begin
+  Result := not (AssocRemovedByUser and WizardSilent);
+end;

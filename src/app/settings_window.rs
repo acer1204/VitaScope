@@ -124,7 +124,7 @@ impl VitascopeApp {
     }
 
     fn system_page(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut changed = ui
+        let changed = ui
             .checkbox(
                 &mut self.settings.single_instance,
                 tr!("只開一個視窗", "Use a single window"),
@@ -138,33 +138,7 @@ impl VitascopeApp {
         ui.add_space(10.0);
         ui.strong(tr!("檔案關聯", "File associations"));
         #[cfg(windows)]
-        {
-            let mut on = self.settings.file_associations;
-            if ui
-                .checkbox(
-                    &mut on,
-                    tr!(
-                        "把影戲加入影片與音訊檔的「開啟檔案」選單",
-                        "Add VitaScope to \"Open with\" for video and audio files"
-                    ),
-                )
-                .changed()
-            {
-                changed = true;
-                self.set_file_associations(on);
-            }
-            ui.add_space(4.0);
-            if ui
-                .button(tr!("選擇預設播放器…", "Choose the default player…"))
-                .clicked()
-            {
-                crate::assoc::open_default_apps_settings();
-            }
-            ui.weak(tr!(
-                "Windows 不讓程式自己設成預設，要在「設定 → 預設應用程式」裡選影戲。",
-                "Windows doesn't let programs make themselves the default; pick VitaScope in Settings → Default apps."
-            ));
-        }
+        let changed = self.windows_associations(ui) || changed;
         #[cfg(target_os = "macos")]
         ui.weak(tr!(
             "在 Finder 對影片按右鍵 →「取得資訊」→「打開檔案的應用程式」選影戲，再按「全部更改」。",
@@ -172,9 +146,44 @@ impl VitascopeApp {
         ));
         #[cfg(all(unix, not(target_os = "macos")))]
         ui.weak(tr!(
-            "用壓縮檔裡的 install.sh 安裝後，檔案管理員的「開啟檔案」就會有影戲（install.sh --default 設成預設）。",
-            "After running install.sh from the archive, VitaScope appears in your file manager's \"Open with\" \
-             (install.sh --default makes it the default)."
+            "tar.gz 版：執行裡面的 install.sh 後，檔案管理員的「開啟檔案」就會有影戲（install.sh --default 設成預設）。\
+             AppImage 版：用 AppImageLauncher 或 Gear Lever 加入應用程式選單。",
+            "tar.gz: after running its install.sh, VitaScope appears in your file manager's \"Open with\" \
+             (install.sh --default makes it the default). AppImage: add it to the app menu with AppImageLauncher or Gear Lever."
+        ));
+        changed
+    }
+
+    /// 檔案關聯的選項（Windows）；回傳設定有沒有改
+    #[cfg(windows)]
+    fn windows_associations(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut on = self.settings.file_associations;
+        let changed = ui
+            .checkbox(
+                &mut on,
+                tr!(
+                    "把影戲加入影片與音訊檔的「開啟檔案」選單",
+                    "Add VitaScope to \"Open with\" for video and audio files"
+                ),
+            )
+            .changed();
+        if changed {
+            self.set_file_associations(on);
+        }
+        ui.add_space(4.0);
+        // 沒有登錄時「預設應用程式」裡不會列出影戲
+        if ui
+            .add_enabled(
+                self.settings.file_associations,
+                egui::Button::new(tr!("選擇預設播放器…", "Choose the default player…")),
+            )
+            .clicked()
+        {
+            crate::assoc::open_default_apps_settings();
+        }
+        ui.weak(tr!(
+            "Windows 不讓程式自己設成預設，要在「設定 → 預設應用程式」裡選影戲。",
+            "Windows doesn't let programs make themselves the default; pick VitaScope in Settings → Default apps."
         ));
         changed
     }
@@ -229,29 +238,32 @@ impl VitascopeApp {
             let _ = self.player.set_hwdec(s.hwdec);
         }
         ui.add_space(8.0);
+        // 拖曳、打字時馬上生效，放開滑鼠或離開欄位時才存檔（不要每一幀都寫一次設定檔）
+        let commit =
+            |r: egui::Response| r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus());
         egui::Grid::new("settings_playback")
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
                 ui.label(tr!("← / → 跳轉", "← / → seek"));
-                changed |= ui
-                    .add(
+                changed |= commit(
+                    ui.add(
                         egui::DragValue::new(&mut s.seek_short)
                             .range(1.0..=60.0)
                             .speed(0.2)
                             .suffix(tr!(" 秒", " s")),
-                    )
-                    .changed();
+                    ),
+                );
                 ui.end_row();
-                ui.label(tr!("Ctrl + ← / → 跳轉", "Ctrl + ← / → seek"));
-                changed |= ui
-                    .add(
+                ui.label(crate::tf!("{CMD} + ← / → 跳轉", "{CMD} + ← / → seek"));
+                changed |= commit(
+                    ui.add(
                         egui::DragValue::new(&mut s.seek_long)
                             .range(5.0..=600.0)
                             .speed(1.0)
                             .suffix(tr!(" 秒", " s")),
-                    )
-                    .changed();
+                    ),
+                );
                 ui.end_row();
             });
         changed
@@ -315,8 +327,11 @@ impl VitascopeApp {
 }
 
 /// 快捷鍵一覽（唯讀）
+/// 快捷鍵說明裡的 Ctrl（macOS 是 ⌘）
+const CMD: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+
 fn shortcuts_page(ui: &mut egui::Ui) {
-    let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+    let cmd = CMD;
     let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
     let rows: Vec<(String, &str)> = vec![
         (tr!("空白鍵", "Space").to_owned(), tr!("播放 / 暫停", "Play / pause")),
@@ -344,8 +359,8 @@ fn shortcuts_page(ui: &mut egui::Ui) {
         ("L".to_owned(), tr!("A-B 重播", "A-B loop")),
         ("Home".to_owned(), tr!("從頭播放", "Play from the start")),
         ("[ / ]".to_owned(), tr!("字幕提早 / 延後", "Subtitle delay")),
-        ("- / =".to_owned(), tr!("聲音提早 / 延後", "Audio delay")),
-        ("A".to_owned(), tr!("畫面比例", "Aspect ratio")),
+        ("- / = (+)".to_owned(), tr!("聲音提早 / 延後", "Audio delay")),
+        (format!("A / {cmd} + F6"), tr!("畫面比例", "Aspect ratio")),
         (
             format!("{} + Q", if cfg!(target_os = "macos") { "Control" } else { "Ctrl" }),
             tr!("裁切", "Crop"),
@@ -355,6 +370,7 @@ fn shortcuts_page(ui: &mut egui::Ui) {
             tr!("放大 / 縮小 / 100%", "Zoom in / out / 100%"),
         ),
         (format!("{alt} + ←↑↓→"), tr!("移動畫面", "Move the picture")),
+        (format!("{cmd} + 5"), tr!("畫面移回中間", "Center the picture")),
         (format!("{alt} + K"), tr!("旋轉 90°", "Rotate 90°")),
         (
             format!("{cmd} + Z / P"),
@@ -363,6 +379,17 @@ fn shortcuts_page(ui: &mut egui::Ui) {
         (format!("{alt} + Backspace"), tr!("畫面調整還原", "Reset the picture")),
         (format!("{cmd} + T"), tr!("視窗置頂", "Always on top")),
         ("F6".to_owned(), tr!("播放清單", "Playlist")),
+        (
+            if cfg!(target_os = "macos") {
+                "Delete / ⌫".to_owned()
+            } else {
+                "Delete".to_owned()
+            },
+            tr!(
+                "從播放清單移除（清單開著時）",
+                "Remove from the playlist (when it is open)"
+            ),
+        ),
         (
             if cfg!(target_os = "macos") {
                 "⌘ + I".to_owned()

@@ -159,6 +159,11 @@ impl Fixup {
     pub fn is_none(&self) -> bool {
         *self == Self::default()
     }
+
+    /// 截圖能不能含字幕：要轉正（旋轉、翻轉）的截圖，字幕會跟著轉（畫面上的字幕是正的），這時不含字幕
+    pub fn keeps_subtitles(&self, wanted: bool) -> bool {
+        wanted && self.is_none()
+    }
 }
 
 /// RGBA 圖（不預乘透明度，由上而下）
@@ -272,7 +277,11 @@ pub enum Target {
 pub enum Done {
     Saved(PathBuf),
     Copied(Image),
-    Failed(String),
+    /// 失敗；存檔時帶著原本要存的位置
+    Failed {
+        path: Option<PathBuf>,
+        error: String,
+    },
 }
 
 /// mpv 寫好截圖之後的處理（在背景執行緒跑：4K 的圖解碼、旋轉、壓縮要零點幾秒）
@@ -286,7 +295,10 @@ pub fn finish(target: Target, fix: Fixup) -> Done {
             let _ = std::fs::remove_file(&tmp);
             match result {
                 Ok(()) => Done::Saved(path),
-                Err(e) => Done::Failed(e.to_string()),
+                Err(e) => Done::Failed {
+                    path: Some(path),
+                    error: e.to_string(),
+                },
             }
         }
         Target::Clipboard { tmp } => {
@@ -301,7 +313,10 @@ pub fn finish(target: Target, fix: Fixup) -> Done {
                     }
                     Done::Copied(img)
                 }
-                Err(e) => Done::Failed(e.to_string()),
+                Err(e) => Done::Failed {
+                    path: None,
+                    error: e.to_string(),
+                },
             }
         }
     }
@@ -330,6 +345,21 @@ pub fn open_folder(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitles_are_left_out_when_the_shot_is_turned_or_flipped() {
+        let none = Fixup::default();
+        assert!(none.keeps_subtitles(true));
+        assert!(!none.keeps_subtitles(false));
+        for fix in [
+            Fixup { rotate: 90, ..none },
+            Fixup { rotate: 180, ..none },
+            Fixup { hflip: true, ..none },
+            Fixup { vflip: true, ..none },
+        ] {
+            assert!(!fix.keeps_subtitles(true), "{fix:?}");
+        }
+    }
 
     /// 2×1 的圖：左紅、右藍
     fn two_pixels() -> Image {

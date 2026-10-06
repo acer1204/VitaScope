@@ -126,28 +126,41 @@ pub struct Batcher {
     fullscreen: bool,
     first: Option<Instant>,
     last: Option<Instant>,
-    pending: bool,
+    /// 這一批到了幾個要求
+    arrivals: usize,
+    /// 上一批的檔案，與它是不是等太久（MAX_WAIT）被切斷的、什麼時候切的
+    previous: Vec<PathBuf>,
+    previous_cut_at: Option<Instant>,
 }
 
 pub enum BatchPoll {
     Idle,
     /// 還在等（多久之後再看一次）
     Wait(Duration),
-    Ready(Request),
+    /// `continues`：接在上一批後面（多選的檔案很多、啟動得慢，等太久先開了前面的）；
+    /// 這時 `request.paths` 是整串的檔案（包括上一批的），清單要換成整串、正在播的不換
+    Ready {
+        request: Request,
+        continues: bool,
+    },
 }
 
 impl Batcher {
-    /// 上一個到了之後多久沒有新的就算一批
+    /// 只到了一個：這麼久沒有新的就開（雙擊一個檔案時不要讓人等）
     pub const GAP: Duration = Duration::from_millis(400);
+    /// 已經到了好幾個（多選）：等久一點，檔案總管啟動程式時卡一下也不會切成兩批
+    pub const BURST_GAP: Duration = Duration::from_millis(800);
     /// 最多等多久
     pub const MAX_WAIT: Duration = Duration::from_millis(2500);
+    /// 等太久先開了前面的之後，這段時間內到的都是同一串
+    pub const CONTINUE: Duration = Duration::from_millis(2000);
 
     /// 加進這一批；回傳 true = 新一批的第一個（可以先把視窗叫到前面）
     pub fn push(&mut self, req: Request, now: Instant) -> bool {
-        let first = !self.pending;
-        self.pending = true;
+        let first = self.first.is_none();
         self.first.get_or_insert(now);
         self.last = Some(now);
+        self.arrivals += 1;
         self.fullscreen |= req.fullscreen;
         for p in req.paths {
             if !self.paths.contains(&p) {
@@ -157,22 +170,45 @@ impl Batcher {
         first
     }
 
+    /// 還沒交出去的檔案（關閉時用）
+    pub fn take_pending(&mut self) -> Vec<PathBuf> {
+        self.first = None;
+        self.last = None;
+        self.arrivals = 0;
+        std::mem::take(&mut self.paths)
+    }
+
     pub fn poll(&mut self, now: Instant) -> BatchPoll {
         let (Some(first), Some(last)) = (self.first, self.last) else {
             return BatchPoll::Idle;
         };
+        let gap = if self.arrivals > 1 { Self::BURST_GAP } else { Self::GAP };
         let quiet = now.saturating_duration_since(last);
         let total = now.saturating_duration_since(first);
-        if quiet >= Self::GAP || total >= Self::MAX_WAIT {
-            self.first = None;
-            self.last = None;
-            self.pending = false;
-            BatchPoll::Ready(Request {
-                paths: std::mem::take(&mut self.paths),
+        if quiet < gap && total < Self::MAX_WAIT {
+            return BatchPoll::Wait((gap - quiet).min(Self::MAX_WAIT - total));
+        }
+        self.first = None;
+        self.last = None;
+        self.arrivals = 0;
+        let continues = self
+            .previous_cut_at
+            .is_some_and(|t| first.saturating_duration_since(t) < Self::CONTINUE);
+        let mut paths = std::mem::take(&mut self.paths);
+        if continues {
+            let mut all = std::mem::take(&mut self.previous);
+            all.extend(paths.into_iter().filter(|p| !all.contains(p)).collect::<Vec<_>>());
+            paths = all;
+        }
+        self.previous = paths.clone();
+        // 還有檔案陸續進來時被切斷的，後面的要接起來
+        self.previous_cut_at = (quiet < gap).then_some(now);
+        BatchPoll::Ready {
+            request: Request {
+                paths,
                 fullscreen: std::mem::take(&mut self.fullscreen),
-            })
-        } else {
-            BatchPoll::Wait((Self::GAP - quiet).min(Self::MAX_WAIT - total))
+            },
+            continues,
         }
     }
 }
@@ -235,20 +271,23 @@ fn runtime_dir() -> Option<PathBuf> {
         };
         match std::env::var_os(var) {
             Some(b) if !b.is_empty() => Some(PathBuf::from(b).join("vitascope")),
-            // 用登入名稱區分使用者（沒有 libc 拿不到 uid）；資料夾權限另外檢查
-            _ => {
-                let user = std::env::var("USER").unwrap_or_else(|_| "user".to_owned());
-                Some(PathBuf::from(format!("/tmp/vitascope-{user}")))
-            }
+            // 用 uid 區分使用者（登入名稱可能沒設）；資料夾的擁有者與權限另外檢查
+            _ => Some(PathBuf::from(format!("/tmp/vitascope-{}", current_uid()))),
         }
     }
 }
 
-/// 建立資料夾；Unix 上只能是自己的（0700），不能是捷徑
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    // SAFETY: geteuid 不會失敗，也沒有參數
+    unsafe { libc::geteuid() }
+}
+
+/// 建立資料夾；Unix 上只能是自己的（擁有者是自己、0700），不能是捷徑
 fn prepare_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
         if let Err(e) = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)
             && e.kind() != io::ErrorKind::AlreadyExists
         {
@@ -257,6 +296,10 @@ fn prepare_private_dir(dir: &Path) -> io::Result<()> {
         let meta = std::fs::symlink_metadata(dir)?;
         if !meta.is_dir() {
             return Err(io::Error::other("不是資料夾"));
+        }
+        // 別人先建好的同名資料夾（/tmp 是大家共用的）：不用
+        if meta.uid() != current_uid() {
+            return Err(io::Error::other("資料夾是別的使用者的"));
         }
         if meta.permissions().mode() & 0o077 != 0 {
             // 是自己的就改回只有自己能用；別人的改不了，就不用
@@ -419,7 +462,13 @@ pub struct Primary {
 }
 
 impl Primary {
-    /// 關閉時呼叫：之後連進來的會收到「正在關閉」，等鎖放開後自己當主視窗
+    /// 開始關閉：之後連進來的會收到「正在關閉」（它們會等鎖放開、自己當主視窗）。
+    /// 鎖先不放：設定、播放紀錄存好之前，新的主視窗不要讀
+    pub fn stop_accepting(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    /// 關閉時呼叫：放開鎖，之後啟動的程式自己當主視窗
     pub fn shutdown(&mut self) {
         let Some(lock) = self.lock.take() else { return };
         self.closing.store(true, Ordering::SeqCst);
@@ -778,20 +827,79 @@ mod tests {
             paths: vec![PathBuf::from(p)],
             fullscreen: false,
         };
-        assert!(b.push(req("a"), t0), "第一個");
-        assert!(!b.push(req("b"), t0 + Duration::from_millis(100)));
-        assert!(!b.push(req("a"), t0 + Duration::from_millis(200)), "重複的不算");
+        // 只開一個檔案：GAP 之後就開
+        assert!(b.push(req("x"), t0), "第一個");
         assert!(matches!(b.poll(t0 + Duration::from_millis(300)), BatchPoll::Wait(_)));
-        match b.poll(t0 + Duration::from_millis(700)) {
-            BatchPoll::Ready(r) => assert_eq!(r.paths, [PathBuf::from("a"), PathBuf::from("b")]),
+        match b.poll(t0 + Duration::from_millis(450)) {
+            BatchPoll::Ready { request, continues } => {
+                assert_eq!(request.paths, [PathBuf::from("x")]);
+                assert!(!continues);
+            }
+            _ => panic!("一個檔案不用等太久"),
+        }
+        // 多選：檔案總管中間卡了一下（比 GAP 久、比 BURST_GAP 短）也算同一批
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(b.push(req("a"), t1), "新一批的第一個");
+        assert!(!b.push(req("b"), t1 + Duration::from_millis(100)));
+        assert!(!b.push(req("a"), t1 + Duration::from_millis(200)), "重複的不算");
+        assert!(matches!(b.poll(t1 + Duration::from_millis(700)), BatchPoll::Wait(_)));
+        b.push(req("c"), t1 + Duration::from_millis(800));
+        match b.poll(t1 + Duration::from_millis(1700)) {
+            BatchPoll::Ready { request, continues } => {
+                assert_eq!(
+                    request.paths,
+                    [PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+                );
+                assert!(!continues, "上一批不是被切斷的");
+            }
             _ => panic!("應該好了"),
         }
-        assert!(matches!(b.poll(t0 + Duration::from_millis(800)), BatchPoll::Idle));
-        // 一直有新的進來：最多等 MAX_WAIT
+        assert!(matches!(b.poll(t1 + Duration::from_millis(1800)), BatchPoll::Idle));
+        // 不久之後使用者自己又開了一個：新的一批，不接上去
+        b.push(req("z"), t1 + Duration::from_millis(2000));
+        match b.poll(t1 + Duration::from_millis(2500)) {
+            BatchPoll::Ready { request, continues } => {
+                assert_eq!(request.paths, [PathBuf::from("z")]);
+                assert!(!continues);
+            }
+            _ => panic!("應該好了"),
+        }
+    }
+
+    #[test]
+    fn batcher_joins_a_burst_that_was_cut_in_two() {
+        let t0 = Instant::now();
         let mut b = Batcher::default();
-        for i in 0..30 {
+        let req = |p: &str| Request {
+            paths: vec![PathBuf::from(p)],
+            fullscreen: false,
+        };
+        // 一直有新的進來：最多等 MAX_WAIT 就先開
+        for i in 0..26 {
             b.push(req(&i.to_string()), t0 + Duration::from_millis(i * 100));
         }
-        assert!(matches!(b.poll(t0 + Duration::from_millis(2600)), BatchPoll::Ready(_)));
+        match b.poll(t0 + Duration::from_millis(2550)) {
+            BatchPoll::Ready { request, continues } => {
+                assert_eq!(request.paths.len(), 26);
+                assert!(!continues);
+            }
+            _ => panic!("最多等 MAX_WAIT"),
+        }
+        // 剩下的到了：接在上一批後面，交出整串
+        for i in 26..30 {
+            b.push(req(&i.to_string()), t0 + Duration::from_millis(i * 100));
+        }
+        match b.poll(t0 + Duration::from_millis(3800)) {
+            BatchPoll::Ready { request, continues } => {
+                assert_eq!(request.paths.len(), 30);
+                assert_eq!(request.paths[29], PathBuf::from("29"));
+                assert!(continues);
+            }
+            _ => panic!("剩下的四個"),
+        }
+        // 還沒交出去的檔案（關閉時）
+        b.push(req("x"), t0 + Duration::from_secs(5));
+        assert_eq!(b.take_pending(), [PathBuf::from("x")]);
+        assert!(matches!(b.poll(t0 + Duration::from_secs(6)), BatchPoll::Idle));
     }
 }

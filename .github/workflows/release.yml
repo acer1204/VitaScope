@@ -167,6 +167,14 @@ jobs:
             throw "沒有開始功能表捷徑"
           }
 
+          # 影戲開著時（AppMutex）解除安裝要停下來，不能留下刪不掉的執行檔
+          $running = [System.Threading.Mutex]::new($false, 'VitaScope.Running')
+          $u = Start-Process "$app\unins000.exe" -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          $running.Dispose()
+          if ($u.ExitCode -eq 0 -or -not (Test-Path "$app\vitascope.exe")) {
+            throw "影戲開著時解除安裝沒有停下來（exit $($u.ExitCode)）"
+          }
+
           # -Wait 會等整個行程樹（unins000.exe 會先把自己複製到暫存資料夾再執行）
           $u = Start-Process "$app\unins000.exe" -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
           if ($u.ExitCode -ne 0) { throw "解除安裝失敗（exit $($u.ExitCode)）" }
@@ -176,7 +184,20 @@ jobs:
           if ($null -ne $mp4.'VitaScope.Video') { throw "解除安裝後 .mp4 的「開啟檔案」還有影戲" }
           $reg = Get-ItemProperty 'HKCU:\Software\RegisteredApplications' -ErrorAction SilentlyContinue
           if ($null -ne $reg.VitaScope) { throw "解除安裝後「預設應用程式」還列著影戲" }
-          Write-Host "安裝、解除安裝都正常"
+
+          # 使用者在程式裡關掉檔案關聯（跟「設定 → 系統」取消勾選一樣）之後升級：不要再自動加回去
+          $p = Start-Process "dist\$name-setup.exe" -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          if ($p.ExitCode -ne 0) { throw "重新安裝失敗（exit $($p.ExitCode)）" }
+          if (-not (Test-Path $keys[0])) { throw "重新安裝後沒有檔案關聯" }
+          Start-Process "$app\vitascope.exe" -Wait -ArgumentList '--unregister-associations'
+          if (Test-Path $keys[0]) { throw "--unregister-associations 沒有移除檔案關聯" }
+          $p = Start-Process "dist\$name-setup.exe" -Wait -PassThru -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\upgrade.log"
+          if ($p.ExitCode -ne 0) { Get-Content upgrade.log; throw "升級安裝失敗（exit $($p.ExitCode)）" }
+          if (Test-Path $keys[0]) { throw "升級時把使用者關掉的檔案關聯加回去了" }
+          $u = Start-Process "$app\unins000.exe" -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          if ($u.ExitCode -ne 0 -or (Test-Path "$app\vitascope.exe")) { throw "第二次解除安裝失敗" }
+          Write-Host "安裝、升級、解除安裝都正常"
 
       # ── macOS：.app，libmpv 和相依的 dylib 都包進 Contents/Frameworks ──
       - name: 打包（macOS）
@@ -327,6 +348,9 @@ jobs:
         env:
           LINUXDEPLOY_URL: https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
           LINUXDEPLOY_SHA256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+          # AppImage 開頭的執行環境也要釘住版本（不指定的話會下載會變動的 continuous）
+          RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
           # runner 不保證有 FUSE；linuxdeploy 本身也是 AppImage
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
@@ -337,12 +361,15 @@ jobs:
           curl -sSfL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
           echo "$LINUXDEPLOY_SHA256  $ld" | sha256sum -c -
           chmod +x "$ld"
+          runtime="$RUNNER_TEMP/runtime-x86_64"
+          curl -sSfL --retry 3 -o "$runtime" "$RUNTIME_URL"
+          echo "$RUNTIME_SHA256  $runtime" | sha256sum -c -
 
           mkdir -p AppDir/usr/share/metainfo AppDir/usr/share/doc/vitascope
           sed -e "s/@VERSION@/${{ steps.version.outputs.version }}/" -e "s/@DATE@/$(date -u +%F)/" \
             $pkg/$id.appdata.xml.in > AppDir/usr/share/metainfo/$id.appdata.xml
           appstreamcli validate --no-net AppDir/usr/share/metainfo/$id.appdata.xml
-          cp LICENSE README.md notices/* AppDir/usr/share/doc/vitascope/
+          cp README.md notices/* AppDir/usr/share/doc/vitascope/
           # linuxdeploy 用檔名當圖示名稱，要跟 .desktop 的 Icon= 一樣
           icons="$RUNNER_TEMP/icons"
           mkdir -p "$icons"
@@ -356,11 +383,13 @@ jobs:
           mkdir -p AppDir/usr/lib/fallback/jack AppDir/usr/lib/fallback/pipewire
           cp -L $lib/libjack.so.0 $lib/libdb-5.3.so AppDir/usr/lib/fallback/jack/
           cp -L $lib/libpipewire-0.3.so.0 AppDir/usr/lib/fallback/pipewire/
-          # 第三方授權：包進去的每個函式庫來自哪個 Ubuntu 原始碼套件、版本
+          # 第二階段：補上備用函式庫的相依函式庫
+          "$ld" --appdir AppDir
+          # 第三方授權：包進去的每個函式庫來自哪個 Ubuntu 原始碼套件、版本，以及授權全文
           bash packaging/linux-third-party.sh AppDir AppDir/usr/share/doc/vitascope/THIRD-PARTY-LINUX.md
-          # 第二階段：產生 AppImage
+          # 第三階段：產生 AppImage
           out="VitaScope-${{ steps.version.outputs.tag }}-linux-x86_64.AppImage"
-          LDAI_OUTPUT="$out" "$ld" --appdir AppDir --output appimage
+          LDAI_OUTPUT="$out" LDAI_RUNTIME_FILE="$runtime" "$ld" --appdir AppDir --output appimage
           mv "$out" dist/
           # 最低需求要算所有包進去的檔案，不只主程式
           glibc=$(find AppDir -type f \( -name '*.so*' -o -path '*/usr/bin/*' \) -exec objdump -T {} + 2>/dev/null \

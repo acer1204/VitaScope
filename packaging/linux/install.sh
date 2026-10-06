@@ -24,6 +24,12 @@ refresh() {
 if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$bin/vitascope" "$desktop"
     find "$data/icons/hicolor" \( -name "$APP_ID.png" -o -name "$APP_ID.svg" \) -exec rm -f {} + 2>/dev/null || true
+    # --default 設的預設程式（只刪影戲的，其他程式的設定不動）
+    mimeapps=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
+    if [ -f "$mimeapps" ]; then
+        id_re=$(printf '%s' "$APP_ID" | sed 's/\./\\./g')
+        sed -i -e "/=$id_re\.desktop;*\$/d" -e "s/$id_re\.desktop;//g" "$mimeapps"
+    fi
     refresh
     echo "已移除。設定檔在 ~/.config/vitascope，不需要可以自行刪除。"
     exit 0
@@ -37,13 +43,27 @@ install -Dm755 "$here/vitascope" "$bin/vitascope"
 done
 
 # Exec 寫絕對路徑：從桌面環境啟動時 ~/.local/bin 不一定在 PATH 裡。
-# 路徑放在雙引號裡，引號內的 " ` $ \ 要加反斜線（Desktop Entry 規格的 Exec 一節）。
+# 路徑放在雙引號裡（Desktop Entry 規格的 Exec 一節）：引號內的 " ` $ \ 要加反斜線，而檔案裡的值
+# 會先做一般字串的跳脫處理（\\ → \），所以 " ` $ 寫成 \\"、\ 寫成 \\\\。
+# 路徑裡有 % 時沒辦法寫（規格是寫成 %%，但 GNOME 的 GLib 用沒展開的路徑找程式，會說找不到）：
+# 改用 PATH 裡的 vitascope，也不寫 TryExec。
 # 用 ENVIRON 把值交給 awk：awk -v 會解讀反斜線，sed 的取代字串又怕 & 和 |
-quoted=$(printf '%s' "$bin/vitascope" | sed 's/[\\"`$]/\\&/g')
+case "$bin" in
+    *%*)
+        exec_line="Exec=vitascope %F"
+        try_line=""
+        echo "提醒：安裝路徑裡有 %，選單項目改用 PATH 裡的 vitascope（$bin 要在 PATH 裡）"
+        ;;
+    *)
+        quoted=$(printf '%s' "$bin/vitascope" | sed -e 's/\\/\\\\\\\\/g' -e 's/["`$]/\\\\&/g')
+        exec_line="Exec=\"$quoted\" %F"
+        try_line="TryExec=$(printf '%s' "$bin/vitascope" | sed -e 's/\\/\\\\/g')"
+        ;;
+esac
 mkdir -p "$data/applications"
-EXEC_LINE="Exec=\"$quoted\" %F" TRY_LINE="TryExec=$bin/vitascope" awk '
+EXEC_LINE="$exec_line" TRY_LINE="$try_line" awk '
     /^Exec=/    { print ENVIRON["EXEC_LINE"]; next }
-    /^TryExec=/ { print ENVIRON["TRY_LINE"]; next }
+    /^TryExec=/ { if (ENVIRON["TRY_LINE"] != "") print ENVIRON["TRY_LINE"]; next }
     { print }' "$here/share/applications/$APP_ID.desktop" > "$desktop"
 refresh
 

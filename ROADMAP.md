@@ -353,10 +353,10 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 97 個樣本（常見 35、通用 37、罕見 25） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 91 | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 98 | Windows、macOS、Linux |
 | 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
-| 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式） | 4 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 89（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
+| 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式、強制結束主視窗） | 6 | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 96（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
 | 硬體解碼 `tests/hwdec.rs`（需要 GPU） | 8 種編碼 | RTX 3090 通過 |
 
 ### 4.5 真實影片庫普查（`examples/media_survey.rs`）
@@ -460,3 +460,15 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **AppImage 刻意不包的函式庫（excludelist），在乾淨的系統上不一定有**：libmpv 直接連結的 JACK、PipeWire，
   和 winit 用 dlopen 載入的 libxkbcommon-x11，缺了就啟動失敗。只在 CI 機器上測看不出來，要在乾淨的容器再跑一次。
 - **Git Bash 會把 `/D…` 之類的參數當成路徑轉換掉**：Inno Setup 的 ISCC 要在 PowerShell 或 cmd 執行。
+- **好幾個視窗共用一個設定檔時，關閉的那個不能把整份舊設定寫回去**：存檔時只寫這個視窗上次讀檔或存檔之後改過的設定，
+  其他的保留檔案裡現在的值。新版寫的、這版讀不懂的設定也要保留（只有讀不懂的那一項用預設值）。
+- **解除安裝時程式還開著，執行檔刪不掉，關閉時還會把設定寫回去**：程式啟動時建立一個具名 mutex，
+  安裝程式用 `AppMutex` 先請使用者關掉。
+- **檔案關聯只認「登錄的那一個執行檔」**：同一台電腦上有安裝版、免安裝版、開發中的建置時，啟動時不能誰都去搶；
+  只有原本登錄的執行檔不在了（免安裝版搬家）才重新登錄。
+- **Desktop Entry 的 Exec 要跳脫兩層**（一般字串、再加引號規則），而 GNOME 的 GLib 找程式時用的是還沒展開 `%%` 的路徑：
+  路徑裡有 `%` 的話只能改用 PATH 裡的程式。
+- **檔案總管一次開很多檔案時，程式陸續啟動、中間會停頓**：已經收到好幾個時要等久一點才算一批；
+  等太久先開了前面的，後面到的要接在同一個清單裡，不能把前面的換掉。
+- **用腳本改程式碼，每一處都要確認真的改到了**：第四批有兩個修正因為腳本中途出錯沒有寫進去，
+  測試也沒抓到（無畫面測試走不到那條路），是第六批的複查才發現。改完要看 diff，修正要有會失敗的測試。

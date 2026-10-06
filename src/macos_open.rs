@@ -10,7 +10,7 @@
 use eframe::egui;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_foundation::{
     NSAppleEventDescriptor, NSAppleEventManager, NSNotification, NSNotificationCenter, NSString, NSURL,
 };

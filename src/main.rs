@@ -81,22 +81,12 @@ fn parse_args() -> (Launch, bool) {
     (launch, new_window)
 }
 
-/// 另一個程式（例如雙擊檔案）傳過來的相對路徑，要在這邊轉成完整路徑（兩個程式的目前資料夾不同）
-fn absolute_paths(files: &[PathBuf]) -> Vec<PathBuf> {
-    files
-        .iter()
-        .map(|p| {
-            if vitascope::m3u::is_url(&p.to_string_lossy()) {
-                p.clone()
-            } else {
-                std::path::absolute(p).unwrap_or_else(|_| p.clone())
-            }
-        })
-        .collect()
-}
-
 fn main() -> eframe::Result {
     let (mut launch, new_window) = parse_args();
+    #[cfg(windows)]
+    mark_running();
+    // 相對路徑轉成完整路徑：送給已經開著的視窗時（兩個程式的目前資料夾不同）、自己開成清單時都要
+    launch.files = launch.files.iter().map(|p| vitascope::playlist::absolute(p)).collect();
 
     // 自動截圖讀使用者的設定（字幕外觀之類的），但不寫回去
     let settings = if launch.autoshot.is_some() {
@@ -105,8 +95,13 @@ fn main() -> eframe::Result {
         Settings::load()
     };
     vitascope::i18n::set_lang(settings.language);
+    // 自動截圖（開發、CI 用）不碰登錄檔
     #[cfg(windows)]
-    let settings = refresh_file_associations(settings);
+    let settings = if launch.autoshot.is_none() {
+        refresh_file_associations(settings)
+    } else {
+        settings
+    };
 
     // mpv 有新事件時要喚醒 egui；egui 的 Context 要等視窗建立後才有，先留一個位置
     let egui_ctx: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
@@ -120,10 +115,13 @@ fn main() -> eframe::Result {
             }
         });
         let req = instance::Request {
-            paths: absolute_paths(&launch.files),
+            paths: launch.files.clone(),
             fullscreen: launch.fullscreen,
         };
-        let forward = settings.single_instance && !new_window;
+        // macOS 從 Finder 開檔時，檔名是之後才用 Apple Event 送來的（命令列沒有檔案）：
+        // 不能先轉送一個空的要求就結束（檔案會不見）。已經開著的 .app 本來就由系統把檔案送過去
+        let finder_launch = cfg!(target_os = "macos") && launch.files.is_empty();
+        let forward = settings.single_instance && !new_window && !finder_launch;
         match instance::Endpoint::for_current_user().map(|ep| instance::start(&ep, &req, forward, wake)) {
             Ok(instance::Startup::Forwarded) => std::process::exit(0),
             Ok(instance::Startup::Primary(p)) => launch.instance = Some(p),
@@ -186,7 +184,12 @@ fn main() -> eframe::Result {
             // 啟動時從 Finder 開的檔案（這時已經收到了）
             #[cfg(target_os = "macos")]
             {
-                launch.files.extend(vitascope::macos_open::take());
+                let finder = vitascope::macos_open::take();
+                if !finder.is_empty() {
+                    // 跟命令列指定檔案一樣：不還原上次的清單（不然關閉時會把它清掉）
+                    launch.playlist = None;
+                    launch.files.extend(finder);
+                }
                 vitascope::macos_open::set_context(&cc.egui_ctx);
             }
             Ok(Box::new(VitascopeApp::new(cc, player, settings, launch)))
@@ -202,25 +205,43 @@ fn main() -> eframe::Result {
     result
 }
 
-/// 檔案關聯的設定跟登錄檔對齊：
-/// - 安裝程式勾了檔案關聯：設定裡的選項跟著打開
-/// - 免安裝版搬到別的資料夾：關聯指向舊的位置，重新登錄（開發中的建置不登錄，免得關聯指到建置資料夾）
+/// 檔案關聯的設定跟登錄檔對齊（見 `assoc::on_startup`）：安裝程式勾了檔案關聯時設定跟著打開；
+/// 免安裝版搬到別的資料夾時重新登錄。開發中的建置不動登錄檔（免得關聯指到建置資料夾）
 #[cfg(windows)]
 fn refresh_file_associations(mut settings: Settings) -> Settings {
+    use vitascope::assoc::{self, OnStartup};
+    if cfg!(debug_assertions) {
+        return settings;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return settings;
     };
-    let places = vitascope::assoc::Places::default();
-    let registered = vitascope::assoc::is_registered(&exe, &places);
-    if registered {
-        settings.file_associations = true;
-    } else if settings.file_associations
-        && !cfg!(debug_assertions)
-        && let Err(e) = vitascope::assoc::register(&exe, &places)
-    {
-        eprintln!("[vitascope] 無法更新檔案關聯：{e}");
+    let places = assoc::Places::default();
+    let registered = assoc::registered_exe(&places);
+    match assoc::on_startup(settings.file_associations, registered.as_deref(), &exe, |p| p.exists()) {
+        OnStartup::Adopt if !settings.file_associations => {
+            settings.file_associations = true;
+            // 馬上存：之後解除安裝程式關掉它時，這個視窗關閉時才不會把舊的值寫回去
+            let _ = settings.save();
+        }
+        OnStartup::Register => {
+            if let Err(e) = assoc::register(&exe, &places) {
+                eprintln!("[vitascope] 無法更新檔案關聯：{e}");
+            }
+        }
+        _ => {}
     }
     settings
+}
+
+/// 讓安裝程式、解除安裝程式知道影戲開著（Inno Setup 的 AppMutex），會先請使用者關掉。
+/// 程式結束時系統自動釋放，不用保存控制代碼
+#[cfg(windows)]
+fn mark_running() {
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "VitaScope.Running\0".encode_utf16().collect();
+    // SAFETY: 名稱以 0 結尾；不需要安全性屬性
+    unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
 }
 
 /// 印出錯誤（給從終端機啟動的情況）並顯示對話框，然後結束
