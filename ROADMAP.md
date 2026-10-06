@@ -168,6 +168,7 @@ src/
 
 用核取方塊追蹤進度，完成並測試通過後打勾。括號裡註明是怎麼驗證的：
 「自動」= `cargo test` 涵蓋；「截圖」= `--shot` 自動截圖檢查；「手動」= 還需要人實際操作確認。
+README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一起更新。
 
 ### L1 基本播放（MVP）
 
@@ -241,7 +242,8 @@ src/
 - [ ] 檔案關聯（Windows 登錄檔、macOS Info.plist、Linux `.desktop`）
 - [ ] 單一執行個體：雙擊另一個檔案時送到已開啟的視窗（可在設定關閉）
 - [ ] 打包發佈：Windows zip / 安裝檔、macOS `.app` / `.dmg`、Linux AppImage
-- [ ] ✅ 「通用」格式測試矩陣通過
+  （Windows zip、macOS `.app`、Linux tar.gz 的自動發佈已完成；安裝程式、`.dmg`、AppImage 未做）
+- [x] ✅ 「通用」格式測試矩陣通過（自動：三平台 CI，`tests/formats.rs` 要求常見與通用全數通過）
 
 ### L3 進階調校
 
