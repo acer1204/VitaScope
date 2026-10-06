@@ -380,3 +380,6 @@ GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試
 - **mpv 的軌道清單通知比 FileLoaded / PlaybackRestart 晚到**：開檔當下要自己讀一次 `track-list`，否則會讀到「還沒選軌」的舊清單。
 - **自己產生的測試樣本不一定重現真實問題**：短的 GBK 字幕 mpv 猜得對，真實的長字幕卻猜錯。
   真實影片庫的普查找到的問題，樣本找不到。
+- **打包後一定要真的執行一次**：macOS 的 .app 打包成功，執行卻當掉。dylibbundler 會把每條既有的 rpath
+  改寫成同一個路徑，產生重複的 LC_RPATH（新版 macOS 拒絕載入），還蓋掉 Swift 執行庫需要的 `/usr/lib/swift`。
+  發佈流程現在打包後會執行 `--version`，並檢查 .app 裡沒有參照 Homebrew 路徑。
