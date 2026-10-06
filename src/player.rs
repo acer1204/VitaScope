@@ -535,7 +535,12 @@ impl Player {
             return None;
         }
         let aspect = d.dw as f64 / d.dh as f64;
-        let rotate = d.rotate.rem_euclid(360);
+        // 檔案標示的旋轉：mpv 自己的 MKV 解析器放在容器層（demux-rotation），FFmpeg 解的 MP4 放在影格上
+        let rotate = self
+            .mpv
+            .get_property::<i64>("current-tracks/video/demux-rotation")
+            .unwrap_or(d.rotate)
+            .rem_euclid(360);
         Some((if rotate % 180 == 90 { 1.0 / aspect } else { aspect }, rotate))
     }
 

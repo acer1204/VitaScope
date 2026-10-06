@@ -125,6 +125,12 @@ pub struct Thumbnailer {
 impl Thumbnailer {
     /// 建立（mpv 在背景執行緒裡初始化）。`repaint`：有新縮圖時叫介面重畫
     pub fn new(repaint: impl Fn() + Send + 'static) -> Self {
+        Self::with_idle_stop(repaint, IDLE_STOP)
+    }
+
+    /// 指定閒置多久停掉檔案（測試用）
+    #[doc(hidden)]
+    pub fn with_idle_stop(repaint: impl Fn() + Send + 'static, idle_stop: Duration) -> Self {
         let shared = Arc::new(Shared {
             inbox: Mutex::new(Inbox::default()),
             cv: Condvar::new(),
@@ -134,7 +140,7 @@ impl Thumbnailer {
         let thread = std::thread::Builder::new()
             .name("vitascope-thumbs".into())
             .spawn(move || {
-                if let Err(e) = worker(&worker_shared, &tx, &repaint) {
+                if let Err(e) = worker(&worker_shared, &tx, &repaint, idle_stop) {
                     eprintln!("[vitascope] 預覽縮圖無法使用：{e}");
                 }
             })
@@ -177,7 +183,7 @@ struct InFlight {
     started: Instant,
 }
 
-fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn()) -> crate::mpv::Result<()> {
+fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn(), idle_stop: Duration) -> crate::mpv::Result<()> {
     let mut mpv = Mpv::new(OPTIONS)?;
     let wake = shared.clone();
     mpv.set_wakeup_callback(move || wake.poke(|_| {}));
@@ -187,8 +193,12 @@ fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn()) -> crate
     rc.set_update_callback(move || wake.poke(|_| {}));
 
     let mut file = 0u64;
+    let mut path = String::new();
     // 檔案開好、知道影片大小了（沒有影像的檔案永遠不會是 true）
     let mut loaded = false;
+    // 開檔後第一次「跳轉完成」時讀影片大小（不能在 VideoReconfig 時讀：那時 mpv 正在等我們畫第一格，
+    // 這裡同步讀屬性會互相等，卡 200 毫秒）
+    let mut need_params = false;
     let mut failed = false;
     let mut timeouts = 0;
     // 縮圖大小、檔案本身的旋轉（知道之前先畫到小緩衝區：mpv 要我們一直畫，不然會卡住）
@@ -219,13 +229,32 @@ fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn()) -> crate
         if quit {
             break;
         }
-        if let Some((f, path)) = open {
+        if let Some((f, p)) = open {
             file = f;
+            path = p;
             loaded = false;
+            need_params = true;
             failed = false;
             timeouts = 0;
             inflight = None;
             stopped = false;
+            last_used = Instant::now();
+            if mpv.command(&["loadfile", &path, "replace"]).is_err() {
+                failed = true;
+            }
+        }
+        // 閒置太久停掉了，又有人要這個檔案的縮圖：重新開檔（要求留著，開好後就會處理）
+        if stopped
+            && !failed
+            && !path.is_empty()
+            && shared
+                .inbox
+                .lock()
+                .is_ok_and(|ib| ib.want.as_ref().is_some_and(|w| w.0 == file))
+        {
+            stopped = false;
+            loaded = false;
+            need_params = true;
             last_used = Instant::now();
             if mpv.command(&["loadfile", &path, "replace"]).is_err() {
                 failed = true;
@@ -237,8 +266,10 @@ fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn()) -> crate
         }
         while let Some(ev) = mpv.wait_event(0.0) {
             match ev {
-                // 第一格解出來、畫面設定好之後才知道影片的大小（開檔當下還不知道）：這時才開始做縮圖
-                Event::VideoReconfig => {
+                // 影片參數變了（換檔、解析度改變）：下一次跳轉完成時重讀
+                Event::VideoReconfig => need_params = true,
+                Event::PlaybackRestart if need_params && inflight.is_none() => {
+                    // 第一格畫好了才知道影片的大小；這時才開始做縮圖
                     if let Some((dw, dh, r)) = dec_params(&mpv) {
                         let new_size = size_for(dw, dh);
                         if new_size != size {
@@ -247,6 +278,7 @@ fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn()) -> crate
                         }
                         rotate = r;
                         loaded = true;
+                        need_params = false;
                     }
                 }
                 Event::PlaybackRestart => {
@@ -292,8 +324,8 @@ fn worker(shared: &Arc<Shared>, tx: &Sender<Thumb>, repaint: &dyn Fn()) -> crate
                 _ => {}
             }
         }
-        // 很久沒用：停掉檔案，放掉解碼器的記憶體（下次要縮圖時介面會重新開檔）
-        if !stopped && inflight.is_none() && last_used.elapsed() > IDLE_STOP {
+        // 很久沒用：停掉檔案，放掉解碼器的記憶體（下次有人要縮圖時上面會重新開檔）
+        if !stopped && inflight.is_none() && last_used.elapsed() > idle_stop {
             let _ = mpv.command(&["stop"]);
             stopped = true;
             loaded = false;
@@ -312,7 +344,11 @@ fn dec_params(mpv: &Mpv) -> Option<(i64, i64, i64)> {
         rotate: i64,
     }
     let d: Dec = serde_json::from_str(&mpv.get_string("video-dec-params").ok()?).ok()?;
-    (d.dw > 0 && d.dh > 0).then_some((d.dw, d.dh, d.rotate.rem_euclid(360)))
+    // 檔案標示的旋轉：MKV 在容器層（demux-rotation），MP4 在影格上（見 Player::natural_shape）
+    let rotate = mpv
+        .get_property::<i64>("current-tracks/video/demux-rotation")
+        .unwrap_or(d.rotate);
+    (d.dw > 0 && d.dh > 0).then_some((d.dw, d.dh, rotate.rem_euclid(360)))
 }
 
 /// 緩衝區（RGBX）→ 縮圖（RGBA、不透明、轉正）

@@ -163,7 +163,9 @@ pub fn pan_after(pan: f64, delta: f64) -> f64 {
 /// 縮放後的值：10% 到 800%（log2 -3.3 … 3；mpv 0.37 放太大會溢位）。
 /// 不四捨五入：觸控板捏合、Ctrl + 精確捲動每一幀只有很小的量，四捨五入會被吃掉（顯示時才取整數百分比）
 pub fn zoom_after(zoom: f64, delta: f64) -> f64 {
-    (zoom + delta).clamp(-3.3, 3.0)
+    let z = (zoom + delta).clamp(-3.3, 3.0);
+    // 9 按三下、1 按三下：浮點數的誤差會留下 2.78e-17，「重設畫面」就一直亮著
+    if z.abs() < 1e-9 { 0.0 } else { z }
 }
 
 #[cfg(test)]
@@ -238,6 +240,11 @@ mod tests {
             z = zoom_after(z, 0.002);
         }
         assert!(close(z, 0.2), "{z}");
+        let mut back = 0.0;
+        for d in [0.1, 0.1, 0.1, -0.1, -0.1, -0.1] {
+            back = zoom_after(back, d);
+        }
+        assert_eq!(back, 0.0, "來回之後剛好是 0");
         assert!(close(pan_after(0.95, 0.1), 1.0));
         assert!(
             close(pan_after(0.1, 0.05 + 0.05), 0.2),

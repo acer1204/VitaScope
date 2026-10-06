@@ -1,0 +1,271 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 影戲 VitaScope.app 的 Info.plist（發佈流程把 @VERSION@、@MIN_OS@ 換成實際的值）。
+     CFBundleDocumentTypes：Finder 的「打開檔案的應用程式」列出影戲；檔名由 Apple Event 送來（src/macos_open.rs） -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>VitaScope</string>
+  <key>CFBundleDisplayName</key><string>影戲 VitaScope</string>
+  <key>CFBundleIdentifier</key><string>io.github.acer1204.vitascope</string>
+  <key>CFBundleExecutable</key><string>vitascope</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>LSMinimumSystemVersion</key><string>@MIN_OS@</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>CFBundleIconFile</key><string>VitaScope</string>
+
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Video</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.mpeg-4</string>
+        <string>com.apple.m4v-video</string>
+        <string>com.apple.quicktime-movie</string>
+        <string>public.avi</string>
+        <string>public.mpeg</string>
+        <string>public.mpeg-2-transport-stream</string>
+        <string>public.3gpp</string>
+        <string>public.3gpp2</string>
+        <string>org.matroska.mkv</string>
+        <string>org.webmproject.webm</string>
+        <string>org.xiph.ogg-video</string>
+        <string>com.microsoft.windows-media-wmv</string>
+        <string>com.adobe.flash.video</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Audio</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Default</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.mp3</string>
+        <string>public.mpeg-4-audio</string>
+        <string>public.aac-audio</string>
+        <string>com.microsoft.waveform-audio</string>
+        <string>org.xiph.flac</string>
+        <string>org.xiph.ogg-audio</string>
+        <string>org.xiph.opus</string>
+        <string>org.matroska.mka</string>
+      </array>
+    </dict>
+    <dict>
+      <!-- 其他任何影片 / 音訊：出現在「打開檔案的應用程式」，但不搶預設 -->
+      <key>CFBundleTypeName</key><string>Media</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.movie</string>
+        <string>public.audio</string>
+      </array>
+    </dict>
+  </array>
+
+  <!-- 系統沒宣告的類型要「匯入」宣告，否則副檔名只會得到 dyn.xxx，不屬於 public.movie。
+       匯入宣告只在沒有別人宣告時生效，和 mpv / IINA 用一樣的識別碼就不會衝突 -->
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.matroska.mkv</string>
+      <key>UTTypeDescription</key><string>Matroska Video</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>mkv</string></array>
+        <key>public.mime-type</key><array><string>video/x-matroska</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.webmproject.webm</string>
+      <key>UTTypeDescription</key><string>WebM Video</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>webm</string></array>
+        <key>public.mime-type</key><array><string>video/webm</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.matroska.mka</string>
+      <key>UTTypeDescription</key><string>Matroska Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>mka</string></array>
+        <key>public.mime-type</key><array><string>audio/x-matroska</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.xiph.ogg-video</string>
+      <key>UTTypeDescription</key><string>Ogg Video</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>ogv</string></array>
+        <key>public.mime-type</key><array><string>video/ogg</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.xiph.ogg-audio</string>
+      <key>UTTypeDescription</key><string>Ogg Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>oga</string><string>ogg</string></array>
+        <key>public.mime-type</key><array><string>audio/ogg</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.xiph.opus</string>
+      <key>UTTypeDescription</key><string>Opus Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>opus</string></array>
+        <key>public.mime-type</key><array><string>audio/opus</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.xiph.flac</string>
+      <key>UTTypeDescription</key><string>FLAC Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>flac</string></array>
+        <key>public.mime-type</key><array><string>audio/flac</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.microsoft.windows-media-wmv</string>
+      <key>UTTypeDescription</key><string>Windows Media Video</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>wmv</string><string>asf</string></array>
+        <key>public.mime-type</key><array><string>video/x-ms-wmv</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.microsoft.windows-media-wma</string>
+      <key>UTTypeDescription</key><string>Windows Media Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>wma</string></array>
+        <key>public.mime-type</key><array><string>audio/x-ms-wma</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.adobe.flash.video</string>
+      <key>UTTypeDescription</key><string>Flash Video</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>flv</string><string>f4v</string></array>
+        <key>public.mime-type</key><array><string>video/x-flv</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>public.mpeg-2-transport-stream</string>
+      <key>UTTypeDescription</key><string>MPEG-2 Transport Stream</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>ts</string><string>m2ts</string><string>mts</string></array>
+        <key>public.mime-type</key><array><string>video/mp2t</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>org.videolan.vob</string>
+      <key>UTTypeDescription</key><string>DVD Video Object</string>
+      <key>UTTypeConformsTo</key><array><string>public.movie</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>vob</string></array>
+        <key>public.mime-type</key><array><string>video/mpeg</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.monkeysaudio.ape</string>
+      <key>UTTypeDescription</key><string>Monkey's Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>ape</string></array>
+        <key>public.mime-type</key><array><string>audio/x-ape</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>com.wavpack.wv</string>
+      <key>UTTypeDescription</key><string>WavPack Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>wv</string></array>
+        <key>public.mime-type</key><array><string>audio/x-wavpack</string></array>
+      </dict>
+    </dict>
+    <!-- 沒有通用識別碼的格式：用自己的識別碼（只是讓它們屬於 public.audio，由上面的 Media 類型接手） -->
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.acer1204.vitascope.tta</string>
+      <key>UTTypeDescription</key><string>True Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>tta</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.acer1204.vitascope.dts</string>
+      <key>UTTypeDescription</key><string>DTS Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>dts</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.acer1204.vitascope.dsf</string>
+      <key>UTTypeDescription</key><string>DSD Stream File</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>dsf</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.acer1204.vitascope.dff</string>
+      <key>UTTypeDescription</key><string>DSD Interchange File</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>dff</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.acer1204.vitascope.spx</string>
+      <key>UTTypeDescription</key><string>Speex Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>spx</string></array>
+      </dict>
+    </dict>
+    <dict>
+      <key>UTTypeIdentifier</key><string>io.github.acer1204.vitascope.alac</string>
+      <key>UTTypeDescription</key><string>Apple Lossless Audio</string>
+      <key>UTTypeConformsTo</key><array><string>public.audio</string></array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key><array><string>alac</string></array>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>

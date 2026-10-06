@@ -277,6 +277,10 @@ def samples() -> list[Sample]:
         S("audio_wav", "general", "wav", None, PCM, None, "pcm_s16le"),
 
         # ───────────── 罕見 ─────────────
+        # 手機直拍轉存成 MKV：旋轉放在 Matroska 的容器層（mpv 自己的 MKV 解析器讀，不在影格上）。
+        # 舊版 ffmpeg（6.1）寫不出 MKV 的旋轉，所以放在「罕見」（失敗只列在報告裡）
+        S("mkv_hevc_aac_rot90", "rare", "mkv", X265, AAC, "hevc", "aac",
+          post="rotate", expect={"rotate": 90}, note="直拍影片轉存的 MKV（容器層的旋轉）"),
         S("rm_rv20_ac3", "rare", "rm", ["-c:v", "rv20", "-b:v", "500k"], AC3, "rv20", "ac3", note="RealMedia"),
         S("mxf_mpeg2_pcm", "rare", "mxf", ["-c:v", "mpeg2video", "-b:v", "8M", "-g", "1"],
           ["-c:a", "pcm_s16le", "-ac", "1"], "mpeg2video", "pcm_s16le", size="720x576", rate="25"),

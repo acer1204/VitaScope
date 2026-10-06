@@ -39,7 +39,33 @@ ureq = "3"
 
 # Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
+# 單一執行個體：具名管道、使用者 SID（只讓同一個使用者連線）、把前景交給已開啟的視窗
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# macOS：Finder 開檔送來的 Apple Event（winit 沒有提供）
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAppleEventDescriptor",
+    "NSAppleEventManager",
+    "NSNotification",
+    "NSString",
+    "NSURL",
+] }
 
 [profile.release]
 opt-level = 3

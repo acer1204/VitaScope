@@ -53,6 +53,43 @@ fn windows() {
     if let Some(profile_dir) = out_dir.ancestors().nth(3) {
         place(&dll, &profile_dir.join("libmpv-2.dll"));
     }
+    resources(&manifest, &out_dir);
+}
+
+/// 執行檔的圖示與版本資訊（packaging/windows/vitascope.rc）。用 MinGW 的 windres 編譯；
+/// 找不到 windres 時只發出警告（開發用的建置照樣能跑，只是執行檔沒有圖示），發佈流程會另外檢查
+fn resources(manifest: &Path, out_dir: &Path) {
+    let rc_dir = manifest.join("packaging/windows");
+    let ico = manifest.join("packaging/icons/vitascope.ico");
+    println!("cargo:rerun-if-changed={}", rc_dir.join("vitascope.rc").display());
+    println!("cargo:rerun-if-changed={}", ico.display());
+    println!("cargo:rerun-if-env-changed=RC");
+    // 複製到 OUT_DIR（純 ASCII 路徑）再編譯：MinGW 的工具打不開非 ASCII 路徑
+    let copied = std::fs::copy(rc_dir.join("vitascope.rc"), out_dir.join("vitascope.rc"))
+        .and_then(|_| std::fs::copy(&ico, out_dir.join("vitascope.ico")));
+    if let Err(e) = copied {
+        println!("cargo:warning=無法準備圖示資源：{e}");
+        return;
+    }
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let parts: Vec<&str> = version.split(['.', '-']).take(3).collect();
+    let obj = out_dir.join("vitascope-res.o");
+    let status = std::process::Command::new(env::var("RC").unwrap_or_else(|_| "windres".into()))
+        .current_dir(out_dir)
+        .args(["--target", "pe-x86-64", "-c", "65001", "-O", "coff"])
+        .arg(format!("-DVER_MAJOR={}", parts[0]))
+        .arg(format!("-DVER_MINOR={}", parts.get(1).unwrap_or(&"0")))
+        .arg(format!("-DVER_PATCH={}", parts.get(2).unwrap_or(&"0")))
+        .arg(format!("-DVER_STR=\\\"{version}\\\""))
+        .args(["-i", "vitascope.rc", "-o"])
+        .arg(&obj)
+        .status();
+    match status {
+        // 直接把目的檔交給連結器（放進 .a 的話，沒有符號被引用會被丟掉）
+        Ok(s) if s.success() => println!("cargo:rustc-link-arg-bins={}", obj.display()),
+        Ok(s) => println!("cargo:warning=windres 失敗（{s}），執行檔不會有圖示"),
+        Err(e) => println!("cargo:warning=找不到 windres（{e}），執行檔不會有圖示"),
+    }
 }
 
 /// 優先建立硬連結（dll 約 120 MB，複製太慢），跨磁碟時才複製。

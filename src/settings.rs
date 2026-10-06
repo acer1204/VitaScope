@@ -38,6 +38,10 @@ pub struct Settings {
     pub seek_short: f64,
     /// Ctrl + ← / → 跳幾秒
     pub seek_long: f64,
+    /// 只開一個視窗：開新檔案時交給已經開著的視窗
+    pub single_instance: bool,
+    /// Windows：加到影音檔的「開啟檔案」選單（登錄在目前使用者底下）
+    pub file_associations: bool,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -157,6 +161,8 @@ impl Default for Settings {
             hwdec: true,
             seek_short: 5.0,
             seek_long: 30.0,
+            single_instance: true,
+            file_associations: false,
             path: None,
         }
     }

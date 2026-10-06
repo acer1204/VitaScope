@@ -46,7 +46,7 @@ L1 完成時的實際結構見 [README](README.md#程式架構)。之後預計�
 src/
 ├─ library/         播放清單、播放紀錄（續播）、最近開啟、書籤（L2）
 ├─ keymap.rs        自訂快捷鍵（L3）
-└─ platform/        檔案關聯、單一執行個體、系統媒體鍵（L2–L3）
+└─ platform/        系統媒體鍵（L3；檔案關聯、單一執行個體已在 L2 完成：assoc.rs、instance.rs、macos_open.rs）
 ```
 
 ### 各平台的 libmpv 來源
@@ -251,11 +251,18 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   漏寫英文編譯不過；語言記在介面執行緒上，背景執行緒產生的訊息帶著同一個語言（自動）
 
 系統整合與發佈
-- [ ] 檔案關聯（Windows 登錄檔、macOS Info.plist、Linux `.desktop`）
-- [ ] 單一執行個體：雙擊另一個檔案時送到已開啟的視窗（可在設定關閉）
-- [ ] 應用程式圖示：視窗、工作列（已完成）；Windows 執行檔、macOS `.app`、Linux `.desktop` 的圖示（圖檔已產生，`examples/make_icon.rs`）
-- [ ] 打包發佈：Windows zip / 安裝檔、macOS `.app` / `.dmg`、Linux AppImage
-  （Windows zip、macOS `.app`、Linux tar.gz 的自動發佈已完成；安裝程式、`.dmg`、AppImage 未做）
+- [x] 檔案關聯：Windows 寫目前使用者的登錄檔（ProgID、OpenWithProgids、Capabilities；安裝程式和「設定 → 系統」寫同一組，
+  解除安裝時程式自己全部移除；免安裝版搬家後啟動時自動更新路徑）。Windows 10 / 11 不讓程式自己設成預設，
+  提供開啟「預設應用程式」設定頁的按鈕。macOS 由 Info.plist 宣告類型，Finder 開檔的 Apple Event 自己接（winit 沒有）；
+  Linux 由 `.desktop` 的 MimeType 宣告，`install.sh --default` 設成預設（自動：登錄檔讀寫、安裝 / 解除安裝、
+  `.desktop` 與 AppStream 驗證；**Finder / 檔案總管雙擊待手動**）
+- [x] 單一執行個體：雙擊另一個檔案時送到已開啟的視窗並帶到前面；檔案總管一次開好幾個檔案（每個檔案各啟動一次）
+  合併成一個播放清單；可在設定關閉，`--new-window` 只對這次開新視窗。鎖定檔決定主視窗，Windows 用只限同一位使用者的
+  具名管道、Unix 用權限 0700 資料夾裡的 socket；主視窗關掉後由下一個接手（自動：多個程式同時啟動、接手、端對端）
+- [x] 應用程式圖示：視窗、工作列、Windows 執行檔（含版本資訊）、macOS `.app`、Linux `.desktop`、安裝程式
+  （圖檔由 `examples/make_icon.rs` 產生；發佈流程檢查執行檔有版本資訊）
+- [x] 打包發佈：Windows zip / 安裝檔（Inno Setup，每位使用者安裝、不需要系統管理員）、macOS `.app` / `.dmg`、
+  Linux tar.gz（附 `install.sh`）/ AppImage（包含 libmpv；在沒有 libmpv 的 Debian 13 容器實際播放）（自動：發佈流程實際安裝、執行、解除安裝）
 - [x] ✅ 「通用」格式測試矩陣通過（自動：三平台 CI，`tests/formats.rs` 要求常見與通用全數通過）
 
 ### L3 進階調校
@@ -337,16 +344,19 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 
 GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試（軟解）與單元測試。
 發佈流程另外在三平台打包、實際執行 `--version`，並在 macOS / Linux 用自動截圖確認影片畫面畫得出來
-（Linux 的虛擬螢幕是軟體繪圖，啟動三次、每次都要通過）。
+（Linux 的虛擬螢幕是軟體繪圖，啟動三次、每次都要通過）。安裝程式也實際跑過：Windows 安裝 → 執行 → 檢查登錄檔 →
+解除安裝 → 確認清乾淨；macOS 掛載 `.dmg` 檢查簽章並執行；Linux 的 AppImage 在本機與乾淨的 Debian 13 容器各播放一次，
+tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 
 ### 4.4 目前的測試數量
 
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 97 個樣本（常見 35、通用 37、罕見 25） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 87 | Windows、macOS、Linux |
-| 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、4 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 78（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 91 | Windows、macOS、Linux |
+| 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
+| 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式） | 4 | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 89（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
 | 硬體解碼 `tests/hwdec.rs`（需要 GPU） | 8 種編碼 | RTX 3090 通過 |
 
 ### 4.5 真實影片庫普查（`examples/media_survey.rs`）
@@ -439,3 +449,14 @@ GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試
 - **字型裡沒有的符號會變成方塊**：介面上的符號（例如 ✕、⋯）要確認內建字型有，不然換成一定有的（×、…）。
 - **測試要先確認抓得到問題**：發佈前的審查找到的問題，先寫測試、再故意把修正拿掉看測試會不會失敗。
   這次有三個測試一開始其實抓不到（樣本只有一個關鍵影格、egui 測試每一幀時間前進 0.25 秒），改過才有用。
+- **winit 沒有「Finder 開檔」的事件**，也不能換掉它的 app delegate：在 `NSApplicationWillFinishLaunchingNotification`
+  的時候自己裝 Apple Event（`odoc`）處理器。太早裝會被 AppKit 的預設處理器蓋掉，太晚就錯過啟動時的開檔事件。
+- **Windows 的具名管道要防別人搶先建立**：用 `FILE_FLAG_FIRST_PIPE_INSTANCE`、只給自己和 SYSTEM 的存取權限、
+  拒絕遠端連線，連進來後再確認對方是同一位使用者；名稱帶工作階段編號和 SID，遠端桌面的另一位使用者不會連錯。
+- **檔案總管選好幾個檔案按「開啟」，是每個檔案各啟動一次程式**：主視窗要等一小段時間把陸續送來的檔案合併，
+  不然只會播到最後一個。
+- **解除安裝程式只會移除自己寫的登錄機碼**：安裝後才在程式裡打開的檔案關聯，要讓解除安裝程式呼叫程式自己移除
+  （`vitascope --unregister-associations`）。
+- **AppImage 刻意不包的函式庫（excludelist），在乾淨的系統上不一定有**：libmpv 直接連結的 JACK、PipeWire，
+  和 winit 用 dlopen 載入的 libxkbcommon-x11，缺了就啟動失敗。只在 CI 機器上測看不出來，要在乾淨的容器再跑一次。
+- **Git Bash 會把 `/D…` 之類的參數當成路徑轉換掉**：Inno Setup 的 ISCC 要在 PowerShell 或 cmd 執行。

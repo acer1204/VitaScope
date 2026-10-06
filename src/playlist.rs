@@ -4,6 +4,7 @@
 
 use crate::formats;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
@@ -65,6 +66,11 @@ impl Playlist {
         self.manual
     }
 
+    /// 清空後的清單：還沒有在播的項目，之後加進來的第一個就是「下一個」
+    pub fn cleared() -> Self {
+        Self::restored(Vec::new(), None)
+    }
+
     /// 上次存下的清單：還沒開始播，「下一個」是上次播的那一項
     pub fn restored(items: Vec<PathBuf>, current: Option<usize>) -> Self {
         Self {
@@ -107,20 +113,41 @@ impl Playlist {
         (!self.current_removed && self.index < self.items.len()).then_some(self.index)
     }
 
-    pub fn next(&self) -> Option<&Path> {
+    /// 直接選第 `i` 項（從清單上點、上一個 / 下一個）：同一個檔案出現兩次時才不會跳回第一個
+    pub fn select_index(&mut self, i: usize) -> bool {
+        if i >= self.items.len() {
+            return false;
+        }
+        self.index = i;
+        self.current_removed = false;
+        true
+    }
+
+    /// 下一個 / 上一個在清單上的位置
+    pub fn next_index(&self) -> Option<usize> {
         let next = if self.current_removed {
             self.index
         } else {
             self.index + 1
         };
-        self.items.get(next).map(PathBuf::as_path)
+        (next < self.items.len()).then_some(next)
+    }
+
+    pub fn prev_index(&self) -> Option<usize> {
+        self.index.checked_sub(1).filter(|i| *i < self.items.len())
+    }
+
+    /// 存檔用的位置：正在播的那一項；已經移出清單（或還原後還沒開始播）時是接下來要播的那一項
+    pub fn resume_index(&self) -> Option<usize> {
+        (self.index < self.items.len()).then_some(self.index)
+    }
+
+    pub fn next(&self) -> Option<&Path> {
+        self.next_index().map(|i| self.items[i].as_path())
     }
 
     pub fn prev(&self) -> Option<&Path> {
-        self.index
-            .checked_sub(1)
-            .and_then(|i| self.items.get(i))
-            .map(PathBuf::as_path)
+        self.prev_index().map(|i| self.items[i].as_path())
     }
 
     pub fn len(&self) -> usize {
@@ -181,12 +208,14 @@ impl Playlist {
         }
     }
 
-    /// 加到清單最後（已經在清單上的不重複加）；回傳加了幾個
+    /// 加到清單最後（已經在清單上的不重複加）；回傳加了幾個。
+    /// 用雜湊表比對：加一個上千個檔案的資料夾時，逐一比對會卡住畫面好幾秒
     pub fn extend(&mut self, files: impl IntoIterator<Item = PathBuf>) -> usize {
         self.manual = true;
         let before = self.items.len();
+        let mut seen: HashSet<String> = self.items.iter().map(|p| file_key(p)).collect();
         for f in files {
-            if !self.contains(&f) {
+            if seen.insert(file_key(&f)) {
                 self.items.push(f);
             }
         }
@@ -228,6 +257,33 @@ fn is_hidden(e: &std::fs::DirEntry) -> bool {
         }
     }
     false
+}
+
+/// 比對用的鍵：跟 `same_file` 一樣（Windows 不分大小寫），路徑分隔符號統一
+fn file_key(p: &Path) -> String {
+    let joined = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    if cfg!(windows) { joined.to_lowercase() } else { joined }
+}
+
+/// 資料夾裡的影音檔，依檔名排序（隱藏檔、資料夾不算）。「加入資料夾」用
+pub fn media_in_dir(dir: &Path) -> Vec<PathBuf> {
+    let mut items: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| formats::media_kind(&e.path()).is_some())
+                .filter(|e| !is_hidden(e))
+                .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    sort_by_name(&mut items);
+    items
 }
 
 /// 是否為同一個檔案。Windows 的檔名不分大小寫（包括中文以外的各種字母）
@@ -424,6 +480,41 @@ mod tests {
         list.index = 2;
         assert!(list.select(Path::new("a")));
         assert_eq!(list.position(), 3, "已經在第二個 a 上，不會跳回第一個");
+    }
+
+    #[test]
+    fn clearing_then_adding_starts_with_the_first_added_file() {
+        let mut list = Playlist::cleared();
+        list.extend(["x".into(), "y".into()]);
+        assert_eq!(list.current(), None, "還沒有在播的項目");
+        assert_eq!(list.next(), Some(Path::new("x")));
+        assert_eq!(list.resume_index(), Some(0));
+    }
+
+    #[test]
+    fn duplicates_are_reached_by_index() {
+        let mut list = Playlist::from_files(vec!["a".into(), "b".into(), "a".into(), "c".into()]);
+        list.select_index(1);
+        assert_eq!(list.next_index(), Some(2));
+        list.select_index(2);
+        assert_eq!(list.next(), Some(Path::new("c")), "第二個 a 之後是 c，不會繞回 b");
+        assert_eq!(list.prev_index(), Some(1));
+    }
+
+    #[test]
+    fn extend_dedupes_like_same_file() {
+        let mut list = Playlist::from_files(vec!["dir/A.mp4".into()]);
+        let added = list.extend(["dir/a.mp4".into(), "dir/b.mp4".into(), "dir/b.mp4".into()]);
+        if cfg!(windows) {
+            assert_eq!(added, 1, "Windows 不分大小寫");
+        } else {
+            assert_eq!(added, 2);
+        }
+        // 很多檔案也很快
+        let many: Vec<PathBuf> = (0..20_000).map(|i| PathBuf::from(format!("dir/{i}.mp4"))).collect();
+        let start = std::time::Instant::now();
+        list.extend(many);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

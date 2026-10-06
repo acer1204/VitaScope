@@ -9,7 +9,8 @@
 |---|---|---|
 | Windows | `libmpv-2.dll`：mpv 與其相依函式庫（FFmpeg、libass、libplacebo、FreeType、HarfBuzz…）靜態連結成一個 DLL | 由 [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) 建置：tag `20261006`（commit `05a60b3cfd04e3e3b89918f4a27f3dde2935dff2`）；mpv commit `6c092d978b`；FFmpeg commit `47313ad3f` |
 | macOS | `VitaScope.app/Contents/Frameworks/*.dylib` | Homebrew 套件，逐一列在 `VitaScope.app/Contents/Resources/THIRD-PARTY-MACOS.md`，各自的授權檔在 `Contents/Resources/licenses/` |
-| Linux | 不內含，使用系統安裝的 libmpv | 各發行版的套件 |
+| Linux（tar.gz） | 不內含，使用系統安裝的 libmpv | 各發行版的套件 |
+| Linux（AppImage） | AppImage 的 `usr/lib`：Ubuntu 24.04 的 libmpv、FFmpeg 及其相依函式庫 | 逐一列在 AppImage 的 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`（二進位套件、原始碼套件與確切版本），各自的 copyright 檔在 `usr/share/doc/<套件>/` |
 
 Windows 的 `libmpv-2.dll` 以 GPL 選項建置（FFmpeg 使用 `--enable-gpl --enable-version3`，並含 x264、x265 等 GPL 元件），
 整體依 **GPL-3.0** 散布。其中每個元件的原始碼位置與確切版本，都固定在上述建置腳本的

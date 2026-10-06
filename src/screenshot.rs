@@ -126,8 +126,14 @@ pub fn file_name(source: &str, time: f64) -> String {
 
 /// 不覆蓋已有的檔案：「名稱 (2).png」「名稱 (3).png」…
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    unique_path_except(dir, name, &[])
+}
+
+/// 同上，`taken` 是還在寫、還沒出現在資料夾裡的
+pub fn unique_path_except(dir: &Path, name: &str, taken: &[PathBuf]) -> PathBuf {
+    let free = |p: &PathBuf| !p.exists() && !taken.contains(p);
     let first = dir.join(name);
-    if !first.exists() {
+    if free(&first) {
         return first;
     }
     let (stem, ext) = match name.rsplit_once('.') {
@@ -136,7 +142,7 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
     };
     (2..)
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
-        .find(|p| !p.exists())
+        .find(free)
         .expect("總有一個名稱沒被用過")
 }
 

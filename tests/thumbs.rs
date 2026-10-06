@@ -81,3 +81,15 @@ fn requests_for_another_file_are_ignored() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn thumbnails_come_back_after_an_idle_stop() {
+    // 閒置 300 毫秒就停掉檔案（實際是 45 秒）
+    let t = Thumbnailer::with_idle_stop(|| {}, Duration::from_millis(300));
+    t.open(1, &sample("common/mp4_long.mp4"));
+    let _ = get(&t, 1, 10.0, 90.0);
+    std::thread::sleep(Duration::from_millis(1500));
+    // 停掉之後又要縮圖：自己重新開檔
+    let again = get(&t, 1, 60.0, 90.0);
+    assert_eq!((again.w, again.h), (240, 135));
+}

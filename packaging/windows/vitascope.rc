@@ -1,0 +1,35 @@
+// 影戲 VitaScope 的 Windows 資源：執行檔圖示、版本資訊（檔案總管「內容」、「開啟檔案」選單顯示的名稱）。
+// build.rs 用 windres 編譯（版本號由 Cargo.toml 帶入）；圖示在 packaging/icons/vitascope.ico。
+#pragma code_page(65001)
+#include <winver.h>
+
+1 ICON "vitascope.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION VER_MAJOR,VER_MINOR,VER_PATCH,0
+PRODUCTVERSION VER_MAJOR,VER_MINOR,VER_PATCH,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040404B0"
+    BEGIN
+      VALUE "CompanyName", "acer1204"
+      VALUE "FileDescription", "影戲 VitaScope"
+      VALUE "ProductName", "影戲 VitaScope"
+      VALUE "FileVersion", VER_STR
+      VALUE "ProductVersion", VER_STR
+      VALUE "InternalName", "vitascope"
+      VALUE "OriginalFilename", "vitascope.exe"
+      VALUE "LegalCopyright", "GPL-3.0-or-later"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0404, 1200
+  END
+END

@@ -1,0 +1,24 @@
+#!/bin/sh
+# 影戲 VitaScope AppImage 啟動腳本
+HERE="$(dirname "$(readlink -f "$0")")"
+
+# libva（硬體解碼）在 Ubuntu 編譯，驅動路徑寫死成 /usr/lib/x86_64-linux-gnu/dri；
+# Fedora / openSUSE 在 /usr/lib64/dri、Arch 在 /usr/lib/dri。可用冒號列多個
+if [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
+  for d in /usr/lib/x86_64-linux-gnu/dri /usr/lib64/dri /usr/lib/dri; do
+    [ -d "$d" ] && LIBVA_DRIVERS_PATH="${LIBVA_DRIVERS_PATH:+$LIBVA_DRIVERS_PATH:}$d"
+  done
+  [ -n "${LIBVA_DRIVERS_PATH:-}" ] && export LIBVA_DRIVERS_PATH
+fi
+
+# JACK / PipeWire 用戶端函式庫要跟系統的音效伺服器同版本，所以優先用系統的；
+# 系統沒有（最小安裝、容器）才退回包進來的版本，否則 libmpv 連載入都會失敗
+ldconfig_bin=$(command -v ldconfig || echo /sbin/ldconfig)
+for pair in jack:libjack.so.0 pipewire:libpipewire-0.3.so.0; do
+  if ! "$ldconfig_bin" -p 2>/dev/null | grep -q "${pair#*:}"; then
+    LD_LIBRARY_PATH="$HERE/usr/lib/fallback/${pair%%:*}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+  fi
+done
+
+exec "$HERE/usr/bin/vitascope" "$@"

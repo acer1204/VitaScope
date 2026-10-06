@@ -2,3 +2,5 @@
 * text=auto eol=lf
 *.png binary
 *.ico binary
+# Inno Setup 的翻譯檔照原樣保存（跟上游比對雜湊值）
+*.isl -text

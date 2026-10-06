@@ -4,6 +4,10 @@ use super::VitascopeApp;
 use crate::thumbs::{self, Thumbnailer};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, TextureHandle, TextureOptions, vec2};
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+/// 新的縮圖多久還沒好，就不再拿上一張頂著（避免顯示錯的時間的畫面）
+const STALE_AFTER: Duration = Duration::from_secs(3);
 
 /// 最多留幾張縮圖的材質（一張 240×135 約 130 KB）
 const CACHE: usize = 128;
@@ -19,6 +23,8 @@ pub(super) struct PreviewCache {
     order: VecDeque<u32>,
     /// 上一次畫的區段（新的還沒好時先顯示舊的，不會一直閃）
     last: Option<u32>,
+    /// 上一次要的區段與時間（同一個不重複要求；等太久就不再顯示舊的）
+    requested: Option<(u32, Instant)>,
 }
 
 impl PreviewCache {
@@ -41,7 +47,14 @@ impl VitascopeApp {
     /// 這個檔案能不能做縮圖：要有影像（不是專輯封面）、本機或網路磁碟上的檔案（串流不做，會多連一條線）
     fn preview_allowed(&self) -> bool {
         let st = &self.player.state;
-        st.loaded && st.has_video() && self.autoshot.is_none() && st.path.as_deref().is_some_and(|p| !super::is_url(p))
+        // 本機的 HLS .m3u8 也是串流（片段在網路上）
+        st.loaded
+            && st.has_video()
+            && self.autoshot.is_none()
+            && st
+                .path
+                .as_deref()
+                .is_some_and(|p| !super::is_url(p) && !crate::formats::is_playlist(std::path::Path::new(p)))
     }
 
     /// 新檔案載入了：縮圖產生器也換檔（還沒建立就等第一次停在進度條上再說）
@@ -98,11 +111,27 @@ impl VitascopeApp {
         }
         let (bucket, target) = thumbs::bucket_of(time, duration);
         let ready = self.preview.textures.contains_key(&bucket);
-        if !ready && let Some(t) = &self.thumbs {
+        // 每一幀都重送同一個要求的話，做好之後會再做一次
+        let new_request = self.preview.requested.is_none_or(|(b, _)| b != bucket);
+        if !ready
+            && new_request
+            && let Some(t) = &self.thumbs
+        {
             t.request(self.file_gen, bucket, target);
+            self.preview.requested = Some((bucket, Instant::now()));
         }
-        // 這個區段還沒好：先畫上一張（滑鼠移動中不會一直閃）
-        let shown = if ready { Some(bucket) } else { self.preview.last };
+        // 這個區段還沒好：先畫上一張（滑鼠移動中不會一直閃）；等太久就不畫（不要一直顯示錯的時間的畫面）
+        let waited_long = self
+            .preview
+            .requested
+            .is_some_and(|(b, at)| b == bucket && at.elapsed() > STALE_AFTER);
+        let shown = if ready {
+            Some(bucket)
+        } else if waited_long {
+            None
+        } else {
+            self.preview.last
+        };
         let Some(texture) = shown.and_then(|b| self.preview.textures.get(&b)).cloned() else {
             return;
         };

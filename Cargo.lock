@@ -3267,6 +3267,8 @@ dependencies = [
  "egui_kittest",
  "encoding_rs",
  "libmpv2-sys",
+ "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
  "png",
  "raw-window-handle",
  "rfd",

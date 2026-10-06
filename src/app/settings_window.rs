@@ -13,15 +13,17 @@ pub(super) enum Page {
     Playback,
     Subtitles,
     Screenshot,
+    System,
     Shortcuts,
 }
 
 impl Page {
-    const ALL: [Page; 5] = [
+    const ALL: [Page; 6] = [
         Page::General,
         Page::Playback,
         Page::Subtitles,
         Page::Screenshot,
+        Page::System,
         Page::Shortcuts,
     ];
 
@@ -31,6 +33,7 @@ impl Page {
             Page::Playback => tr!("播放", "Playback"),
             Page::Subtitles => tr!("字幕", "Subtitles"),
             Page::Screenshot => tr!("截圖", "Screenshots"),
+            Page::System => tr!("系統", "System"),
             Page::Shortcuts => tr!("快捷鍵", "Shortcuts"),
         }
     }
@@ -71,6 +74,7 @@ impl VitascopeApp {
                                 Page::Playback => changed |= self.playback_page(ui),
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
+                                Page::System => changed |= self.system_page(ui),
                                 Page::Shortcuts => shortcuts_page(ui),
                             }
                         });
@@ -117,6 +121,86 @@ impl VitascopeApp {
             *action = Some(Action::ToggleOnTop);
         }
         changed
+    }
+
+    fn system_page(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut changed = ui
+            .checkbox(
+                &mut self.settings.single_instance,
+                tr!("只開一個視窗", "Use a single window"),
+            )
+            .on_hover_text(tr!(
+                "已經開著影戲時，雙擊其他影片會交給開著的視窗播放，不會再開一個（下次開啟時生效）",
+                "When VitaScope is already open, files you open are sent to that window instead of starting another one \
+                 (takes effect the next time it starts)"
+            ))
+            .changed();
+        ui.add_space(10.0);
+        ui.strong(tr!("檔案關聯", "File associations"));
+        #[cfg(windows)]
+        {
+            let mut on = self.settings.file_associations;
+            if ui
+                .checkbox(
+                    &mut on,
+                    tr!(
+                        "把影戲加入影片與音訊檔的「開啟檔案」選單",
+                        "Add VitaScope to \"Open with\" for video and audio files"
+                    ),
+                )
+                .changed()
+            {
+                changed = true;
+                self.set_file_associations(on);
+            }
+            ui.add_space(4.0);
+            if ui
+                .button(tr!("選擇預設播放器…", "Choose the default player…"))
+                .clicked()
+            {
+                crate::assoc::open_default_apps_settings();
+            }
+            ui.weak(tr!(
+                "Windows 不讓程式自己設成預設，要在「設定 → 預設應用程式」裡選影戲。",
+                "Windows doesn't let programs make themselves the default; pick VitaScope in Settings → Default apps."
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        ui.weak(tr!(
+            "在 Finder 對影片按右鍵 →「取得資訊」→「打開檔案的應用程式」選影戲，再按「全部更改」。",
+            "In Finder, choose Get Info on a video, pick VitaScope under \"Open with\", then click \"Change All\"."
+        ));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        ui.weak(tr!(
+            "用壓縮檔裡的 install.sh 安裝後，檔案管理員的「開啟檔案」就會有影戲（install.sh --default 設成預設）。",
+            "After running install.sh from the archive, VitaScope appears in your file manager's \"Open with\" \
+             (install.sh --default makes it the default)."
+        ));
+        changed
+    }
+
+    /// 打開 / 關掉檔案關聯（Windows）
+    #[cfg(windows)]
+    pub(super) fn set_file_associations(&mut self, on: bool) {
+        let places = crate::assoc::Places::default();
+        let result = match std::env::current_exe() {
+            Ok(exe) if on => crate::assoc::register(&exe, &places),
+            Ok(_) => {
+                crate::assoc::unregister(&places);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => self.settings.file_associations = on,
+            Err(e) => {
+                self.settings.file_associations = false;
+                self.osd(crate::tf!(
+                    "無法設定檔案關聯：{e}",
+                    "Cannot set up file associations: {e}"
+                ));
+            }
+        }
     }
 
     fn playback_page(&mut self, ui: &mut egui::Ui) -> bool {

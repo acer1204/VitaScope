@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=VitaScope
+Name[zh_TW]=影戲 VitaScope
+GenericName=Media Player
+GenericName[zh_TW]=影片播放器
+Comment=Video player powered by libmpv
+Comment[zh_TW]=以 libmpv 為引擎的影片播放器
+Icon=io.github.acer1204.vitascope
+TryExec=vitascope
+Exec=vitascope %F
+Terminal=false
+StartupNotify=true
+StartupWMClass=io.github.acer1204.vitascope
+Categories=AudioVideo;Video;Player;
+Keywords=video;movie;player;mpv;影片;播放器;
+MimeType=video/mp4;video/x-m4v;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/vnd.avi;video/avi;video/mp2t;video/mpeg;video/x-ms-wmv;video/x-ms-asf;application/vnd.ms-asf;video/x-flv;video/3gpp;video/3gpp2;video/ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/x-opus+ogg;audio/opus;audio/x-wav;audio/wav;audio/vnd.wave;audio/x-ms-wma;audio/ac3;audio/vnd.dts;audio/x-matroska;audio/x-ape;audio/x-wavpack;audio/x-tta;audio/AMR;audio/x-speex+ogg;audio/x-dsf;audio/x-dff;audio/x-mpegurl;application/vnd.apple.mpegurl;

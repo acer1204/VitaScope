@@ -24,7 +24,7 @@ pub struct Entry {
 /// 播放清單檔最大多少（避免不小心開到很大的檔案）
 const MAX_SIZE: u64 = 16 * 1024 * 1024;
 
-fn read_text(path: &Path) -> std::io::Result<String> {
+pub fn read_text(path: &Path) -> std::io::Result<String> {
     let size = std::fs::metadata(path)?.len();
     if size > MAX_SIZE {
         return Err(std::io::Error::other(crate::tf!(
@@ -41,6 +41,12 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Entry>> {
     let text = read_text(path)?;
     let base = path.parent().unwrap_or(Path::new(""));
     Ok(parse(&text, base))
+}
+
+/// 清單裡的這一項要不要留下：清單裡的本機清單檔不展開（自己包含自己會一直開下去），
+/// 但網址（IPTV 的 `…/index.m3u8`）和 HLS 串流照樣播
+pub fn keep_entry(p: &Path) -> bool {
+    is_url(&p.to_string_lossy()) || !crate::formats::is_playlist(p) || is_hls_file(p)
 }
 
 /// HLS 串流（有 `#EXT-X-` 標籤的 .m3u8）：裡面是一段一段的影片片段，不是播放清單
@@ -132,7 +138,7 @@ pub fn is_url(s: &str) -> bool {
 
 /// `file:///C:/影片/a.mp4`、`file:///home/a.mp4`、`file://server/share/a.mp4`（`file://` 之後的部分）
 fn file_url_to_path(rest: &str) -> PathBuf {
-    let decoded = percent_decode(rest);
+    let decoded = percent_decode(strip_localhost(rest));
     let s = decoded.as_str();
     if cfg!(windows) {
         // /C:/… → C:/…；//server/share → \\server\share
@@ -144,6 +150,14 @@ fn file_url_to_path(rest: &str) -> PathBuf {
         PathBuf::from(s.replace('/', "\\"))
     } else {
         PathBuf::from(s.strip_prefix("localhost").unwrap_or(s))
+    }
+}
+
+/// `file://localhost/…` 等於 `file:///…`
+fn strip_localhost(s: &str) -> &str {
+    match s.get(..9) {
+        Some(head) if head.eq_ignore_ascii_case("localhost") => &s[9..],
+        _ => s,
     }
 }
 
@@ -204,11 +218,19 @@ pub fn format(entries: &[Entry], playlist_path: &Path) -> String {
         } else {
             match e.path.strip_prefix(base) {
                 // 相對路徑用「/」：各系統的 mpv、Windows 都看得懂（Linux、macOS 不認得「\」）
-                Ok(rel) if !base.as_os_str().is_empty() => rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join("/"),
+                Ok(rel) if !base.as_os_str().is_empty() => {
+                    let rel = rel
+                        .components()
+                        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    // 「#」開頭會被當成註解、空白開頭會被去掉：前面加「./」
+                    if rel.starts_with('#') || rel.starts_with(char::is_whitespace) {
+                        format!("./{rel}")
+                    } else {
+                        rel
+                    }
+                }
                 _ => text.into_owned(),
             }
         };
@@ -435,6 +457,29 @@ mod tests {
         assert!(!path.exists());
         assert!(load_session_from(&path).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn iptv_streams_are_kept_but_nested_lists_are_not() {
+        assert!(keep_entry(Path::new("http://example.com/live/news/index.m3u8")));
+        assert!(keep_entry(Path::new("a.mp4")));
+        assert!(!keep_entry(Path::new("does-not-exist/nested.m3u")));
+    }
+
+    #[test]
+    fn names_starting_with_hash_survive_a_round_trip() {
+        let dir = std::env::temp_dir().join("vitascope-m3u-hash");
+        let e = entry(&dir.join("#1 Intro.mp3").to_string_lossy());
+        let text = format(std::slice::from_ref(&e), &dir.join("list.m3u8"));
+        assert!(text.contains("\n./#1 Intro.mp3\n"), "{text}");
+        assert_eq!(parse(&text, &dir)[0].path, e.path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_localhost_urls() {
+        let list = parse("file://localhost/C:/a.mp4\n", Path::new("x"));
+        assert_eq!(list[0].path, PathBuf::from(r"C:\a.mp4"));
     }
 
     #[test]

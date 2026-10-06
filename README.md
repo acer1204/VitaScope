@@ -14,15 +14,20 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 | 平台 | 檔案 | 使用方式 |
 |---|---|---|
-| Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64.zip` | 解壓縮後執行資料夾裡的 `vitascope.exe` |
-| macOS（Apple Silicon，最低版本見各版本的發佈說明） | `VitaScope-*-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
-| Linux（x64） | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `vitascope` |
+| Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64-setup.exe`（建議） | 執行安裝程式。不需要系統管理員，裝在 `%LOCALAPPDATA%\Programs\VitaScope`；可勾選加入影音檔的「開啟檔案」選單 |
+| | `VitaScope-*-windows-x64.zip`（免安裝） | 解壓縮後執行資料夾裡的 `vitascope.exe` |
+| macOS（Apple Silicon，最低版本見各版本的發佈說明） | `VitaScope-*-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
+| | `VitaScope-*-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
+| Linux（x64） | `VitaScope-*-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv |
+| | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `./install.sh` 加入應用程式選單（`./install.sh --default` 同時設成預設播放器），或直接執行 `vitascope` |
 
-- **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」。
-  需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境）。
+- **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」
+  （開啟「智慧型應用程式控制」的 Windows 11 會直接擋下）。需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境）。
+  Windows 不允許程式自己設成預設播放器：到「設定 → 應用程式 → 預設應用程式」選影戲，或在影戲的「設定 → 系統」按「選擇預設播放器…」。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
-- **Linux**：需要 glibc 2.39 以上與 libmpv.so.2（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
+- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2。
+  AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
 
@@ -30,7 +35,12 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 ### 設定檔與移除
 
-程式本身不需要安裝，刪掉資料夾即可移除。另外會建立這些資料：
+- **Windows 安裝版**：在「設定 → 應用程式」解除安裝（會一併移除檔案關聯）。
+- **Windows 免安裝版**：刪掉資料夾即可。如果在「設定 → 系統」打開過檔案關聯，刪除前先把它關掉。
+- **macOS**：把 `VitaScope.app` 丟到垃圾桶。
+- **Linux**：AppImage 直接刪除；用 `install.sh` 安裝的，執行 `./install.sh --uninstall`。
+
+程式另外會建立這些資料（移除程式時保留，不需要可以自己刪）：
 
 | 平台 | 設定、播放紀錄、播放清單 | 字幕轉碼暫存 |
 |---|---|---|
@@ -100,11 +110,12 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] 介面語言：繁體中文 / English
 
 系統整合與發佈
-- [ ] 檔案關聯（Windows、macOS、Linux）
-- [ ] 單一執行個體：雙擊另一個檔案時送到已開啟的視窗
-- [ ] 應用程式圖示
+- [x] 檔案關聯：Windows（安裝程式或「設定 → 系統」加入「開啟檔案」選單）、macOS（Finder 的「打開檔案的應用程式」）、
+  Linux（`.desktop` 檔；`install.sh --default` 設成預設）
+- [x] 單一執行個體：雙擊另一個檔案時送到已開啟的視窗（一次選好幾個檔案會變成一個播放清單；可在設定關閉，`--new-window` 只對這次開新視窗）
+- [x] 應用程式圖示：視窗、工作列、Windows 執行檔、macOS `.app`、Linux 選單
 - [x] 三平台安裝包自動發佈（Windows zip、macOS `.app`、Linux tar.gz）
-- [ ] 安裝程式：Windows 安裝檔、macOS `.dmg`、Linux AppImage
+- [x] 安裝程式：Windows 安裝檔（不需要系統管理員）、macOS `.dmg`、Linux AppImage
 - [x] 「通用」格式三平台全數通過自動測試
 
 ### L3 進階調校（未開始）
@@ -233,7 +244,9 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 |---|---|
 | `tests/formats.rs` | 格式測試矩陣：每個樣本檢查編碼、解碼、字幕文字、旋轉 / HDR 中繼資料、跳轉、播到結尾 |
 | `tests/smoke.rs` | libmpv 載入、開檔、錯誤訊息 |
-| `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、「關於」與檢查更新 |
+| `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、播放清單面板、截圖、設定視窗、「關於」與檢查更新 |
+| `tests/instance.rs` | 單一執行個體：同時啟動好幾個程式，檔案都送到同一個視窗；第一個關掉後由下一個接手 |
+| `tests/mediainfo.rs`、`tests/thumbs.rs` | 媒體資訊、進度條預覽縮圖 |
 | `tests/hwdec.rs` | 硬體解碼確實走 GPU，Hi10P 自動退回軟解 |
 
 影片畫面的渲染可以用自動截圖驗證：
@@ -278,7 +291,7 @@ cargo run --release --example media_survey -- 檔案清單.tsv [--per-ext 200] [
 
 ```
 src/
-├─ main.rs       進入點、命令列參數
+├─ main.rs       進入點、命令列參數（`vitascope [檔案…] [--fullscreen] [--new-window]`）
 ├─ app.rs        播放器視窗：控制列、快捷鍵、全螢幕、OSD
 ├─ app/          視窗的各個部分：播放清單面板、媒體資訊、擷取畫面、進度條預覽縮圖
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
@@ -295,10 +308,19 @@ src/
 ├─ icon.rs       視窗圖示（圖檔在 packaging/icons/）
 ├─ i18n.rs       介面語言（繁體中文 / English）
 ├─ settings.rs   設定檔（音量、視窗位置、播放選項）
+├─ instance.rs   單一執行個體：鎖定檔決定誰是主視窗，其他程式用具名管道（Unix socket）把檔案送過去
+├─ assoc.rs      Windows 檔案關聯（目前使用者的登錄檔；安裝程式寫的是同一組）
+├─ macos_open.rs macOS：接收 Finder 開檔的 Apple Event
 ├─ update.rs     檢查更新（GitHub Releases）
 ├─ formats.rs    支援的副檔名
 ├─ fonts.rs      載入系統中文字型
 └─ autoshot.rs   開發用：自動截圖
+
+packaging/
+├─ icons/        各尺寸圖示、.ico、.icns（`cargo run --example make_icon` 產生）
+├─ windows/      執行檔的圖示與版本資訊（.rc）、Inno Setup 安裝程式（.iss）
+├─ macos/        .app 的 Info.plist（檔案關聯、圖示）
+└─ linux/        .desktop 檔、AppStream 中繼資料、install.sh、AppImage 的 AppRun
 ```
 
 ## 授權

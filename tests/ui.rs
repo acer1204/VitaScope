@@ -36,7 +36,7 @@ fn harness(file: Option<PathBuf>) -> Harness<'static, VitascopeApp> {
 fn harness_with(file: Option<PathBuf>, settings: Settings) -> Harness<'static, VitascopeApp> {
     harness_launch(
         Launch {
-            file,
+            files: file.into_iter().collect(),
             ..Default::default()
         },
         settings,
@@ -2207,4 +2207,143 @@ fn hardware_decoding_can_be_switched_in_the_settings() {
     h.run_steps(2);
     assert!(h.state().settings().hwdec);
     assert_eq!(prop(&h, "hwdec"), "auto-safe");
+}
+
+// ───────────── 單一執行個體 ─────────────
+
+#[test]
+fn files_sent_by_another_launch_open_in_this_window() {
+    let dir = TempDir::new("instance");
+    let a = dir.clip("第1集.mp4");
+    let b = dir.clip("第2集.mp4");
+    let c = dir.clip("第3集.mp4");
+    let suffix = format!("-ui{}", std::process::id());
+    let ep = vitascope::instance::Endpoint::in_dir(dir.0.join("run"), &suffix).unwrap();
+    let primary = match vitascope::instance::start(
+        &ep,
+        &vitascope::instance::Request::default(),
+        true,
+        std::sync::Arc::new(|| {}),
+    ) {
+        vitascope::instance::Startup::Primary(p) => p,
+        _ => panic!("應該是主視窗"),
+    };
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![a.clone()],
+            instance: Some(primary),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(
+        &mut h,
+        "自己的檔案（等一小段合併期間後）開始播",
+        |s| playing(s, "第1集.mp4"),
+    );
+    // 另一個程式（例如在檔案總管選了兩個檔案按 Enter）：送過來，這個視窗開成清單
+    for f in [&c, &b] {
+        let req = vitascope::instance::Request {
+            paths: vec![f.clone()],
+            fullscreen: false,
+        };
+        let sent = vitascope::instance::start(&ep, &req, true, std::sync::Arc::new(|| {}));
+        assert!(matches!(sent, vitascope::instance::Startup::Forwarded));
+    }
+    step_until(&mut h, "播放送來的第一個（依檔名排序：第2集）", |s| {
+        playing(s, "第2集.mp4")
+    });
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+}
+
+#[test]
+fn dragging_in_a_scrolled_long_list_lands_where_dropped() {
+    let dir = TempDir::new("panel-long");
+    for i in 1..=40 {
+        dir.clip(&format!("第{i:02}集.mp4"));
+    }
+    let mut h = harness(Some(dir.0.join("第01集.mp4")));
+    settle(&mut h, "第01集.mp4");
+    step_until_app(&mut h, "掃描到 40 個影片", |app| playlist_len(app) == 40);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    // 捲到中間
+    let first = h.get_by_label("1. 第01集.mp4").rect();
+    h.event(egui::Event::PointerMoved(first.center()));
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -400.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+    });
+    h.run_steps(3);
+    // 找一列看得到的（中間附近），拖到它下面第 3 列的上半部
+    // 完全看得到的列（捲動區上緣被裁掉一半的列點不到）
+    let header = h.get_by_label_contains("播放清單（").rect();
+    let visible = |h: &Harness<'_, VitascopeApp>, n: usize| {
+        h.query_by_label(&format!("{n}. 第{n:02}集.mp4")).is_some_and(|r| {
+            r.rect().top() > header.bottom() + 30.0 && r.rect().bottom() < h.ctx.content_rect().bottom() - 90.0
+        })
+    };
+    let k = (5..35)
+        .find(|&k| visible(&h, k) && visible(&h, k + 3))
+        .expect("捲動後中間的列看得到");
+    assert!(k > 5, "清單有捲動：{k}");
+    let from = h.get_by_label(&format!("{k}. 第{k:02}集.mp4")).rect().center();
+    let target = h.get_by_label(&format!("{}. 第{:02}集.mp4", k + 3, k + 3)).rect();
+    let to = egui::pos2(target.center().x, target.top() + 3.0);
+    h.event(egui::Event::PointerMoved(from));
+    h.event(left_button(from, true));
+    h.step();
+    for i in 1..=8 {
+        h.event(egui::Event::PointerMoved(from.lerp(to, i as f32 / 8.0)));
+        h.step();
+    }
+    h.event(left_button(to, false));
+    h.run_steps(2);
+    let names = playlist_names(h.state());
+    // 第 k 集移到原本第 k+3 集的前面（清單上的位置 k+1，從 0 算）
+    assert_eq!(names[k + 1], format!("第{k:02}集.mp4"), "{names:?}");
+    assert_eq!(names[k + 2], format!("第{:02}集.mp4", k + 3), "{names:?}");
+}
+
+#[test]
+fn repeated_entries_do_not_loop() {
+    let dir = three_episodes("m3u-dup");
+    let list = dir.0.join("重複.m3u8");
+    std::fs::write(&list, "第1集.mp4\n第2集.mp4\n第1集.mp4\n第3集.mp4\n").unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, list);
+    step_until(&mut h, "第1集", |s| playing(s, "第1集.mp4"));
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "第2集", |s| playing(s, "第2集.mp4"));
+    h.key_press(egui::Key::PageDown);
+    step_until_app(&mut h, "清單上第 3 項（第二次的第1集）", |app| {
+        app.playlist().is_some_and(|l| l.position() == 3)
+    });
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "第3集（不會繞回第2集）", |s| playing(s, "第3集.mp4"));
+}
+
+#[test]
+fn rotated_mkv_crops_and_stretches_the_upright_picture() {
+    // 直拍影片轉存的 MKV：旋轉在容器層（mpv 自己的 MKV 解析器讀），影格上沒有
+    let mut h = opened(sample("rare/mkv_hevc_aac_rot90.mkv")); // 320x240，標示轉 90°
+    if prop(&h, "video-params/rotate") != "90" {
+        // 舊版 ffmpeg（6.1）產生的樣本沒有旋轉資訊
+        eprintln!("樣本沒有旋轉資訊，略過");
+        return;
+    }
+    let natural = h.state().player().natural_shape().unwrap();
+    assert!(
+        (natural.0 - 0.75).abs() < 0.01 && natural.1 == 90,
+        "原本是直的 3:4：{natural:?}"
+    );
+    assert_eq!(h.state().player().state.video_size, Some([240, 320]));
+    // 裁成 16:9（第一下）：直的畫面裁掉上下
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    step_until(&mut h, "裁成 16:9", |s| s.video_size == Some([240, 135]));
 }

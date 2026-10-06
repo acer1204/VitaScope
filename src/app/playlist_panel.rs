@@ -88,7 +88,6 @@ impl VitascopeApp {
 
     /// 面板內容
     pub(super) fn playlist_panel(&mut self, ui: &mut egui::Ui) {
-        self.poll_folder_add();
         let mut op = None;
         let count = self.playlist.as_ref().map_or(0, Playlist::len);
         let current = self.playlist.as_ref().and_then(Playlist::current_index);
@@ -177,6 +176,8 @@ impl VitascopeApp {
         let ctx = ui.ctx().clone();
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
         let dragging = DragAndDrop::payload::<DragRow>(&ctx);
+        // show_rows 用外層的 item_spacing 算每一列的間距：設成 0，跟列高、放下的位置、捲動的計算一致
+        ui.spacing_mut().item_spacing.y = 0.0;
         let mut area = egui::ScrollArea::vertical()
             .id_salt("playlist_rows")
             .auto_shrink([false, false]);
@@ -249,13 +250,22 @@ impl VitascopeApp {
 
     fn apply_list_op(&mut self, ctx: &egui::Context, op: Option<ListOp>) {
         let Some(op) = op else { return };
+        // 開對話框的操作取消的話什麼都沒變；真的改了清單時它們自己會處理
         let edits = !matches!(
             op,
-            ListOp::Close | ListOp::Select(_) | ListOp::Play(_) | ListOp::Save | ListOp::CopyPath(_)
+            ListOp::Close
+                | ListOp::Select(_)
+                | ListOp::Play(_)
+                | ListOp::Save
+                | ListOp::CopyPath(_)
+                | ListOp::AddFiles
+                | ListOp::AddFolder
+                | ListOp::Open
         );
         // 手動改過清單：背景還在掃描的資料夾結果不能再蓋掉它
         if edits {
             self.playlist_scan = None;
+            self.owns_session = true;
         }
         match op {
             ListOp::Close => self.toggle_playlist(ctx),
@@ -263,12 +273,16 @@ impl VitascopeApp {
             ListOp::Play(i) => {
                 self.playlist_selected = Some(i);
                 let list = self.playlist.as_ref();
-                // 已經在播的那一項不重新開（三連擊之類的）
-                let playing = list.and_then(Playlist::current_index) == Some(i) && self.player.state.loaded;
-                if let Some(path) = list.and_then(|l| l.items().get(i)).cloned()
-                    && !playing
+                let st = &self.player.state;
+                let is_current = list.and_then(Playlist::current_index) == Some(i) && st.loaded;
+                if is_current && st.eof {
+                    // 播完停在最後一格的那一項：從頭再播
+                    self.run(ctx, super::Action::Restart);
+                } else if let Some(path) = list.and_then(|l| l.items().get(i)).cloned()
+                    && !is_current
                 {
-                    self.open(&path);
+                    // 正在播的那一項不重新開（三連擊之類的）
+                    self.open_at(&path, Some(i));
                 }
             }
             ListOp::Remove(i) => self.remove_from_playlist(i),
@@ -293,7 +307,7 @@ impl VitascopeApp {
                 self.playlist_selected = None;
             }
             ListOp::Clear => {
-                self.playlist = Some(Playlist::default().manual());
+                self.playlist = Some(Playlist::cleared());
                 self.playlist_selected = None;
                 self.pending_auto_next = false;
             }
@@ -329,6 +343,7 @@ impl VitascopeApp {
             .collect();
         let Some(first) = files.first().cloned() else { return };
         self.playlist_scan = None;
+        self.owns_session = true;
         let added = match &mut self.playlist {
             Some(list) => list.extend(files),
             None => {
@@ -376,16 +391,8 @@ impl VitascopeApp {
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
-            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-                .map(|entries| {
-                    entries
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| formats::media_kind(p).is_some())
-                        .collect()
-                })
-                .unwrap_or_default();
-            crate::playlist::sort_by_name(&mut files);
+            // 跟同資料夾播放清單一樣：隱藏檔（包括 macOS 留下的「._檔名」）、資料夾不算
+            let files = crate::playlist::media_in_dir(&dir);
             if tx.send(files).is_ok() {
                 ctx.request_repaint();
             }
@@ -393,7 +400,7 @@ impl VitascopeApp {
         self.folder_add = Some(rx);
     }
 
-    fn poll_folder_add(&mut self) {
+    pub(super) fn poll_folder_add(&mut self) {
         let Some(rx) = &self.folder_add else { return };
         match rx.try_recv() {
             Ok(files) => {
@@ -422,18 +429,22 @@ impl VitascopeApp {
 
     /// 開啟播放清單檔：換成檔案裡的清單，從第一個開始播
     pub(super) fn open_playlist_file(&mut self, path: &Path) {
-        let entries = match m3u::read(path) {
-            Ok(entries) => entries,
-            Err(e) => {
-                self.osd(crate::tf!("無法開啟播放清單：{e}", "Cannot open the playlist: {e}"));
-                return;
-            }
-        };
-        // 清單裡的清單檔不展開（自己包含自己會一直開下去）
-        let files: Vec<PathBuf> = entries
+        match m3u::read_text(path) {
+            Ok(text) => self.open_playlist_text(path, &text),
+            Err(e) => self.osd(crate::tf!("無法開啟播放清單：{e}", "Cannot open the playlist: {e}")),
+        }
+    }
+
+    /// 播放清單檔的內容（已經讀好的）
+    pub(super) fn open_playlist_text(&mut self, path: &Path, text: &str) {
+        // 相對路徑（命令列）先轉成完整路徑：清單裡的相對路徑以它所在的資料夾為準
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = path.as_path();
+        let base = path.parent().unwrap_or(Path::new(""));
+        let files: Vec<PathBuf> = m3u::parse(text, base)
             .into_iter()
             .map(|e| e.path)
-            .filter(|p| !formats::is_playlist(p))
+            .filter(|p| m3u::keep_entry(p))
             .collect();
         let Some(first) = files.first().cloned() else {
             self.osd(crate::tf!(
@@ -447,8 +458,9 @@ impl VitascopeApp {
         self.playlist_scan = None;
         self.playlist_selected = None;
         self.playlist = Some(Playlist::from_files(files).manual());
+        self.owns_session = true;
         self.persist_playlist();
-        self.open(&first);
+        self.open_at(&first, Some(0));
     }
 
     fn save_playlist_dialog(&mut self) {
@@ -485,11 +497,12 @@ impl VitascopeApp {
 
     /// 手動整理的清單存起來（下次開啟時還在）；同資料夾掃描出來的清單不存（存檔刪掉）
     pub(super) fn persist_playlist(&self) {
-        if !self.persist_playlist {
+        if !self.persist_playlist || !self.owns_session {
             return;
         }
+        // 正在播的已經移出清單（或還原後還沒開始播）時，記下接下來要播的那一項
         let (items, current): (&[PathBuf], Option<usize>) = match &self.playlist {
-            Some(list) if list.is_manual() => (list.items(), list.current_index()),
+            Some(list) if list.is_manual() => (list.items(), list.resume_index()),
             _ => (&[], None),
         };
         if let Err(e) = m3u::save_session(items, current) {

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppImage 的 AppStream 中繼資料（發佈流程把 @VERSION@、@DATE@ 換成實際的值，
+     放到 AppDir/usr/share/metainfo/io.github.acer1204.vitascope.appdata.xml） -->
+<component type="desktop-application">
+  <id>io.github.acer1204.vitascope</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>VitaScope</name>
+  <name xml:lang="zh-TW">影戲 VitaScope</name>
+  <summary>Video player powered by libmpv</summary>
+  <summary xml:lang="zh-TW">以 libmpv 為引擎的影片播放器</summary>
+  <description>
+    <p>A cross-platform video player with an egui interface and the libmpv playback engine.</p>
+    <p xml:lang="zh-TW">跨平台影片播放器：libmpv 播放引擎、egui 介面。</p>
+  </description>
+  <launchable type="desktop-id">io.github.acer1204.vitascope.desktop</launchable>
+  <url type="homepage">https://github.com/acer1204/VitaScope</url>
+  <url type="bugtracker">https://github.com/acer1204/VitaScope/issues</url>
+  <developer id="io.github.acer1204">
+    <name>acer1204</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

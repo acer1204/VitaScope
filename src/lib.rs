@@ -6,6 +6,7 @@
 //! - [`video`]：把 mpv 的畫面畫進 egui
 
 pub mod app;
+pub mod assoc;
 pub mod autoshot;
 pub mod fonts;
 pub mod formats;
@@ -13,7 +14,10 @@ pub mod geometry;
 pub mod history;
 pub mod i18n;
 pub mod icon;
+pub mod instance;
 pub mod m3u;
+#[cfg(target_os = "macos")]
+pub mod macos_open;
 pub mod mediainfo;
 pub mod mpv;
 pub mod player;

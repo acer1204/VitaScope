@@ -1,6 +1,7 @@
 name: Release
 
 # 推送版本標籤（例如 v0.1.0）時：三個平台編譯、打包，建立 GitHub Release 並附上安裝檔。
+# 每個平台兩種：Windows 安裝程式 + 免安裝 zip、macOS .dmg + zip、Linux AppImage + tar.gz。
 # 手動執行（Actions 頁面的 Run workflow）時：只編譯打包、上傳成 artifact，不建立 Release，用來先驗證打包流程。
 on:
   push:
@@ -52,6 +53,8 @@ jobs:
             tag="v$cargo_version-dev"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # 純數字版本：Windows 檔案版本、macOS 的 CFBundleVersion 不能帶 -dev
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
 
       - name: 安裝 Rust（Windows GNU）
         if: runner.os == 'Windows'
@@ -81,6 +84,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libmpv-dev xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0
 
+      # 執行檔的圖示與版本資訊要用 MinGW 的 windres 編譯（build.rs 找不到只會警告，這裡先確認）
+      - name: 確認 windres（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command windres -ErrorAction SilentlyContinue)) {
+            $dir = 'C:\mingw64\bin', 'C:\msys64\mingw64\bin', 'C:\msys64\ucrt64\bin' |
+              Where-Object { Test-Path "$_\windres.exe" } | Select-Object -First 1
+            if (-not $dir) { throw "找不到 windres（MinGW binutils），執行檔會沒有圖示" }
+            $dir | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+            Write-Host "windres：$dir"
+          }
+
+      - name: 安裝 Linux 打包工具
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: sudo apt-get install -y desktop-file-utils appstream
+
       - name: 編譯
         run: cargo build --release
 
@@ -106,11 +127,56 @@ jobs:
           $out = & "$dir/vitascope.exe" --version | Out-String
           if ($LASTEXITCODE -ne 0) { throw "打包後的程式無法執行：$out" }
           Write-Host $out
+          # 圖示與版本資訊有沒有嵌進去（檔案總管、工作管理員顯示的名稱）
+          $info = (Get-Item "$dir/vitascope.exe").VersionInfo
+          Write-Host "FileDescription=$($info.FileDescription) FileVersion=$($info.FileVersion)"
+          if ($info.FileDescription -ne "影戲 VitaScope") { throw "執行檔沒有版本資訊（windres 沒有執行？）" }
           # 記錄 libmpv-2.dll 依賴的 DLL（例如 vulkan-1.dll 需要顯示卡驅動提供）
           if (Get-Command objdump -ErrorAction SilentlyContinue) {
             objdump -p $dir/libmpv-2.dll | Select-String "DLL Name" | ForEach-Object { $_.Line.Trim() }
           }
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
+
+      # ── Windows 安裝程式（Inno Setup，windows-latest 已預裝）：每位使用者安裝，不需要系統管理員 ──
+      - name: 安裝程式（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "VitaScope-${{ steps.version.outputs.tag }}-windows-x64"
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc /Qp "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$PWD\dist\$name" `
+            "/O$PWD\dist" "/F$name-setup" packaging\windows\vitascope.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 失敗（exit $LASTEXITCODE）" }
+
+          # 實際安裝 → 執行 → 檢查關聯 → 解除安裝 → 確認都清掉了
+          $p = Start-Process "dist\$name-setup.exe" -Wait -PassThru -ArgumentList `
+            '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=$PWD\setup.log"
+          if ($p.ExitCode -ne 0) { Get-Content setup.log; throw "安裝失敗（exit $($p.ExitCode)）" }
+          $app = "$env:LOCALAPPDATA\Programs\VitaScope"
+          $out = & "$app\vitascope.exe" --version | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "安裝後無法執行：$out" }
+          Write-Host $out
+          $keys = 'HKCU:\Software\Classes\VitaScope.Video\shell\open\command',
+                  'HKCU:\Software\Classes\Applications\vitascope.exe',
+                  'HKCU:\Software\VitaScope\Capabilities'
+          foreach ($k in $keys) { if (-not (Test-Path $k)) { throw "安裝後沒有 $k" } }
+          $mp4 = Get-ItemProperty 'HKCU:\Software\Classes\.mp4\OpenWithProgids' -ErrorAction SilentlyContinue
+          if ($null -eq $mp4.'VitaScope.Video') { throw ".mp4 的「開啟檔案」沒有影戲" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\影戲 VitaScope.lnk")) {
+            throw "沒有開始功能表捷徑"
+          }
+
+          # -Wait 會等整個行程樹（unins000.exe 會先把自己複製到暫存資料夾再執行）
+          $u = Start-Process "$app\unins000.exe" -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          if ($u.ExitCode -ne 0) { throw "解除安裝失敗（exit $($u.ExitCode)）" }
+          if (Test-Path "$app\vitascope.exe") { throw "解除安裝後程式還在" }
+          foreach ($k in $keys) { if (Test-Path $k) { throw "解除安裝後 $k 還在" } }
+          $mp4 = Get-ItemProperty 'HKCU:\Software\Classes\.mp4\OpenWithProgids' -ErrorAction SilentlyContinue
+          if ($null -ne $mp4.'VitaScope.Video') { throw "解除安裝後 .mp4 的「開啟檔案」還有影戲" }
+          $reg = Get-ItemProperty 'HKCU:\Software\RegisteredApplications' -ErrorAction SilentlyContinue
+          if ($null -ne $reg.VitaScope) { throw "解除安裝後「預設應用程式」還列著影戲" }
+          Write-Host "安裝、解除安裝都正常"
 
       # ── macOS：.app，libmpv 和相依的 dylib 都包進 Contents/Frameworks ──
       - name: 打包（macOS）
@@ -153,23 +219,11 @@ jobs:
           echo "最低需求：macOS $min_os"
           echo "$min_os" > dist/macos-min-version.txt
 
-          cat > "$app/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>VitaScope</string>
-            <key>CFBundleDisplayName</key><string>影戲 VitaScope</string>
-            <key>CFBundleIdentifier</key><string>io.github.acer1204.vitascope</string>
-            <key>CFBundleExecutable</key><string>vitascope</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>${version}</string>
-            <key>CFBundleShortVersionString</key><string>${version}</string>
-            <key>LSMinimumSystemVersion</key><string>${min_os}</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
-          EOF
+          # Info.plist：檔案關聯（Finder 的「打開檔案的應用程式」）、圖示；版本與最低系統需求在這裡填
+          sed -e "s/@VERSION@/${{ steps.version.outputs.version }}/g" -e "s/@MIN_OS@/$min_os/g" \
+            packaging/macos/Info.plist.in > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          cp packaging/icons/vitascope.icns "$app/Contents/Resources/VitaScope.icns"
 
           # 授權：放在 .app 裡（跟著程式走），也放在 .app 旁邊（解壓縮就看得到）
           cp notices/* "$app/Contents/Resources/"
@@ -186,6 +240,35 @@ jobs:
           "$app/Contents/MacOS/vitascope" --version
           ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
           echo "app=$app" >> "$GITHUB_ENV"
+
+      # ── macOS .dmg：VitaScope.app ＋「應用程式」捷徑，打開後拖曳安裝 ──
+      - name: 磁碟映像（macOS）
+        if: runner.os == 'macOS'
+        run: |
+          name="VitaScope-${{ steps.version.outputs.tag }}-macos-arm64"
+          stage="$RUNNER_TEMP/dmg"
+          rm -rf "$stage"
+          mkdir -p "$stage/授權聲明"
+          ditto "$app" "$stage/VitaScope.app"   # ditto 保留簽章與延伸屬性
+          ln -s /Applications "$stage/Applications"
+          cp "dist/$name"/LICENSE "dist/$name"/THIRD-PARTY-* "$stage/授權聲明/"
+          dmg="dist/$name.dmg"
+          # GitHub 的 macOS 機器偶爾讓 hdiutil 回報 Resource busy（XProtect 鎖住剛寫入的映像），重試即可
+          for i in 1 2 3 4 5; do
+            hdiutil create -volname VitaScope -srcfolder "$stage" -fs HFS+ -format ULMO -ov "$dmg" && break
+            [ "$i" = 5 ] && exit 1
+            echo "::warning::hdiutil create 第 $i 次失敗，重試"
+            hdiutil detach /Volumes/VitaScope -force 2>/dev/null || true
+            sleep $((i * 5))
+          done
+          hdiutil verify "$dmg"
+          # 掛載起來確認裡面的 .app 簽章完整、能執行
+          mnt=$(mktemp -d)
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+          codesign --verify --deep --strict "$mnt/VitaScope.app"
+          "$mnt/VitaScope.app/Contents/MacOS/vitascope" --version
+          hdiutil detach "$mnt" || hdiutil detach "$mnt" -force
+          ls -la dist
 
       # 實際開視窗播放測試畫面並自動截圖（驗證 OpenGL + mpv 渲染路徑）。
       # macOS 虛擬機的 OpenGL 支援不一定完整，只記錄結果、不擋發佈
@@ -210,16 +293,82 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           name="VitaScope-${{ steps.version.outputs.tag }}-linux-x64"
-          mkdir -p "dist/$name"
-          cp target/release/vitascope README.md notices/* "dist/$name/"
+          pkg=packaging/linux
+          id=io.github.acer1204.vitascope
+          mkdir -p "dist/$name/share/applications"
+          cp target/release/vitascope README.md notices/* $pkg/install.sh "dist/$name/"
+          # 選單項目與圖示：install.sh 裝到 ~/.local/share
+          desktop-file-validate $pkg/$id.desktop
+          cp $pkg/$id.desktop "dist/$name/share/applications/"
+          for size in 16 24 32 48 64 128 256 512; do
+            mkdir -p "dist/$name/share/icons/hicolor/${size}x${size}/apps"
+            cp packaging/icons/icon-$size.png "dist/$name/share/icons/hicolor/${size}x${size}/apps/$id.png"
+          done
           "dist/$name/vitascope" --version
           # 記錄執行需求：最低 glibc 版本、動態連結的函式庫
           glibc=$(objdump -T "dist/$name/vitascope" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
           echo "最低需求：glibc $glibc"
           echo "$glibc" > dist/linux-glibc.txt
           ldd "dist/$name/vitascope"
+          # install.sh 裝到暫時的家目錄試一次：選單項目的 Exec 要指到裝好的程式
+          home="$RUNNER_TEMP/home"
+          HOME="$home" XDG_DATA_HOME= sh "dist/$name/install.sh"
+          grep -q "^Exec=\"$home/.local/bin/vitascope\" %F$" "$home/.local/share/applications/$id.desktop"
+          desktop-file-validate "$home/.local/share/applications/$id.desktop"
+          test -f "$home/.local/share/icons/hicolor/256x256/apps/$id.png"
+          HOME="$home" XDG_DATA_HOME= sh "dist/$name/install.sh" --uninstall
+          test ! -e "$home/.local/bin/vitascope"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "bin=dist/$name/vitascope" >> "$GITHUB_ENV"
+
+      # ── Linux AppImage：libmpv 與其相依函式庫包進去；glibc、OpenGL、X11/Wayland、ALSA、字型用系統的 ──
+      - name: AppImage（Linux）
+        if: runner.os == 'Linux'
+        env:
+          LINUXDEPLOY_URL: https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          LINUXDEPLOY_SHA256: c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+          # runner 不保證有 FUSE；linuxdeploy 本身也是 AppImage
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          ld="$RUNNER_TEMP/linuxdeploy"
+          lib=/usr/lib/x86_64-linux-gnu
+          pkg=packaging/linux
+          id=io.github.acer1204.vitascope
+          curl -sSfL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"
+          echo "$LINUXDEPLOY_SHA256  $ld" | sha256sum -c -
+          chmod +x "$ld"
+
+          mkdir -p AppDir/usr/share/metainfo AppDir/usr/share/doc/vitascope
+          sed -e "s/@VERSION@/${{ steps.version.outputs.version }}/" -e "s/@DATE@/$(date -u +%F)/" \
+            $pkg/$id.appdata.xml.in > AppDir/usr/share/metainfo/$id.appdata.xml
+          appstreamcli validate --no-net AppDir/usr/share/metainfo/$id.appdata.xml
+          cp LICENSE README.md notices/* AppDir/usr/share/doc/vitascope/
+          # linuxdeploy 用檔名當圖示名稱，要跟 .desktop 的 Icon= 一樣
+          icons="$RUNNER_TEMP/icons"
+          mkdir -p "$icons"
+          cp packaging/icons/icon-256.png "$icons/$id.png"
+          # 第一階段：執行檔＋相依函式庫；libxkbcommon-x11 是 winit 用 dlopen 載入的，要明講
+          "$ld" --appdir AppDir --executable target/release/vitascope \
+            --desktop-file $pkg/$id.desktop --icon-file "$icons/$id.png" \
+            --custom-apprun $pkg/AppRun --library $lib/libxkbcommon-x11.so.0
+          # 備用的 JACK / PipeWire 用戶端（AppRun 只在系統沒有時才用）。
+          # linuxdeploy 會把這兩個子資料夾裡的 RUNPATH 設成 $ORIGIN，所以 libjack 的相依 libdb 也要放同一處
+          mkdir -p AppDir/usr/lib/fallback/jack AppDir/usr/lib/fallback/pipewire
+          cp -L $lib/libjack.so.0 $lib/libdb-5.3.so AppDir/usr/lib/fallback/jack/
+          cp -L $lib/libpipewire-0.3.so.0 AppDir/usr/lib/fallback/pipewire/
+          # 第三方授權：包進去的每個函式庫來自哪個 Ubuntu 原始碼套件、版本
+          bash packaging/linux-third-party.sh AppDir AppDir/usr/share/doc/vitascope/THIRD-PARTY-LINUX.md
+          # 第二階段：產生 AppImage
+          out="VitaScope-${{ steps.version.outputs.tag }}-linux-x86_64.AppImage"
+          LDAI_OUTPUT="$out" "$ld" --appdir AppDir --output appimage
+          mv "$out" dist/
+          # 最低需求要算所有包進去的檔案，不只主程式
+          glibc=$(find AppDir -type f \( -name '*.so*' -o -path '*/usr/bin/*' \) -exec objdump -T {} + 2>/dev/null \
+                  | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "AppImage 最低需求：glibc $glibc"
+          echo "$glibc" > dist/appimage-glibc.txt
+          ls -la dist
+          echo "appimage=dist/$out" >> "$GITHUB_ENV"
 
       - name: 介面測試（Linux，虛擬螢幕）
         if: runner.os == 'Linux'
@@ -236,6 +385,29 @@ jobs:
             awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
           done
 
+      - name: 介面測試（AppImage；本機＋乾淨的 Debian 13）
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          timeout 60 xvfb-run -a -s "-screen 0 1280x800x24" "$appimage" "$TEST_VIDEO" \
+            --shot shot-linux-appimage.png --shot-delay 3 < /dev/null 2>&1 | tee shot-appimage.log
+          pct=$(grep -o '非黑色像素 [0-9.]*' shot-appimage.log | awk '{print $2}')
+          echo "AppImage：非黑色像素 ${pct:-沒有截圖}%"
+          awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
+          # runner 上什麼都裝了，看不出漏包；在沒有 libmpv、JACK、PipeWire、xkbcommon-x11 的容器再跑一次
+          docker run --rm -e APPIMAGE_EXTRACT_AND_RUN=1 -e TEST_VIDEO -v "$PWD/dist:/dist:ro" debian:trixie-slim bash -ec '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends xvfb xauth libgl1 libegl1 libgl1-mesa-dri libasound2t64 \
+              libfontconfig1 libfribidi0 libharfbuzz0b libusb-1.0-0 libcom-err2 libgpg-error0 >/dev/null
+            cp /dist/*.AppImage /tmp/app
+            chmod +x /tmp/app
+            /tmp/app --version
+            timeout 60 xvfb-run -a /tmp/app "$TEST_VIDEO" --shot /tmp/s.png --shot-delay 3 </dev/null 2>&1 | tee /tmp/log
+            p=$(grep -o "非黑色像素 [0-9.]*" /tmp/log | awk "{print \$2}")
+            echo "Debian 13：非黑色像素 ${p:-沒有截圖}%"
+            awk -v p="${p:-0}" "BEGIN { exit !(p > 60) }"'
+
       - name: 上傳介面測試截圖
         if: always() && runner.os != 'Windows'
         uses: actions/upload-artifact@v4
@@ -251,6 +423,9 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.exe
+            dist/*.dmg
+            dist/*.AppImage
             dist/*.txt
           if-no-files-found: error
 
@@ -274,6 +449,7 @@ jobs:
         run: |
           macos_min=$(cat assets/macos-min-version.txt)
           glibc=$(cat assets/linux-glibc.txt)
+          appimage_glibc=$(cat assets/appimage-glibc.txt)
           # Debian 12 的 glibc 是 2.36、Debian 13 是 2.41
           if printf '%s\n%s\n' "$glibc" 2.36 | sort -V -C; then debian=12; else debian=13; fi
 
@@ -292,28 +468,36 @@ jobs:
 
           | 平台 | 檔案 | 使用方式 |
           |---|---|---|
-          | Windows 10 / 11（64 位元） | `VitaScope-@TAG@-windows-x64.zip` | 解壓縮後執行資料夾裡的 `vitascope.exe` |
-          | macOS @MACOS_MIN@ 以上（Apple Silicon） | `VitaScope-@TAG@-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
-          | Linux（x64） | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `vitascope` |
+          | Windows 10 / 11（64 位元） | `VitaScope-@TAG@-windows-x64-setup.exe`（建議） | 執行安裝程式；不需要系統管理員，裝在 `%LOCALAPPDATA%\Programs\VitaScope`，可勾選加入影音檔的「開啟檔案」選單 |
+          | | `VitaScope-@TAG@-windows-x64.zip`（免安裝） | 解壓縮後執行資料夾裡的 `vitascope.exe` |
+          | macOS @MACOS_MIN@ 以上（Apple Silicon） | `VitaScope-@TAG@-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
+          | | `VitaScope-@TAG@-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
+          | Linux（x64） | `VitaScope-@TAG@-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv；需要 glibc @APPIMAGE_GLIBC@ 以上 |
+          | | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `install.sh` 加入應用程式選單（`install.sh --default` 設成預設播放器），或直接執行 `vitascope` |
 
-          **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」。
+          **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」
+          （開啟「智慧型應用程式控制」的 Windows 11 會直接擋下，沒有「仍要執行」可按）。
+          Windows 不允許程式自己設成預設播放器：裝好後到「設定 → 應用程式 → 預設應用程式」選影戲，或在影戲的「設定 → 系統」按「選擇預設播放器…」。
           需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境，一般電腦裝好顯示卡驅動就有）。
 
           **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，
           在下方按「仍要打開」；也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
 
-          **Linux**：需要 glibc @GLIBC@ 以上與 libmpv.so.2（例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
-          中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），開檔對話框需要 xdg-desktop-portal 或 zenity。
+          **Linux**：tar.gz 需要 glibc @GLIBC@ 以上與 libmpv.so.2（例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
+          AppImage 需要 FUSE（大多數桌面發行版都有；沒有的話加 `--appimage-extract-and-run` 執行）。
+          兩者都需要 libxkbcommon-x11（一般桌面都有）；中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），
+          開檔對話框需要 xdg-desktop-portal 或 zenity。
 
           **授權**：影戲 VitaScope 以 GPL-3.0-or-later 授權。每個安裝包都附有 `LICENSE` 與第三方元件的授權聲明
-          （`THIRD-PARTY-NOTICES.md`、`THIRD-PARTY-RUST.html`；macOS 另有 `THIRD-PARTY-MACOS.md`）。
+          （`THIRD-PARTY-NOTICES.md`、`THIRD-PARTY-RUST.html`；macOS 另有 `THIRD-PARTY-MACOS.md`，
+          AppImage 另有 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`）。
 
           完整功能與開發進度見 [ROADMAP.md](https://github.com/acer1204/VitaScope/blob/@TAG@/ROADMAP.md)。
           EOF
           sed -i -e "s/@TAG@/$GITHUB_REF_NAME/g" -e "s/@MACOS_MIN@/$macos_min/g" \
-                 -e "s/@GLIBC@/$glibc/g" -e "s/@DEBIAN@/$debian/g" notes.md
+                 -e "s/@GLIBC@/$glibc/g" -e "s/@DEBIAN@/$debian/g" -e "s/@APPIMAGE_GLIBC@/$appimage_glibc/g" notes.md
           cat notes.md
-          gh release create "$GITHUB_REF_NAME" assets/*.zip assets/*.tar.gz \
+          gh release create "$GITHUB_REF_NAME" assets/*.exe assets/*.dmg assets/*.AppImage assets/*.zip assets/*.tar.gz \
             --title "影戲 VitaScope $GITHUB_REF_NAME" \
             --notes-file notes.md \
             --generate-notes

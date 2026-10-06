@@ -51,7 +51,8 @@ const RECENT_ON_START: usize = 6;
 /// 右鍵選單列出幾個最近開啟的檔案
 const RECENT_IN_MENU: usize = 10;
 /// 改了長寬比、裁切、旋轉之後，多久之內的畫面設定都跟著調整視窗高度（實測兩次 VideoReconfig 相隔 50–160 毫秒）
-const REFIT_WINDOW: Duration = Duration::from_millis(1500);
+/// 暫停時改旋轉要從前一個關鍵影格解到目前這一格，長 GOP 的 4K 影片要等比較久
+const REFIT_WINDOW: Duration = Duration::from_secs(5);
 
 /// 鍵盤或按鈕觸發的操作
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +230,13 @@ pub struct VitascopeApp {
     folder_add: Option<Receiver<Vec<PathBuf>>>,
     /// 手動整理的清單要不要存起來（自動測試、`--shot` 不存）
     persist_playlist: bool,
+    /// 存下的清單是這次還原的、或這次手動整理過：才可以覆蓋 / 刪掉（雙擊一個影片開起來的不能刪掉上次存的清單）
+    owns_session: bool,
+    /// 單一執行個體：收別的程式送來的檔案，同時到達的合併成一批
+    instance: Option<crate::instance::Primary>,
+    batch: crate::instance::Batcher,
+    /// 叫視窗到前面之後，什麼時候檢查有沒有成功（沒有就閃工作列）
+    attention_at: Option<Instant>,
     /// 清單已經捲到哪一項（正在播的換了才再捲）
     playlist_follow: Option<usize>,
     /// 清單上一幀的捲動位置、看得到的高度
@@ -292,7 +300,8 @@ impl HasDisplayHandle for Owner {
 /// 啟動參數
 #[derive(Default)]
 pub struct Launch {
-    pub file: Option<PathBuf>,
+    /// 要開的檔案（命令列；好幾個 = 一次開一個播放清單）
+    pub files: Vec<PathBuf>,
     pub fullscreen: bool,
     pub autoshot: Option<AutoShot>,
     /// 播放紀錄；預設只放在記憶體（自動測試用），播放器用 `History::load()`
@@ -301,6 +310,8 @@ pub struct Launch {
     pub playlist: Option<Playlist>,
     /// 手動整理的播放清單要存起來（預設不存：自動測試不能動到使用者的檔案）
     pub persist_playlist: bool,
+    /// 單一執行個體：自己是主視窗時，收別的程式送來的檔案
+    pub instance: Option<crate::instance::Primary>,
 }
 
 impl VitascopeApp {
@@ -380,7 +391,7 @@ impl VitascopeApp {
             update_status: None,
             engine_versions: String::new(),
             history: launch.history,
-            playlist: launch.playlist,
+            playlist: launch.playlist.clone(),
             was_eof: false,
             wheel: 0.0,
             right_controls_width: 0.0,
@@ -413,6 +424,10 @@ impl VitascopeApp {
             pointer_over_playlist: false,
             folder_add: None,
             persist_playlist: launch.persist_playlist,
+            owns_session: launch.playlist.is_some(),
+            instance: launch.instance,
+            batch: crate::instance::Batcher::default(),
+            attention_at: None,
             playlist_follow: None,
             playlist_view: (0.0, 0.0),
             owner: Owner::from_creation(cc),
@@ -431,14 +446,20 @@ impl VitascopeApp {
             &app.player.get_string("mpv-version").unwrap_or_default(),
             &app.player.get_string("ffmpeg-version").unwrap_or_default(),
         );
-        match launch.file {
-            Some(path) => app.open(&path),
+        if launch.files.is_empty() {
             // 沒有要開檔：截的是起始畫面，現在就開始計時
-            None => {
-                if let Some(shot) = &mut app.autoshot {
-                    shot.arm();
-                }
+            if let Some(shot) = &mut app.autoshot {
+                shot.arm();
             }
+        } else if app.instance.is_some() {
+            // 跟同時啟動的其他程式（檔案總管多選按 Enter）送來的檔案合併成一批再開
+            let request = crate::instance::Request {
+                paths: launch.files,
+                fullscreen: false,
+            };
+            app.batch.push(request, Instant::now());
+        } else {
+            app.open_paths(launch.files, false);
         }
         app
     }
@@ -471,10 +492,22 @@ impl VitascopeApp {
     // ───────────── 操作 ─────────────
 
     fn open(&mut self, path: &Path) {
-        // 播放清單檔：換成檔案裡的清單
-        if formats::is_playlist(path) && !is_url(&path.to_string_lossy()) && !crate::m3u::is_hls_file(path) {
-            self.open_playlist_file(path);
-            return;
+        self.open_at(path, None);
+    }
+
+    /// 開檔。`list_index`：從播放清單上開的（上一個 / 下一個、雙擊）是第幾項，
+    /// 同一個檔案在清單上出現兩次時才不會跳回第一個
+    fn open_at(&mut self, path: &Path, list_index: Option<usize>) {
+        // 播放清單檔：換成檔案裡的清單（只讀一次；HLS 串流的 .m3u8 交給 mpv）
+        if formats::is_playlist(path) && !is_url(&path.to_string_lossy()) {
+            match crate::m3u::read_text(path) {
+                Ok(text) if !crate::m3u::is_hls(&text) => {
+                    self.open_playlist_text(path, &text);
+                    return;
+                }
+                // HLS，或讀不到（交給 mpv，它會說明原因）
+                _ => {}
+            }
         }
         // 先記下目前的檔案看到哪裡
         self.remember_position();
@@ -485,7 +518,17 @@ impl VitascopeApp {
             std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
         };
         // 同一份清單裡的檔案只移動位置；其他檔案先自己成一份清單，背景再掃描同資料夾的檔案
-        let in_list = self.playlist.as_mut().is_some_and(|list| list.select(&path));
+        let in_list = self.playlist.as_mut().is_some_and(|list| match list_index {
+            Some(i)
+                if list
+                    .items()
+                    .get(i)
+                    .is_some_and(|p| crate::playlist::same_file(p, &path)) =>
+            {
+                list.select_index(i)
+            }
+            _ => list.select(&path),
+        });
         if !in_list {
             self.playlist_scan = None;
             self.playlist = None;
@@ -604,13 +647,13 @@ impl VitascopeApp {
 
     /// 播放清單的上一個 / 下一個檔案
     fn step_file(&mut self, forward: bool) {
-        let target = self
-            .playlist
-            .as_ref()
-            .and_then(|l| if forward { l.next() } else { l.prev() });
-        match target.map(Path::to_path_buf) {
-            Some(path) => {
-                self.open(&path);
+        let target = self.playlist.as_ref().and_then(|l| {
+            let i = if forward { l.next_index() } else { l.prev_index() }?;
+            Some((i, l.items()[i].clone()))
+        });
+        match target {
+            Some((i, path)) => {
+                self.open_at(&path, Some(i));
                 let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
                 let dir = if forward {
                     crate::tr!("下一個", "Next")
@@ -892,7 +935,8 @@ impl VitascopeApp {
                 }
                 self.osd(crate::tr!("畫面已重設", "Picture reset"));
             }
-            Action::ToggleOnTop if self.owner.is_some_and(|o| o.is_wayland()) => {
+            // Wayland 不能設成置頂（存下來的設定是在別的桌面環境開的，照樣可以關掉）
+            Action::ToggleOnTop if !self.settings.always_on_top && self.owner.is_some_and(|o| o.is_wayland()) => {
                 self.osd(crate::tr!(
                     "這個桌面環境（Wayland）不支援讓程式自己設定視窗置頂",
                     "This desktop (Wayland) does not let programs keep themselves on top"
@@ -1050,8 +1094,9 @@ impl VitascopeApp {
         //（用舊的方向算會先閃一下錯的裁切，視窗也會跟著變成錯的高度）
         let stale = rotate_changed || out.rotate.rem_euclid(360) as u32 != vo_rotate;
         let crop = match g.crop {
-            _ if stale => None,
+            // 不裁切跟方向無關，馬上清掉（重設畫面時也是旋轉剛改，要不然舊的裁切會留著）
             None => Some(String::new()),
+            _ if stale => None,
             Some(i) => {
                 // 畫面上整張影片的比例：選了長寬比就是那個比例，不然是原本的比例（轉 90° 時倒過來）
                 let display = match g.aspect {
@@ -1093,6 +1138,55 @@ impl VitascopeApp {
                 self.apply_window_level(ctx);
             }
         }
+    }
+
+    /// 單一執行個體：收別的程式送來的檔案。第一個到的時候先把視窗叫到前面，
+    /// 一小段時間內沒有新的了才一起開（檔案總管多選按 Enter 會同時啟動好幾個程式）
+    fn poll_instance(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let mut raise = false;
+        if let Some(p) = &self.instance {
+            while let Ok(req) = p.rx.try_recv() {
+                raise |= self.batch.push(req, now);
+            }
+        }
+        if raise {
+            self.bring_to_front(ctx);
+        }
+        match self.batch.poll(now) {
+            crate::instance::BatchPoll::Idle => {}
+            crate::instance::BatchPoll::Wait(d) => ctx.request_repaint_after(d),
+            crate::instance::BatchPoll::Ready(req) => {
+                if req.fullscreen {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                }
+                if !req.paths.is_empty() {
+                    self.open_paths(req.paths, false);
+                }
+            }
+        }
+        if let Some(t) = self.attention_at {
+            if now < t {
+                ctx.request_repaint_after(t - now);
+            } else {
+                self.attention_at = None;
+                // 系統不讓搶前景時（Windows 的前景鎖、Wayland）：閃工作列 / 跳 Dock
+                if ctx.input(|i| i.viewport().focused) != Some(true) {
+                    ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
+                        egui::UserAttentionType::Informational,
+                    ));
+                }
+            }
+        }
+    }
+
+    fn bring_to_front(&mut self, ctx: &egui::Context) {
+        // 縮小的視窗不能直接叫到前面，先還原
+        if ctx.input(|i| i.viewport().minimized) == Some(true) {
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+        self.attention_at = Some(Instant::now() + Duration::from_millis(300));
     }
 
     fn apply_window_level(&self, ctx: &egui::Context) {
@@ -1325,8 +1419,12 @@ impl VitascopeApp {
     }
 
     fn play_next_in_list(&mut self) {
-        if let Some(next) = self.playlist.as_ref().and_then(|l| l.next()).map(Path::to_path_buf) {
-            self.open(&next);
+        let target = self
+            .playlist
+            .as_ref()
+            .and_then(|l| l.next_index().map(|i| (i, l.items()[i].clone())));
+        if let Some((i, next)) = target {
+            self.open_at(&next, Some(i));
             let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
             self.osd(crate::tf!(
                 "下一個（{pos}/{len}）：{}",
@@ -1387,11 +1485,14 @@ impl VitascopeApp {
         let esc_exits_fullscreen = is_fullscreen(ctx) && !egui::Popup::is_any_open(ctx);
         let playlist_open = self.settings.show_playlist;
         let (seek_short, seek_long) = (self.settings.seek_short, self.settings.seek_long);
+        let text_selected = ctx
+            .with_plugin::<egui::text_selection::LabelSelectionState, _>(|s| s.has_selection())
+            .unwrap_or(false);
         // 先把快捷鍵吃掉，避免同一個按鍵又觸發 egui 的按鈕（例如空白鍵按下有焦點的按鈕）
         let mut actions = Vec::new();
         ctx.input_mut(|i| {
-            // Ctrl+C 不會變成按鍵事件：egui 把它轉成「複製」（Event::Copy）
-            if i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
+            // Ctrl+C 不會變成按鍵事件：egui 把它轉成「複製」（Event::Copy）。有選取文字時是複製文字
+            if !text_selected && i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
                 actions.push(Action::CopyFrame);
             }
             let mut key = |mods: Modifiers, key: Key, action: Action| {
@@ -1472,6 +1573,12 @@ impl VitascopeApp {
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
+        self.open_paths(dropped, true);
+    }
+
+    /// 開一組檔案（拖放、命令列、別的程式送來的）：好幾個影音檔 = 依檔名排序的播放清單；
+    /// 只有字幕 = 加到正在播的影片；播放清單檔照樣開。`dropped` = 拖放進來的（播放清單開著時加到清單最後）
+    pub(super) fn open_paths(&mut self, dropped: Vec<PathBuf>, from_drop: bool) {
         let Some(first) = dropped.first().cloned() else { return };
         let dropped_count = dropped.len();
         let dropped_paths = dropped.clone();
@@ -1534,8 +1641,8 @@ impl VitascopeApp {
             })
         };
         let extra_subs: Vec<PathBuf> = subs.into_iter().filter(|s| !belongs_to_some_video(s)).collect();
-        // 播放清單開著：加到清單最後（沒有在播的話播第一個），不換掉清單
-        if self.settings.show_playlist {
+        // 播放清單開著時拖放進來的：加到清單最後（沒有在播的話播第一個），不換掉清單
+        if from_drop && self.settings.show_playlist {
             self.add_to_playlist(media);
             if !extra_subs.is_empty() {
                 self.osd(crate::tr!(
@@ -1550,6 +1657,7 @@ impl VitascopeApp {
             self.remember_position();
             self.playlist_scan = None;
             self.playlist = Some(Playlist::from_files(media).manual());
+            self.owns_session = true;
             self.persist_playlist();
         }
         self.open(&video);
@@ -1607,6 +1715,10 @@ impl VitascopeApp {
         // 控制列是整個視窗寬（含播放清單），至少要放得下按鈕
         let width = (size.x + self.playlist_width).max(MIN_WINDOW_WIDTH);
         let target = vec2(width, size.y + self.controls_height);
+        // 播放清單開著時換了檔：關掉清單時照樣縮回去
+        if let Some((by, _)) = self.playlist_grew {
+            self.playlist_grew = Some((by, target.x));
+        }
         eprintln!("[vitascope] 視窗配合影片 {w}×{h} → {:.0}×{:.0}", target.x, target.y);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
     }
@@ -2894,6 +3006,17 @@ impl eframe::App for VitascopeApp {
         self.poll_playlist_scan();
         self.poll_screenshots(ctx);
         self.poll_previews(ctx);
+        self.poll_folder_add();
+        self.poll_instance(ctx);
+        // macOS：已經開著時從 Finder 開的檔案
+        #[cfg(target_os = "macos")]
+        {
+            let files = crate::macos_open::take();
+            if !files.is_empty() {
+                self.bring_to_front(ctx);
+                self.open_paths(files, false);
+            }
+        }
         self.auto_next();
         self.autosave();
         if ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()) {
@@ -3001,6 +3124,10 @@ impl eframe::App for VitascopeApp {
         self.remember_position();
         self.save_settings();
         self.persist_playlist();
+        // 之後啟動的程式自己當主視窗
+        if let Some(p) = &mut self.instance {
+            p.shutdown();
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
