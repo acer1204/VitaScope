@@ -2290,7 +2290,7 @@ fn a_tall_window_is_moved_up_so_the_controls_stay_on_screen() {
             egui::vec2(960.0, 600.0),
         ));
     }
-    let mut size = None;
+    // 調整大小與移動可能在不同的畫面送出（開檔時配合影片、之後畫面形狀確定再調整一次）
     let mut moved = None;
     let start = Instant::now();
     while moved.is_none() && start.elapsed() < TIMEOUT {
@@ -2302,16 +2302,31 @@ fn a_tall_window_is_moved_up_so_the_controls_stay_on_screen() {
             .map(|v| v.commands.clone())
             .unwrap_or_default()
         {
-            match c {
-                egui::ViewportCommand::InnerSize(s) => size = Some(s),
-                egui::ViewportCommand::OuterPosition(p) => moved = Some(p),
-                _ => {}
+            if let egui::ViewportCommand::OuterPosition(p) = c {
+                moved = Some(p);
             }
         }
     }
-    let (size, moved) = (size.expect("視窗配合影片"), moved.expect("超出螢幕時要移回來"));
-    // 新的外框（加上標題列、邊框）要在螢幕裡，下面留給工作列
+    let mut moved = moved.expect("超出螢幕時要移回來");
+    // 之後如果又調整一次，以最後一次為準
+    for _ in 0..10 {
+        h.step();
+        for c in h
+            .output()
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+        {
+            if let egui::ViewportCommand::OuterPosition(p) = c {
+                moved = p;
+            }
+        }
+    }
+    // 測試環境會照 InnerSize 改變畫面大小：用最後的大小算新的外框（加上標題列、邊框）
+    let size = h.ctx.content_rect().size();
     let bottom = moved.y + size.y + (635.0 - 600.0);
+    assert!(size.y > 600.0, "直式影片的視窗比原本高：{size:?}");
     assert!(
         bottom <= 960.0 - 48.0 + 0.5,
         "下緣 {bottom} 不能被工作列蓋住（視窗高 {}）",
