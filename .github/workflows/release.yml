@@ -115,6 +115,11 @@ jobs:
           </dict>
           </plist>
           EOF
+          # build.rs 為了開發方便加了 Homebrew 的 rpath；先刪掉，否則 dylibbundler 改寫後會出現
+          # 重複的 LC_RPATH，新版 macOS 會拒絕載入（dyld: duplicate LC_RPATH）
+          for p in /opt/homebrew/lib /usr/local/lib; do
+            install_name_tool -delete_rpath "$p" "$app/Contents/MacOS/vitascope" 2>/dev/null || true
+          done
           # 把 libmpv 及其相依函式庫複製進 .app，並把載入路徑改成 .app 內部
           dylibbundler -od -b -x "$app/Contents/MacOS/vitascope" \
             -d "$app/Contents/Frameworks" -p @executable_path/../Frameworks/
