@@ -2,7 +2,9 @@
 //! 介面（app）和自動測試（tests/）都透過這一層操作 mpv。
 
 use crate::mpv::{self, EndReason, Event, Format, Mpv, Value};
+use crate::subs::{self, ExternalSub, SubLang};
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,8 +16,10 @@ pub struct Options {
     pub hwdec: String,
     /// 播完停在最後一格（播放器介面用）；false = 播完就卸載檔案（測試用）
     pub keep_open: bool,
-    /// 有字幕軌但 mpv 沒有自動選上時，自動顯示第一條字幕
+    /// 開檔後自動選字幕：繁中優先；沒有字幕被選上時也選一條（比照 PotPlayer）
     pub auto_select_subs: bool,
+    /// 外掛字幕自己找、自己判斷編碼和語言（見 `subs` 模組）；false = 交給 mpv 的 sub-auto
+    pub external_subs: bool,
     /// 有新事件時呼叫（在 mpv 的執行緒上，只能用來喚醒 UI）
     pub wakeup: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -27,6 +31,7 @@ impl Default for Options {
             hwdec: "auto-safe".into(),
             keep_open: true,
             auto_select_subs: true,
+            external_subs: true,
             wakeup: None,
         }
     }
@@ -207,6 +212,7 @@ pub struct Player {
     /// 這次開檔期間 mpv 回報的錯誤訊息（開檔失敗時拿來說明原因）
     recent_errors: Vec<String>,
     auto_select_subs: bool,
+    external_subs: bool,
     /// 最近一次開檔失敗的基本原因。mpv 的記錄訊息要等一般事件都取完才會送出，
     /// 常常比 EndFile 晚到，所以失敗後收到的錯誤記錄還要補進說明裡
     failure: Option<String>,
@@ -224,8 +230,8 @@ impl Player {
             ("osc", "no"),
             ("input-default-bindings", "no"),
             ("input-vo-keyboard", "no"),
-            // 外掛字幕：檔名包含影片檔名就載入（movie.zh-TW.srt 也算）
-            ("sub-auto", "fuzzy"),
+            // 外掛字幕預設由 subs 模組處理（mpv 對 GBK / UTF-16 字幕常猜錯編碼）
+            ("sub-auto", if opts.external_subs { "no" } else { "fuzzy" }),
             ("slang", SUB_LANGS),
             // 網站影片（yt-dlp）屬於 L3，先關掉避免開檔時意外呼叫外部程式
             ("ytdl", "no"),
@@ -250,8 +256,10 @@ impl Player {
             },
             recent_errors: Vec::new(),
             auto_select_subs: opts.auto_select_subs,
+            external_subs: opts.external_subs,
             failure: None,
         })
+        .inspect(|_| subs::clean_cache())
     }
 
     pub fn mpv(&self) -> &Arc<Mpv> {
@@ -314,9 +322,51 @@ impl Player {
         }
     }
 
-    /// 載入外掛字幕並立刻顯示
+    /// 載入外掛字幕並立刻顯示（拖放字幕檔、選單「載入字幕」）。編碼和語言一樣自動判斷
     pub fn add_subtitle(&self, path: &str) -> mpv::Result<()> {
-        self.mpv.command(&["sub-add", path, "select"])
+        let sub_path = Path::new(path);
+        let video = self
+            .state
+            .path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| sub_path.to_path_buf());
+        match subs::load(sub_path, &video) {
+            Ok(sub) => self.add_external(&sub, true),
+            // 讀不了（例如不是本機檔案）就直接交給 mpv
+            Err(_) => self.mpv.command(&["sub-add", path, "select"]),
+        }
+    }
+
+    fn add_external(&self, sub: &ExternalSub, select: bool) -> mpv::Result<()> {
+        let path = sub.load_path().map_err(|e| mpv::Error {
+            code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
+            context: format!("無法轉換字幕 {}：{e}", sub.path.display()),
+        })?;
+        let path = path.to_string_lossy();
+        let flag = if select { "select" } else { "auto" };
+        let mut args = vec!["sub-add", &path, flag, &sub.title];
+        if let Some(lang) = sub.lang.code() {
+            args.push(lang);
+        }
+        self.mpv.command(&args)
+    }
+
+    /// 找出並載入目前影片的外掛字幕
+    fn load_external_subs(&mut self) {
+        let Ok(path) = self.mpv.get_string("path") else { return };
+        if path.contains("://") {
+            return; // 網路串流沒有「同資料夾」可找
+        }
+        let video = PathBuf::from(path);
+        for p in subs::find_external(&video) {
+            let result = subs::load(&p, &video)
+                .map_err(|e| e.to_string())
+                .and_then(|sub| self.add_external(&sub, false).map_err(|e| e.to_string()));
+            if let Err(e) = result {
+                self.recent_errors.push(format!("[subs] 無法載入 {}：{e}", p.display()));
+            }
+        }
     }
 
     pub fn get_string(&self, name: &str) -> mpv::Result<String> {
@@ -423,8 +473,11 @@ impl Player {
             Event::FileLoaded => {
                 self.state.loading = false;
                 self.state.loaded = true;
+                if self.external_subs {
+                    self.load_external_subs();
+                }
                 if self.auto_select_subs {
-                    self.ensure_subtitle_selected();
+                    self.choose_subtitle();
                 }
                 self.refresh_tracks();
                 Some(PlayerEvent::FileLoaded)
@@ -499,17 +552,41 @@ impl Player {
         }
     }
 
-    fn ensure_subtitle_selected(&self) {
+    /// 開檔後選字幕：
+    /// - 有繁中就選繁中（其次中文、簡中），依語言碼、標題和外掛字幕的內容判斷
+    /// - 沒有中文字幕時尊重 mpv 的選擇；mpv 什麼都沒選時（很多 MKV 的字幕軌沒有語言標籤）選第一條，比照 PotPlayer
+    fn choose_subtitle(&self) {
         let Ok(json) = self.mpv.get_string("track-list") else {
             return;
         };
         let tracks: Vec<Track> = serde_json::from_str(&json).unwrap_or_default();
         let subs: Vec<&Track> = tracks.iter().filter(|t| t.kind == TrackKind::Sub).collect();
-        if subs.is_empty() || subs.iter().any(|t| t.selected) {
+        if subs.is_empty() {
             return;
         }
-        let pick = subs.iter().find(|t| !t.forced).unwrap_or(&subs[0]);
-        let _ = self.select_track(TrackKind::Sub, Some(pick.id));
+        let lang_of = |t: &Track| {
+            let label = format!(
+                "{} {}",
+                t.lang.as_deref().unwrap_or(""),
+                t.title.as_deref().unwrap_or("")
+            );
+            subs::classify_label(&label).unwrap_or(SubLang::Unknown)
+        };
+        // 語言最優先；同語言時外掛優先（字幕組另外附的通常比內嵌的好）；再來是軌道順序
+        let best = subs
+            .iter()
+            .filter(|t| !t.forced)
+            .max_by_key(|t| (lang_of(t), t.external, std::cmp::Reverse(t.id)))
+            .or(subs.first());
+        let current = subs.iter().find(|t| t.selected);
+        let pick = match (current, best) {
+            (None, Some(b)) => Some(b),
+            (Some(c), Some(b)) if lang_of(b).is_chinese() && lang_of(b) > lang_of(c) => Some(b),
+            _ => None,
+        };
+        if let Some(t) = pick {
+            let _ = self.select_track(TrackKind::Sub, Some(t.id));
+        }
     }
 
     /// 基本原因加上 mpv 記錄裡的細節，整理成給使用者看的說明。

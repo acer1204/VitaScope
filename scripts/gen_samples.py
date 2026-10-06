@@ -34,12 +34,43 @@ TIERS = ("common", "general", "rare")
 
 # 字幕內容。測試會在 SUB_PROBE_TIME 秒讀取畫面上的字幕，跟 SUB_PROBE_TEXT 比對。
 # 文字只用 Big5 編得出來的字，Big5 樣本才能共用同一份內容。
+# 第三句是一般對白，含足夠的繁簡差異字，讓播放器能從「內容」判斷繁體或簡體。
 SUB_CUES = [
     (0.2, 1.4, "第一句字幕 First line"),
     (1.5, 2.6, "影戲播放器測試"),
+    (2.7, 2.95, "這是我們的世界，他們會來這裡嗎？為什麼還沒到"),
+]
+# 簡體版：測試「有繁中就選繁中」
+SUB_CUES_SIMP = [
+    (0.2, 1.4, "第一句字幕 First line"),
+    (1.5, 2.6, "影戏播放器测试"),
+    (2.7, 2.95, "这是我们的世界，他们会来这里吗？为什么还没到"),
 ]
 SUB_PROBE_TIME = 2.0
 SUB_PROBE_TEXT = "影戲播放器測試"
+
+# 一般對白（自己寫的句子），放在 3 秒之後（影片結束後不會顯示），讓字幕檔長度和用字接近真實字幕。
+# 實際影片庫裡「繁體字用 GBK 編碼」的長字幕，mpv 會誤判成 BIG5，整份變亂碼；短字幕反而猜得對。
+DIALOGUE_TRAD = [
+    "你今天怎麼這麼晚才回來", "我們一起去吃飯吧", "這件事情我會處理好的", "別擔心，一切都會好起來的",
+    "他說明天會來學校", "你知道她為什麼生氣嗎", "我覺得這樣做不太好", "快點走吧，要遲到了",
+    "謝謝你一直以來的照顧", "我們是最好的朋友", "這個問題很難回答", "你還記得那天發生的事嗎",
+    "對不起，我不是故意的", "等一下，我馬上就來", "這裡的風景真漂亮", "你在說什麼啊",
+    "沒關係，下次再說吧", "我想和你談談", "讓我們開始吧", "時間過得真快",
+]
+DIALOGUE_SIMP = [
+    "你今天怎么这么晚才回来", "我们一起去吃饭吧", "这件事情我会处理好的", "别担心，一切都会好起来的",
+    "他说明天会来学校", "你知道她为什么生气吗", "我觉得这样做不太好", "快点走吧，要迟到了",
+    "谢谢你一直以来的照顾", "我们是最好的朋友", "这个问题很难回答", "你还记得那天发生的事吗",
+    "对不起，我不是故意的", "等一下，我马上就来", "这里的风景真漂亮", "你在说什么啊",
+    "没关系，下次再说吧", "我想和你谈谈", "让我们开始吧", "时间过得真快",
+]
+
+
+def long_cues(base, dialogue, repeat=6):
+    """在測試用的三句之後，接上大量一般對白（從第 4 秒開始，每句 2 秒）"""
+    lines = [d for _ in range(repeat) for d in dialogue]
+    return base + [(4.0 + i * 2, 5.5 + i * 2, t) for i, t in enumerate(lines)]
 
 # 常用的編碼參數
 AAC = ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
@@ -76,6 +107,8 @@ class Sample:
     vf: str | None = None
     sub_embed: str | None = None  # 內嵌字幕編碼：srt / ass / mov_text / webvtt
     sub_ext: str | None = None  # 外掛字幕：srt_utf8 / srt_big5 / srt_utf16 / ass / vtt / smi / microdvd
+    # 自訂外掛字幕：(檔名後綴, 格式 srt/ass/ssa, 編碼, 繁簡 trad/simp)
+    extra_subs: list[tuple[str, str, str, str]] = field(default_factory=list)
     subs: list[str] = field(default_factory=list)  # 預期的字幕編碼（內嵌 + 外掛）
     expect: dict = field(default_factory=dict)  # 其他預期：rotate、gamma、primaries、aspect
     post: str | None = None  # 後處理：rotate（加上手機直拍的旋轉中繼資料）
@@ -127,6 +160,25 @@ def samples() -> list[Sample]:
           note="Big5 編碼的舊中文字幕"),
         S("extsub_srt_utf16", "common", "mp4", X264, AAC, "h264", "aac", sub_ext="srt_utf16", subs=["subrip"]),
         S("extsub_ass", "common", "mkv", X264, AAC, "h264", "aac", sub_ext="ass", subs=["ass"]),
+        # ── 以下重現實際影片庫普查遇到的字幕問題（mpv 內建的 sub-auto 會出錯）──
+        S("extsub_gbk_named_tw", "common", "mp4", X264, AAC, "h264", "aac", subs=["ass"],
+          extra_subs=[(".zh-TW.ssa", "ssa", "gbk", "trad_long")], note="繁體字用 GBK 編碼、檔名標 zh-TW"),
+        S("extsub_gbk_simp", "common", "mkv", X264, AAC, "h264", "aac", subs=["subrip"],
+          extra_subs=[(".srt", "srt", "gbk", "simp_long")], expect={"sub_text": "影戏播放器测试"},
+          note="GBK 編碼的簡體字幕"),
+        S("extsub_ass_no_header", "general", "mkv", X264, AAC, "h264", "aac", subs=["ass"],
+          extra_subs=[(".ass", "ass_noheader", "utf-8-sig", "trad")], note="ASS 少了 [Script Info] 標頭"),
+        S("extsub_ssa_utf16", "common", "avi", ["-c:v", "mpeg4", "-vtag", "XVID", "-q:v", "4"], MP3, "mpeg4", "mp3",
+          subs=["ass"], extra_subs=[(".ssa", "ssa", "utf-16", "trad")], note="UTF-16 的 SSA（mpv 會誤判成 Shift_JIS）"),
+        S("extsub_doubledot_tc_sc", "common", "mkv", X264, AAC, "h264", "aac", subs=["ass", "ass"],
+          extra_subs=[(".Zh-CN..ass", "ass", "utf-8-sig", "simp"), (".Zh-TW..ass", "ass", "utf-8-sig", "trad")],
+          note="Zh-TW..ass 雙點檔名，要選到繁中"),
+        S("extsub_big5_gb", "common", "mkv", X264, AAC, "h264", "aac", subs=["ass", "ass"],
+          extra_subs=[(".gb.ass", "ass", "gbk", "simp"), (".big5.ass", "ass", "cp950", "trad")],
+          note="big5.ass / gb.ass，要選到繁中"),
+        S("extsub_unlabeled_content", "common", "mkv", X264, AAC, "h264", "aac", subs=["subrip", "subrip"],
+          extra_subs=[(".1.srt", "srt", "utf-8", "simp"), (".2.srt", "srt", "utf-8", "trad")],
+          note="沒標語言，靠內容判斷繁簡"),
         # 多音軌、多字幕：介面測試（tests/ui.rs）也用這個檔案測選單切換
         S("mkv_multitrack", "common", "mkv", X264, AAC, "h264", "aac", subs=["subrip", "subrip"], dur=20,
           note="雙音軌 + 雙字幕", custom=[
@@ -246,21 +298,35 @@ def _ts(t: float, sep: str = ",") -> str:
     return f"{h:02}:{m:02}:{s:02}{sep}{ms:03}"
 
 
-def srt_text() -> str:
-    return "".join(f"{i}\n{_ts(a)} --> {_ts(b)}\n{t}\n\n" for i, (a, b, t) in enumerate(SUB_CUES, 1))
+def srt_text(cues=SUB_CUES) -> str:
+    return "".join(f"{i}\n{_ts(a)} --> {_ts(b)}\n{t}\n\n" for i, (a, b, t) in enumerate(cues, 1))
 
 
-def vtt_text() -> str:
-    return "WEBVTT\n\n" + "".join(f"{_ts(a, '.')} --> {_ts(b, '.')}\n{t}\n\n" for a, b, t in SUB_CUES)
+def vtt_text(cues=SUB_CUES) -> str:
+    return "WEBVTT\n\n" + "".join(f"{_ts(a, '.')} --> {_ts(b, '.')}\n{t}\n\n" for a, b, t in cues)
 
 
-def ass_text() -> str:
-    def ass_ts(t: float) -> str:
-        cs = int(round(t * 100))
-        return f"{cs // 360000}:{cs // 6000 % 60:02}:{cs // 100 % 60:02}.{cs % 100:02}"
+def _ass_ts(t: float) -> str:
+    cs = int(round(t * 100))
+    return f"{cs // 360000}:{cs // 6000 % 60:02}:{cs // 100 % 60:02}.{cs % 100:02}"
 
+
+def ssa_text(cues=SUB_CUES) -> str:
+    """舊式 SSA（v4.00）。實際影片庫裡有 UTF-16 編碼的 SSA，mpv 會把它誤判成 Shift_JIS。"""
+    events = "".join(f"Dialogue: Marked=0,{_ass_ts(a)},{_ass_ts(b)},Default,,0000,0000,0000,,{t}\n" for a, b, t in cues)
+    return (
+        "[Script Info]\nScriptType: v4.00\nPlayResX: 320\nPlayResY: 240\n\n"
+        "[V4 Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding\n"
+        "Style: Default,Arial,20,16777215,65535,65535,0,0,0,1,2,1,2,10,10,10,0,1\n\n"
+        "[Events]\nFormat: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" + events
+    )
+
+
+def ass_text(cues=SUB_CUES) -> str:
     events = "".join(
-        f"Dialogue: 0,{ass_ts(a)},{ass_ts(b)},Default,,0,0,0,,{{\\fad(100,100)}}{t}\n" for a, b, t in SUB_CUES
+        f"Dialogue: 0,{_ass_ts(a)},{_ass_ts(b)},Default,,0,0,0,,{{\\fad(100,100)}}{t}\n" for a, b, t in cues
     )
     return (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 240\n\n"
@@ -304,6 +370,23 @@ def write_ext_sub(kind: str, video: Path) -> None:
     }
     ext, make, enc = table[kind]
     Path(f"{stem}{ext}").write_text(make(), encoding=enc, newline="\r\n" if ext in (".srt", ".smi") else "\n")
+
+
+def write_extra_sub(video: Path, suffix: str, fmt: str, encoding: str, variant: str) -> None:
+    """寫一個自訂檔名、格式、編碼、繁簡的外掛字幕（重現實際影片庫遇到的情況）"""
+    cues = {
+        "trad": SUB_CUES,
+        "simp": SUB_CUES_SIMP,
+        "trad_long": long_cues(SUB_CUES, DIALOGUE_TRAD),
+        "simp_long": long_cues(SUB_CUES_SIMP, DIALOGUE_SIMP),
+    }[variant]
+    make = {"srt": srt_text, "ass": ass_text, "ssa": ssa_text, "ass_noheader": ass_text}[fmt]
+    text = make(cues)
+    if fmt == "ass_noheader":
+        # 實際遇過的壞檔：少了開頭的 [Script Info]，FFmpeg 認不出格式
+        text = text.replace("[Script Info]\n", "", 1)
+    stem = str(video.with_suffix(""))
+    Path(stem + suffix).write_text(text, encoding=encoding, newline="\r\n")
 
 
 def find_font() -> Path | None:
@@ -358,6 +441,9 @@ def generate(s: Sample, sub_src: dict[str, Path], font: Path | None, tmp: Path) 
     """產生一個樣本；成功回傳 None，失敗回傳錯誤訊息。"""
     out = s.path
     out.parent.mkdir(parents=True, exist_ok=True)
+    # 清掉這個樣本以前產生的檔案（包括外掛字幕），舊的字幕檔會被當成多出來的軌道
+    for old in out.parent.glob(f"{s.id}.*"):
+        old.unlink()
     target = tmp / f"{s.id}.{s.ext}" if s.post else out
     r = subprocess.run(build_cmd(s, target, sub_src, font), capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
@@ -379,6 +465,8 @@ def generate(s: Sample, sub_src: dict[str, Path], font: Path | None, tmp: Path) 
             return r.stderr.strip() or f"ffmpeg exit {r.returncode}"
     if s.sub_ext:
         write_ext_sub(s.sub_ext, out)
+    for extra in s.extra_subs:
+        write_extra_sub(out, *extra)
     return None
 
 
@@ -393,13 +481,19 @@ def manifest_entry(s: Sample) -> dict:
         "duration": s.dur,
         "note": s.note,
     }
+    expect = dict(s.expect)
     if s.subs:
-        e["sub_probe"] = {"time": SUB_PROBE_TIME, "text": SUB_PROBE_TEXT}
-    e.update(s.expect)
+        # 預設預期繁體字幕；只有簡體字幕的樣本用 expect={"sub_text": ...} 指定
+        e["sub_probe"] = {"time": SUB_PROBE_TIME, "text": expect.pop("sub_text", SUB_PROBE_TEXT)}
+    e.update(expect)
     return e
 
 
 def main() -> int:
+    # Windows 主控台（例如 CI）預設編碼不是 UTF-8，印中文會出錯
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tier", choices=(*TIERS, "all"), default="all")
     ap.add_argument("--force", action="store_true", help="已存在的樣本也重新產生")

@@ -12,5 +12,6 @@ pub mod formats;
 pub mod mpv;
 pub mod player;
 pub mod settings;
+pub mod subs;
 pub mod update;
 pub mod video;

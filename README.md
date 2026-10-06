@@ -25,7 +25,10 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - 開檔：檔案對話框、拖放、命令列（`vitascope 影片.mkv`）
 - 播放、暫停、停止；進度條可拖曳跳轉，滑鼠停在上面會顯示該位置的時間
 - 硬體解碼自動啟用（NVIDIA 為 nvdec），不支援時自動退回軟解
-- 音軌、字幕切換；同檔名的外掛字幕自動載入，**Big5 / UTF-16 舊字幕自動偵測編碼**
+- 音軌、字幕切換；同檔名的外掛字幕自動載入（也會找 `Subs` 之類的子資料夾）
+- **外掛字幕自動判斷編碼**：UTF-8、UTF-16、Big5、GBK、Shift_JIS…，舊字幕不會變亂碼
+- **繁中字幕優先**：看得懂字幕組的各種標法（`tc`、`cht`、`BIG5`、`zh-Hant`、`繁體`、`jptc`…），
+  檔名沒標的也會從內容判斷繁簡
 - 有字幕軌就自動顯示（比照 PotPlayer；mpv 預設只顯示有語言標籤的字幕）
 - 視窗依影片比例調整，高 DPI 螢幕上 1:1 顯示；手機直拍影片會自動轉正
 - 全螢幕時控制列浮在畫面上，2 秒沒動作自動隱藏；控制列出現時字幕自動上移，不會被蓋住
@@ -50,7 +53,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 ## 支援格式
 
 格式分為「常見 / 通用 / 罕見」三級，詳見 [ROADMAP.md 第 2 節](ROADMAP.md#2-格式支援分級)。
-目前自動測試涵蓋 **85 個樣本，三個等級全數通過**，例如：
+目前自動測試涵蓋 **92 個樣本，三個等級全數通過**；另外用一個約 1.4 萬部動畫的影片庫抽樣 626 個檔案實測，
+**全部能播放**（含 RMVB、VC-1、Hi10P、PGS 字幕等）。例如：
 
 - **常見**：MP4、MKV、WebM、MOV、AVI；H.264（含 Hi10P）、HEVC（含 10-bit、4K）、AV1、VP9；AAC、MP3、Opus、AC-3、FLAC；SRT、ASS、mov_text
 - **通用**：TS / M2TS、MPG / VOB、WMV、FLV、3GP、OGV；MPEG-2、Xvid、VC-1、ProRes、MJPEG；E-AC-3、DTS；WebVTT、SAMI；HDR10、HLG、隔行掃描
@@ -129,6 +133,7 @@ src/
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
 ├─ player.rs     播放器核心：mpv 屬性與事件 → Rust 狀態（介面和測試共用）
 ├─ mpv/          libmpv 的安全包裝（client API、render API）
+├─ subs.rs       外掛字幕：尋找、編碼偵測、繁簡判斷
 ├─ settings.rs   設定檔（音量、視窗位置）
 ├─ update.rs     檢查更新（GitHub Releases）
 ├─ formats.rs    支援的副檔名

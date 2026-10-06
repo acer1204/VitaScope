@@ -13,6 +13,7 @@
 //! 環境變數：
 //!   VITASCOPE_TIERS=common,general   只測這些等級（預設全部）
 //!   VITASCOPE_ONLY=h264              只測 id 包含這段文字的樣本
+//!   VITASCOPE_MPV_SUBAUTO=1          外掛字幕改交給 mpv 內建的 sub-auto（對照用）
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -94,7 +95,12 @@ fn check(sample: &Sample) -> Outcome {
 /// 回傳 Err = 無法繼續的錯誤；可以繼續檢查的問題放進 `problems`。
 fn run_checks(s: &Sample, problems: &mut Vec<String>) -> Result<String, String> {
     let path = samples_dir().join(&s.file);
-    let mut p = Player::new(Options::headless()).map_err(|e| e.to_string())?;
+    // VITASCOPE_MPV_SUBAUTO=1：外掛字幕改用 mpv 內建的 sub-auto，對照自己的處理差在哪
+    let opts = Options {
+        external_subs: std::env::var_os("VITASCOPE_MPV_SUBAUTO").is_none(),
+        ..Options::headless()
+    };
+    let mut p = Player::new(opts).map_err(|e| e.to_string())?;
     p.set_pause(true).map_err(|e| e.to_string())?;
     p.open(path.to_str().unwrap()).map_err(|e| e.to_string())?;
 

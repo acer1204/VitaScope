@@ -12,6 +12,9 @@ keywords = ["video", "player", "mpv", "media"]
 categories = ["multimedia::video"]
 
 [dependencies]
+# 外掛字幕的編碼偵測（Firefox 的偵測器，擅長 Big5 / GBK / Shift_JIS 這類舊編碼）與轉碼
+chardetng = "1"
+encoding_rs = "0.8"
 # glow（OpenGL）後端：mpv 的 render API 只支援 OpenGL，要和 egui 共用同一個 GL context
 # 不開 persistence：設定（含視窗位置）自己存，見 src/settings.rs
 # links：「關於」視窗的超連結、檢查更新後開啟下載頁面
