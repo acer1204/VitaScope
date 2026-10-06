@@ -240,6 +240,9 @@ impl Player {
         if opts.headless {
             options.push(("ao", "null"));
         }
+        // 排查用：VITASCOPE_MPV_OPTS="名稱=值 名稱=值" 額外指定 mpv 選項（以空白分隔）
+        let extra = std::env::var("VITASCOPE_MPV_OPTS").unwrap_or_default();
+        options.extend(extra.split_whitespace().filter_map(|kv| kv.split_once('=')));
         let mut mpv = Mpv::new(&options)?;
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
