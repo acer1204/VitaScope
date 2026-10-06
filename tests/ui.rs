@@ -2278,7 +2278,8 @@ fn a_tall_window_is_moved_up_so_the_controls_stay_on_screen() {
     // 下緣超出螢幕，控制列被工作列蓋住
     let mut settings = Settings::default();
     settings.auto_next = false;
-    let mut h = harness_with(Some(sample("common/mov_hevc_aac_rot90.mov")), settings);
+    // 先設好螢幕與視窗的位置再開檔（開檔後很快就會配合影片調整視窗）
+    let mut h = harness_with(None, settings);
     if let Some(v) = h.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
         v.monitor_size = Some(egui::vec2(1707.0, 960.0));
         v.outer_rect = Some(egui::Rect::from_min_size(
@@ -2290,6 +2291,10 @@ fn a_tall_window_is_moved_up_so_the_controls_stay_on_screen() {
             egui::vec2(960.0, 600.0),
         ));
     }
+    h.step();
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(sample("common/mov_hevc_aac_rot90.mov"))));
     // 調整大小與移動可能在不同的畫面送出（開檔時配合影片、之後畫面形狀確定再調整一次）
     let mut moved = None;
     let start = Instant::now();
