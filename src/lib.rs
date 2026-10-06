@@ -11,6 +11,7 @@ pub mod fonts;
 pub mod formats;
 pub mod geometry;
 pub mod history;
+pub mod i18n;
 pub mod icon;
 pub mod m3u;
 pub mod mediainfo;

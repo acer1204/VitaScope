@@ -216,7 +216,7 @@ pub fn decode_png(path: &Path) -> std::io::Result<Image> {
     let mut reader = decoder.read_info().map_err(std::io::Error::other)?;
     let size = reader
         .output_buffer_size()
-        .ok_or_else(|| std::io::Error::other("圖太大"))?;
+        .ok_or_else(|| std::io::Error::other(crate::tr!("圖太大", "image too large")))?;
     let mut buf = vec![0; size];
     let info = reader.next_frame(&mut buf).map_err(std::io::Error::other)?;
     buf.truncate(info.buffer_size());
@@ -225,7 +225,12 @@ pub fn decode_png(path: &Path) -> std::io::Result<Image> {
         png::ColorType::Rgb => buf.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
         png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
-        other => return Err(std::io::Error::other(format!("不支援的 PNG 格式 {other:?}"))),
+        other => {
+            return Err(std::io::Error::other(crate::tf!(
+                "不支援的 PNG 格式 {other:?}",
+                "unsupported PNG format {other:?}"
+            )));
+        }
     };
     Ok(Image {
         w: info.width as usize,

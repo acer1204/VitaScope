@@ -63,7 +63,10 @@ impl VitascopeApp {
     pub(super) fn take_screenshot(&mut self, dest: ShotDest) {
         let st = &self.player.state;
         if !st.loaded || !st.has_video() {
-            self.osd("這個檔案沒有影像，不能擷取畫面");
+            self.osd(crate::tr!(
+                "這個檔案沒有影像，不能擷取畫面",
+                "This file has no video to capture"
+            ));
             return;
         }
         let fix = self.shot_fixup();
@@ -79,7 +82,10 @@ impl VitascopeApp {
                     _ => {
                         let dir = self.screenshot_dir();
                         if let Err(e) = std::fs::create_dir_all(&dir) {
-                            self.osd(format!("無法建立截圖資料夾：{e}"));
+                            self.osd(crate::tf!(
+                                "無法建立截圖資料夾：{e}",
+                                "Cannot create the screenshot folder: {e}"
+                            ));
                             return;
                         }
                         let source = st.path.clone().unwrap_or_default();
@@ -106,10 +112,13 @@ impl VitascopeApp {
             Ok(()) => {
                 self.capture.pending.push((id, target, fix));
                 if flipped && self.settings.screenshot_subtitles {
-                    self.osd("畫面翻轉時，截圖不含字幕");
+                    self.osd(crate::tr!(
+                        "畫面翻轉時，截圖不含字幕",
+                        "Screenshots of a flipped picture leave out subtitles"
+                    ));
                 }
             }
-            Err(e) => self.osd(format!("無法擷取畫面：{e}")),
+            Err(e) => self.osd(crate::tf!("無法擷取畫面：{e}", "Cannot capture the frame: {e}")),
         }
     }
 
@@ -120,12 +129,14 @@ impl VitascopeApp {
         };
         let (_, target, fix) = self.capture.pending.remove(i);
         if let Some(e) = error {
-            self.osd(format!("無法擷取畫面：{e}"));
+            self.osd(crate::tf!("無法擷取畫面：{e}", "Cannot capture the frame: {e}"));
             return;
         }
         let tx = self.capture.tx.clone();
         let ctx = self.egui_ctx.clone();
+        let lang = crate::i18n::lang();
         std::thread::spawn(move || {
+            crate::i18n::set_lang(lang);
             let done = screenshot::finish(target, fix);
             if tx.send(done).is_ok() {
                 ctx.request_repaint();
@@ -137,12 +148,12 @@ impl VitascopeApp {
     pub(super) fn poll_screenshots(&mut self, ctx: &egui::Context) {
         while let Ok(done) = self.capture.rx.try_recv() {
             match done {
-                Done::Saved(path) => self.osd(format!("已儲存截圖：{}", file_name(&path))),
+                Done::Saved(path) => self.osd(crate::tf!("已儲存截圖：{}", "Screenshot saved: {}", file_name(&path))),
                 Done::Copied(img) => {
                     ctx.copy_image(egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.rgba));
-                    self.osd(format!("已複製畫面（{}×{}）", img.w, img.h));
+                    self.osd(crate::tf!("已複製畫面（{}×{}）", "Frame copied ({}×{})", img.w, img.h));
                 }
-                Done::Failed(e) => self.osd(format!("無法擷取畫面：{e}")),
+                Done::Failed(e) => self.osd(crate::tf!("無法擷取畫面：{e}", "Cannot capture the frame: {e}")),
             }
         }
     }
@@ -155,8 +166,8 @@ impl VitascopeApp {
         let name = screenshot::file_name(st.path.as_deref().unwrap_or_default(), st.time_pos);
         let Some(mut path) = self
             .file_dialog()
-            .set_title("另存截圖")
-            .add_filter("PNG 圖片", &["png"])
+            .set_title(crate::tr!("另存截圖", "Save screenshot as"))
+            .add_filter(crate::tr!("PNG 圖片", "PNG image"), &["png"])
             .set_directory(self.screenshot_dir())
             .set_file_name(&name)
             .save_file()
@@ -172,11 +183,11 @@ impl VitascopeApp {
     pub(super) fn choose_screenshot_dir(&mut self) {
         if let Some(dir) = self
             .file_dialog()
-            .set_title("選擇截圖資料夾")
+            .set_title(crate::tr!("選擇截圖資料夾", "Choose the screenshot folder"))
             .set_directory(self.screenshot_dir())
             .pick_folder()
         {
-            self.osd(format!("截圖資料夾：{}", dir.display()));
+            self.osd(crate::tf!("截圖資料夾：{}", "Screenshot folder: {}", dir.display()));
             self.settings.screenshot_dir = Some(dir);
             self.save_settings();
         }
@@ -186,28 +197,41 @@ impl VitascopeApp {
     pub(super) fn screenshot_menu(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<Action> {
         let mut action = None;
         ui.add_enabled_ui(enabled, |ui| {
-            ui.menu_button("擷取畫面", |ui| {
-                if menu_item(ui, true, "存到截圖資料夾", SHOT_SHORTCUT) {
+            ui.menu_button(crate::tr!("擷取畫面", "Screenshot"), |ui| {
+                if menu_item(
+                    ui,
+                    true,
+                    crate::tr!("存到截圖資料夾", "Save to the screenshot folder"),
+                    SHOT_SHORTCUT,
+                ) {
                     action = Some(Action::Screenshot);
                 }
-                if menu_item(ui, true, "另存新檔…", "") {
+                if menu_item(ui, true, crate::tr!("另存新檔…", "Save as…"), "") {
                     action = Some(Action::ScreenshotAs);
                 }
-                if menu_item(ui, true, "複製到剪貼簿", COPY_SHORTCUT) {
+                if menu_item(ui, true, crate::tr!("複製到剪貼簿", "Copy to clipboard"), COPY_SHORTCUT) {
                     action = Some(Action::CopyFrame);
                 }
                 ui.separator();
                 if ui
-                    .checkbox(&mut self.settings.screenshot_subtitles, "包含字幕")
+                    .checkbox(
+                        &mut self.settings.screenshot_subtitles,
+                        crate::tr!("包含字幕", "Include subtitles"),
+                    )
                     .changed()
                 {
                     self.save_settings();
                 }
                 ui.separator();
-                if menu_item(ui, true, "開啟截圖資料夾", "") {
+                if menu_item(ui, true, crate::tr!("開啟截圖資料夾", "Open the screenshot folder"), "") {
                     action = Some(Action::OpenScreenshotDir);
                 }
-                if menu_item(ui, true, "變更截圖資料夾…", "") {
+                if menu_item(
+                    ui,
+                    true,
+                    crate::tr!("變更截圖資料夾…", "Change the screenshot folder…"),
+                    "",
+                ) {
                     action = Some(Action::ChooseScreenshotDir);
                 }
                 ui.weak(self.screenshot_dir().display().to_string());

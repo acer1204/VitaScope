@@ -27,7 +27,11 @@ const MAX_SIZE: u64 = 16 * 1024 * 1024;
 fn read_text(path: &Path) -> std::io::Result<String> {
     let size = std::fs::metadata(path)?.len();
     if size > MAX_SIZE {
-        return Err(std::io::Error::other(format!("檔案太大（{} MB）", size / 1024 / 1024)));
+        return Err(std::io::Error::other(crate::tf!(
+            "檔案太大（{} MB）",
+            "File too large ({} MB)",
+            size / 1024 / 1024
+        )));
     }
     Ok(crate::subs::decode(&std::fs::read(path)?).0)
 }

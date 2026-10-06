@@ -30,6 +30,14 @@ pub struct Settings {
     pub screenshot_dir: Option<PathBuf>,
     /// 截圖包含字幕
     pub screenshot_subtitles: bool,
+    /// 介面語言
+    pub language: crate::i18n::Lang,
+    /// 硬體解碼（失敗時 mpv 自動退回軟解）
+    pub hwdec: bool,
+    /// ← / → 跳幾秒
+    pub seek_short: f64,
+    /// Ctrl + ← / → 跳幾秒
+    pub seek_long: f64,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -145,6 +153,10 @@ impl Default for Settings {
             show_playlist: false,
             screenshot_dir: None,
             screenshot_subtitles: true,
+            language: crate::i18n::Lang::default(),
+            hwdec: true,
+            seek_short: 5.0,
+            seek_long: 30.0,
             path: None,
         }
     }

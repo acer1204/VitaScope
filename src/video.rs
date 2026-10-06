@@ -280,7 +280,10 @@ unsafe fn create_target(gl: &glow::Context, w: i32, h: i32) -> Result<Target, St
         if status != glow::FRAMEBUFFER_COMPLETE {
             gl.delete_framebuffer(fbo);
             gl.delete_texture(tex);
-            return Err(format!("framebuffer 不完整（0x{status:x}）"));
+            return Err(crate::tf!(
+                "framebuffer 不完整（0x{status:x}）",
+                "incomplete framebuffer (0x{status:x})"
+            ));
         }
         Ok(Target { fbo, tex, size: [w, h] })
     }
@@ -290,7 +293,10 @@ unsafe fn create_target(gl: &glow::Context, w: i32, h: i32) -> Result<Target, St
 unsafe fn create_quad(gl: &glow::Context) -> Result<Quad, String> {
     let version = egui_glow::ShaderVersion::get(gl);
     if !version.is_new_shader_interface() {
-        return Err(format!("GLSL 版本太舊（{version:?}）"));
+        return Err(crate::tf!(
+            "GLSL 版本太舊（{version:?}）",
+            "GLSL version too old ({version:?})"
+        ));
     }
     let header = version.version_declaration();
     let precision = if header.contains(" es") {

@@ -65,11 +65,11 @@ impl Geometry {
     }
 
     pub fn aspect_label(&self) -> &'static str {
-        self.aspect.map_or("原始比例", |i| ASPECTS[i].0)
+        self.aspect.map_or(crate::tr!("原始比例", "Original"), |i| ASPECTS[i].0)
     }
 
     pub fn crop_label(&self) -> &'static str {
-        self.crop.map_or("不裁切", |i| CROPS[i].0)
+        self.crop.map_or(crate::tr!("不裁切", "No crop"), |i| CROPS[i].0)
     }
 }
 

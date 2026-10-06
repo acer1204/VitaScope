@@ -94,6 +94,6 @@ impl VitascopeApp {
         self.info_cache = None;
         let text = mediainfo::to_text(&self.info_sections());
         ctx.copy_text(text);
-        self.osd("已複製媒體資訊");
+        self.osd(crate::tr!("已複製媒體資訊", "Media info copied"));
     }
 }

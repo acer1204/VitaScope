@@ -58,7 +58,7 @@ pub fn interpret(json: &str, current: &str) -> UpdateStatus {
     match tag {
         Some(latest) if is_newer(&latest, current) => UpdateStatus::Available { latest },
         Some(latest) => UpdateStatus::UpToDate { latest },
-        None => UpdateStatus::Failed("GitHub 的回應格式不正確".into()),
+        None => UpdateStatus::Failed(crate::tr!("GitHub 的回應格式不正確", "Unexpected response from GitHub").into()),
     }
 }
 
@@ -76,10 +76,10 @@ pub fn check_blocking() -> UpdateStatus {
     match response {
         Ok(mut r) => match r.body_mut().read_to_string() {
             Ok(body) => interpret(&body, current_version()),
-            Err(e) => UpdateStatus::Failed(format!("讀取回應失敗：{e}")),
+            Err(e) => UpdateStatus::Failed(crate::tf!("讀取回應失敗：{e}", "Cannot read the response: {e}")),
         },
         Err(ureq::Error::StatusCode(code)) => from_http_status(code),
-        Err(e) => UpdateStatus::Failed(format!("無法連線到 GitHub：{e}")),
+        Err(e) => UpdateStatus::Failed(crate::tf!("無法連線到 GitHub：{e}", "Cannot connect to GitHub: {e}")),
     }
 }
 
@@ -89,8 +89,17 @@ fn from_http_status(code: u16) -> UpdateStatus {
         // 沒有任何 Release 時，GitHub 回 404
         404 => UpdateStatus::NoRelease,
         // 未登入的查詢每小時限 60 次（以 IP 計算，公司或宿舍網路可能共用額度）
-        403 | 429 => UpdateStatus::Failed("GitHub 暫時限制查詢次數，請稍後再試，或直接開啟發佈頁面".into()),
-        _ => UpdateStatus::Failed(format!("GitHub 回應錯誤（HTTP {code}）")),
+        403 | 429 => UpdateStatus::Failed(
+            crate::tr!(
+                "GitHub 暫時限制查詢次數，請稍後再試，或直接開啟發佈頁面",
+                "GitHub is rate-limiting requests. Try again later, or open the releases page"
+            )
+            .into(),
+        ),
+        _ => UpdateStatus::Failed(crate::tf!(
+            "GitHub 回應錯誤（HTTP {code}）",
+            "GitHub returned an error (HTTP {code})"
+        )),
     }
 }
 
@@ -98,7 +107,10 @@ fn from_http_status(code: u16) -> UpdateStatus {
 pub fn check_in_background(on_done: impl Fn() + Send + 'static) -> Arc<Mutex<UpdateStatus>> {
     let status = Arc::new(Mutex::new(UpdateStatus::Checking));
     let slot = status.clone();
+    // 介面語言記在執行緒上：背景執行緒產生的訊息也要用同一個語言
+    let lang = crate::i18n::lang();
     std::thread::spawn(move || {
+        crate::i18n::set_lang(lang);
         let result = check_blocking();
         if let Ok(mut s) = slot.lock() {
             *s = result;

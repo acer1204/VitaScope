@@ -224,7 +224,12 @@ impl Mpv {
         if api >> 16 != 2 {
             return Err(Error::new(
                 sys::mpv_error_MPV_ERROR_UNSUPPORTED,
-                format!("libmpv client API {}.{} 不相容（需要 2.x）", api >> 16, api & 0xffff),
+                crate::tf!(
+                    "libmpv client API {}.{} 不相容（需要 2.x）",
+                    "libmpv client API {}.{} is not compatible (2.x required)",
+                    api >> 16,
+                    api & 0xffff
+                ),
             ));
         }
 
@@ -242,7 +247,9 @@ impl Mpv {
                 eprintln!("[vitascope] 這個 libmpv 沒有選項 {name}，略過");
                 continue;
             }
-            check(code, || format!("設定選項 {name}={value}"))?;
+            check(code, || {
+                crate::tf!("設定選項 {name}={value}", "setting option {name}={value}")
+            })?;
         }
         check(unsafe { sys::mpv_initialize(mpv.raw()) }, || "mpv_initialize".into())?;
         Ok(mpv)
@@ -258,7 +265,7 @@ impl Mpv {
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         let code = unsafe { sys::mpv_command(self.raw(), ptrs.as_mut_ptr()) };
-        check(code, || format!("指令 {}", args.join(" ")))
+        check(code, || crate::tf!("指令 {}", "command {}", args.join(" ")))
     }
 
     /// 非同步指令，結果以 `Event::CommandReply { id }` 回報。
@@ -267,20 +274,20 @@ impl Mpv {
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         let code = unsafe { sys::mpv_command_async(self.raw(), id, ptrs.as_mut_ptr()) };
-        check(code, || format!("非同步指令 {}", args.join(" ")))
+        check(code, || crate::tf!("非同步指令 {}", "async command {}", args.join(" ")))
     }
 
     pub fn set_property<T: PropertyValue>(&self, name: &str, value: T) -> Result<()> {
         let n = cstring(name);
         let code =
             value.with_raw(|format, data| unsafe { sys::mpv_set_property(self.raw(), n.as_ptr(), format, data) });
-        check(code, || format!("設定屬性 {name}"))
+        check(code, || crate::tf!("設定屬性 {name}", "setting property {name}"))
     }
 
     pub fn get_property<T: PropertyValue>(&self, name: &str) -> Result<T> {
         let n = cstring(name);
         T::read(|format, data| unsafe { sys::mpv_get_property(self.raw(), n.as_ptr(), format, data) })
-            .map_err(|code| Error::new(code, format!("讀取屬性 {name}")))
+            .map_err(|code| Error::new(code, crate::tf!("讀取屬性 {name}", "reading property {name}")))
     }
 
     /// 以字串讀取屬性。Node 型別（`track-list`、`metadata`…）會拿到 JSON。
@@ -291,7 +298,7 @@ impl Mpv {
     pub fn observe(&self, id: u64, name: &str, format: Format) -> Result<()> {
         let n = cstring(name);
         let code = unsafe { sys::mpv_observe_property(self.raw(), id, n.as_ptr(), format.raw()) };
-        check(code, || format!("觀察屬性 {name}"))
+        check(code, || crate::tf!("觀察屬性 {name}", "observing property {name}"))
     }
 
     /// 要求 mpv 把 `level` 以上的記錄訊息以 `Event::Log` 送來（"error"、"warn"、"info"…）。
@@ -329,7 +336,7 @@ impl Mpv {
             sys::mpv_event_id_MPV_EVENT_END_FILE => {
                 let e = unsafe { &*(ev.data as *const sys::mpv_event_end_file) };
                 let reason = EndReason::from_raw(e.reason);
-                let error = (e.error < 0).then(|| Error::new(e.error, "播放失敗"));
+                let error = (e.error < 0).then(|| Error::new(e.error, crate::tr!("播放失敗", "Playback failed")));
                 Event::EndFile { reason, error }
             }
             sys::mpv_event_id_MPV_EVENT_VIDEO_RECONFIG => Event::VideoReconfig,
@@ -346,7 +353,7 @@ impl Mpv {
             }
             sys::mpv_event_id_MPV_EVENT_COMMAND_REPLY => Event::CommandReply {
                 id: ev.reply_userdata,
-                result: check(ev.error, || "非同步指令".into()),
+                result: check(ev.error, || crate::tr!("非同步指令", "async command").into()),
             },
             sys::mpv_event_id_MPV_EVENT_QUEUE_OVERFLOW => Event::QueueOverflow,
             other => Event::Other(other),

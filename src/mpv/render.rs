@@ -61,7 +61,13 @@ impl RenderContext {
         ];
         let mut ctx: *mut sys::mpv_render_context = std::ptr::null_mut();
         let code = unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) };
-        check(code, || "建立 mpv OpenGL render context".into())?;
+        check(code, || {
+            crate::tr!(
+                "建立 mpv OpenGL render context",
+                "creating the mpv OpenGL render context"
+            )
+            .into()
+        })?;
         Ok(Self {
             ctx,
             _gpa: Some(gpa),
@@ -84,7 +90,13 @@ impl RenderContext {
         ];
         let mut ctx: *mut sys::mpv_render_context = std::ptr::null_mut();
         let code = unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) };
-        check(code, || "建立 mpv 軟體 render context".into())?;
+        check(code, || {
+            crate::tr!(
+                "建立 mpv 軟體 render context",
+                "creating the mpv software render context"
+            )
+            .into()
+        })?;
         Ok(Self {
             ctx,
             _gpa: None,
@@ -122,7 +134,7 @@ impl RenderContext {
             },
         ];
         let code = unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) };
-        check(code, || "mpv 軟體繪圖".into())
+        check(code, || crate::tr!("mpv 軟體繪圖", "mpv software rendering").into())
     }
 
     /// 有新影格要畫、或需要重繪時呼叫 `f`。跟 wakeup callback 一樣，

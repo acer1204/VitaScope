@@ -5,7 +5,7 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use vitascope::app::{APP_NAME, Launch, VitascopeApp};
+use vitascope::app::{Launch, VitascopeApp, app_name};
 use vitascope::autoshot::AutoShot;
 use vitascope::history::History;
 use vitascope::player::{Options, Player};
@@ -63,6 +63,14 @@ fn parse_args() -> Launch {
 fn main() -> eframe::Result {
     let launch = parse_args();
 
+    // 自動截圖讀使用者的設定（字幕外觀之類的），但不寫回去
+    let settings = if launch.autoshot.is_some() {
+        Settings::load().detached()
+    } else {
+        Settings::load()
+    };
+    vitascope::i18n::set_lang(settings.language);
+
     // mpv 有新事件時要喚醒 egui；egui 的 Context 要等視窗建立後才有，先留一個位置
     let egui_ctx: Arc<OnceLock<egui::Context>> = Arc::new(OnceLock::new());
     let wake = egui_ctx.clone();
@@ -72,20 +80,18 @@ fn main() -> eframe::Result {
                 ctx.request_repaint();
             }
         })),
+        hwdec: if settings.hwdec { "auto-safe" } else { "no" }.into(),
         ..Options::default()
     }) {
         Ok(p) => p,
-        Err(e) => fatal(&format!("無法啟動播放引擎 libmpv：\n{e}")),
+        Err(e) => fatal(&vitascope::tf!(
+            "無法啟動播放引擎 libmpv：\n{e}",
+            "Cannot start the libmpv playback engine:\n{e}"
+        )),
     };
 
-    // 自動截圖讀使用者的設定（字幕外觀之類的），但不寫回去
-    let settings = if launch.autoshot.is_some() {
-        Settings::load().detached()
-    } else {
-        Settings::load()
-    };
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title(APP_NAME)
+        .with_title(app_name())
         .with_inner_size([960.0, 600.0])
         .with_min_inner_size([vitascope::app::MIN_WINDOW_WIDTH, 300.0])
         .with_drag_and_drop(true);
@@ -118,8 +124,9 @@ fn main() -> eframe::Result {
     );
     // 發佈版沒有主控台，視窗開不起來（例如顯示卡不支援 OpenGL 3）時要用對話框告訴使用者
     if let Err(e) = &result {
-        fatal(&format!(
-            "無法開啟播放器視窗：\n{e}\n\n請確認顯示卡驅動程式已安裝，並支援 OpenGL 3.0 以上。"
+        fatal(&vitascope::tf!(
+            "無法開啟播放器視窗：\n{e}\n\n請確認顯示卡驅動程式已安裝，並支援 OpenGL 3.0 以上。",
+            "Cannot open the player window:\n{e}\n\nMake sure a graphics driver with OpenGL 3.0 or later is installed."
         ));
     }
     result
@@ -130,7 +137,7 @@ fn fatal(message: &str) -> ! {
     eprintln!("[vitascope] {message}");
     rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
-        .set_title(APP_NAME)
+        .set_title(app_name())
         .set_description(message)
         .show();
     std::process::exit(1)

@@ -139,7 +139,7 @@ impl Track {
             detail.push(format!("{ch}ch"));
         }
         if self.external {
-            detail.push("外掛".into());
+            detail.push(crate::tr!("外掛", "external").into());
         }
         if !detail.is_empty() {
             s += &format!(" · {}", detail.join(" "));
@@ -588,7 +588,7 @@ impl Player {
         }
         let path = crate::geometry::flip_shader_path(horizontal).map_err(|e| mpv::Error {
             code: libmpv2_sys::mpv_error_MPV_ERROR_GENERIC,
-            context: format!("無法寫出翻轉用的著色器：{e}"),
+            context: crate::tf!("無法寫出翻轉用的著色器：{e}", "Cannot write the flip shader: {e}"),
         })?;
         let path = path.to_string_lossy();
         let listed = self
@@ -677,7 +677,11 @@ impl Player {
             .unwrap_or_else(|| info.original.clone());
         let sub = subs::load_as(&info.original, &video, encoding).map_err(|e| mpv::Error {
             code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
-            context: format!("無法讀取字幕 {}：{e}", info.original.display()),
+            context: crate::tf!(
+                "無法讀取字幕 {}：{e}",
+                "Cannot read subtitle {}: {e}",
+                info.original.display()
+            ),
         })?;
         // 用 select（不是 cached）：換成同樣內容的編碼時，cached 會選回舊的那條，接著就被移除了
         self.add_external(&sub, AddMode::Select)?;
@@ -749,7 +753,11 @@ impl Player {
     fn add_external(&mut self, sub: &ExternalSub, mode: AddMode) -> mpv::Result<()> {
         let path = sub.load_path().map_err(|e| mpv::Error {
             code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
-            context: format!("無法轉換字幕 {}：{e}", sub.path.display()),
+            context: crate::tf!(
+                "無法轉換字幕 {}：{e}",
+                "Cannot convert subtitle {}: {e}",
+                sub.path.display()
+            ),
         })?;
         let path = path.to_string_lossy().into_owned();
         // 記住轉碼後的檔案對應到哪個原始檔，之後才能用別的編碼重新載入
@@ -833,6 +841,11 @@ impl Player {
 
     pub fn get_f64(&self, name: &str) -> mpv::Result<f64> {
         self.mpv.get_property::<f64>(name)
+    }
+
+    /// 硬體解碼開關（設定視窗；換檔時才完全生效，mpv 會盡量馬上切換）
+    pub fn set_hwdec(&self, on: bool) -> mpv::Result<()> {
+        self.mpv.set_property("hwdec", if on { "auto-safe" } else { "no" })
     }
 
     pub fn get_i64(&self, name: &str) -> mpv::Result<i64> {
@@ -1086,17 +1099,29 @@ impl Player {
         // 常見情況直接翻成中文；其他的附上 mpv 的原始訊息，方便回報問題
         let all = self.recent_errors.join("\n");
         let known = [
-            ("No such file", "找不到檔案"),
-            ("Failed to open", "檔案不存在，或沒有讀取權限"),
-            ("Permission denied", "沒有讀取權限"),
-            ("Failed to recognize file format", "無法辨識的檔案格式"),
-            ("No video or audio streams", "檔案裡沒有可播放的影像或聲音"),
+            ("No such file", crate::tr!("找不到檔案", "file not found")),
+            (
+                "Failed to open",
+                crate::tr!(
+                    "檔案不存在，或沒有讀取權限",
+                    "the file does not exist or cannot be read"
+                ),
+            ),
+            ("Permission denied", crate::tr!("沒有讀取權限", "permission denied")),
+            (
+                "Failed to recognize file format",
+                crate::tr!("無法辨識的檔案格式", "Unrecognized file format"),
+            ),
+            (
+                "No video or audio streams",
+                crate::tr!("檔案裡沒有可播放的影像或聲音", "No playable video or audio in the file"),
+            ),
         ];
         if let Some((_, zh)) = known.iter().find(|(en, _)| all.contains(en)) {
-            return format!("{base}：{zh}");
+            return crate::tf!("{base}：{zh}", "{base}: {zh}");
         }
         match self.recent_errors.last() {
-            Some(detail) => format!("{base}（{detail}）"),
+            Some(detail) => crate::tf!("{base}（{detail}）", "{base} ({detail})"),
             None => base.to_owned(),
         }
     }
@@ -1121,13 +1146,15 @@ fn display_size(json: &str) -> Option<[i64; 2]> {
 fn failure_reason(code: i32) -> &'static str {
     use libmpv2_sys as sys;
     match code {
-        sys::mpv_error_MPV_ERROR_LOADING_FAILED => "無法載入檔案",
-        sys::mpv_error_MPV_ERROR_UNKNOWN_FORMAT => "無法辨識的檔案格式",
-        sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY => "檔案裡沒有可播放的影像或聲音",
-        sys::mpv_error_MPV_ERROR_AO_INIT_FAILED => "無法開啟音訊裝置",
-        sys::mpv_error_MPV_ERROR_VO_INIT_FAILED => "無法初始化影像輸出",
-        sys::mpv_error_MPV_ERROR_UNSUPPORTED => "不支援的格式",
-        _ => "播放失敗",
+        sys::mpv_error_MPV_ERROR_LOADING_FAILED => crate::tr!("無法載入檔案", "Cannot load the file"),
+        sys::mpv_error_MPV_ERROR_UNKNOWN_FORMAT => crate::tr!("無法辨識的檔案格式", "Unrecognized file format"),
+        sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY => {
+            crate::tr!("檔案裡沒有可播放的影像或聲音", "No playable video or audio in the file")
+        }
+        sys::mpv_error_MPV_ERROR_AO_INIT_FAILED => crate::tr!("無法開啟音訊裝置", "Cannot open the audio device"),
+        sys::mpv_error_MPV_ERROR_VO_INIT_FAILED => crate::tr!("無法初始化影像輸出", "Cannot initialize video output"),
+        sys::mpv_error_MPV_ERROR_UNSUPPORTED => crate::tr!("不支援的格式", "Unsupported format"),
+        _ => crate::tr!("播放失敗", "Playback failed"),
     }
 }
 

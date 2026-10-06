@@ -166,7 +166,7 @@ pub fn audio_device_name(player: &Player) -> Option<String> {
     }
     let current = player.get_string("audio-device").ok()?;
     if current == "auto" {
-        return Some("預設裝置".to_owned());
+        return Some(crate::tr!("預設裝置", "Default device").to_owned());
     }
     let list: Vec<Device> = json(player, "audio-device-list").unwrap_or_default();
     Some(
@@ -255,7 +255,7 @@ pub fn dynamic_range(vp: &VideoParams, video: Option<&TrackInfo>) -> String {
             }
         }
         Some("hlg") => "HLG".to_owned(),
-        _ if wide => "SDR（廣色域）".to_owned(),
+        _ if wide => crate::tr!("SDR（廣色域）", "SDR (wide gamut)").to_owned(),
         _ => "SDR".to_owned(),
     }
 }
@@ -304,12 +304,12 @@ pub fn container_name(format: &str) -> String {
     let first = format.split(',').next().unwrap_or(format);
     match first {
         "mov" => "MP4 / MOV".to_owned(),
-        "mkv" | "matroska" => "Matroska（MKV / WebM）".to_owned(),
+        "mkv" | "matroska" => crate::tr!("Matroska（MKV / WebM）", "Matroska (MKV / WebM)").to_owned(),
         "mpegts" => "MPEG-TS".to_owned(),
         "mpeg" => "MPEG-PS".to_owned(),
         "avi" => "AVI".to_owned(),
         "flv" => "FLV".to_owned(),
-        "asf" => "ASF（WMV）".to_owned(),
+        "asf" => crate::tr!("ASF（WMV）", "ASF (WMV)").to_owned(),
         "ogg" => "Ogg".to_owned(),
         "mp3" => "MP3".to_owned(),
         "flac" => "FLAC".to_owned(),
@@ -321,7 +321,7 @@ pub fn container_name(format: &str) -> String {
 /// 硬體解碼的說明
 pub fn hwdec_label(hwdec: Option<&str>) -> String {
     match hwdec {
-        None | Some("") | Some("no") => "軟體解碼".to_owned(),
+        None | Some("") | Some("no") => crate::tr!("軟體解碼", "Software decoding").to_owned(),
         Some(h) => {
             let (api, copy) = match h.strip_suffix("-copy") {
                 Some(api) => (api, true),
@@ -338,9 +338,12 @@ pub fn hwdec_label(hwdec: Option<&str>) -> String {
                 other => other,
             };
             if copy {
-                format!("硬體解碼（{api}，複製回記憶體）")
+                crate::tf!(
+                    "硬體解碼（{api}，複製回記憶體）",
+                    "Hardware decoding ({api}, copy-back)"
+                )
             } else {
-                format!("硬體解碼（{api}）")
+                crate::tf!("硬體解碼（{api}）", "Hardware decoding ({api})")
             }
         }
     }
@@ -349,10 +352,10 @@ pub fn hwdec_label(hwdec: Option<&str>) -> String {
 /// 聲道：stereo → 立體聲、5.1(side) → 5.1
 pub fn channels_label(hr: Option<&str>, count: Option<i64>) -> Option<String> {
     let label = match hr {
-        Some("mono") => "單聲道".to_owned(),
-        Some("stereo") => "立體聲".to_owned(),
+        Some("mono") => crate::tr!("單聲道", "Mono").to_owned(),
+        Some("stereo") => crate::tr!("立體聲", "Stereo").to_owned(),
         Some(h) => h.split('(').next().unwrap_or(h).to_owned(),
-        None => format!("{} 聲道", count?),
+        None => crate::tf!("{} 聲道", "{} channels", count?),
     };
     Some(label)
 }
@@ -375,12 +378,12 @@ fn lang_label(lang: Option<&str>) -> Option<String> {
     let lang = lang?;
     Some(
         match lang.to_ascii_lowercase().as_str() {
-            "chi" | "zho" | "zh" => "中文",
-            "zh-tw" | "zh-hant" | "cht" => "繁體中文",
-            "zh-cn" | "zh-hans" | "chs" => "簡體中文",
-            "eng" | "en" => "英文",
-            "jpn" | "ja" => "日文",
-            "kor" | "ko" => "韓文",
+            "chi" | "zho" | "zh" => crate::tr!("中文", "Chinese"),
+            "zh-tw" | "zh-hant" | "cht" => crate::tr!("繁體中文", "Traditional Chinese"),
+            "zh-cn" | "zh-hans" | "chs" => crate::tr!("簡體中文", "Simplified Chinese"),
+            "eng" | "en" => crate::tr!("英文", "English"),
+            "jpn" | "ja" => crate::tr!("日文", "Japanese"),
+            "kor" | "ko" => crate::tr!("韓文", "Korean"),
             other => return Some(other.to_owned()),
         }
         .to_owned(),
@@ -406,16 +409,20 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
     if let Some(d) = info.duration.filter(|d| *d > 0.0) {
         facts.push(crate::app::fmt_time(d));
         if let Some(size) = info.file_size.filter(|s| *s > 0) {
-            facts.push(format!("總位元率 {}", fmt_bitrate((size as f64 * 8.0 / d) as i64)));
+            facts.push(crate::tf!(
+                "總位元率 {}",
+                "Overall bitrate {}",
+                fmt_bitrate((size as f64 * 8.0 / d) as i64)
+            ));
         }
     }
     if let Some(n) = info.chapters {
-        facts.push(format!("{n} 個章節"));
+        facts.push(crate::tf!("{n} 個章節", "{n} chapters"));
     }
     if !facts.is_empty() {
         file.push(facts.join(" · "));
     }
-    out.push(("檔案", file));
+    out.push((crate::tr!("檔案", "File"), file));
 
     // 影像（專輯封面不算）
     if let Some(v) = info.video.as_ref().filter(|v| !v.albumart && !v.image) {
@@ -426,22 +433,22 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
                 let aspect = vp
                     .aspect
                     .map(aspect_name)
-                    .map(|a| format!("（{a}）"))
+                    .map(|a| crate::tf!("（{a}）", " ({a})"))
                     .unwrap_or_default();
                 size.push(format!("{w}×{h}{aspect}"));
             }
             if let Some(fps) = info.container_fps {
                 let mut s = format!("{} fps", fmt_fps(fps));
                 if let Some(real) = live.vf_fps.filter(|r| (r - fps).abs() / fps > 0.02) {
-                    s.push_str(&format!("（實測 {}）", fmt_fps(real)));
+                    s.push_str(&crate::tf!("（實測 {}）", " (measured {})", fmt_fps(real)));
                 }
                 size.push(s);
             }
             if let Some(par) = vp.par.filter(|p| (p - 1.0).abs() > 0.01) {
-                size.push(format!("像素比例 {par:.3}"));
+                size.push(crate::tf!("像素比例 {par:.3}", "Pixel aspect {par:.3}"));
             }
             if let Some(r) = vp.rotate.filter(|r| *r != 0) {
-                size.push(format!("旋轉 {r}°"));
+                size.push(crate::tf!("旋轉 {r}°", "Rotated {r}°"));
             }
             if !size.is_empty() {
                 lines.push(size.join(" · "));
@@ -480,11 +487,11 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
             .or_else(|| {
                 v.demux_bitrate
                     .filter(|b| *b > 0)
-                    .map(|b| format!("{}（標示）", fmt_bitrate(b)))
+                    .map(|b| crate::tf!("{}（標示）", "{} (declared)", fmt_bitrate(b)))
             })
-            .unwrap_or_else(|| "計算中…".to_owned());
-        lines.push(format!("位元率 {bitrate}"));
-        out.push(("影像", lines));
+            .unwrap_or_else(|| crate::tr!("計算中…", "measuring…").to_owned());
+        lines.push(crate::tf!("位元率 {bitrate}", "Bitrate {bitrate}"));
+        out.push((crate::tr!("影像", "Video"), lines));
     }
 
     // 音訊
@@ -509,7 +516,7 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
             facts.push(l);
         }
         if a.external {
-            facts.push("外掛".to_owned());
+            facts.push(crate::tr!("外掛", "external").to_owned());
         }
         let mut lines = vec![facts.join(" · ")];
         let output = [
@@ -520,9 +527,9 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
         .flatten()
         .collect::<Vec<_>>();
         if !output.is_empty() {
-            lines.push(format!("輸出 {}", output.join(" · ")));
+            lines.push(crate::tf!("輸出 {}", "Output {}", output.join(" · ")));
         }
-        out.push(("音訊", lines));
+        out.push((crate::tr!("音訊", "Audio"), lines));
     }
 
     // 字幕
@@ -536,7 +543,14 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
         } else if let Some(l) = lang_label(s.lang.as_deref()) {
             facts.push(l);
         }
-        facts.push(if s.external { "外掛" } else { "內嵌" }.to_owned());
+        facts.push(
+            if s.external {
+                crate::tr!("外掛", "external")
+            } else {
+                crate::tr!("內嵌", "embedded")
+            }
+            .to_owned(),
+        );
         facts.join(" · ")
     };
     let mut subs = Vec::new();
@@ -544,10 +558,10 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
         subs.push(sub_line(s));
     }
     if let Some(s) = &info.sub2 {
-        subs.push(format!("第二字幕 {}", sub_line(s)));
+        subs.push(crate::tf!("第二字幕 {}", "Secondary {}", sub_line(s)));
     }
     if !subs.is_empty() {
-        out.push(("字幕", subs));
+        out.push((crate::tr!("字幕", "Subtitles"), subs));
     }
 
     // 播放狀態
@@ -556,14 +570,19 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
         let drops = [live.vo_drops, live.decoder_drops];
         if drops.iter().any(Option::is_some) {
             let n = |v: Option<i64>| v.map_or("-".to_owned(), |v| v.to_string());
-            stats.push(format!("掉格 {}（畫面）/ {}（解碼）", n(drops[0]), n(drops[1])));
+            stats.push(crate::tf!(
+                "掉格 {}（畫面）/ {}（解碼）",
+                "Dropped frames {} (output) / {} (decoder)",
+                n(drops[0]),
+                n(drops[1])
+            ));
         }
     }
     if let Some(av) = live.avsync {
-        stats.push(format!("影音差 {:+.0} ms", av * 1000.0));
+        stats.push(crate::tf!("影音差 {:+.0} ms", "A/V sync {:+.0} ms", av * 1000.0));
     }
     if !stats.is_empty() {
-        out.push(("狀態", vec![stats.join(" · ")]));
+        out.push((crate::tr!("狀態", "Status"), vec![stats.join(" · ")]));
     }
     out
 }

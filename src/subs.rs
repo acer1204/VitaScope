@@ -344,16 +344,24 @@ pub fn belongs_to(name: &str, stem: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', ' ', '_', '-', '[', '(']))
 }
 
-/// 選單「字幕編碼」的選項：（顯示名稱, encoding_rs 的編碼）
-pub const ENCODINGS: &[(&str, &encoding_rs::Encoding)] = &[
-    ("UTF-8", encoding_rs::UTF_8),
-    ("Big5（繁體中文）", encoding_rs::BIG5),
-    ("GB18030 / GBK（簡體中文）", encoding_rs::GB18030),
-    ("Shift_JIS（日文）", encoding_rs::SHIFT_JIS),
-    ("EUC-KR（韓文）", encoding_rs::EUC_KR),
-    ("UTF-16LE", encoding_rs::UTF_16LE),
-    ("UTF-16BE", encoding_rs::UTF_16BE),
-    ("Windows-1252（西歐）", encoding_rs::WINDOWS_1252),
+/// 選單「字幕編碼」的選項：（中文名稱, 英文名稱, encoding_rs 的編碼）
+pub const ENCODINGS: &[(&str, &str, &encoding_rs::Encoding)] = &[
+    ("UTF-8", "UTF-8", encoding_rs::UTF_8),
+    ("Big5（繁體中文）", "Big5 (Traditional Chinese)", encoding_rs::BIG5),
+    (
+        "GB18030 / GBK（簡體中文）",
+        "GB18030 / GBK (Simplified Chinese)",
+        encoding_rs::GB18030,
+    ),
+    ("Shift_JIS（日文）", "Shift_JIS (Japanese)", encoding_rs::SHIFT_JIS),
+    ("EUC-KR（韓文）", "EUC-KR (Korean)", encoding_rs::EUC_KR),
+    ("UTF-16LE", "UTF-16LE", encoding_rs::UTF_16LE),
+    ("UTF-16BE", "UTF-16BE", encoding_rs::UTF_16BE),
+    (
+        "Windows-1252（西歐）",
+        "Windows-1252 (Western)",
+        encoding_rs::WINDOWS_1252,
+    ),
 ];
 
 /// 讀取並分析一個外掛字幕檔（自動判斷編碼）
@@ -401,7 +409,10 @@ pub fn load_as(
     }
 
     if std::fs::metadata(path)?.len() > MAX_TEXT_SIZE {
-        return Err(std::io::Error::other("檔案太大，不像字幕"));
+        return Err(std::io::Error::other(crate::tr!(
+            "檔案太大，不像字幕",
+            "file too large to be a subtitle"
+        )));
     }
     let bytes = std::fs::read(path)?;
     let (text, encoding) = match encoding {

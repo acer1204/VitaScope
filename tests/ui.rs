@@ -2110,3 +2110,101 @@ fn opening_the_playlist_scrolls_to_the_current_file() {
     let len = playlist_len(h.state());
     h.get_by_label(&format!("{len}. webm_vp9p2_opus.webm"));
 }
+
+// ───────────── 設定視窗、介面語言 ─────────────
+
+#[test]
+fn f5_opens_settings_and_escape_closes_them() {
+    let mut h = harness(None);
+    h.step();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("一般");
+    h.get_by_label("快捷鍵").click();
+    h.run_steps(2);
+    h.get_by_label("擷取畫面（存檔）");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("快捷鍵").is_none(), "Esc 關閉設定視窗");
+}
+
+#[test]
+fn switching_the_language_to_english_updates_the_whole_ui() {
+    let mut h = harness(None);
+    h.step();
+    h.get_by_label_contains("拖放到這裡");
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    // 下拉選單的值是目前的語言
+    h.get_by_value("繁體中文").click();
+    h.run_steps(2);
+    h.get_by_label("English").click();
+    h.run_steps(3);
+    assert_eq!(h.state().settings().language, vitascope::i18n::Lang::En);
+    h.get_by_label("General");
+    h.get_by_label("Playback");
+    h.get_by_label_contains("Drop a video here");
+    assert!(h.query_by_label_contains("拖放到這裡").is_none());
+    // 換回中文
+    h.get_by_value("English").click();
+    h.run_steps(2);
+    h.get_by_label("繁體中文").click();
+    h.run_steps(3);
+    h.get_by_label_contains("拖放到這裡");
+}
+
+#[test]
+fn english_menus_and_messages() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.get_by_label("Subtitles");
+    h.get_by_label("Audio");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("Open file");
+    h.get_by_label_contains("Speed (1×)");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 媒體資訊也是英文
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("640×360 (16:9)");
+    // 「Video」：影片畫面本身和媒體資訊的「影像」
+    assert_eq!(h.query_all_by_label("Video").count(), 2);
+}
+
+#[test]
+fn seek_step_comes_from_the_settings() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    // 樣本的關鍵影格很稀疏，跳轉會落在附近的關鍵影格：用 40 秒才分得出跟預設的 5 秒不一樣
+    settings.seek_short = 40.0;
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings); // 90 秒
+    settle(&mut h, "mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t0 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "前進 40 秒", |s| s.time_pos >= t0 + 30.0);
+}
+
+#[test]
+fn hardware_decoding_can_be_switched_in_the_settings() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("播放").click();
+    h.run_steps(2);
+    // 預設開著：關掉、再打開
+    h.get_by_label("硬體解碼").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().hwdec);
+    assert_eq!(prop(&h, "hwdec"), "no");
+    h.get_by_label("硬體解碼").click();
+    h.run_steps(2);
+    assert!(h.state().settings().hwdec);
+    assert_eq!(prop(&h, "hwdec"), "auto-safe");
+}

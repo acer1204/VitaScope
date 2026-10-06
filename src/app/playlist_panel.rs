@@ -96,61 +96,83 @@ impl VitascopeApp {
 
         ui.horizontal(|ui| {
             let title = match current {
-                Some(i) => format!("播放清單（{}/{count}）", i + 1),
-                None => format!("播放清單（{count}）"),
+                Some(i) => crate::tf!("播放清單（{}/{count}）", "Playlist ({}/{count})", i + 1),
+                None => crate::tf!("播放清單（{count}）", "Playlist ({count})"),
             };
             ui.strong(title);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(icon_button("×")).on_hover_text("關閉（F6）").clicked() {
+                if ui
+                    .add(icon_button("×"))
+                    .on_hover_text(crate::tr!("關閉（F6）", "Close (F6)"))
+                    .clicked()
+                {
                     op = Some(ListOp::Close);
                 }
                 ui.menu_button("…", |ui| {
-                    if ui.button("加入檔案…").clicked() {
+                    if ui.button(crate::tr!("加入檔案…", "Add files…")).clicked() {
                         op = Some(ListOp::AddFiles);
                     }
-                    if ui.button("加入資料夾…").clicked() {
+                    if ui.button(crate::tr!("加入資料夾…", "Add folder…")).clicked() {
                         op = Some(ListOp::AddFolder);
                     }
-                    if ui.add_enabled(count > 1, egui::Button::new("依檔名排序")).clicked() {
+                    if ui
+                        .add_enabled(count > 1, egui::Button::new(crate::tr!("依檔名排序", "Sort by name")))
+                        .clicked()
+                    {
                         op = Some(ListOp::Sort);
                     }
                     if ui
                         .add_enabled(
                             selected.is_some(),
-                            egui::Button::new("移除選取的項目").shortcut_text("Delete"),
+                            egui::Button::new(crate::tr!("移除選取的項目", "Remove selected")).shortcut_text("Delete"),
                         )
                         .clicked()
                         && let Some(i) = selected
                     {
                         op = Some(ListOp::Remove(i));
                     }
-                    if ui.add_enabled(count > 0, egui::Button::new("清空清單")).clicked() {
+                    if ui
+                        .add_enabled(count > 0, egui::Button::new(crate::tr!("清空清單", "Clear")))
+                        .clicked()
+                    {
                         op = Some(ListOp::Clear);
                     }
                     ui.separator();
-                    if ui.button("開啟播放清單檔…").clicked() {
+                    if ui
+                        .button(crate::tr!("開啟播放清單檔…", "Open playlist file…"))
+                        .clicked()
+                    {
                         op = Some(ListOp::Open);
                     }
                     if ui
-                        .add_enabled(count > 0, egui::Button::new("儲存播放清單檔…"))
+                        .add_enabled(
+                            count > 0,
+                            egui::Button::new(crate::tr!("儲存播放清單檔…", "Save playlist file…")),
+                        )
                         .clicked()
                     {
                         op = Some(ListOp::Save);
                     }
                 })
                 .response
-                .on_hover_text("加入檔案、排序、存成播放清單檔");
+                .on_hover_text(crate::tr!(
+                    "加入檔案、排序、存成播放清單檔",
+                    "Add files, sort, save as a playlist file"
+                ));
             });
         });
         ui.separator();
 
         let Some(list) = &self.playlist else {
-            ui.weak("還沒有播放清單。開啟或拖放影片，或從「…」加入檔案。");
+            ui.weak(crate::tr!(
+                "還沒有播放清單。開啟或拖放影片，或從「…」加入檔案。",
+                "No playlist yet. Open or drop videos, or add files from “…”."
+            ));
             self.apply_list_op(ui.ctx(), op);
             return;
         };
         if count == 0 {
-            ui.weak("清單是空的");
+            ui.weak(crate::tr!("清單是空的", "The list is empty"));
         }
         let ctx = ui.ctx().clone();
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
@@ -192,13 +214,13 @@ impl VitascopeApp {
                 }
                 let resp = resp.on_hover_text(path.to_string_lossy());
                 resp.context_menu(|ui| {
-                    if ui.button("播放").clicked() {
+                    if ui.button(crate::tr!("播放", "Play")).clicked() {
                         op = Some(ListOp::Play(i));
                     }
-                    if ui.button("從清單移除").clicked() {
+                    if ui.button(crate::tr!("從清單移除", "Remove from list")).clicked() {
                         op = Some(ListOp::Remove(i));
                     }
-                    if ui.button("複製路徑").clicked() {
+                    if ui.button(crate::tr!("複製路徑", "Copy path")).clicked() {
                         op = Some(ListOp::CopyPath(i));
                     }
                 });
@@ -261,7 +283,7 @@ impl VitascopeApp {
             ListOp::CopyPath(i) => {
                 if let Some(path) = self.playlist.as_ref().and_then(|l| l.items().get(i)) {
                     ctx.copy_text(path.to_string_lossy().into_owned());
-                    self.osd("已複製路徑");
+                    self.osd(crate::tr!("已複製路徑", "Path copied"));
                 }
             }
             ListOp::Sort => {
@@ -320,16 +342,19 @@ impl VitascopeApp {
         if !st.loaded && !st.loading {
             self.open(&first);
         } else {
-            self.osd(format!("加入播放清單：{added} 個檔案"));
+            self.osd(crate::tf!(
+                "加入播放清單：{added} 個檔案",
+                "Added to the playlist: {added} file(s)"
+            ));
         }
     }
 
     fn add_files_dialog(&mut self) {
         let mut dialog = self
             .file_dialog()
-            .set_title("加入播放清單")
-            .add_filter("影音檔案", &formats::all_media())
-            .add_filter("所有檔案", &["*"]);
+            .set_title(crate::tr!("加入播放清單", "Add to playlist"))
+            .add_filter(crate::tr!("影音檔案", "Media files"), &formats::all_media())
+            .add_filter(crate::tr!("所有檔案", "All files"), &["*"]);
         if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
             dialog = dialog.set_directory(dir);
         }
@@ -341,7 +366,11 @@ impl VitascopeApp {
 
     /// 加入資料夾：裡面的影音檔依檔名排序（網路磁碟上的大資料夾要掃一陣子，在背景掃）
     fn add_folder_dialog(&mut self) {
-        let Some(dir) = self.file_dialog().set_title("加入資料夾").pick_folder() else {
+        let Some(dir) = self
+            .file_dialog()
+            .set_title(crate::tr!("加入資料夾", "Add folder"))
+            .pick_folder()
+        else {
             return;
         };
         let (tx, rx) = mpsc::channel();
@@ -370,7 +399,7 @@ impl VitascopeApp {
             Ok(files) => {
                 self.folder_add = None;
                 if files.is_empty() {
-                    self.osd("資料夾裡沒有影音檔");
+                    self.osd(crate::tr!("資料夾裡沒有影音檔", "No media files in that folder"));
                 } else {
                     self.add_to_playlist(files);
                 }
@@ -383,8 +412,8 @@ impl VitascopeApp {
     fn open_playlist_dialog(&mut self) {
         if let Some(path) = self
             .file_dialog()
-            .set_title("開啟播放清單檔")
-            .add_filter("播放清單", formats::PLAYLIST)
+            .set_title(crate::tr!("開啟播放清單檔", "Open playlist file"))
+            .add_filter(crate::tr!("播放清單", "Playlist"), formats::PLAYLIST)
             .pick_file()
         {
             self.open_playlist_file(&path);
@@ -396,7 +425,7 @@ impl VitascopeApp {
         let entries = match m3u::read(path) {
             Ok(entries) => entries,
             Err(e) => {
-                self.osd(format!("無法開啟播放清單：{e}"));
+                self.osd(crate::tf!("無法開啟播放清單：{e}", "Cannot open the playlist: {e}"));
                 return;
             }
         };
@@ -407,7 +436,11 @@ impl VitascopeApp {
             .filter(|p| !formats::is_playlist(p))
             .collect();
         let Some(first) = files.first().cloned() else {
-            self.osd(format!("播放清單是空的：{}", file_name(path)));
+            self.osd(crate::tf!(
+                "播放清單是空的：{}",
+                "The playlist is empty: {}",
+                file_name(path)
+            ));
             return;
         };
         self.remember_position();
@@ -432,10 +465,10 @@ impl VitascopeApp {
         // 第一個篩選條件的副檔名是預設的（Windows）
         let mut dialog = self
             .file_dialog()
-            .set_title("儲存播放清單")
-            .add_filter("UTF-8 播放清單", &["m3u8"])
-            .add_filter("播放清單", &["m3u"])
-            .set_file_name("播放清單.m3u8");
+            .set_title(crate::tr!("儲存播放清單", "Save playlist"))
+            .add_filter(crate::tr!("UTF-8 播放清單", "UTF-8 playlist"), &["m3u8"])
+            .add_filter(crate::tr!("播放清單", "Playlist"), &["m3u"])
+            .set_file_name(crate::tr!("播放清單.m3u8", "Playlist.m3u8"));
         if let Some(dir) = list.items().first().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
@@ -445,8 +478,8 @@ impl VitascopeApp {
             path.set_extension("m3u8");
         }
         match m3u::write(&path, &entries) {
-            Ok(()) => self.osd(format!("已儲存播放清單：{}", file_name(&path))),
-            Err(e) => self.osd(format!("無法儲存播放清單：{e}")),
+            Ok(()) => self.osd(crate::tf!("已儲存播放清單：{}", "Playlist saved: {}", file_name(&path))),
+            Err(e) => self.osd(crate::tf!("無法儲存播放清單：{e}", "Cannot save the playlist: {e}")),
         }
     }
 
