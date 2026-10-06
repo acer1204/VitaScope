@@ -2273,6 +2273,54 @@ fn english_menus_and_messages() {
 }
 
 #[test]
+fn a_tall_window_is_moved_up_so_the_controls_stay_on_screen() {
+    // 實際遇到的：高 DPI 筆電（1707×960 點），系統把新視窗放在 (171, 171)；直式影片的視窗配合影片之後
+    // 下緣超出螢幕，控制列被工作列蓋住
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mov_hevc_aac_rot90.mov")), settings);
+    if let Some(v) = h.input_mut().viewports.get_mut(&egui::ViewportId::ROOT) {
+        v.monitor_size = Some(egui::vec2(1707.0, 960.0));
+        v.outer_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(171.0, 171.0),
+            egui::vec2(972.0, 635.0),
+        ));
+        v.inner_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(177.0, 206.0),
+            egui::vec2(960.0, 600.0),
+        ));
+    }
+    let mut size = None;
+    let mut moved = None;
+    let start = Instant::now();
+    while moved.is_none() && start.elapsed() < TIMEOUT {
+        h.step();
+        for c in h
+            .output()
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.commands.clone())
+            .unwrap_or_default()
+        {
+            match c {
+                egui::ViewportCommand::InnerSize(s) => size = Some(s),
+                egui::ViewportCommand::OuterPosition(p) => moved = Some(p),
+                _ => {}
+            }
+        }
+    }
+    let (size, moved) = (size.expect("視窗配合影片"), moved.expect("超出螢幕時要移回來"));
+    // 新的外框（加上標題列、邊框）要在螢幕裡，下面留給工作列
+    let bottom = moved.y + size.y + (635.0 - 600.0);
+    assert!(
+        bottom <= 960.0 - 48.0 + 0.5,
+        "下緣 {bottom} 不能被工作列蓋住（視窗高 {}）",
+        size.y
+    );
+    assert_eq!(moved.x, 171.0, "左右放得下就不動");
+}
+
+#[test]
 fn english_controls_fit_a_minimum_width_window() {
     // 直式、一小時以上的影片：視窗是最小寬度，英文的按鈕比較寬、時間比較長
     let mut settings = Settings::default();

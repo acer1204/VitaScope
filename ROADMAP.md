@@ -353,7 +353,7 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 97 個樣本（常見 35、通用 37、罕見 25） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 98 | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 99 | Windows、macOS、Linux |
 | 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
 | 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式、強制結束主視窗） | 6 | Windows、macOS、Linux |
 | 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 97（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |

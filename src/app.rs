@@ -39,6 +39,8 @@ const HIDE_AFTER: Duration = Duration::from_secs(2);
 const OSD_DURATION: Duration = Duration::from_millis(1500);
 /// 控制列完整顯示需要的寬度（也是視窗的最小寬度）
 pub const MIN_WINDOW_WIDTH: f32 = 640.0;
+/// 螢幕下方留給工作列（Windows）/ Dock（macOS）的高度，視窗不要被蓋住
+const TASKBAR_ALLOWANCE: f32 = 48.0;
 /// 播放中每隔多久把續播位置存起來（當機、關機時才不會整段遺失）
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 /// 右鍵選單的播放速度選項
@@ -1748,6 +1750,36 @@ impl VitascopeApp {
         }
         eprintln!("[vitascope] 視窗配合影片 {w}×{h} → {:.0}×{:.0}", target.x, target.y);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
+        self.keep_on_screen(ctx, target);
+    }
+
+    /// 視窗改大之後會超出螢幕的話（例如直式影片，下面的控制列被工作列蓋住），往上、往左移回螢幕裡。
+    /// 只知道螢幕大小、不知道螢幕在哪裡：視窗在主螢幕的範圍內才調整
+    fn keep_on_screen(&self, ctx: &egui::Context, inner: Vec2) {
+        let (outer, inner_rect, monitor) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.outer_rect, v.inner_rect, v.monitor_size)
+        });
+        let (Some(outer), Some(inner_rect), Some(monitor)) = (outer, inner_rect, monitor) else {
+            return;
+        };
+        if outer.min.x < 0.0 || outer.min.y < 0.0 || outer.min.x >= monitor.x || outer.min.y >= monitor.y {
+            return;
+        }
+        // 標題列與邊框
+        let frame = (outer.size() - inner_rect.size()).max(Vec2::ZERO);
+        let size = inner + frame;
+        let limit = monitor - vec2(0.0, TASKBAR_ALLOWANCE);
+        let mut pos = outer.min;
+        if pos.y + size.y > limit.y {
+            pos.y = (limit.y - size.y).max(0.0);
+        }
+        if pos.x + size.x > limit.x {
+            pos.x = (limit.x - size.x).max(0.0);
+        }
+        if pos != outer.min {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+        }
     }
 
     /// 長寬比、裁切、旋轉改了：視窗寬度不變，高度配合新的比例（不超過螢幕）
@@ -1770,7 +1802,9 @@ impl VitascopeApp {
         // 影片的寬度（不含播放清單）
         let width = (content.width() - self.playlist_width).max(1.0);
         let height = (width * h as f32 / w as f32 + self.controls_height).min(max_height);
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(content.width(), height)));
+        let size = vec2(content.width(), height);
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        self.keep_on_screen(ctx, size);
     }
 
     /// 測試用：直接設定檢查更新的結果（不連網）
