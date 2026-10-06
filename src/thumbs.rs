@@ -44,6 +44,9 @@ const OPTIONS: &[(&str, &str)] = &[
     // 第一次繪圖時不要去列舉系統字型（DirectWrite / fontconfig 要零點幾秒）
     ("sub-font-provider", "none"),
     ("osd-level", "0"),
+    // 不讓 mpv 自己處理檔案標示的旋轉：軟體繪圖不會轉，而且旋轉 90° 時它算的來源範圍會超出影格，
+    // 有開斷言的 libmpv（Linux、macOS）會直接中止整個程式。改成自己轉（解碼器參數裡的旋轉不受這個設定影響）
+    ("video-rotate", "no"),
     ("osc", "no"),
     ("ytdl", "no"),
     ("load-scripts", "no"),
