@@ -10,7 +10,24 @@ use vitascope::autoshot::AutoShot;
 use vitascope::player::{Options, Player};
 use vitascope::settings::Settings;
 
-/// 命令列：`vitascope [影片] [--fullscreen] [--shot 輸出.png [--shot-delay 秒]]`
+/// 印出版本後結束。會真的載入 libmpv，發佈流程用它確認打包出來的程式能執行
+fn print_version() -> ! {
+    let version = env!("CARGO_PKG_VERSION");
+    match Player::new(Options::headless()) {
+        Ok(p) => {
+            let mpv = p.get_string("mpv-version").unwrap_or_default();
+            let ffmpeg = p.get_string("ffmpeg-version").unwrap_or_default();
+            println!("VitaScope {version}\n{mpv}\nFFmpeg {ffmpeg}");
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("VitaScope {version}\n無法載入 libmpv：{e}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// 命令列：`vitascope [影片] [--fullscreen] [--version] [--shot 輸出.png [--shot-delay 秒]]`
 fn parse_args() -> Launch {
     let mut launch = Launch::default();
     let mut shot: Option<PathBuf> = None;
@@ -18,6 +35,7 @@ fn parse_args() -> Launch {
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--version" | "-V") => print_version(),
             Some("--fullscreen") => launch.fullscreen = true,
             Some("--shot") => shot = args.next().map(PathBuf::from),
             Some("--shot-delay") => {

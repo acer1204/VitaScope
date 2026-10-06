@@ -28,7 +28,7 @@ jobs:
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 版本號
         id: version
@@ -83,6 +83,10 @@ jobs:
           Copy-Item target/release/vitascope.exe $dir
           Copy-Item vendor/libmpv/windows-x64/libmpv-2.dll $dir
           Copy-Item LICENSE, README.md $dir
+          # 確認打包出來的程式能執行（--version 會載入 libmpv-2.dll）
+          $out = & "$dir/vitascope.exe" --version | Out-String
+          if ($LASTEXITCODE -ne 0) { throw "打包後的程式無法執行：$out" }
+          Write-Host $out
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
 
       # ── macOS：.app，libmpv 和相依的 dylib 都包進 Contents/Frameworks ──
@@ -116,6 +120,12 @@ jobs:
             -d "$app/Contents/Frameworks" -p @executable_path/../Frameworks/
           # 改過載入路徑的執行檔要重新簽章，否則 Apple Silicon 不讓它執行（ad-hoc 簽章，未經公證）
           codesign --force --deep --sign - "$app"
+          # 確認 .app 不再參照 Homebrew 的路徑（使用者電腦上沒有），而且真的能執行
+          if otool -L "$app/Contents/MacOS/vitascope" "$app"/Contents/Frameworks/*.dylib | grep -E '/(opt/homebrew|usr/local)/'; then
+            echo "::error::.app 裡還有參照 Homebrew 路徑的函式庫"
+            exit 1
+          fi
+          "$app/Contents/MacOS/vitascope" --version
           ditto -c -k --keepParent "$app" "dist/VitaScope-${tag}-macos-arm64.zip"
 
       # ── Linux：執行檔，libmpv 用系統套件 ──
@@ -125,6 +135,7 @@ jobs:
           name="VitaScope-${{ steps.version.outputs.tag }}-linux-x64"
           mkdir -p "dist/$name"
           cp target/release/vitascope LICENSE README.md "dist/$name/"
+          "dist/$name/vitascope" --version
           tar -czf "dist/$name.tar.gz" -C dist "$name"
 
       - uses: actions/upload-artifact@v4
@@ -141,7 +152,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: assets

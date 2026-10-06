@@ -125,10 +125,9 @@ impl VitascopeApp {
             update_status: None,
             engine_versions: String::new(),
         };
-        app.engine_versions = format!(
-            "{} · FFmpeg {}",
-            app.player.get_string("mpv-version").unwrap_or_default(),
-            app.player.get_string("ffmpeg-version").unwrap_or_default()
+        app.engine_versions = short_versions(
+            &app.player.get_string("mpv-version").unwrap_or_default(),
+            &app.player.get_string("ffmpeg-version").unwrap_or_default(),
         );
         match launch.file {
             Some(path) => app.open(&path),
@@ -933,6 +932,21 @@ fn file_name(path: &Path) -> String {
     )
 }
 
+/// 「mpv v0.41.0-1102-g6c092d978」「N-127218-g47313ad3f」→「mpv 0.41.0 · FFmpeg N-127218」
+/// （去掉 git 雜湊，「關於」視窗才放得下）
+fn short_versions(mpv: &str, ffmpeg: &str) -> String {
+    let mpv = mpv.trim_start_matches("mpv ").trim_start_matches('v');
+    let mpv = mpv.split('-').next().unwrap_or(mpv);
+    // FFmpeg 每日建置是「N-<編號>-g<雜湊>」，正式版是「7.1.1」之類
+    let parts: Vec<&str> = ffmpeg.split('-').collect();
+    let ffmpeg = if parts.first() == Some(&"N") && parts.len() > 1 {
+        format!("N-{}", parts[1])
+    } else {
+        parts.first().copied().unwrap_or(ffmpeg).to_owned()
+    };
+    format!("mpv {mpv} · FFmpeg {ffmpeg}")
+}
+
 /// 秒數 → 「1:23:45」或「03:21」
 pub fn fmt_time(secs: f64) -> String {
     let s = secs.max(0.0).round() as u64;
@@ -946,7 +960,7 @@ pub fn fmt_time(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::fmt_time;
+    use super::{fmt_time, short_versions};
 
     #[test]
     fn formats_time() {
@@ -954,5 +968,18 @@ mod tests {
         assert_eq!(fmt_time(83.4), "01:23");
         assert_eq!(fmt_time(3600.0 + 23.0 * 60.0 + 45.0), "1:23:45");
         assert_eq!(fmt_time(-3.0), "00:00");
+    }
+
+    #[test]
+    fn shortens_engine_versions() {
+        assert_eq!(
+            short_versions("mpv v0.41.0-1102-g6c092d978", "N-127218-g47313ad3f"),
+            "mpv 0.41.0 · FFmpeg N-127218"
+        );
+        // Linux 發行版的套件
+        assert_eq!(
+            short_versions("mpv 0.37.0", "6.1.1-3ubuntu5"),
+            "mpv 0.37.0 · FFmpeg 6.1.1"
+        );
     }
 }
