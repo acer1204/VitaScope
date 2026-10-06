@@ -160,9 +160,10 @@ pub fn pan_after(pan: f64, delta: f64) -> f64 {
     (((pan + delta) * 100.0).round() / 100.0).clamp(-1.0, 1.0)
 }
 
-/// 縮放後的值：10% 到 800%（log2 -3.3 … 3；mpv 0.37 放太大會溢位）
+/// 縮放後的值：10% 到 800%（log2 -3.3 … 3；mpv 0.37 放太大會溢位）。
+/// 不四捨五入：觸控板捏合、Ctrl + 精確捲動每一幀只有很小的量，四捨五入會被吃掉（顯示時才取整數百分比）
 pub fn zoom_after(zoom: f64, delta: f64) -> f64 {
-    (((zoom + delta) * 100.0).round() / 100.0).clamp(-3.3, 3.0)
+    (zoom + delta).clamp(-3.3, 3.0)
 }
 
 #[cfg(test)]
@@ -231,6 +232,12 @@ mod tests {
     fn zoom_and_pan_are_bounded_and_rounded() {
         assert!(close(zoom_after(0.0, 0.1), 0.1));
         assert!(close(zoom_after(2.95, 0.1), 3.0));
+        // 慢慢捏合：每一幀很小的量也要累積起來
+        let mut z = 0.0;
+        for _ in 0..100 {
+            z = zoom_after(z, 0.002);
+        }
+        assert!(close(z, 0.2), "{z}");
         assert!(close(pan_after(0.95, 0.1), 1.0));
         assert!(
             close(pan_after(0.1, 0.05 + 0.05), 0.2),

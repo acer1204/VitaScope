@@ -1,6 +1,7 @@
-//! mpv render API（OpenGL）：讓 mpv 把影片畫到我們指定的 framebuffer。
-//!
-//! 所有方法（除了 update callback 本身）都必須在 GL context 生效的執行緒上呼叫。
+//! mpv render API：
+//! - OpenGL：讓 mpv 把影片畫到我們指定的 framebuffer。所有方法（除了 update callback 本身）
+//!   都必須在 GL context 生效的執行緒上呼叫
+//! - 軟體繪圖（`new_sw`）：畫到記憶體裡的緩衝區，不需要 GL（進度條預覽縮圖用，mpv 0.33 起）
 
 use super::{Callback, Mpv, Result, check, trampoline};
 use libmpv2_sys as sys;
@@ -13,8 +14,8 @@ pub type GetProcAddress = Arc<dyn Fn(&CStr) -> *const c_void + Send + Sync>;
 pub struct RenderContext {
     ctx: *mut sys::mpv_render_context,
     // mpv 可能在之後（例如第一次啟用硬體解碼時）才查詢 GL 函式，
-    // 所以 get_proc_address 的資料要活得跟 render context 一樣久
-    _gpa: Box<GetProcAddress>,
+    // 所以 get_proc_address 的資料要活得跟 render context 一樣久（軟體繪圖沒有）
+    _gpa: Option<Box<GetProcAddress>>,
     update: Option<Box<Callback>>,
     // render context 必須在 mpv 核心之前釋放
     _mpv: Arc<Mpv>,
@@ -63,10 +64,65 @@ impl RenderContext {
         check(code, || "建立 mpv OpenGL render context".into())?;
         Ok(Self {
             ctx,
-            _gpa: gpa,
+            _gpa: Some(gpa),
             update: None,
             _mpv: mpv,
         })
+    }
+
+    /// 建立軟體繪圖的 render context（mpv 要用 `vo=libmpv`）。之後所有 render 呼叫都要在同一個執行緒
+    pub fn new_sw(mpv: Arc<Mpv>) -> Result<Self> {
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
+                data: sys::MPV_RENDER_API_TYPE_SW.as_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
+                data: std::ptr::null_mut(),
+            },
+        ];
+        let mut ctx: *mut sys::mpv_render_context = std::ptr::null_mut();
+        let code = unsafe { sys::mpv_render_context_create(&mut ctx, mpv.raw(), params.as_mut_ptr()) };
+        check(code, || "建立 mpv 軟體 render context".into())?;
+        Ok(Self {
+            ctx,
+            _gpa: None,
+            update: None,
+            _mpv: mpv,
+        })
+    }
+
+    /// 軟體繪圖：把目前的影格縮放到 `w`×`h`，寫進 `buf`（每個像素 4 位元組 R G B X，第 4 個位元組沒有定義；
+    /// 一列 `w * 4` 位元組）。影片比例跟 `w`×`h` 不同時會留黑邊
+    pub fn render_sw(&self, w: usize, h: usize, buf: &mut [u8]) -> Result<()> {
+        assert!(buf.len() >= w * h * 4, "緩衝區太小");
+        let mut size = [w as c_int, h as c_int];
+        let mut stride: usize = w * 4;
+        let mut params = [
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_SIZE,
+                data: size.as_mut_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_FORMAT,
+                data: c"rgb0".as_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_STRIDE,
+                data: &mut stride as *mut usize as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
+                data: buf.as_mut_ptr() as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
+                data: std::ptr::null_mut(),
+            },
+        ];
+        let code = unsafe { sys::mpv_render_context_render(self.ctx, params.as_mut_ptr()) };
+        check(code, || "mpv 軟體繪圖".into())
     }
 
     /// 有新影格要畫、或需要重繪時呼叫 `f`。跟 wakeup callback 一樣，

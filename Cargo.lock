@@ -3268,10 +3268,12 @@ dependencies = [
  "encoding_rs",
  "libmpv2-sys",
  "png",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

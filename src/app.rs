@@ -1,5 +1,10 @@
 //! 播放器視窗：影片畫面、控制列、快捷鍵、全螢幕。
 
+mod capture;
+mod info_panel;
+mod playlist_panel;
+mod preview;
+
 use crate::autoshot::AutoShot;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
@@ -14,6 +19,9 @@ use eframe::egui::{
     Sense, Stroke, Vec2, ViewportCommand, pos2, vec2,
 };
 use eframe::glow;
+use raw_window_handle::{
+    DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
+};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -36,6 +44,8 @@ const AB_COLOR: Color32 = Color32::from_rgb(0xff, 0xc1, 0x07);
 const RECENT_ON_START: usize = 6;
 /// 右鍵選單列出幾個最近開啟的檔案
 const RECENT_IN_MENU: usize = 10;
+/// 改了長寬比、裁切、旋轉之後，多久之內的畫面設定都跟著調整視窗高度（實測兩次 VideoReconfig 相隔 50–160 毫秒）
+const REFIT_WINDOW: Duration = Duration::from_millis(1500);
 
 /// 鍵盤或按鈕觸發的操作
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +101,19 @@ enum Action {
     Flip(bool),
     /// 畫面的調整全部還原
     ResetView,
+    /// 播放清單面板（F6）
+    TogglePlaylist,
+    /// 把清單上選取的項目移出清單（Delete）
+    PlaylistRemove,
+    /// 媒體資訊面板（Ctrl+F1 / Ctrl+I）
+    ToggleInfo,
+    CopyInfo,
+    /// 擷取畫面：存到截圖資料夾（Ctrl+E）、另存新檔、複製到剪貼簿（Ctrl+C）
+    Screenshot,
+    ScreenshotAs,
+    CopyFrame,
+    OpenScreenshotDir,
+    ChooseScreenshotDir,
 }
 
 pub struct VitascopeApp {
@@ -176,11 +199,83 @@ pub struct VitascopeApp {
     geometry: Geometry,
     /// 這個檔案原本的顯示比例（已含檔案本身的旋轉）與畫面輸出的旋轉，換長寬比、裁切時的基準
     natural: Option<(f64, i64)>,
-    /// 長寬比、裁切、旋轉改了之後，等新的畫面尺寸出來再調整視窗高度
-    refit_pending: bool,
+    /// 長寬比、裁切、旋轉改了之後的一小段時間：這段期間每次畫面設定好（VideoReconfig）都重新調整視窗高度。
+    /// mpv 換旋轉、長寬比時會送兩次 VideoReconfig，第一次還是舊的參數，不能只看第一次
+    refit_until: Option<Instant>,
+    /// 這一幀要依新的畫面尺寸調整視窗高度
+    refit_now: bool,
     /// 已經送出開新檔、新檔案還沒開始：這段期間舊檔案的事件不能拿來補設畫面調整
     ///（mpv 換檔時會先把畫面選項還原，補設的話會帶到新檔案）
     switching_file: bool,
+    /// 播放清單面板上選取的項目
+    playlist_selected: Option<usize>,
+    /// 播放清單面板這一幀的寬度（沒打開是 0）
+    playlist_width: f32,
+    /// 使用者調整過的面板寬度（下次打開時用）
+    playlist_width_pref: f32,
+    /// 打開播放清單時視窗加寬了多少、加寬後的寬度（關掉時縮回去；使用者自己調整過視窗就不縮）
+    playlist_grew: Option<(f32, f32)>,
+    /// 滑鼠在播放清單上（全螢幕時控制列、滑鼠游標不隱藏）
+    pointer_over_playlist: bool,
+    /// 「加入資料夾」背景掃描的結果
+    folder_add: Option<Receiver<Vec<PathBuf>>>,
+    /// 手動整理的清單要不要存起來（自動測試、`--shot` 不存）
+    persist_playlist: bool,
+    /// 清單已經捲到哪一項（正在播的換了才再捲）
+    playlist_follow: Option<usize>,
+    /// 清單上一幀的捲動位置、看得到的高度
+    playlist_view: (f32, f32),
+    /// 主視窗（開檔對話框的擁有者；視窗置頂時對話框才不會被蓋在下面）
+    owner: Option<Owner>,
+    /// 上一幀是否全螢幕（macOS 離開全螢幕時會把「置頂」拿掉，要再設一次）
+    was_fullscreen: bool,
+    /// 什麼時候再設一次視窗置頂（macOS 離開全螢幕的動畫結束之後）
+    reapply_level_at: Option<Instant>,
+    /// 擷取畫面
+    capture: capture::Capture,
+    /// 進度條預覽縮圖（第一次停在進度條上才建立）
+    thumbs: Option<crate::thumbs::Thumbnailer>,
+    preview: preview::PreviewCache,
+    /// 媒體資訊面板
+    info_open: bool,
+    info_cache: Option<info_panel::InfoCache>,
+    /// 音訊裝置的名稱（面板打開時查一次）
+    audio_device: Option<String>,
+}
+
+/// 主視窗的 handle（給開檔對話框當擁有者）
+#[derive(Clone, Copy)]
+struct Owner {
+    window: RawWindowHandle,
+    display: RawDisplayHandle,
+}
+
+impl Owner {
+    fn from_creation(cc: &eframe::CreationContext<'_>) -> Option<Self> {
+        Some(Self {
+            window: cc.window_handle().ok()?.as_raw(),
+            display: cc.display_handle().ok()?.as_raw(),
+        })
+    }
+
+    /// Wayland 不讓程式自己把視窗設成置頂
+    fn is_wayland(&self) -> bool {
+        matches!(self.window, RawWindowHandle::Wayland(_))
+    }
+}
+
+impl HasWindowHandle for Owner {
+    fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+        // SAFETY: 主視窗在整個程式執行期間都存在，handle 不會變
+        Ok(unsafe { WindowHandle::borrow_raw(self.window) })
+    }
+}
+
+impl HasDisplayHandle for Owner {
+    fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
+        // SAFETY: 同上
+        Ok(unsafe { DisplayHandle::borrow_raw(self.display) })
+    }
 }
 
 /// 啟動參數
@@ -191,6 +286,10 @@ pub struct Launch {
     pub autoshot: Option<AutoShot>,
     /// 播放紀錄；預設只放在記憶體（自動測試用），播放器用 `History::load()`
     pub history: History,
+    /// 上次手動整理的播放清單（沒有指定要開的檔案時還原）
+    pub playlist: Option<Playlist>,
+    /// 手動整理的播放清單要存起來（預設不存：自動測試不能動到使用者的檔案）
+    pub persist_playlist: bool,
 }
 
 impl VitascopeApp {
@@ -254,7 +353,7 @@ impl VitascopeApp {
             update_status: None,
             engine_versions: String::new(),
             history: launch.history,
-            playlist: None,
+            playlist: launch.playlist,
             was_eof: false,
             wheel: 0.0,
             right_controls_width: 0.0,
@@ -277,8 +376,27 @@ impl VitascopeApp {
             popup_open_at_start: false,
             geometry: Geometry::default(),
             natural: None,
-            refit_pending: false,
+            refit_until: None,
+            refit_now: false,
             switching_file: false,
+            playlist_selected: None,
+            playlist_width: 0.0,
+            playlist_width_pref: playlist_panel::PANEL_WIDTH,
+            playlist_grew: None,
+            pointer_over_playlist: false,
+            folder_add: None,
+            persist_playlist: launch.persist_playlist,
+            playlist_follow: None,
+            playlist_view: (0.0, 0.0),
+            owner: Owner::from_creation(cc),
+            was_fullscreen: false,
+            reapply_level_at: None,
+            capture: capture::Capture::default(),
+            thumbs: None,
+            preview: preview::PreviewCache::default(),
+            info_open: false,
+            info_cache: None,
+            audio_device: None,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -324,6 +442,11 @@ impl VitascopeApp {
     // ───────────── 操作 ─────────────
 
     fn open(&mut self, path: &Path) {
+        // 播放清單檔：換成檔案裡的清單
+        if formats::is_playlist(path) && !is_url(&path.to_string_lossy()) && !crate::m3u::is_hls_file(path) {
+            self.open_playlist_file(path);
+            return;
+        }
         // 先記下目前的檔案看到哪裡
         self.remember_position();
         let path = if is_url(&path.to_string_lossy()) {
@@ -352,6 +475,7 @@ impl VitascopeApp {
         self.video_click_time = None;
         self.pending_auto_next = false;
         self.switching_file = true;
+        self.info_cache = None;
         // 開新檔一律從播放開始（mpv 會沿用上一個檔案的暫停狀態）；A-B 重播也會沿用，要清掉
         let _ = self.player.set_pause(false);
         let _ = self.player.clear_ab_loop();
@@ -361,6 +485,8 @@ impl VitascopeApp {
         let _ = self.player.set_sub_delay(0.0);
         if let Err(e) = self.player.open(&path.to_string_lossy()) {
             self.player.state.last_error = Some(format!("無法開啟：{e}"));
+            // 不會有 StartFile 了：舊檔案照樣在播，畫面調整要繼續同步
+            self.switching_file = false;
         }
     }
 
@@ -468,8 +594,18 @@ impl VitascopeApp {
         }
     }
 
+    /// 開檔對話框，擁有者是主視窗（視窗置頂時才不會被蓋在下面）
+    fn file_dialog(&self) -> rfd::FileDialog {
+        let dialog = rfd::FileDialog::new();
+        match &self.owner {
+            Some(owner) => dialog.set_parent(owner),
+            None => dialog,
+        }
+    }
+
     fn open_dialog(&mut self) {
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = self
+            .file_dialog()
             .set_title("開啟影片")
             .add_filter("影音檔案", &formats::all_media())
             .add_filter("所有檔案", &["*"]);
@@ -488,6 +624,9 @@ impl VitascopeApp {
     fn run(&mut self, ctx: &egui::Context, action: Action) {
         let st = &self.player.state;
         let loaded = st.loaded;
+        // 畫面調整：要有影像（純音訊、專輯封面不算，跟右鍵選單的「畫面」一樣），
+        // 也不能在換檔途中（會設到下一個檔案上，跟面板顯示的不一致）
+        let view = loaded && st.has_video() && !self.switching_file;
         match action {
             Action::TogglePause if loaded => {
                 let msg = if st.paused { "▶ 播放" } else { "⏸ 暫停" };
@@ -535,6 +674,24 @@ impl VitascopeApp {
             Action::ExitFullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false)),
             Action::Open => self.open_dialog(),
             Action::About => self.about_open = true,
+            Action::TogglePlaylist => self.toggle_playlist(ctx),
+            Action::ToggleInfo => self.toggle_info(),
+            Action::CopyInfo => self.copy_info(ctx),
+            Action::Screenshot => self.take_screenshot(capture::ShotDest::Folder),
+            Action::ScreenshotAs => self.screenshot_as_dialog(),
+            Action::CopyFrame => self.take_screenshot(capture::ShotDest::Clipboard),
+            Action::OpenScreenshotDir => {
+                let dir = self.screenshot_dir();
+                if let Err(e) = crate::screenshot::open_folder(&dir) {
+                    self.osd(format!("無法開啟截圖資料夾：{e}"));
+                }
+            }
+            Action::ChooseScreenshotDir => self.choose_screenshot_dir(),
+            Action::PlaylistRemove => {
+                if let Some(i) = self.playlist_selected {
+                    self.remove_from_playlist(i);
+                }
+            }
             Action::PrevFile => self.step_file(false),
             Action::NextFile => self.step_file(true),
             Action::SpeedStep(dir) => {
@@ -583,17 +740,17 @@ impl VitascopeApp {
             }
             Action::LoadSubtitle if loaded => self.load_file_dialog(true),
             Action::SubtitleStyle => self.sub_style_open = true,
-            Action::AspectCycle if loaded => {
+            Action::AspectCycle if view => {
                 let next = geometry::cycle(self.geometry.aspect, ASPECTS.len());
                 self.set_aspect(next);
             }
-            Action::SetAspect(aspect) if loaded => self.set_aspect(aspect),
-            Action::CropCycle if loaded => {
+            Action::SetAspect(aspect) if view => self.set_aspect(aspect),
+            Action::CropCycle if view => {
                 let next = geometry::cycle(self.geometry.crop, CROPS.len());
                 self.set_crop(next);
             }
-            Action::SetCrop(crop) if loaded => self.set_crop(crop),
-            Action::ToggleFill if loaded => {
+            Action::SetCrop(crop) if view => self.set_crop(crop),
+            Action::ToggleFill if view => {
                 self.geometry.fill = !self.geometry.fill;
                 let _ = self
                     .player
@@ -605,18 +762,18 @@ impl VitascopeApp {
                     "填滿視窗：關閉"
                 });
             }
-            Action::Zoom(delta) if loaded => {
+            Action::Zoom(delta) if view => {
                 self.geometry.zoom = geometry::zoom_after(self.geometry.zoom, delta);
                 let _ = self.player.mpv().set_property("video-zoom", self.geometry.zoom);
                 self.osd(format!("縮放 {:.0}%", self.geometry.zoom_percent()));
             }
-            Action::ZoomReset if loaded => {
+            Action::ZoomReset if view => {
                 self.geometry.zoom = 0.0;
                 self.geometry.pan = [0.0, 0.0];
                 self.apply_zoom_and_pan();
                 self.osd("縮放 100%");
             }
-            Action::Pan(dx, dy) if loaded => {
+            Action::Pan(dx, dy) if view => {
                 self.geometry.pan = [
                     geometry::pan_after(self.geometry.pan[0], dx),
                     geometry::pan_after(self.geometry.pan[1], dy),
@@ -624,14 +781,14 @@ impl VitascopeApp {
                 self.apply_zoom_and_pan();
                 self.osd("移動畫面");
             }
-            Action::PanCenter if loaded => {
+            Action::PanCenter if view => {
                 self.geometry.pan = [0.0, 0.0];
                 self.apply_zoom_and_pan();
                 self.osd("畫面置中");
             }
-            Action::RotateCw if loaded => self.set_rotate((self.geometry.rotate + 90) % 360),
-            Action::SetRotate(deg) if loaded => self.set_rotate(deg),
-            Action::Flip(horizontal) if loaded => {
+            Action::RotateCw if view => self.set_rotate((self.geometry.rotate + 90) % 360),
+            Action::SetRotate(deg) if view => self.set_rotate(deg),
+            Action::Flip(horizontal) if view => {
                 let on = if horizontal {
                     self.geometry.hflip = !self.geometry.hflip;
                     self.geometry.hflip
@@ -643,7 +800,7 @@ impl VitascopeApp {
                 let name = if horizontal { "左右翻轉" } else { "上下翻轉" };
                 self.osd(format!("{name}：{}", if on { "開啟" } else { "關閉" }));
             }
-            Action::ResetView if loaded => {
+            Action::ResetView if view => {
                 let had_shape =
                     self.geometry.aspect.is_some() || self.geometry.crop.is_some() || self.geometry.rotate != 0;
                 let (hflip, vflip) = (self.geometry.hflip, self.geometry.vflip);
@@ -660,6 +817,9 @@ impl VitascopeApp {
                     self.sync_shape(true);
                 }
                 self.osd("畫面已重設");
+            }
+            Action::ToggleOnTop if self.owner.is_some_and(|o| o.is_wayland()) => {
+                self.osd("這個桌面環境（Wayland）不支援讓程式自己設定視窗置頂");
             }
             Action::ToggleOnTop => {
                 self.settings.always_on_top = !self.settings.always_on_top;
@@ -690,7 +850,8 @@ impl VitascopeApp {
         } else {
             ("載入音軌檔", "音訊檔", formats::AUDIO)
         };
-        let mut dialog = rfd::FileDialog::new()
+        let mut dialog = self
+            .file_dialog()
             .set_title(title)
             .add_filter(filter, exts)
             .add_filter("所有檔案", &["*"]);
@@ -761,7 +922,9 @@ impl VitascopeApp {
         } else {
             self.geometry.vflip
         };
-        let quarter = self.geometry.rotate % 180 == 90;
+        // 濾鏡在畫面輸出旋轉之前翻：看的是檔案本身的旋轉加上使用者的旋轉
+        let file_rotate = self.natural.map_or(0, |(_, r)| r);
+        let quarter = (file_rotate + i64::from(self.geometry.rotate)).rem_euclid(180) == 90;
         if let Err(e) = self.player.set_flip(horizontal, on, self.flip_with_filter(), quarter) {
             self.osd(format!("無法翻轉畫面：{e}"));
         }
@@ -771,24 +934,31 @@ impl VitascopeApp {
     /// 旋轉改了之後影格的方向也變了，裁切要等新的畫面參數出來再算一次，所以畫面設定好時（VideoReconfig）也會呼叫。
     /// 回傳是否有送出改變（還會再收到一次 VideoReconfig）
     fn sync_shape(&mut self, user_changed: bool) -> bool {
+        // 還不知道原本的形狀（第一次 VideoReconfig 之前）：先不送，知道的時候會補做
+        let Some((natural_aspect, natural_rotate)) = self.natural else {
+            return false;
+        };
         let Some(out) = self.player.out_params() else {
             return false;
         };
         let g = self.geometry.clone();
-        let (natural_aspect, natural_rotate) = self.natural.unwrap_or_else(|| {
-            let [w, h] = self.player.state.video_size.unwrap_or([out.dw, out.dh]);
-            (w as f64 / h.max(1) as f64, out.rotate)
-        });
         let total_rotate = (natural_rotate + i64::from(g.rotate)).rem_euclid(360) as u32;
         let mut changed = false;
-        changed |= self
+        let rotate_changed = self
             .player
             .set_option_if_changed("video-rotate", &g.rotate.to_string())
             .unwrap_or(false);
+        changed |= rotate_changed;
         let aspect = g.aspect.map(|i| geometry::aspect_override(ASPECTS[i].1, total_rotate));
         changed |= self.player.set_aspect_override(aspect).unwrap_or(false);
+        // 畫面輸出要做的旋轉：視窗裡由畫面輸出轉（vo_libmpv），沒有畫面時（vo=null）mpv 用濾鏡先轉好
+        let vo_rotate = if self.video.is_some() { total_rotate } else { 0 };
+        // 旋轉剛改、或 mpv 先送來還是舊參數的 VideoReconfig：影格的方向還是舊的，裁切等新的參數出來再算
+        //（用舊的方向算會先閃一下錯的裁切，視窗也會跟著變成錯的高度）
+        let stale = rotate_changed || out.rotate.rem_euclid(360) as u32 != vo_rotate;
         let crop = match g.crop {
-            None => String::new(),
+            _ if stale => None,
+            None => Some(String::new()),
             Some(i) => {
                 // 畫面上整張影片的比例：選了長寬比就是那個比例，不然是原本的比例（轉 90° 時倒過來）
                 let display = match g.aspect {
@@ -801,16 +971,35 @@ impl VitascopeApp {
                     h: out.h as f64,
                     rotate: out.rotate.rem_euclid(360) as u32,
                 };
-                geometry::crop_value(frame, geometry::crop_edges(display, CROPS[i].1))
+                Some(geometry::crop_value(frame, geometry::crop_edges(display, CROPS[i].1)))
             }
         };
-        changed |= self.player.set_option_if_changed("video-crop", &crop).unwrap_or(false);
+        if let Some(crop) = crop {
+            changed |= self.player.set_option_if_changed("video-crop", &crop).unwrap_or(false);
+        }
         if changed && user_changed {
-            // 畫面形狀變了：等新的尺寸出來，視窗寬度不變、高度跟著調
-            self.refit_pending = true;
+            // 畫面形狀變了：接下來一小段時間內新的尺寸出來時，視窗寬度不變、高度跟著調
+            self.refit_until = Some(Instant::now() + REFIT_WINDOW);
             self.video_reconfigured = false;
         }
         changed
+    }
+
+    /// macOS 離開全螢幕時會把視窗層級改回一般（設定還是「置頂」）：離開時再設一次，
+    /// 動畫結束後（約一秒）再設一次。其他系統重設一次沒有影響
+    fn keep_window_level(&mut self, ctx: &egui::Context) {
+        let fullscreen = is_fullscreen(ctx);
+        if std::mem::replace(&mut self.was_fullscreen, fullscreen) && !fullscreen && self.settings.always_on_top {
+            self.apply_window_level(ctx);
+            self.reapply_level_at = Some(Instant::now() + Duration::from_secs(1));
+            ctx.request_repaint_after(Duration::from_millis(1100));
+        }
+        if self.reapply_level_at.is_some_and(|t| Instant::now() >= t) {
+            self.reapply_level_at = None;
+            if self.settings.always_on_top && !fullscreen {
+                self.apply_window_level(ctx);
+            }
+        }
     }
 
     fn apply_window_level(&self, ctx: &egui::Context) {
@@ -884,7 +1073,8 @@ impl VitascopeApp {
                 // 畫面調整是每個檔案各自的（mpv 那邊由 reset-on-next-file 還原）
                 self.geometry = Geometry::default();
                 self.natural = None;
-                self.refit_pending = false;
+                self.refit_until = None;
+                self.refit_now = false;
                 self.switching_file = false;
                 self.pending_auto_next = false;
                 // 自動存檔從開檔起重新計時（不然停在起始畫面很久再開檔，第一幀就會存到 0）
@@ -892,19 +1082,43 @@ impl VitascopeApp {
                 self.file_gen += 1;
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
+            PlayerEvent::CommandReply { id, error } => self.on_command_reply(id, error),
             // 新檔案的影像設定好了，尺寸才是新的
             PlayerEvent::VideoReconfig => {
-                // 第一次設定好畫面時（還沒有任何調整）記下原本的比例，之後換長寬比、裁切都以它為準
+                // 記下檔案原本的形狀（解碼器的參數，不受任何調整影響），之後換長寬比、裁切都以它為準
+                let mut early_shape = false;
+                // 讀不到解碼器參數時（不太會發生），還沒有任何調整的話用畫面輸出的參數
+                let fallback = || {
+                    let out = self.player.out_params()?;
+                    let [w, h] = self.player.state.video_size?;
+                    self.geometry
+                        .is_default()
+                        .then(|| (w as f64 / h.max(1) as f64, out.rotate.rem_euclid(360)))
+                };
                 if self.natural.is_none()
-                    && self.geometry.is_default()
-                    && let (Some([w, h]), Some(out)) = (self.player.state.video_size, self.player.out_params())
+                    && !self.switching_file
+                    && let Some(natural) = self.player.natural_shape().or_else(fallback)
                 {
-                    self.natural = Some((w as f64 / h.max(1) as f64, out.rotate));
+                    self.natural = Some(natural);
+                    // 畫面設定好之前就按了長寬比、裁切、旋轉：現在才真的套用，視窗也要跟著調
+                    let g = &self.geometry;
+                    early_shape = g.aspect.is_some() || g.crop.is_some() || g.rotate != 0;
+                    // 用濾鏡翻轉時要看檔案本身的旋轉，之前翻的要重新套一次
+                    if self.flip_with_filter() {
+                        for (horizontal, on) in [(true, self.geometry.hflip), (false, self.geometry.vflip)] {
+                            if on {
+                                self.apply_flip(horizontal);
+                            }
+                        }
+                    }
                 }
                 // 有調整的話依新的畫面參數再對一次（例如旋轉之後要重算裁切）；有改就再等下一次
-                let resent = !self.switching_file && !self.geometry.is_default() && self.sync_shape(false);
+                let resent = !self.switching_file && !self.geometry.is_default() && self.sync_shape(early_shape);
                 if !resent {
                     self.video_reconfigured = true;
+                    if self.refit_until.is_some_and(|t| Instant::now() < t) {
+                        self.refit_now = true;
+                    }
                 }
             }
             PlayerEvent::PlaybackRestart => {
@@ -934,6 +1148,7 @@ impl VitascopeApp {
 
     /// 檔案載入完成：加進最近開啟，有上次的位置就從那裡繼續
     fn on_file_loaded(&mut self) {
+        self.preview_file_loaded();
         let Ok(path) = self.player.get_string("path") else {
             return;
         };
@@ -1046,11 +1261,24 @@ impl VitascopeApp {
             self.save_settings();
             return;
         }
+        // Esc 也先關媒體資訊
+        if self.info_open
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.info_open = false;
+            return;
+        }
         // Esc 只在全螢幕、而且沒有選單開著時才用來離開全螢幕；其他時候留給 egui 關選單
         let esc_exits_fullscreen = is_fullscreen(ctx) && !egui::Popup::is_any_open(ctx);
+        let playlist_open = self.settings.show_playlist;
         // 先把快捷鍵吃掉，避免同一個按鍵又觸發 egui 的按鈕（例如空白鍵按下有焦點的按鈕）
         let mut actions = Vec::new();
         ctx.input_mut(|i| {
+            // Ctrl+C 不會變成按鍵事件：egui 把它轉成「複製」（Event::Copy）
+            if i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
+                actions.push(Action::CopyFrame);
+            }
             let mut key = |mods: Modifiers, key: Key, action: Action| {
                 if i.consume_key(mods, key) {
                     actions.push(action);
@@ -1102,7 +1330,18 @@ impl VitascopeApp {
             key(Modifiers::NONE, Key::M, Action::ToggleMute);
             key(Modifiers::NONE, Key::F, Action::ToggleFullscreen);
             key(Modifiers::NONE, Key::Enter, Action::ToggleFullscreen);
+            key(Modifiers::COMMAND, Key::E, Action::Screenshot);
+            key(Modifiers::COMMAND, Key::F1, Action::ToggleInfo);
+            key(Modifiers::COMMAND, Key::I, Action::ToggleInfo);
             key(Modifiers::NONE, Key::F1, Action::About);
+            key(Modifiers::NONE, Key::F6, Action::TogglePlaylist);
+            if playlist_open {
+                key(Modifiers::NONE, Key::Delete, Action::PlaylistRemove);
+                // Mac 的鍵盤沒有 Delete 鍵（Alt+Backspace 已經在前面處理掉了）
+                if cfg!(target_os = "macos") {
+                    key(Modifiers::NONE, Key::Backspace, Action::PlaylistRemove);
+                }
+            }
             if esc_exits_fullscreen {
                 key(Modifiers::NONE, Key::Escape, Action::ExitFullscreen);
             }
@@ -1176,11 +1415,20 @@ impl VitascopeApp {
             })
         };
         let extra_subs: Vec<PathBuf> = subs.into_iter().filter(|s| !belongs_to_some_video(s)).collect();
+        // 播放清單開著：加到清單最後（沒有在播的話播第一個），不換掉清單
+        if self.settings.show_playlist {
+            self.add_to_playlist(media);
+            if !extra_subs.is_empty() {
+                self.osd("播放清單開著時，字幕要拖到正在播的影片上（關掉清單再拖）");
+            }
+            return;
+        }
         let video = media[0].clone();
         if media.len() > 1 {
             self.remember_position();
             self.playlist_scan = None;
-            self.playlist = Some(Playlist::from_files(media));
+            self.playlist = Some(Playlist::from_files(media).manual());
+            self.persist_playlist();
         }
         self.open(&video);
         // 影片載入完再加上去（open 會把路徑轉成完整路徑，這裡也一樣）
@@ -1204,8 +1452,8 @@ impl VitascopeApp {
 
     /// 新檔案的影片尺寸確定後，把視窗調整成影片比例（不超過螢幕的 80%）
     fn fit_window(&mut self, ctx: &egui::Context) {
-        if self.refit_pending && !self.fit_window_pending && self.video_reconfigured {
-            self.refit_pending = false;
+        if self.refit_now && !self.fit_window_pending {
+            self.refit_now = false;
             self.refit_height(ctx);
             return;
         }
@@ -1228,13 +1476,14 @@ impl VitascopeApp {
         }
         // 影片像素 → egui 點數，高 DPI 螢幕上才會是 1:1 顯示
         let video = vec2(w as f32, h as f32) / ctx.pixels_per_point();
-        let max = monitor.unwrap_or(vec2(1920.0, 1080.0)) * 0.8 - vec2(0.0, self.controls_height);
+        let max = monitor.unwrap_or(vec2(1920.0, 1080.0)) * 0.8 - vec2(self.playlist_width, self.controls_height);
         let fit = (max.x / video.x).min(max.y / video.y);
         // 原尺寸優先；太小的影片（例如 320×240）放大到 640 寬；兩者都不超過螢幕
         let want = if video.x < 640.0 { 640.0 / video.x } else { 1.0 };
         let size = video * want.min(fit);
         // 直式影片很窄，控制列放不下，兩側補黑邊
-        let width = size.x.max(MIN_WINDOW_WIDTH);
+        // 控制列是整個視窗寬（含播放清單），至少要放得下按鈕
+        let width = (size.x + self.playlist_width).max(MIN_WINDOW_WIDTH);
         let target = vec2(width, size.y + self.controls_height);
         eprintln!("[vitascope] 視窗配合影片 {w}×{h} → {:.0}×{:.0}", target.x, target.y);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
@@ -1257,9 +1506,10 @@ impl VitascopeApp {
             return;
         }
         let max_height = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
-        let width = content.width();
+        // 影片的寬度（不含播放清單）
+        let width = (content.width() - self.playlist_width).max(1.0);
         let height = (width * h as f32 / w as f32 + self.controls_height).min(max_height);
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(width, height)));
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(content.width(), height)));
     }
 
     /// 測試用：直接設定檢查更新的結果（不連網）
@@ -1553,6 +1803,8 @@ impl VitascopeApp {
             || st.paused
             || idle < HIDE_AFTER
             || self.pointer_over_controls
+            || self.pointer_over_playlist
+            || egui::DragAndDrop::has_any_payload(ctx)
             || self.seek_drag.is_some()
             || menu_open;
         if visible && st.loaded && !st.paused {
@@ -1613,10 +1865,15 @@ impl VitascopeApp {
         if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
             ui.painter()
                 .rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(160));
+            let hint = if self.settings.show_playlist {
+                "放開以加入播放清單"
+            } else {
+                "放開以播放"
+            };
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "放開以播放",
+                hint,
                 FontId::proportional(28.0),
                 Color32::WHITE,
             );
@@ -1634,6 +1891,7 @@ impl VitascopeApp {
         }
         response.context_menu(|ui| self.context_menu(ui));
 
+        self.paint_info(&ui.ctx().clone(), rect);
         self.paint_osd(ui, rect);
     }
 
@@ -1668,8 +1926,17 @@ impl VitascopeApp {
         steps as i32
     }
 
-    /// 在影片上按右鍵的選單
+    /// 在影片上按右鍵的選單。視窗矮（例如小影片的 640×421）時選單會超出視窗，下面的項目點不到，
+    /// 所以放在可以捲動的區域裡
     fn context_menu(&mut self, ui: &mut egui::Ui) {
+        // 扣掉選單的邊框和上下的空隙
+        let max_height = (ui.ctx().content_rect().height() - 48.0).max(120.0);
+        egui::ScrollArea::vertical()
+            .max_height(max_height)
+            .show(ui, |ui| self.context_menu_items(ui));
+    }
+
+    fn context_menu_items(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let mut action = None;
         let mut open_recent = None;
@@ -1769,9 +2036,24 @@ impl VitascopeApp {
         if let Some(a) = self.view_menu(ui) {
             action = Some(a);
         }
+        let has_video = self.player.state.loaded && self.player.state.has_video();
+        if let Some(a) = self.screenshot_menu(ui, has_video) {
+            action = Some(a);
+        }
         ui.separator();
         if menu_item(ui, true, "全螢幕", "F") {
             action = Some(Action::ToggleFullscreen);
+        }
+        let playlist = egui::Button::selectable(self.settings.show_playlist, "播放清單").shortcut_text("F6");
+        if ui.add(playlist).clicked() {
+            action = Some(Action::TogglePlaylist);
+        }
+        let info = egui::Button::selectable(self.info_open, "媒體資訊").shortcut_text(INFO_SHORTCUT);
+        if ui.add_enabled(loaded, info).clicked() {
+            action = Some(Action::ToggleInfo);
+        }
+        if menu_item(ui, loaded, "複製媒體資訊", "") {
+            action = Some(Action::CopyInfo);
         }
         let on_top = egui::Button::selectable(self.settings.always_on_top, "視窗置頂").shortcut_text(ON_TOP_SHORTCUT);
         if ui.add(on_top).clicked() {
@@ -1954,6 +2236,10 @@ impl VitascopeApp {
                 }
                 if ui.add(icon_button("ℹ")).on_hover_text("關於影戲（F1）").clicked() {
                     self.run(ui.ctx(), Action::About);
+                }
+                let list_button = egui::Button::selectable(self.settings.show_playlist, "☰").min_size(vec2(28.0, 22.0));
+                if ui.add(list_button).on_hover_text("播放清單（F6）").clicked() {
+                    self.run(ui.ctx(), Action::TogglePlaylist);
                 }
                 self.track_menu(ui, TrackKind::Sub, "字幕");
                 self.track_menu(ui, TrackKind::Audio, "音軌");
@@ -2342,6 +2628,9 @@ impl VitascopeApp {
                 Color32::from_black_alpha(200),
             );
             p.galley(text_pos, galley, Color32::WHITE);
+            // 時間上面是那個位置的畫面
+            let ctx = ui.ctx().clone();
+            self.paint_preview(&ctx, t, hover.x, text_pos.y - 3.0, rect);
         }
     }
 }
@@ -2352,6 +2641,8 @@ impl eframe::App for VitascopeApp {
             self.on_player_event(ev);
         }
         self.poll_playlist_scan();
+        self.poll_screenshots(ctx);
+        self.poll_previews(ctx);
         self.auto_next();
         self.autosave();
         if ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()) {
@@ -2360,6 +2651,7 @@ impl eframe::App for VitascopeApp {
         self.handle_keys(ctx);
         self.handle_drops(ctx);
         self.update_title(ctx);
+        self.keep_window_level(ctx);
         if self.frames >= 2 {
             if std::mem::take(&mut self.start_fullscreen) {
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
@@ -2400,6 +2692,20 @@ impl eframe::App for VitascopeApp {
             self.controls_height = r.response.rect.height();
             self.pointer_over_controls = false;
         }
+        // 播放清單在影片右邊（控制列在下面、整個視窗寬，按鈕才放得下）
+        self.playlist_width = 0.0;
+        self.pointer_over_playlist = false;
+        if self.settings.show_playlist {
+            let r = egui::Panel::right("playlist")
+                .frame(Self::playlist_frame())
+                .resizable(true)
+                .default_size(self.playlist_width_pref)
+                .size_range(180.0..=600.0)
+                .show(ui, |ui| self.playlist_panel(ui));
+            self.playlist_width = r.response.rect.width();
+            self.playlist_width_pref = self.playlist_width;
+            self.pointer_over_playlist = r.response.contains_pointer();
+        }
 
         egui::CentralPanel::no_frame()
             .frame(Frame::NONE.fill(Color32::BLACK))
@@ -2409,15 +2715,17 @@ impl eframe::App for VitascopeApp {
         if fullscreen {
             if show_controls {
                 let screen = ctx.content_rect();
+                // 播放清單開著時，控制列只蓋在影片上
+                let width = screen.width() - self.playlist_width;
                 let r = egui::Area::new(Id::new("overlay_controls"))
                     .anchor(Align2::LEFT_BOTTOM, Vec2::ZERO)
                     .show(&ctx, |ui| {
-                        ui.set_width(screen.width());
+                        ui.set_width(width);
                         Frame::NONE
                             .fill(Color32::from_black_alpha(170))
                             .inner_margin(Margin::symmetric(16, 10))
                             .show(ui, |ui| {
-                                ui.set_width(screen.width() - 32.0);
+                                ui.set_width(width - 32.0);
                                 self.controls(ui);
                             });
                     });
@@ -2440,6 +2748,7 @@ impl eframe::App for VitascopeApp {
         }
         self.remember_position();
         self.save_settings();
+        self.persist_playlist();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -2542,6 +2851,8 @@ const CHAPTER_SHORTCUT: &str = if cfg!(target_os = "macos") {
 
 /// 開檔快捷鍵的說明文字（macOS 用 Command 鍵）
 const OPEN_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
+/// macOS 的 Ctrl+F1 是系統的「鍵盤操作」快捷鍵，用 Cmd+I（QuickTime 的「影片檢閱器」）
+const INFO_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+I" } else { "Ctrl+F1" };
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))

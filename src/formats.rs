@@ -23,12 +23,19 @@ pub const AUDIO: &[&str] = &[
 /// 字幕（拖放字幕檔到播放中的影片 = 載入外掛字幕）
 pub const SUBTITLE: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "sami", "txt"];
 
+/// 播放清單檔（開啟 = 載入清單，見 `m3u.rs`）
+pub const PLAYLIST: &[&str] = &["m3u", "m3u8"];
+
 fn ext_of(path: &std::path::Path) -> Option<String> {
     path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase())
 }
 
 pub fn is_subtitle(path: &std::path::Path) -> bool {
     ext_of(path).is_some_and(|e| SUBTITLE.contains(&e.as_str()))
+}
+
+pub fn is_playlist(path: &std::path::Path) -> bool {
+    ext_of(path).is_some_and(|e| PLAYLIST.contains(&e.as_str()))
 }
 
 /// 開檔對話框用：所有能播的副檔名

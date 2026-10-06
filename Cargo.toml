@@ -29,11 +29,17 @@ eframe = { version = "0.36", default-features = false, features = [
 # 只用底層綁定，安全包裝自己寫（src/mpv/）
 libmpv2-sys = "4"
 png = "0.18"
+# 開檔對話框的擁有者（主視窗）；eframe、rfd 也是用這個版本
+raw-window-handle = "0.6"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 檢查更新（查詢 GitHub Releases）
 ureq = "3"
+
+# Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [profile.release]
 opt-level = 3

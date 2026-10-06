@@ -32,11 +32,13 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 程式本身不需要安裝，刪掉資料夾即可移除。另外會建立這些資料：
 
-| 平台 | 設定（音量、視窗位置） | 字幕轉碼暫存 |
+| 平台 | 設定、播放紀錄、播放清單 | 字幕轉碼暫存 |
 |---|---|---|
-| Windows | `%APPDATA%\Vitascope\settings.json` | `%LOCALAPPDATA%\VitaScope\subs` |
-| macOS | `~/Library/Application Support/Vitascope/settings.json` | `~/Library/Caches/VitaScope/subs` |
-| Linux | `~/.config/vitascope/settings.json` | `~/.cache/vitascope/subs` |
+| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\subs` |
+| macOS | `~/Library/Application Support/Vitascope/` | `~/Library/Caches/VitaScope/subs` |
+| Linux | `~/.config/vitascope/` | `~/.cache/vitascope/subs` |
+
+截圖預設存在系統「圖片」資料夾裡的 `VitaScope`，不會隨程式刪除。
 
 ## 功能清單
 
@@ -63,14 +65,15 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 播放控制
 - [x] 播放清單：同資料夾的影片依檔名排序（第 2 集在第 10 集前面），播完自動接下一個；PgUp / PgDn 切換
-- [ ] 播放清單面板：排序、刪除、拖曳排序；儲存 / 讀取 `.m3u`
+- [x] 播放清單面板（F6）：雙擊播放、拖曳排序、Delete 移除、依檔名排序、加入檔案 / 資料夾；
+  開啟 / 儲存 `.m3u` / `.m3u8`；自己整理的清單下次開啟時還在
 - [x] 續播：再次開啟時從上次看到的地方繼續
 - [x] 最近開啟的檔案（起始畫面、右鍵選單）
 - [x] 變速 0.25×–4×（保持音調）
 - [x] 逐格前進 / 後退
 - [x] A-B 段落重播
 - [x] 章節：進度條上的標記與名稱、跳到上 / 下一章
-- [ ] 進度條預覽縮圖
+- [x] 進度條預覽縮圖（滑鼠停在進度條上顯示那個時間的畫面）
 
 字幕與音訊
 - [x] 字幕外觀：字型、大小、顏色、邊框、陰影、位置、粗體（字幕選單 →「字幕外觀…」）
@@ -91,14 +94,15 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] OSD 提示（音量、跳轉、暫停、切換軌道時在畫面上顯示）
 - [x] 拖放字幕檔載入外掛字幕、單擊畫面暫停
 - [x] 「關於」與檢查更新
-- [ ] 截圖：原始解析度 / 含字幕，存檔或複製到剪貼簿
-- [ ] 媒體資訊面板：編碼、解析度、位元率、硬解狀態、掉格數
+- [x] 截圖：原始解析度、可選含不含字幕，存檔（預設在「圖片」資料夾的 VitaScope）或複製到剪貼簿
+- [x] 媒體資訊面板：編碼、解析度、位元率、HDR、硬解狀態、掉格數；可以複製成文字
 - [ ] 設定視窗
 - [ ] 介面語言：繁體中文 / English
 
 系統整合與發佈
 - [ ] 檔案關聯（Windows、macOS、Linux）
 - [ ] 單一執行個體：雙擊另一個檔案時送到已開啟的視窗
+- [ ] 應用程式圖示
 - [x] 三平台安裝包自動發佈（Windows zip、macOS `.app`、Linux tar.gz）
 - [ ] 安裝程式：Windows 安裝檔、macOS `.dmg`、Linux AppImage
 - [x] 「通用」格式三平台全數通過自動測試
@@ -164,13 +168,18 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | Ctrl（⌘）+ Z / P | 左右翻轉 / 上下翻轉 |
 | Alt（Option）+ Backspace | 畫面調整全部還原 |
 | Ctrl（⌘）+ T | 視窗置頂 |
+| F6 | 播放清單（清單開著時 Delete 移除選取的項目；macOS 也可以用 Backspace） |
+| Ctrl + F1（macOS：⌘ + I），或 Ctrl + I | 媒體資訊 |
+| Ctrl（⌘）+ E | 擷取畫面（存到截圖資料夾） |
+| Ctrl（⌘）+ C | 擷取畫面（複製到剪貼簿） |
 | L | A-B 重播：設定起點 → 設定終點 → 取消 |
 | Home | 從頭播放（再次開啟的檔案會從上次看到的地方繼續） |
 | 在畫面上捲動滑鼠滾輪 | 音量 ±5 |
 | 在畫面上按右鍵 | 選單：最近開啟的檔案、播放速度、章節、音軌、字幕… |
 
 字幕選單另有「第二字幕」「字幕延遲」「字幕編碼」「載入字幕檔…」「字幕外觀…」；音軌選單有「音訊延遲」「載入音軌檔…」。
-右鍵選單的「畫面」有畫面比例、裁切、縮放、移動、旋轉、翻轉與重設。
+右鍵選單的「畫面」有畫面比例、裁切、縮放、移動、旋轉、翻轉與重設；「擷取畫面」可以另存新檔、選擇含不含字幕、開啟或變更截圖資料夾。
+播放清單開著時，拖放進來的檔案會加到清單最後；清單上可以按右鍵複製路徑。
 
 ## 支援格式
 
@@ -270,12 +279,19 @@ cargo run --release --example media_survey -- 檔案清單.tsv [--per-ext 200] [
 src/
 ├─ main.rs       進入點、命令列參數
 ├─ app.rs        播放器視窗：控制列、快捷鍵、全螢幕、OSD
+├─ app/          視窗的各個部分：播放清單面板、媒體資訊、擷取畫面、進度條預覽縮圖
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
 ├─ player.rs     播放器核心：mpv 屬性與事件 → Rust 狀態（介面和測試共用）
-├─ mpv/          libmpv 的安全包裝（client API、render API）
+├─ mpv/          libmpv 的安全包裝（client API、render API：OpenGL 與軟體繪圖）
+├─ geometry.rs   畫面調整：長寬比、裁切、縮放、旋轉、翻轉
 ├─ subs.rs       外掛字幕：尋找、編碼偵測、繁簡判斷
-├─ playlist.rs   播放清單：同資料夾的檔案、自然排序
+├─ playlist.rs   播放清單：同資料夾的檔案、自然排序、編輯
+├─ m3u.rs        播放清單檔（.m3u / .m3u8）的讀寫、下次開啟時還原
 ├─ history.rs    播放紀錄：最近開啟的檔案、續播位置
+├─ mediainfo.rs  媒體資訊：讀 mpv 的格式資訊、整理成文字
+├─ screenshot.rs 擷取畫面：檔名、轉正、PNG、截圖資料夾
+├─ thumbs.rs     進度條預覽縮圖（另一個 mpv，在背景執行緒用軟體繪圖）
+├─ icon.rs       視窗圖示（圖檔在 packaging/icons/）
 ├─ settings.rs   設定檔（音量、視窗位置、播放選項）
 ├─ update.rs     檢查更新（GitHub Releases）
 ├─ formats.rs    支援的副檔名

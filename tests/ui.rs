@@ -34,6 +34,16 @@ fn harness(file: Option<PathBuf>) -> Harness<'static, VitascopeApp> {
 }
 
 fn harness_with(file: Option<PathBuf>, settings: Settings) -> Harness<'static, VitascopeApp> {
+    harness_launch(
+        Launch {
+            file,
+            ..Default::default()
+        },
+        settings,
+    )
+}
+
+fn harness_launch(launch: Launch, settings: Settings) -> Harness<'static, VitascopeApp> {
     // 跟真正的播放器一樣播完停在最後一格，只是不出畫面、不出聲音。
     // 播放紀錄只放在記憶體（Launch 的預設），不會碰到使用者真正的紀錄
     let player = Player::new(Options {
@@ -41,17 +51,9 @@ fn harness_with(file: Option<PathBuf>, settings: Settings) -> Harness<'static, V
         ..Options::headless()
     })
     .unwrap();
-    Harness::builder().with_size([960.0, 600.0]).build_eframe(move |cc| {
-        VitascopeApp::new(
-            cc,
-            player,
-            settings,
-            Launch {
-                file,
-                ..Default::default()
-            },
-        )
-    })
+    Harness::builder()
+        .with_size([960.0, 600.0])
+        .build_eframe(move |cc| VitascopeApp::new(cc, player, settings, launch))
 }
 
 /// 一直跑介面幀，直到播放器狀態符合條件
@@ -1372,19 +1374,78 @@ fn viewport_commands(h: &Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand
         .unwrap_or_default()
 }
 
-#[test]
-fn always_on_top_from_context_menu() {
-    let mut h = playing_multitrack();
+/// 在影片上按右鍵、點選單裡的項目。選單比視窗長時（小影片的視窗只有 421 高）先用滾輪捲到看得到
+fn click_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     h.get_by_label("影片畫面").click_secondary();
     h.run_steps(2);
-    h.get_by_label_contains("視窗置頂").click();
+    let screen = h.ctx.content_rect();
+    for _ in 0..10 {
+        let item = h.get_by_label_contains(label).rect();
+        if item.bottom() <= screen.bottom() {
+            break;
+        }
+        let over_menu = egui::pos2(item.center().x, screen.center().y);
+        h.event(egui::Event::PointerMoved(over_menu));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.run_steps(2);
+    }
+    // 捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：先移到要點的項目上，等子選單關掉
+    h.get_by_label_contains(label).hover();
+    h.run_steps(3);
+    h.get_by_label_contains(label).click();
     h.step();
+}
+
+#[test]
+fn always_on_top_from_context_menu_and_keys() {
+    let mut h = playing_multitrack();
+    click_context_item(&mut h, "視窗置頂");
     let cmds = viewport_commands(&h);
     assert!(
         cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
         "{cmds:?}"
     );
     assert!(h.state().settings().always_on_top);
+    // Ctrl+T 切回一般
+    h.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::T,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    });
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
+        "{cmds:?}"
+    );
+    assert!(!h.state().settings().always_on_top);
+}
+
+#[test]
+fn leaving_fullscreen_restores_always_on_top() {
+    let mut h = playing_multitrack();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    h.run_steps(2);
+    set_fullscreen(&mut h, true);
+    // 離開全螢幕（macOS 會把置頂拿掉）：再設一次
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
+        "{cmds:?}"
+    );
 }
 
 fn ratio(s: &State) -> f64 {
@@ -1404,6 +1465,9 @@ fn aspect_key_cycles_and_reset_restores() {
     assert_eq!(h.state().geometry().aspect, Some(0));
     h.key_press(egui::Key::A);
     step_until(&mut h, "再按 A：4:3", |s| (ratio(s) - 4.0 / 3.0).abs() < 0.02);
+    // 換成跟原本不一樣的比例，才看得出還原有沒有作用
+    h.key_press(egui::Key::A);
+    step_until(&mut h, "再按 A：16:10", |s| (ratio(s) - 1.6).abs() < 0.02);
     h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::Backspace);
     step_until(&mut h, "Alt+Backspace：回到原始比例", |s| {
         (ratio(s) - 4.0 / 3.0).abs() < 0.01
@@ -1440,7 +1504,7 @@ fn rotate_key_turns_the_picture_and_keeps_the_crop_shape() {
     // 轉了之後再裁成 4:3：畫面上看起來是 4:3
     h.get_by_label("影片畫面").click_secondary();
     h.run_steps(2);
-    h.get_by_label_contains("畫面 ⏵").click();
+    h.get_by_label("畫面 ⏵").click();
     h.run_steps(2);
     h.get_by_label_contains("裁切").click();
     h.run_steps(2);
@@ -1516,6 +1580,533 @@ fn view_menu_is_disabled_for_audio_only_files() {
     h.run_steps(2);
     h.get_by_label("影片畫面").click_secondary();
     h.run_steps(2);
-    let view = h.get_by_label_contains("畫面 ⏵");
+    let view = h.get_by_label("畫面 ⏵");
     assert!(view.accesskit_node().is_disabled(), "純音訊檔沒有畫面可以調整");
+    // 快捷鍵也一樣（跟選單一致）
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::A);
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
+    h.key_press(egui::Key::Num9);
+    h.run_steps(2);
+    assert!(h.state().geometry().is_default(), "{:?}", h.state().geometry());
+}
+
+/// 檔案一載入就按畫面鍵（放大、裁切兩下）：裁切只套用一次，不會一直變來變去。
+/// 審查時用探針重現過「畫面設定好之前就按」的情況（記不到原本的形狀，裁切來回跳）；
+/// headless 的 mpv 通常同一幀就把畫面設定好，這裡多半是測正常的順序
+#[test]
+fn shape_keys_right_after_loading_apply_once() {
+    let mut h = harness(Some(sample("common/mp4_hevc10_4k.mp4"))); // 3840x2160
+    let start = Instant::now();
+    while !h.state().player().state.loaded {
+        h.step();
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：載入");
+    }
+    h.key_press(egui::Key::Num9);
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    step_until(&mut h, "裁成 4:3", |s| s.video_size == Some([2880, 2160]));
+    let crop = prop(&h, "video-crop");
+    wait_real(&mut h, 0.6);
+    assert_eq!(prop(&h, "video-crop"), crop, "裁切不會一直變來變去");
+    assert_eq!(h.state().player().state.video_size, Some([2880, 2160]));
+}
+
+#[test]
+fn window_height_follows_rotation() {
+    let mut h = playing_multitrack(); // 640x360
+    let width = h.ctx.content_rect().width();
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
+    let mut sizes = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        h.step();
+        sizes.extend(viewport_commands(&h).into_iter().filter_map(|c| match c {
+            egui::ViewportCommand::InnerSize(s) => Some(s),
+            _ => None,
+        }));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.state().player().state.video_size, Some([360, 640]));
+    // 最後一次調整：寬度不變，高度配合直的畫面
+    let last = sizes.last().copied().expect("視窗有調整");
+    assert_eq!(last.x, width, "{sizes:?}");
+    assert!(last.y > width * 640.0 / 360.0, "{sizes:?}");
+}
+
+// ───────────── 播放清單面板 ─────────────
+
+fn playlist_names(app: &VitascopeApp) -> Vec<String> {
+    app.playlist()
+        .map(|l| {
+            l.items()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 開啟資料夾裡的第一集、等清單掃描完、按 F6 打開面板
+fn playlist_panel_open(dir: &TempDir) -> Harness<'static, VitascopeApp> {
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h
+}
+
+fn three_episodes(name: &str) -> TempDir {
+    let dir = TempDir::new(name);
+    for name in ["第1集.mp4", "第2集.mp4", "第3集.mp4"] {
+        dir.clip(name);
+    }
+    dir
+}
+
+fn left_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// 在 `pos` 雙擊：自己控制 egui 的時間，兩下在雙擊的時間內（預設每一幀前進 0.25 秒，太久）
+fn double_click(h: &mut Harness<'_, VitascopeApp>, pos: egui::Pos2) {
+    let mut now = h.ctx.input(|i| i.time) + 1.0;
+    h.event(egui::Event::PointerMoved(pos));
+    for _ in 0..2 {
+        for pressed in [true, false] {
+            h.event(left_button(pos, pressed));
+        }
+        h.input_mut().time = Some(now);
+        h.step();
+        now += 0.05;
+    }
+}
+
+#[test]
+fn f6_shows_the_playlist_and_double_click_plays_an_item() {
+    let dir = three_episodes("panel");
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    let width_of = |cmds: &[egui::ViewportCommand]| {
+        cmds.iter().find_map(|c| match c {
+            egui::ViewportCommand::InnerSize(s) => Some(s.x),
+            _ => None,
+        })
+    };
+    // 一般視窗：打開清單時視窗變寬（預設 280），影片大小不變；關掉時變回來
+    let before = h.ctx.content_rect().width();
+    let cmds = press_and_get_commands(&mut h, egui::Key::F6);
+    assert_eq!(width_of(&cmds), Some(before + 280.0), "{cmds:?}");
+    h.run_steps(2);
+    assert!(h.state().settings().show_playlist);
+    h.get_by_label("播放清單（1/3）");
+    let cmds = press_and_get_commands(&mut h, egui::Key::F6);
+    let narrowed = width_of(&cmds).expect("關閉時視窗變窄");
+    assert!((narrowed - before).abs() < 2.0, "{cmds:?}");
+    h.run_steps(2);
+    assert!(h.query_by_label("播放清單（1/3）").is_none(), "再按一次 F6 關閉");
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    // 雙擊第 2 項：播放它
+    let pos = h.get_by_label("2. 第2集.mp4").rect().center();
+    double_click(&mut h, pos);
+    step_until(&mut h, "雙擊 → 播放第2集", |s| playing(s, "第2集.mp4"));
+    assert_eq!(h.state().playlist().unwrap().position(), 2);
+}
+
+#[test]
+fn delete_removes_the_selected_item_but_keeps_playing() {
+    let dir = three_episodes("panel-delete");
+    let mut h = playlist_panel_open(&dir);
+    // 單擊只是選取，不換檔
+    h.get_by_label("1. 第1集.mp4").click();
+    h.run_steps(2);
+    assert!(playing(&h.state().player().state, "第1集.mp4"));
+    // 刪掉正在播的第1集：繼續播，下一個是第2集
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+    assert!(playing(&h.state().player().state, "第1集.mp4"), "正在播的不受影響");
+    h.get_by_label("播放清單（2）");
+    // 選取移到下一項，可以連按
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(playlist_names(h.state()), ["第3集.mp4"]);
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "下一個是第3集", |s| playing(s, "第3集.mp4"));
+}
+
+#[test]
+fn dragging_an_item_reorders_the_playlist() {
+    let dir = three_episodes("panel-drag");
+    let mut h = playlist_panel_open(&dir);
+    let from = h.get_by_label("3. 第3集.mp4").rect().center();
+    let first = h.get_by_label("1. 第1集.mp4").rect();
+    // 拖到第 1 項的上半部 = 放在最前面
+    let to = egui::pos2(first.center().x, first.top() + 2.0);
+    h.event(egui::Event::PointerMoved(from));
+    h.event(left_button(from, true));
+    h.step();
+    for i in 1..=8 {
+        h.event(egui::Event::PointerMoved(from.lerp(to, i as f32 / 8.0)));
+        h.step();
+    }
+    h.event(left_button(to, false));
+    h.run_steps(2);
+    assert_eq!(playlist_names(h.state()), ["第3集.mp4", "第1集.mp4", "第2集.mp4"]);
+    // 正在播的還是第1集，下一個照新的順序
+    let list = h.state().playlist().unwrap();
+    assert_eq!(list.position(), 2);
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "下一個是第2集", |s| playing(s, "第2集.mp4"));
+}
+
+#[test]
+fn opening_an_m3u8_plays_its_list_in_order() {
+    let dir = three_episodes("m3u");
+    let list = dir.0.join("清單.m3u8");
+    // 相對路徑、自己（清單檔不展開）、不存在的註解行
+    std::fs::write(
+        &list,
+        "#EXTM3U\n#EXTINF:3,第三集\n第3集.mp4\n# 註解\n清單.m3u8\n第1集.mp4\n",
+    )
+    .unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, list);
+    step_until(&mut h, "從清單的第一個（第3集）開始", |s| {
+        playing(s, "第3集.mp4")
+    });
+    assert_eq!(playlist_names(h.state()), ["第3集.mp4", "第1集.mp4"]);
+    // 不會被背景掃描的同資料夾清單蓋掉
+    wait_real(&mut h, 0.5);
+    assert_eq!(playlist_len(h.state()), 2);
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "下一個是第1集", |s| playing(s, "第1集.mp4"));
+}
+
+// ───────────── 媒體資訊 ─────────────
+
+#[test]
+fn media_info_panel_toggles_and_copies() {
+    let mut h = playing_multitrack();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("H.264");
+    h.get_by_label_contains("640×360（16:9）");
+    // 面板不接收滑鼠：點畫面照樣暫停
+    h.get_by_label("影片畫面").click();
+    step_until(&mut h, "點畫面暫停", |s| s.paused);
+    // Esc 先關面板（不是離開全螢幕之類的）
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(
+        h.query_by_label_contains("640×360（16:9）").is_none(),
+        "Esc 關閉媒體資訊"
+    );
+    // Ctrl+F1 也可以打開（macOS 是 Cmd+F1，跟 F1「關於」分開）
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F1);
+    h.run_steps(2);
+    h.get_by_label_contains("640×360（16:9）");
+    assert!(
+        h.query_by_label("acer1204/VitaScope").is_none(),
+        "Ctrl+F1 不是 F1（不開「關於」）"
+    );
+    // 右鍵選單「複製媒體資訊」（選單比視窗長，要捲動才點得到）：純文字放到剪貼簿
+    click_context_item(&mut h, "複製媒體資訊");
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    let copied = copied.expect("有複製到剪貼簿");
+    assert!(
+        copied.contains("影像") && copied.contains("H.264") && copied.contains("mkv_multitrack.mkv"),
+        "{copied}"
+    );
+}
+
+#[test]
+fn dropping_files_while_the_playlist_is_open_appends_them() {
+    let dir = three_episodes("panel-drop");
+    let extra = TempDir::new("panel-drop-extra");
+    let more = [extra.clip("番外1.mp4"), extra.clip("番外2.mp4")];
+    let mut h = playlist_panel_open(&dir);
+    for f in &more {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    h.run_steps(2);
+    assert_eq!(
+        playlist_names(h.state()),
+        ["第1集.mp4", "第2集.mp4", "第3集.mp4", "番外1.mp4", "番外2.mp4"]
+    );
+    assert!(playing(&h.state().player().state, "第1集.mp4"), "照樣播原本的");
+}
+
+#[test]
+fn dragging_below_the_last_row_moves_to_the_end() {
+    let dir = three_episodes("panel-drag-end");
+    let mut h = playlist_panel_open(&dir);
+    let from = h.get_by_label("1. 第1集.mp4").rect().center();
+    let last = h.get_by_label("3. 第3集.mp4").rect();
+    let to = egui::pos2(last.center().x, last.bottom() + 30.0);
+    h.event(egui::Event::PointerMoved(from));
+    h.event(left_button(from, true));
+    h.step();
+    for i in 1..=8 {
+        h.event(egui::Event::PointerMoved(from.lerp(to, i as f32 / 8.0)));
+        h.step();
+    }
+    h.event(left_button(to, false));
+    h.run_steps(2);
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4", "第1集.mp4"]);
+}
+
+#[test]
+fn hls_m3u8_is_played_as_one_stream() {
+    let dir = three_episodes("hls");
+    let hls = dir.0.join("live.m3u8");
+    std::fs::write(
+        &hls,
+        "#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:3
+#EXTINF:3.0,
+第1集.mp4
+#EXTINF:3.0,
+第2集.mp4
+#EXT-X-ENDLIST
+",
+    )
+    .unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, hls);
+    // 不展開成片段：清單只有串流本身
+    step_until_app(&mut h, "清單是 live.m3u8", |app| {
+        playlist_names(app) == ["live.m3u8"]
+    });
+    wait_real(&mut h, 0.3);
+    assert_eq!(playlist_names(h.state()), ["live.m3u8"]);
+}
+
+#[test]
+fn restored_playlist_waits_and_page_down_plays_the_saved_item() {
+    let dir = three_episodes("restored");
+    let items: Vec<PathBuf> = ["第1集.mp4", "第2集.mp4", "第3集.mp4"]
+        .iter()
+        .map(|n| dir.0.join(n))
+        .collect();
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    let mut h = harness_launch(
+        Launch {
+            playlist: Some(vitascope::playlist::Playlist::restored(items, Some(1))),
+            ..Default::default()
+        },
+        settings,
+    );
+    h.run_steps(3);
+    // 清單還在，但不自動播
+    h.get_by_label("播放清單（3）");
+    h.get_by_label("2. 第2集.mp4");
+    assert!(!h.state().player().state.loaded && !h.state().player().state.loading);
+    // PgDn：從上次播的那一項開始
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "播放第2集", |s| playing(s, "第2集.mp4"));
+    assert_eq!(playlist_names(h.state()).len(), 3, "清單不會被換掉");
+}
+
+// ───────────── 擷取畫面 ─────────────
+
+fn pngs_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|e| {
+            e.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "png"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+/// 等到截圖資料夾裡有 `n` 張圖、而且都寫完了，回傳第一張的大小
+fn wait_for_png(h: &mut Harness<'_, VitascopeApp>, dir: &std::path::Path, n: usize) -> (usize, usize) {
+    step_until_app(h, "截圖存好", |_| pngs_in(dir).len() >= n);
+    // 檔案出現之後還要等寫完（先建立檔案再寫入）
+    let start = Instant::now();
+    loop {
+        h.step();
+        let decoded: Vec<_> = pngs_in(dir)
+            .iter()
+            .filter_map(|p| vitascope::screenshot::decode_png(p).ok())
+            .collect();
+        if decoded.len() >= n {
+            return (decoded[0].w, decoded[0].h);
+        }
+        assert!(start.elapsed() < TIMEOUT, "截圖讀不出來");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn harness_with_shot_dir(file: PathBuf, dir: &TempDir) -> Harness<'static, VitascopeApp> {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.screenshot_dir = Some(dir.0.clone());
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let mut h = harness_with(Some(file), settings);
+    settle(&mut h, &name);
+    h
+}
+
+#[test]
+fn ctrl_e_saves_a_screenshot_at_original_size() {
+    let dir = TempDir::new("shots");
+    let mut h = harness_with_shot_dir(sample("common/mkv_multitrack.mkv"), &dir); // 640x360
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    assert_eq!(wait_for_png(&mut h, &dir.0, 1), (640, 360));
+    let name = pngs_in(&dir.0)[0].file_name().unwrap().to_string_lossy().into_owned();
+    assert!(name.starts_with("mkv_multitrack 00.00."), "{name}");
+    // 同一個時間再截一次：不覆蓋，加上 (2)
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    wait_for_png(&mut h, &dir.0, 2);
+    assert!(
+        pngs_in(&dir.0)
+            .iter()
+            .any(|p| p.to_string_lossy().ends_with(" (2).png"))
+    );
+}
+
+#[test]
+fn screenshots_follow_rotation() {
+    let dir = TempDir::new("shots-rotated");
+    let mut h = harness_with_shot_dir(sample("common/mkv_multitrack.mkv"), &dir);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
+    step_until(&mut h, "轉 90°", |s| s.video_size == Some([360, 640]));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    // 視窗裡由畫面輸出旋轉，mpv 的截圖不含旋轉，要自己轉正；這裡（沒有畫面）是 mpv 用濾鏡先轉好的
+    assert_eq!(wait_for_png(&mut h, &dir.0, 1), (360, 640));
+}
+
+#[test]
+fn ctrl_c_copies_the_frame() {
+    let mut h = playing_multitrack();
+    h.event(egui::Event::Copy);
+    let start = Instant::now();
+    let size = loop {
+        h.step();
+        let found = h.output().platform_output.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyImage(img) => Some(img.size),
+            _ => None,
+        });
+        if let Some(size) = found {
+            break size;
+        }
+        assert!(start.elapsed() < TIMEOUT, "沒有複製到剪貼簿");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(size, [640, 360]);
+}
+
+#[test]
+fn audio_only_files_have_nothing_to_capture() {
+    let dir = TempDir::new("shots-audio");
+    let mut settings = Settings::default();
+    settings.screenshot_dir = Some(dir.0.clone());
+    let mut h = harness_with(Some(sample("general/audio_flac.flac")), settings);
+    step_until(&mut h, "播放", |s| playing(s, "audio_flac.flac"));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    wait_real(&mut h, 0.5);
+    assert!(pngs_in(&dir.0).is_empty());
+}
+
+#[test]
+fn screenshots_follow_the_flip() {
+    let dir = TempDir::new("shots-flip");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.screenshot_dir = Some(dir.0.clone());
+    settings.screenshot_subtitles = false;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    wait_for_png(&mut h, &dir.0, 1);
+    // 左右翻轉（著色器，mpv 的截圖不含）之後再截一張：要是第一張的鏡像
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::E);
+    wait_for_png(&mut h, &dir.0, 2);
+    // 同一個時間：第二張的檔名多了「 (2)」
+    let shots = pngs_in(&dir.0);
+    let second = shots
+        .iter()
+        .find(|p| p.to_string_lossy().ends_with(" (2).png"))
+        .unwrap();
+    let first = shots.iter().find(|p| *p != second).unwrap();
+    let a = vitascope::screenshot::decode_png(first).unwrap();
+    let b = vitascope::screenshot::decode_png(second).unwrap();
+    assert_eq!((a.w, a.h), (b.w, b.h));
+    let mirrored = a.clone().fixed(vitascope::screenshot::Fixup {
+        hflip: true,
+        ..Default::default()
+    });
+    assert!(mirrored == b, "第二張是第一張左右翻轉");
+    assert!(a != b, "畫面不是左右對稱的（不然測不出來）");
+}
+
+// ───────────── 進度條預覽縮圖 ─────────────
+
+#[test]
+fn hovering_the_progress_bar_shows_a_thumbnail() {
+    let mut h = opened(sample("common/mp4_long.mp4")); // 90 秒
+    let bar = h.get_by_label("進度").rect();
+    let at = |frac: f32| egui::pos2(bar.left() + bar.width() * frac, bar.center().y);
+    h.event(egui::Event::PointerMoved(at(0.5)));
+    step_until_app(&mut h, "顯示 45 秒附近的縮圖", |app| {
+        app.preview_shown()
+            .is_some_and(|(b, size)| b == 45 && size == [240, 135])
+    });
+    // 移到別的地方：換成那裡的縮圖
+    h.event(egui::Event::PointerMoved(at(0.1)));
+    step_until_app(&mut h, "顯示 9 秒附近的縮圖", |app| {
+        app.preview_shown().is_some_and(|(b, _)| b == 9)
+    });
+}
+
+#[test]
+fn audio_files_have_no_thumbnails() {
+    let mut h = opened(sample("general/audio_mp3_cover.mp3"));
+    let bar = h.get_by_label("進度").rect();
+    h.event(egui::Event::PointerMoved(bar.center()));
+    wait_real(&mut h, 0.5);
+    assert!(h.state().preview_shown().is_none());
+}
+
+#[test]
+fn opening_the_playlist_scrolls_to_the_current_file() {
+    // 樣本資料夾裡有 30 幾個影片，最後一個在清單的最下面（一開始看不到）
+    let mut h = opened(sample("common/webm_vp9p2_opus.webm"));
+    step_until_app(&mut h, "掃描完資料夾", |app| playlist_len(app) > 25);
+    h.key_press(egui::Key::F6);
+    h.run_steps(4);
+    let len = playlist_len(h.state());
+    h.get_by_label(&format!("{len}. webm_vp9p2_opus.webm"));
 }

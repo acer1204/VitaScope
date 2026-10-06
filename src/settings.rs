@@ -24,6 +24,12 @@ pub struct Settings {
     pub subtitle: SubStyle,
     /// 視窗置頂（蓋在其他視窗上面）
     pub always_on_top: bool,
+    /// 顯示播放清單面板
+    pub show_playlist: bool,
+    /// 截圖資料夾；None = 「圖片」資料夾裡的 VitaScope
+    pub screenshot_dir: Option<PathBuf>,
+    /// 截圖包含字幕
+    pub screenshot_subtitles: bool,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -136,6 +142,9 @@ impl Default for Settings {
             resume: true,
             subtitle: SubStyle::default(),
             always_on_top: false,
+            show_playlist: false,
+            screenshot_dir: None,
+            screenshot_subtitles: true,
             path: None,
         }
     }
@@ -158,14 +167,26 @@ impl Settings {
 
     /// 讀取設定；檔案不存在或格式錯誤就用預設值。之後 `save` 會存回同一個檔案
     pub fn load() -> Self {
-        let path = Self::path();
-        let mut settings: Self = path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
+        match Self::path() {
+            Some(path) => Self::load_from(path),
+            None => Self::default(),
+        }
+    }
+
+    /// 從指定的檔案讀取，之後 `save()` 也寫回這個檔案
+    pub fn load_from(path: PathBuf) -> Self {
+        let mut settings: Self = std::fs::read_to_string(&path)
+            .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        settings.path = path;
+        settings.path = Some(path);
         settings
+    }
+
+    /// 只放在記憶體、不寫回檔案（`--shot` 自動截圖時用，不會改到使用者的視窗大小之類的設定）
+    pub fn detached(mut self) -> Self {
+        self.path = None;
+        self
     }
 
     /// 存檔；不是從檔案讀進來的設定（例如自動測試用的預設值）不寫檔
@@ -209,6 +230,28 @@ mod tests {
         assert!(s.window.is_none());
         assert!(s.auto_next && s.resume, "新功能預設開啟");
         assert_eq!(s.subtitle, SubStyle::default());
+    }
+
+    #[test]
+    fn loaded_settings_save_back_to_their_file() {
+        let dir = std::env::temp_dir().join(format!("vitascope-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        assert_eq!(s.volume, Settings::default().volume, "沒有檔案時用預設值");
+        s.always_on_top = true;
+        s.show_playlist = true;
+        s.volume = 42.0;
+        s.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert!(back.always_on_top && back.show_playlist);
+        assert_eq!(back.volume, 42.0);
+        // 自動截圖用的設定：讀得到，但不寫回去
+        let mut shot = back.detached();
+        shot.volume = 1.0;
+        shot.save().unwrap();
+        assert_eq!(Settings::load_from(path).volume, 42.0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

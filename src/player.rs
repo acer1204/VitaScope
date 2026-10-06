@@ -244,7 +244,15 @@ pub enum PlayerEvent {
     PlaybackRestart,
     VideoReconfig,
     Seek,
-    EndFile { reason: EndReason, error: Option<String> },
+    EndFile {
+        reason: EndReason,
+        error: Option<String>,
+    },
+    /// 非同步指令（例如截圖）完成；`error` 是失敗的原因
+    CommandReply {
+        id: u64,
+        error: Option<String>,
+    },
     Shutdown,
 }
 
@@ -386,6 +394,10 @@ impl Player {
             ("audio-client-name", "VitaScope"),
             // 畫面調整（長寬比、裁切、縮放、旋轉、翻轉）每個檔案各自的：換檔時 mpv 自動還原，不會閃一下
             ("reset-on-next-file", GEOMETRY_OPTIONS),
+            // 截圖：8 位元 PNG（10 位元影片預設會存 16 位元，檔案大、壓縮慢）、壓縮快一點
+            ("screenshot-format", "png"),
+            ("screenshot-high-bit-depth", "no"),
+            ("screenshot-png-compression", "3"),
         ];
         if opts.headless {
             options.push(("ao", "null"));
@@ -508,6 +520,25 @@ impl Player {
             .filter(|p: &OutParams| p.w > 0 && p.h > 0)
     }
 
+    /// 檔案原本的形狀，不含任何畫面調整（`video-dec-params`，長寬比、旋轉、裁切都不影響）：
+    /// （畫面上的比例（已含檔案本身的旋轉）, 檔案本身的旋轉）
+    pub fn natural_shape(&self) -> Option<(f64, i64)> {
+        #[derive(Deserialize)]
+        struct Dec {
+            dw: i64,
+            dh: i64,
+            #[serde(default)]
+            rotate: i64,
+        }
+        let d: Dec = serde_json::from_str(&self.mpv.get_string("video-dec-params").ok()?).ok()?;
+        if d.dw <= 0 || d.dh <= 0 {
+            return None;
+        }
+        let aspect = d.dw as f64 / d.dh as f64;
+        let rotate = d.rotate.rem_euclid(360);
+        Some((if rotate % 180 == 90 { 1.0 / aspect } else { aspect }, rotate))
+    }
+
     /// 「原始比例」：mpv 的 video-aspect-override 預設值（0.37 是 -1、0.40 起是 -2，不能寫 "no"）
     pub fn aspect_default(&self) -> String {
         self.mpv
@@ -604,6 +635,13 @@ impl Player {
             Some(id) => self.mpv.set_property("secondary-sid", id),
             None => self.mpv.set_property("secondary-sid", "no"),
         }
+    }
+
+    /// 截圖存成檔案（原始解析度；`subtitles` = 含字幕）。非同步：寫完時送出 `CommandReply { id }`。
+    /// 一定要用非同步：同步呼叫會卡住介面（4K 的 PNG 要壓縮零點幾秒，還可能等畫面輸出交出下一格）
+    pub fn screenshot_to_file(&self, id: u64, path: &str, subtitles: bool) -> mpv::Result<()> {
+        let mode = if subtitles { "subtitles" } else { "video" };
+        self.mpv.command_async(id, &["screenshot-to-file", path, mode])
     }
 
     /// 載入外部音軌檔並切換過去
@@ -797,6 +835,10 @@ impl Player {
         self.mpv.get_property::<f64>(name)
     }
 
+    pub fn get_i64(&self, name: &str) -> mpv::Result<i64> {
+        self.mpv.get_property::<i64>(name)
+    }
+
     // ───────────── 事件 ─────────────
 
     /// 處理所有待處理的事件（介面每一幀呼叫），回傳介面需要反應的事件。
@@ -936,6 +978,10 @@ impl Player {
             }
             Event::Seek => Some(PlayerEvent::Seek),
             Event::Shutdown => Some(PlayerEvent::Shutdown),
+            Event::CommandReply { id, result } => Some(PlayerEvent::CommandReply {
+                id,
+                error: result.err().map(|e| e.to_string()),
+            }),
             _ => None,
         }
     }

@@ -9,6 +9,7 @@ use vitascope::app::{APP_NAME, Launch, VitascopeApp};
 use vitascope::autoshot::AutoShot;
 use vitascope::history::History;
 use vitascope::player::{Options, Player};
+use vitascope::playlist::Playlist;
 use vitascope::settings::Settings;
 
 /// 印出版本後結束。會真的載入 libmpv，發佈流程用它確認打包出來的程式能執行
@@ -47,9 +48,14 @@ fn parse_args() -> Launch {
         }
     }
     launch.autoshot = shot.map(|p| AutoShot::new(p, Duration::from_secs_f64(delay)));
-    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄：畫面才固定，也不會混進使用者的最近開啟清單
+    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
     if launch.autoshot.is_none() {
         launch.history = History::load();
+        launch.persist_playlist = true;
+        // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
+        if launch.file.is_none() {
+            launch.playlist = vitascope::m3u::load_session().map(|(items, current)| Playlist::restored(items, current));
+        }
     }
     launch
 }
@@ -72,12 +78,20 @@ fn main() -> eframe::Result {
         Err(e) => fatal(&format!("無法啟動播放引擎 libmpv：\n{e}")),
     };
 
-    let settings = Settings::load();
+    // 自動截圖讀使用者的設定（字幕外觀之類的），但不寫回去
+    let settings = if launch.autoshot.is_some() {
+        Settings::load().detached()
+    } else {
+        Settings::load()
+    };
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_inner_size([960.0, 600.0])
         .with_min_inner_size([vitascope::app::MIN_WINDOW_WIDTH, 300.0])
         .with_drag_and_drop(true);
+    if let Some(icon) = vitascope::icon::window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     if let Some(g) = settings.window {
         viewport = viewport
             .with_inner_size(g.size)
