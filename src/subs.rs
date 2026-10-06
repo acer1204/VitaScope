@@ -283,7 +283,17 @@ pub fn find_external(video: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for d in dirs {
         let Ok(entries) = std::fs::read_dir(&d) else { continue };
-        let files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+        // 先用檔名篩選，最後才查檔案類型：網路磁碟上的大資料夾，每查一個檔案都要時間
+        let files: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_lowercase();
+                let ext = name.rsplit('.').next().unwrap_or_default();
+                belongs_to(&name, &stem) && (TEXT_EXTS.contains(&ext) || BINARY_EXTS.contains(&ext) || ext == "sub")
+            })
+            .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
+            .map(|e| e.path())
+            .collect();
         for p in &files {
             let name = p
                 .file_name()
@@ -293,7 +303,7 @@ pub fn find_external(video: &Path) -> Vec<PathBuf> {
                 .extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            if !name.starts_with(&stem) || p.as_path() == video {
+            if !belongs_to(&name, &stem) || p.as_path() == video {
                 continue;
             }
             // VobSub 是 .idx + .sub 一組：只載入 .idx，對應的 .sub 不當成文字字幕
@@ -327,15 +337,51 @@ fn repair(ext: &str, text: String) -> String {
     text
 }
 
-/// 讀取並分析一個外掛字幕檔
+/// 檔名（小寫）是不是屬於這部影片（影片檔名去掉副檔名，小寫）：要以影片名稱開頭，
+/// 而且後面接著分隔符號，「Ep1」才不會抓到「Ep10」的字幕
+pub fn belongs_to(name: &str, stem: &str) -> bool {
+    name.strip_prefix(stem)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', ' ', '_', '-', '[', '(']))
+}
+
+/// 選單「字幕編碼」的選項：（顯示名稱, encoding_rs 的編碼）
+pub const ENCODINGS: &[(&str, &encoding_rs::Encoding)] = &[
+    ("UTF-8", encoding_rs::UTF_8),
+    ("Big5（繁體中文）", encoding_rs::BIG5),
+    ("GB18030 / GBK（簡體中文）", encoding_rs::GB18030),
+    ("Shift_JIS（日文）", encoding_rs::SHIFT_JIS),
+    ("EUC-KR（韓文）", encoding_rs::EUC_KR),
+    ("UTF-16LE", encoding_rs::UTF_16LE),
+    ("UTF-16BE", encoding_rs::UTF_16BE),
+    ("Windows-1252（西歐）", encoding_rs::WINDOWS_1252),
+];
+
+/// 讀取並分析一個外掛字幕檔（自動判斷編碼）
 pub fn load(path: &Path, video: &Path) -> std::io::Result<ExternalSub> {
+    load_as(path, video, None)
+}
+
+/// 讀取並分析一個外掛字幕檔；`encoding` = 使用者指定的編碼（自動判斷猜錯時用），None = 自動判斷
+pub fn load_as(
+    path: &Path,
+    video: &Path,
+    encoding: Option<&'static encoding_rs::Encoding>,
+) -> std::io::Result<ExternalSub> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let stem_len = video.file_stem().map_or(0, |s| s.to_string_lossy().chars().count());
-    // 標題 = 檔名去掉影片名稱，例如「影片.tc.ass」→「tc.ass」
-    let suffix: String = file_name.chars().skip(stem_len).collect();
+    let stem = video
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    // 標題 = 檔名去掉影片名稱，例如「影片.tc.ass」→「tc.ass」；
+    // 檔名不是影片名稱開頭的（例如手動拖進來的別的字幕）就用完整檔名
+    let suffix: String = if belongs_to(&file_name.to_lowercase(), &stem) {
+        file_name.chars().skip(stem.chars().count()).collect()
+    } else {
+        file_name.clone()
+    };
     let title = suffix.trim_start_matches(['.', ' ', '_', '-']).to_owned();
     let title = if title.is_empty() { file_name.clone() } else { title };
 
@@ -357,7 +403,15 @@ pub fn load(path: &Path, video: &Path) -> std::io::Result<ExternalSub> {
     if std::fs::metadata(path)?.len() > MAX_TEXT_SIZE {
         return Err(std::io::Error::other("檔案太大，不像字幕"));
     }
-    let (text, encoding) = decode(&std::fs::read(path)?);
+    let bytes = std::fs::read(path)?;
+    let (text, encoding) = match encoding {
+        // 指定的編碼優先；檔案開頭有 BOM 時以 BOM 為準（encoding_rs 的做法）
+        Some(enc) => {
+            let (text, used, _) = enc.decode(&bytes);
+            (text.into_owned(), used.name())
+        }
+        None => decode(&bytes),
+    };
     let text = repair(&ext, text);
     // 內容判斷優先：實際影片庫裡有「檔名標 zh-TW、內容是簡體」的字幕
     let lang = classify_content(&text).or(label_lang).unwrap_or(SubLang::Unknown);
@@ -373,6 +427,52 @@ pub fn load(path: &Path, video: &Path) -> std::io::Result<ExternalSub> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_names_need_a_separator_after_the_video_name() {
+        assert!(belongs_to("ep1.srt", "ep1"));
+        assert!(belongs_to("ep1.tc.ass", "ep1"));
+        assert!(belongs_to("ep1 [cht].ass", "ep1"));
+        assert!(!belongs_to("ep10.srt", "ep1"), "Ep1 不能抓到 Ep10 的字幕");
+        assert!(!belongs_to("ep2.srt", "ep1"));
+    }
+
+    #[test]
+    fn title_is_the_part_after_the_video_name() {
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("影片.mkv");
+        for (name, title) in [
+            ("影片.tc.srt", "tc.srt"),
+            ("影片.SRT", "SRT"),
+            ("別的字幕.srt", "別的字幕.srt"),
+        ] {
+            std::fs::write(
+                dir.join(name),
+                "1
+00:00:01,000 --> 00:00:02,000
+字幕
+",
+            )
+            .unwrap();
+            assert_eq!(load(&dir.join(name), &video).unwrap().title, title, "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn forced_encoding_overrides_detection() {
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("影片.srt");
+        // 「測試」的 Big5 編碼；內容很短，自動判斷不一定猜得對
+        let (big5, _, _) = encoding_rs::BIG5.encode("1\n00:00:01,000 --> 00:00:02,000\n測試字幕\n");
+        std::fs::write(&path, &big5).unwrap();
+        let sub = load_as(&path, &dir.join("影片.mkv"), Some(encoding_rs::BIG5)).unwrap();
+        assert!(sub.text.unwrap().contains("測試字幕"));
+        assert_eq!(sub.encoding, Some("Big5"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn labels_seen_in_real_libraries() {

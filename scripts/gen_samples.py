@@ -112,6 +112,7 @@ class Sample:
     subs: list[str] = field(default_factory=list)  # 預期的字幕編碼（內嵌 + 外掛）
     expect: dict = field(default_factory=dict)  # 其他預期：rotate、gamma、primaries、aspect
     post: str | None = None  # 後處理：rotate（加上手機直拍的旋轉中繼資料）
+    ext_audio: bool = False  # 另外產生同名的外掛音軌 .mka（英語、660 Hz）
     note: str = ""
     dur: int = DUR
     # 完整的 ffmpeg 參數（輸入、對應、編碼），給多軌之類的特殊樣本用；{srt} 會換成字幕來源檔
@@ -202,6 +203,19 @@ def samples() -> list[Sample]:
               "-map", "0:v", "-map", "1:a", "-map_chapters", "2",
               *X264, *AAC,
           ]),
+        # 沒有音軌的影片：介面測試用它測「暫停中逐格到結尾不換檔」（有音軌時 mpv 的行為不一樣）
+        S("mp4_h264_noaudio", "common", "mp4", X264, None, "h264", None, note="只有影像、沒有音軌"),
+        # 有專輯封面和標籤的 MP3：介面測試確認會顯示封面與歌名、演出者、專輯
+        S("audio_mp3_cover", "general", "mp3", None, MP3, None, "mp3", note="專輯封面 + ID3 標籤", custom=[
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=3",
+            "-f", "lavfi", "-i", "testsrc2=size=300x300:rate=1:duration=1",
+            # 不要加 -frames:v 1：會讓整個檔案在第一格就結束，音訊只剩 1 秒
+            "-map", "0:a", "-map", "1:v", *MP3, "-c:v", "mjpeg",
+            "-disposition:v:0", "attached_pic", "-id3v2_version", "3",
+            "-metadata", "title=測試歌曲", "-metadata", "artist=影戲樂團", "-metadata", "album=範例專輯",
+        ]),
+        # 同名的外掛音軌（字幕組常附的 .mka）：介面測試確認會載入、但預設還是影片內建的音軌
+        S("mkv_extaudio", "common", "mkv", X264, AAC, "h264", "aac", ext_audio=True, note="同名的外掛音軌 .mka"),
         # 一分半的小檔案：續播只記一分鐘以上的檔案，介面測試用它測續播
         S("mp4_long", "common", "mp4", X264, AAC, "h264", "aac", size="160x90", rate="10", dur=90,
           note="90 秒（續播測試）"),
@@ -486,6 +500,14 @@ def generate(s: Sample, sub_src: dict[str, Path], font: Path | None, tmp: Path) 
             if r.returncode == 0:
                 break
         else:
+            return r.stderr.strip() or f"ffmpeg exit {r.returncode}"
+    if s.ext_audio:
+        mka = out.with_suffix(".mka")
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", f"sine=frequency=660:sample_rate=48000:duration={s.dur}",
+                            "-c:a", "flac", "-metadata:s:a:0", "language=eng", str(mka)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
             return r.stderr.strip() or f"ffmpeg exit {r.returncode}"
     if s.sub_ext:
         write_ext_sub(s.sub_ext, out)

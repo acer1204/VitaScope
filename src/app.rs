@@ -5,7 +5,7 @@ use crate::formats;
 use crate::history::History;
 use crate::player::{MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
-use crate::settings::{Settings, WindowGeometry};
+use crate::settings::{Settings, SubStyle, WindowGeometry};
 use crate::update::{self, UpdateStatus};
 use crate::video::VideoView;
 use eframe::egui::{
@@ -61,6 +61,12 @@ enum Action {
     Chapter(i64),
     /// 回到開頭
     Restart,
+    /// 字幕 / 音訊延遲加減（秒）；None = 歸零
+    SubDelay(Option<f64>),
+    AudioDelay(Option<f64>),
+    LoadSubtitle,
+    LoadAudio,
+    SubtitleStyle,
 }
 
 pub struct VitascopeApp {
@@ -126,6 +132,22 @@ pub struct VitascopeApp {
     video_click_time: Option<f64>,
     /// 拖曳進度條期間播到結尾（mpv 會自動暫停）：放開後要繼續播，才會接著播下一個檔案
     resume_after_drag: bool,
+    /// 上一幀結束時有文字輸入框在輸入（快捷鍵先停用）
+    typing_last_frame: bool,
+    /// 「字幕外觀」視窗
+    sub_style_open: bool,
+    /// 正在逐格（暫停中）：mpv 逐格時會短暫取消暫停，這段期間不算「播放中」，到結尾也不換檔
+    frame_stepping: bool,
+    /// 逐格中卻一直沒有暫停（從什麼時候開始）：超過一下子就當作已經回到一般播放
+    stepping_unpaused_since: Option<Instant>,
+    /// 續播：已經送出跳到上次位置、還沒跳到（開始播放的那一下時間是 0，不能拿去存檔）
+    resume_target: Option<(f64, Instant)>,
+    /// 跟影片一起拖放進來的字幕：等那個影片載入完再加上去
+    pending_subs: Option<(PathBuf, Vec<PathBuf>)>,
+    /// 播完時資料夾還沒掃描完（不知道有沒有下一個）：掃描完再接下一個
+    pending_auto_next: bool,
+    /// 這一幀開始時是否有選單開著（點畫面關選單時，不要順便暫停）
+    popup_open_at_start: bool,
 }
 
 /// 啟動參數
@@ -145,6 +167,7 @@ impl VitascopeApp {
 
         let _ = player.set_volume(settings.volume);
         let _ = player.set_mute(settings.muted);
+        player.apply_sub_style(&settings.subtitle);
 
         if let Some(gl) = &cc.gl {
             use eframe::glow::HasContext;
@@ -211,6 +234,14 @@ impl VitascopeApp {
             drag_gen: None,
             video_click_time: None,
             resume_after_drag: false,
+            typing_last_frame: false,
+            sub_style_open: false,
+            frame_stepping: false,
+            stepping_unpaused_since: None,
+            resume_target: None,
+            pending_subs: None,
+            pending_auto_next: false,
+            popup_open_at_start: false,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -277,9 +308,14 @@ impl VitascopeApp {
             }
         }
         self.video_click_time = None;
+        self.pending_auto_next = false;
         // 開新檔一律從播放開始（mpv 會沿用上一個檔案的暫停狀態）；A-B 重播也會沿用，要清掉
         let _ = self.player.set_pause(false);
         let _ = self.player.clear_ab_loop();
+        // 第二字幕的軌道編號在每個檔案都不一樣，換檔時關掉；字幕延遲也是每個檔案各自的
+        //（音訊延遲通常是藍牙耳機之類的裝置延遲，保留）
+        let _ = self.player.set_secondary_sub(None);
+        let _ = self.player.set_sub_delay(0.0);
         if let Err(e) = self.player.open(&path.to_string_lossy()) {
             self.player.state.last_error = Some(format!("無法開啟：{e}"));
         }
@@ -302,6 +338,14 @@ impl VitascopeApp {
                     && list.select(&current)
                 {
                     self.playlist = Some(list);
+                    let st = &self.player.state;
+                    let still_allowed = self.settings.auto_next
+                        && self.seek_drag.is_none()
+                        && self.drag_gen.is_none()
+                        && self.autoshot.is_none();
+                    if std::mem::take(&mut self.pending_auto_next) && still_allowed && st.loaded && st.eof {
+                        self.play_next_in_list();
+                    }
                 }
             }
             Err(TryRecvError::Empty) => {}
@@ -312,7 +356,7 @@ impl VitascopeApp {
     /// 記下目前的檔案看到哪裡（換檔、停止、關閉時）
     fn remember_position(&mut self) {
         let st = &self.player.state;
-        if !st.loaded {
+        if !st.loaded || self.resume_target.is_some() {
             return;
         }
         let (Some(path), Some(duration)) = (st.path.clone(), st.duration) else {
@@ -344,8 +388,15 @@ impl VitascopeApp {
     /// 播放中定時、以及剛暫停時，存一下續播位置（當機、關機時才不會整段遺失）
     fn autosave(&mut self) {
         let st = &self.player.state;
+        // 續播的跳轉完成了（或等太久，例如檔案不能跳轉）：之後的位置才是真的
+        if let Some((target, since)) = self.resume_target
+            && ((st.time_pos - target).abs() < 3.0 || since.elapsed() > Duration::from_secs(10))
+        {
+            self.resume_target = None;
+        }
         let paused_now = st.loaded && st.paused;
-        let just_paused = paused_now && !self.was_paused;
+        // 逐格每一下都會暫停一次，不用每次都存
+        let just_paused = paused_now && !self.was_paused && !self.frame_stepping;
         self.was_paused = paused_now;
         let playing = st.loaded && !st.paused;
         if just_paused || (playing && self.last_autosave.elapsed() >= AUTOSAVE_EVERY) {
@@ -397,6 +448,9 @@ impl VitascopeApp {
         match action {
             Action::TogglePause if loaded => {
                 let msg = if st.paused { "▶ 播放" } else { "⏸ 暫停" };
+                if st.paused {
+                    self.frame_stepping = false;
+                }
                 let _ = self.player.toggle_pause();
                 self.osd(msg);
             }
@@ -446,7 +500,14 @@ impl VitascopeApp {
                 self.set_speed(speed);
             }
             Action::SpeedReset => self.set_speed(1.0),
+            Action::FrameStep(_) if loaded && !st.tracks_of(TrackKind::Video).any(|t| t.selected && !t.albumart) => {
+                // 沒有畫面（純音訊、專輯封面）時 mpv 不會逐格，會一直播下去
+                self.osd("這個檔案沒有影像，不能逐格");
+            }
             Action::FrameStep(forward) if loaded => {
+                self.frame_stepping = true;
+                self.stepping_unpaused_since = None;
+                self.was_playing = false;
                 let _ = self.player.frame_step(forward);
                 self.osd(if forward {
                     "逐格前進 ▶"
@@ -464,13 +525,58 @@ impl VitascopeApp {
                 self.osd(msg);
             }
             Action::Chapter(delta) if loaded => self.step_chapter(delta),
+            Action::SubDelay(delta) if loaded => {
+                // 直接問 mpv 目前的值：連按時屬性變化的通知可能還沒送到
+                let current = self.player.get_f64("sub-delay").unwrap_or(st.sub_delay);
+                let delay = delta.map_or(0.0, |d| current + d);
+                let _ = self.player.set_sub_delay(delay);
+                self.osd(format!("字幕延遲 {}", fmt_delay(delay)));
+            }
+            Action::AudioDelay(delta) if loaded => {
+                let current = self.player.get_f64("audio-delay").unwrap_or(st.audio_delay);
+                let delay = delta.map_or(0.0, |d| current + d);
+                let _ = self.player.set_audio_delay(delay);
+                self.osd(format!("音訊延遲 {}", fmt_delay(delay)));
+            }
+            Action::LoadSubtitle if loaded => self.load_file_dialog(true),
+            Action::SubtitleStyle => self.sub_style_open = true,
+            Action::LoadAudio if loaded => self.load_file_dialog(false),
             Action::Restart if loaded && st.seekable => {
                 let _ = self.player.seek_to(0.0, true);
                 // 播完停在最後一格（暫停中）時也要開始播
                 let _ = self.player.set_pause(false);
+                self.frame_stepping = false;
                 self.osd("從頭播放");
             }
             _ => {}
+        }
+    }
+
+    /// 選單「載入字幕檔…」「載入音軌檔…」：從目前影片的資料夾開始找
+    fn load_file_dialog(&mut self, subtitle: bool) {
+        let (title, filter, exts) = if subtitle {
+            ("載入字幕檔", "字幕檔", formats::SUBTITLE)
+        } else {
+            ("載入音軌檔", "音訊檔", formats::AUDIO)
+        };
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter(filter, exts)
+            .add_filter("所有檔案", &["*"]);
+        if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else { return };
+        let path_str = path.to_string_lossy().into_owned();
+        let result = if subtitle {
+            self.player.add_subtitle(&path_str)
+        } else {
+            self.player.add_audio(&path_str)
+        };
+        let kind = if subtitle { "字幕" } else { "音軌" };
+        match result {
+            Ok(()) => self.osd(format!("載入{kind}：{}", file_name(&path))),
+            Err(e) => self.osd(format!("無法載入{kind}：{e}")),
         }
     }
 
@@ -509,8 +615,11 @@ impl VitascopeApp {
     }
 
     fn select_track(&mut self, kind: TrackKind, id: Option<i64>) {
-        let _ = self.player.select_track(kind, id);
         let name = if kind == TrackKind::Sub { "字幕" } else { "音軌" };
+        if let Err(e) = self.player.select_track(kind, id) {
+            self.osd(format!("無法切換{name}：{e}"));
+            return;
+        }
         let label = id
             .and_then(|id| self.player.state.tracks_of(kind).find(|t| t.id == id))
             .map_or_else(|| "關閉".to_owned(), |t| t.label());
@@ -527,6 +636,11 @@ impl VitascopeApp {
                 self.was_eof = false;
                 self.was_playing = false;
                 self.resume_after_drag = false;
+                self.frame_stepping = false;
+                self.resume_target = None;
+                self.pending_auto_next = false;
+                // 自動存檔從開檔起重新計時（不然停在起始畫面很久再開檔，第一幀就會存到 0）
+                self.last_autosave = Instant::now();
                 self.file_gen += 1;
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
@@ -562,6 +676,16 @@ impl VitascopeApp {
         let Ok(path) = self.player.get_string("path") else {
             return;
         };
+        if let Some((video, subs)) = self.pending_subs.take()
+            && crate::playlist::same_file(&video, Path::new(&path))
+        {
+            // 一起拖進來的字幕：第一個選上，其他的加到選單裡
+            for (i, sub) in subs.iter().enumerate() {
+                if let Err(e) = self.player.add_subtitle_as(&sub.to_string_lossy(), i == 0) {
+                    self.osd(format!("無法載入字幕：{e}"));
+                }
+            }
+        }
         if is_url(&path) {
             return;
         }
@@ -575,6 +699,7 @@ impl VitascopeApp {
             let duration = self.player.get_f64("duration").ok();
             if duration.is_none_or(|d| crate::history::worth_resuming(t, d)) {
                 let _ = self.player.seek_to(t, true);
+                self.resume_target = Some((t, Instant::now()));
                 self.osd(format!("從 {} 繼續播放（Home 從頭播放）", fmt_time(t)));
             } else {
                 self.update_history(|h| h.forget(&path));
@@ -583,7 +708,7 @@ impl VitascopeApp {
     }
 
     /// 播完時自動播放清單的下一個檔案。只算「播放中播到結尾」：
-    /// 暫停中逐格、跳轉到結尾不算；拖曳進度條期間也先不動，放開後再說
+    /// 暫停中逐格或跳轉到結尾不算；拖曳進度條期間也先不動，放開後再說
     fn auto_next(&mut self) {
         if self.seek_drag.is_some() || self.drag_gen.is_some() {
             let st = &self.player.state;
@@ -593,14 +718,35 @@ impl VitascopeApp {
             return;
         }
         let st = &self.player.state;
+        // 逐格一下最多播一格就會暫停；一直沒暫停代表其實是在播放（例如 mpv 沒辦法逐格）
+        if self.frame_stepping && st.loaded && !st.paused {
+            let since = *self.stepping_unpaused_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > Duration::from_secs(1) {
+                self.frame_stepping = false;
+                self.stepping_unpaused_since = None;
+            }
+        } else {
+            self.stepping_unpaused_since = None;
+        }
         let eof = st.loaded && st.eof;
         let just_ended = eof && !self.was_eof && self.was_playing;
         self.was_eof = eof;
         // mpv 播到結尾時會同時設定暫停，所以看的是上一幀還在播放
-        self.was_playing = st.loaded && !st.paused && !st.eof;
-        if !just_ended || !self.settings.auto_next {
+        self.was_playing = st.loaded && !st.paused && !st.eof && !self.frame_stepping;
+        // 自動截圖（開發、CI 用）要固定的畫面，不換檔
+        if !just_ended || !self.settings.auto_next || self.autoshot.is_some() {
             return;
         }
+        let has_next = self.playlist.as_ref().is_some_and(|l| l.next().is_some());
+        if has_next {
+            self.play_next_in_list();
+        } else if self.playlist_scan.is_some() {
+            // 資料夾還在掃描：掃完再看有沒有下一個
+            self.pending_auto_next = true;
+        }
+    }
+
+    fn play_next_in_list(&mut self) {
         if let Some(next) = self.playlist.as_ref().and_then(|l| l.next()).map(Path::to_path_buf) {
             self.open(&next);
             let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
@@ -624,8 +770,19 @@ impl VitascopeApp {
                 }
             });
         }
-        // 「關於」視窗開著時，按鍵都交給它（Esc 關閉視窗，而不是離開全螢幕）
-        if self.about_open {
+        // 「關於」視窗開著時，按鍵都交給它（Esc 關閉視窗，而不是離開全螢幕）；
+        // 正在輸入文字（例如字幕外觀的字型名稱）時，字母鍵不能變成快捷鍵。
+        // 也看上一幀：在輸入框按 Esc 時，egui 會先取消焦點，這一幀的 Esc 不能拿去離開全螢幕
+        if self.about_open || self.typing_last_frame || ctx.text_edit_focused() {
+            return;
+        }
+        // Esc 先關「字幕外觀」視窗（不要直接離開全螢幕）
+        if self.sub_style_open
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.sub_style_open = false;
+            self.save_settings();
             return;
         }
         // Esc 只在全螢幕、而且沒有選單開著時才用來離開全螢幕；其他時候留給 egui 關選單
@@ -652,6 +809,12 @@ impl VitascopeApp {
             key(Modifiers::NONE, Key::Comma, Action::FrameStep(false));
             key(Modifiers::NONE, Key::L, Action::AbLoop);
             key(Modifiers::NONE, Key::Home, Action::Restart);
+            key(Modifiers::NONE, Key::OpenBracket, Action::SubDelay(Some(-0.1)));
+            key(Modifiers::NONE, Key::CloseBracket, Action::SubDelay(Some(0.1)));
+            key(Modifiers::NONE, Key::Minus, Action::AudioDelay(Some(-0.1)));
+            key(Modifiers::NONE, Key::Equals, Action::AudioDelay(Some(0.1)));
+            // 數字鍵盤的 +、德文鍵盤的 + 鍵是 Plus，不是 Equals
+            key(Modifiers::NONE, Key::Plus, Action::AudioDelay(Some(0.1)));
             key(Modifiers::NONE, Key::ArrowLeft, Action::Seek(-5.0));
             key(Modifiers::NONE, Key::ArrowRight, Action::Seek(5.0));
             key(Modifiers::NONE, Key::ArrowUp, Action::Volume(5.0));
@@ -676,13 +839,10 @@ impl VitascopeApp {
     fn handle_drops(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         let Some(first) = dropped.first().cloned() else { return };
-        if formats::is_subtitle(&first) && self.player.state.loaded {
-            match self.player.add_subtitle(&first.to_string_lossy()) {
-                Ok(()) => self.osd(format!("載入字幕：{}", file_name(&first))),
-                Err(e) => self.osd(format!("無法載入字幕：{e}")),
-            }
-            return;
-        }
+        let dropped_count = dropped.len();
+        let dropped_paths = dropped.clone();
+        let mut subs: Vec<PathBuf> = dropped.iter().filter(|p| formats::is_subtitle(p)).cloned().collect();
+        crate::playlist::sort_by_name(&mut subs);
         // 一次拖放多個影音檔：播放清單就是這幾個檔案，依檔名排序
         //（拖放的順序跟系統有關，Windows 會把滑鼠抓著的那個檔案放在最前面）
         let mut media: Vec<PathBuf> = dropped
@@ -690,16 +850,64 @@ impl VitascopeApp {
             .filter(|p| formats::media_kind(p).is_some())
             .collect();
         crate::playlist::sort_by_name(&mut media);
-        match media.len() {
-            0 => self.open(&first),
-            1 => self.open(&media[0]),
-            _ => {
-                let first = media[0].clone();
-                self.remember_position();
-                self.playlist_scan = None;
-                self.playlist = Some(Playlist::from_files(media));
-                self.open(&first);
+        let all_subs = subs.len() == dropped_count;
+        if media.is_empty() && all_subs {
+            // 只拖了字幕檔：加到正在播（或正在開）的影片
+            let st = &self.player.state;
+            if st.loaded {
+                for (i, sub) in subs.iter().enumerate() {
+                    match self.player.add_subtitle_as(&sub.to_string_lossy(), i == 0) {
+                        Ok(()) => self.osd(format!("載入字幕：{}", file_name(sub))),
+                        Err(e) => self.osd(format!("無法載入字幕：{e}")),
+                    }
+                }
+            } else if st.loading
+                && let Ok(path) = self.player.get_string("path")
+            {
+                self.pending_subs = Some((PathBuf::from(path), subs));
+            } else {
+                self.osd("請先開啟影片，再拖放字幕檔");
             }
+            return;
+        }
+        if media.is_empty() {
+            // 副檔名不在清單上的檔案：照樣交給 mpv 試試看，字幕等它載入完再加
+            let other = dropped_paths
+                .into_iter()
+                .find(|p| !formats::is_subtitle(p))
+                .unwrap_or(first);
+            self.open(&other);
+            if !subs.is_empty() {
+                let other = std::path::absolute(&other).unwrap_or(other);
+                self.pending_subs = Some((other, subs));
+            }
+            return;
+        }
+        // 屬於某個拖進來的影片的字幕（同資料夾、檔名以影片名稱開頭），那個影片載入時就會自動找到；
+        // 只有其他的字幕才加到第一個影片
+        let belongs_to_some_video = |sub: &Path| {
+            let name = sub
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            media.iter().any(|v| {
+                v.parent() == sub.parent()
+                    && v.file_stem()
+                        .is_some_and(|stem| crate::subs::belongs_to(&name, &stem.to_string_lossy().to_lowercase()))
+            })
+        };
+        let extra_subs: Vec<PathBuf> = subs.into_iter().filter(|s| !belongs_to_some_video(s)).collect();
+        let video = media[0].clone();
+        if media.len() > 1 {
+            self.remember_position();
+            self.playlist_scan = None;
+            self.playlist = Some(Playlist::from_files(media));
+        }
+        self.open(&video);
+        // 影片載入完再加上去（open 會把路徑轉成完整路徑，這裡也一樣）
+        if !extra_subs.is_empty() {
+            let video = std::path::absolute(&video).unwrap_or(video);
+            self.pending_subs = Some((video, extra_subs));
         }
     }
 
@@ -872,6 +1080,123 @@ impl VitascopeApp {
         }
     }
 
+    /// 「字幕外觀」視窗：改了馬上套用（影片繼續播，看得到效果），關掉時存檔
+    fn subtitle_style_window(&mut self, ctx: &egui::Context) {
+        if !self.sub_style_open {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut reset = false;
+        egui::Window::new("字幕外觀")
+            .id(Id::new("subtitle_style"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(pos2(40.0, 40.0))
+            .show(ctx, |ui| {
+                let style = &mut self.settings.subtitle;
+                egui::Grid::new("subtitle_style_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("字型");
+                        let current = SubStyle::font_choices()
+                            .iter()
+                            .find(|(name, _)| *name == style.effective_font())
+                            .map_or_else(|| style.effective_font().to_owned(), |(_, label)| (*label).to_owned());
+                        egui::ComboBox::from_id_salt("subtitle_font")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for (name, label) in SubStyle::font_choices() {
+                                    changed |= ui
+                                        .selectable_value(&mut style.font, (*name).to_owned(), *label)
+                                        .changed();
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label("其他字型");
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut style.font)
+                                    .hint_text("輸入字型名稱")
+                                    .desired_width(180.0),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("大小");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut style.size, 20.0..=100.0).step_by(1.0))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("文字顏色");
+                        changed |= ui.color_edit_button_srgba_unmultiplied(&mut style.color).changed();
+                        ui.end_row();
+
+                        ui.label("邊框顏色");
+                        changed |= ui
+                            .color_edit_button_srgba_unmultiplied(&mut style.border_color)
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("邊框粗細");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut style.border_size, 0.0..=8.0).step_by(0.5))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("陰影");
+                        changed |= ui
+                            .add(egui::Slider::new(&mut style.shadow, 0.0..=4.0).step_by(0.5))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("位置");
+                        changed |= ui
+                            .add(
+                                egui::Slider::new(&mut style.position, 0.0..=100.0)
+                                    .step_by(1.0)
+                                    .custom_formatter(|v, _| match v {
+                                        v if v >= 100.0 => "最下面".to_owned(),
+                                        v if v <= 0.0 => "最上面".to_owned(),
+                                        v => format!("{v:.0}"),
+                                    }),
+                            )
+                            .changed();
+                        ui.end_row();
+
+                        ui.label("");
+                        changed |= ui.checkbox(&mut style.bold, "粗體").changed();
+                        ui.end_row();
+
+                        ui.label("");
+                        changed |= ui
+                            .checkbox(&mut style.override_ass, "也套用到 ASS 字幕")
+                            .on_hover_text("字幕組的 ASS 字幕有自己的字型、顏色和特效，勾選後會被這裡的設定蓋掉")
+                            .changed();
+                        ui.end_row();
+                    });
+                ui.separator();
+                if ui.button("恢復預設").clicked() {
+                    reset = true;
+                }
+            });
+        if reset {
+            self.settings.subtitle = SubStyle::default();
+            changed = true;
+        }
+        if changed {
+            self.player.apply_sub_style(&self.settings.subtitle);
+        }
+        if !open {
+            self.sub_style_open = false;
+            self.save_settings();
+        }
+    }
+
     /// 全螢幕的控制列浮在畫面上時，把字幕往上推，不要被蓋住。
     /// `overlay`：控制列高度佔畫面高度的比例，0 = 沒有顯示
     fn lift_subtitles(&mut self, overlay: f32) {
@@ -940,24 +1265,15 @@ impl VitascopeApp {
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "影片畫面"));
         let st = &self.player.state;
 
-        if (st.loaded || st.loading)
+        // 沒有任何影像（連專輯封面都沒有）的檔案不畫：不然會留著上一個檔案的最後一格
+        let has_picture = st.tracks_of(TrackKind::Video).next().is_some();
+        if (st.loading || (st.loaded && has_picture))
             && let Some(video) = &self.video
         {
             video.paint(ui, rect);
         }
         if st.loaded && !st.has_video() && !st.tracks.is_empty() {
-            // 純音訊：顯示檔名
-            let title = st.title.clone().unwrap_or_default();
-            let mut ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(rect)
-                    .layout(Layout::centered_and_justified(egui::Direction::TopDown)),
-            );
-            ui.label(
-                egui::RichText::new(format!("♪  {title}"))
-                    .size(22.0)
-                    .color(Color32::from_gray(200)),
-            );
+            audio_info(ui, rect, st);
         }
         if !st.loaded
             && !st.loading
@@ -967,7 +1283,7 @@ impl VitascopeApp {
         }
 
         // 選單開著時點畫面只是關掉選單，不要順便暫停
-        let menu_was_open = egui::Popup::is_any_open(ui.ctx());
+        let menu_was_open = self.popup_open_at_start;
         let now = ui.ctx().input(|i| i.time);
         let max_delay = ui.ctx().options(|o| o.input_options.max_double_click_delay);
         let first_click_on_video = self.video_click_time.is_some_and(|t| now - t <= max_delay);
@@ -1356,29 +1672,147 @@ impl VitascopeApp {
         }
     }
 
+    /// 控制列與右鍵選單的「字幕」「音軌」選單：選軌道、延遲、載入檔案；字幕另有第二字幕、編碼、外觀
     fn track_menu(&mut self, ui: &mut egui::Ui, kind: TrackKind, name: &str) {
-        let tracks: Vec<(i64, String, bool)> = self
-            .player
-            .state
-            .tracks_of(kind)
-            .map(|t| (t.id, t.label(), t.selected))
-            .collect();
-        let none_selected = !tracks.iter().any(|t| t.2);
+        let is_sub = kind == TrackKind::Sub;
+        let st = &self.player.state;
+        let loaded = st.loaded;
+        let tracks: Vec<(i64, String)> = st.tracks_of(kind).map(|t| (t.id, t.label())).collect();
+        let selected = st.selected(kind).map(|t| t.id);
+        let secondary = st.secondary_sid;
+        let delay = if is_sub { st.sub_delay } else { st.audio_delay };
+        // 選中的是外掛文字字幕：可以換編碼重新載入
+        let encoding = st
+            .selected(kind)
+            .filter(|_| is_sub)
+            .and_then(|t| self.player.external_sub_info(t))
+            .and_then(|info| {
+                info.encoding
+                    .map(|used| (used, info.detected.unwrap_or(used), info.forced))
+            });
+
         let mut choice: Option<Option<i64>> = None;
-        ui.add_enabled_ui(!tracks.is_empty(), |ui| {
+        let mut secondary_choice: Option<Option<i64>> = None;
+        let mut reload: Option<Option<&'static encoding_rs::Encoding>> = None;
+        let mut action = None;
+        ui.add_enabled_ui(loaded, |ui| {
             ui.menu_button(name, |ui| {
-                if kind == TrackKind::Sub && ui.selectable_label(none_selected, "關閉字幕").clicked() {
+                if is_sub && ui.selectable_label(selected.is_none(), "關閉字幕").clicked() {
                     choice = Some(None);
                 }
-                for (id, label, selected) in &tracks {
-                    if ui.selectable_label(*selected, label).clicked() {
+                for (id, label) in &tracks {
+                    if ui.selectable_label(selected == Some(*id), label).clicked() {
                         choice = Some(Some(*id));
                     }
+                }
+                if tracks.is_empty() {
+                    ui.weak(if is_sub {
+                        "（沒有字幕）"
+                    } else {
+                        "（沒有音軌）"
+                    });
+                }
+                ui.separator();
+                if is_sub && !tracks.is_empty() {
+                    ui.menu_button("第二字幕", |ui| {
+                        if ui.selectable_label(secondary.is_none(), "關閉").clicked() {
+                            secondary_choice = Some(None);
+                        }
+                        for (id, label) in tracks.iter().filter(|(id, _)| Some(*id) != selected) {
+                            if ui.selectable_label(secondary == Some(*id), label).clicked() {
+                                secondary_choice = Some(Some(*id));
+                            }
+                        }
+                        ui.separator();
+                        ui.weak("和主字幕同時顯示，在畫面上方");
+                    });
+                }
+                // 延遲的子選單點了不關閉，才能連按
+                let delay_menu = egui::containers::menu::SubMenuButton::new(format!(
+                    "{}延遲：{}",
+                    if is_sub { "字幕" } else { "音訊" },
+                    fmt_delay(delay)
+                ))
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+                );
+                delay_menu.ui(ui, |ui| {
+                    let step = |d| {
+                        if is_sub {
+                            Action::SubDelay(d)
+                        } else {
+                            Action::AudioDelay(d)
+                        }
+                    };
+                    ui.horizontal(|ui| {
+                        if ui.button("−0.1 秒").clicked() {
+                            action = Some(step(Some(-0.1)));
+                        }
+                        if ui.button("+0.1 秒").clicked() {
+                            action = Some(step(Some(0.1)));
+                        }
+                        if ui.button("歸零").clicked() {
+                            action = Some(step(None));
+                        }
+                    });
+                    ui.weak(if is_sub {
+                        "快捷鍵 [ / ]。正數 = 字幕晚一點出現"
+                    } else {
+                        "快捷鍵 - / =。正數 = 聲音晚一點"
+                    });
+                });
+                if let Some((current, detected, forced)) = encoding {
+                    ui.menu_button("字幕編碼", |ui| {
+                        let auto = format!("自動判斷（{detected}）");
+                        if ui.selectable_label(!forced, auto).clicked() {
+                            reload = Some(None);
+                        }
+                        ui.separator();
+                        for (label, enc) in crate::subs::ENCODINGS {
+                            if ui.selectable_label(forced && enc.name() == current, *label).clicked() {
+                                reload = Some(Some(*enc));
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                let load = if is_sub {
+                    "載入字幕檔…"
+                } else {
+                    "載入音軌檔…"
+                };
+                if ui.button(load).clicked() {
+                    action = Some(if is_sub {
+                        Action::LoadSubtitle
+                    } else {
+                        Action::LoadAudio
+                    });
+                }
+                if is_sub && ui.button("字幕外觀…").clicked() {
+                    action = Some(Action::SubtitleStyle);
                 }
             });
         });
         if let Some(id) = choice {
             self.select_track(kind, id);
+        }
+        if let Some(id) = secondary_choice {
+            let _ = self.player.set_secondary_sub(id);
+            let label = id
+                .and_then(|id| self.player.state.tracks_of(kind).find(|t| t.id == id))
+                .map_or_else(|| "關閉".to_owned(), |t| t.label());
+            self.osd(format!("第二字幕：{label}"));
+        }
+        if let (Some(encoding), Some(id)) = (reload, selected) {
+            match self.player.reload_subtitle(id, encoding) {
+                Ok(()) => self.osd(format!("字幕編碼：{}", encoding.map_or("自動判斷", |e| e.name()))),
+                Err(e) => self.osd(format!("無法重新載入字幕：{e}")),
+            }
+        }
+        if let Some(a) = action {
+            let ctx = ui.ctx().clone();
+            self.run(&ctx, a);
         }
     }
 
@@ -1386,7 +1820,9 @@ impl VitascopeApp {
         let st = &self.player.state;
         let duration = st.duration.unwrap_or(0.0);
         let can_seek = st.loaded && st.seekable && duration > 0.0;
-        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::click_and_drag());
+        // 固定的 id：拖曳中切換全螢幕時，進度條換到浮動的控制列，拖曳還是同一個
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+        let response = ui.interact(rect, Id::new("seek_bar"), Sense::click_and_drag());
         let active = can_seek && (response.hovered() || response.dragged());
         // 自己畫的元件也要有無障礙資訊：螢幕閱讀器、介面測試才找得到
         response.widget_info(|| egui::WidgetInfo::slider(can_seek, st.time_pos, "進度"));
@@ -1538,6 +1974,8 @@ impl eframe::App for VitascopeApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.frames += 1;
         let ctx = ui.ctx().clone();
+        // 控制列的選單在畫面之前處理，點畫面時那個選單已經關掉了；所以在一開始就記下來
+        self.popup_open_at_start = egui::Popup::is_any_open(&ctx);
         let fullscreen = is_fullscreen(&ctx);
         let show_controls = self.controls_visible(&ctx, fullscreen);
 
@@ -1582,6 +2020,8 @@ impl eframe::App for VitascopeApp {
         }
         self.lift_subtitles(overlay_height);
         self.about_window(&ctx);
+        self.subtitle_style_window(&ctx);
+        self.typing_last_frame = ctx.text_edit_focused();
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
@@ -1602,6 +2042,15 @@ fn is_url(path: &str) -> bool {
     path.contains("://")
 }
 
+/// 延遲：0 →「0 秒」、0.3 →「+0.3 秒」、-0.25 →「-0.25 秒」
+fn fmt_delay(seconds: f64) -> String {
+    if seconds.abs() < 0.0005 {
+        return "0 秒".to_owned();
+    }
+    let s = format!("{seconds:+.3}");
+    format!("{} 秒", s.trim_end_matches('0').trim_end_matches('.'))
+}
+
 /// 1.0 → 「1」、1.25 →「1.25」、0.5 →「0.5」
 fn fmt_speed(speed: f64) -> String {
     let s = format!("{speed:.2}");
@@ -1615,6 +2064,37 @@ fn chapter_label(chapters: &[crate::player::Chapter], index: usize) -> String {
         .and_then(|c| c.title.clone())
         .filter(|t| !t.trim().is_empty())
         .unwrap_or_else(|| format!("第 {} 章", index + 1))
+}
+
+/// 純音訊檔：歌名、演出者、專輯。有專輯封面時（mpv 把封面當成畫面畫出來）字放在下方，沒有封面就放中間
+fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
+    let has_cover = st.tracks_of(TrackKind::Video).any(|t| t.albumart);
+    let title = st.tag("title").or(st.title.as_deref()).unwrap_or_default().to_owned();
+    let details: Vec<&str> = ["artist", "album"].iter().filter_map(|k| st.tag(k)).collect();
+    let lines = 1 + details.len();
+    let height = 24.0 + 22.0 * lines as f32 + 24.0;
+    let area = if has_cover {
+        let band = Rect::from_min_max(pos2(rect.left(), rect.bottom() - height), rect.max);
+        ui.painter()
+            .rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(150));
+        band
+    } else {
+        Rect::from_center_size(rect.center(), vec2(rect.width(), height))
+    };
+    let mut ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(area.shrink2(vec2(16.0, 12.0)))
+            .layout(Layout::top_down(Align::Center)),
+    );
+    let prefix = if has_cover { "" } else { "♪  " };
+    ui.label(
+        egui::RichText::new(format!("{prefix}{title}"))
+            .size(22.0)
+            .color(Color32::from_gray(230)),
+    );
+    for d in details {
+        ui.label(egui::RichText::new(d).size(16.0).color(Color32::from_gray(170)));
+    }
 }
 
 /// 選單項目：文字 + 右側的快捷鍵說明，回傳是否被點選
@@ -1693,7 +2173,7 @@ pub fn fmt_time(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_speed, fmt_time, is_mesa_software_renderer, short_versions};
+    use super::{fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, short_versions};
 
     #[test]
     fn formats_time() {
@@ -1714,6 +2194,16 @@ mod tests {
             short_versions("mpv 0.37.0", "6.1.1-3ubuntu5"),
             "mpv 0.37.0 · FFmpeg 6.1.1"
         );
+    }
+
+    #[test]
+    fn formats_delay() {
+        assert_eq!(fmt_delay(0.0), "0 秒");
+        assert_eq!(fmt_delay(0.0001), "0 秒");
+        assert_eq!(fmt_delay(0.3), "+0.3 秒");
+        assert_eq!(fmt_delay(-0.25), "-0.25 秒");
+        assert_eq!(fmt_delay(1.0), "+1 秒");
+        assert_eq!(fmt_delay(-0.1 - 0.2), "-0.3 秒");
     }
 
     #[test]

@@ -109,7 +109,20 @@ impl Track {
     /// 選單上顯示的名稱，例如「#2 日本語 (jpn) · aac 2ch」
     pub fn label(&self) -> String {
         let mut s = format!("#{}", self.id);
-        if let Some(t) = self.title.as_deref().filter(|t| !t.is_empty()) {
+        // 外掛檔案沒有標題時，mpv 用檔名的一部分當標題（新版是「mka」、「jpn.mka」，舊版是完整檔名）：
+        // 這種情況顯示完整檔名，比較認得出來
+        let file_name = self
+            .external_filename
+            .as_deref()
+            .and_then(|f| Path::new(f).file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let title = self.title.as_deref().filter(|t| !t.is_empty());
+        let title = match (&file_name, title) {
+            (Some(name), Some(t)) if name.ends_with(t) => Some(name.as_str()),
+            (Some(name), None) => Some(name.as_str()),
+            (_, t) => t,
+        };
+        if let Some(t) = title {
             s += &format!(" {t}");
         }
         if let Some(l) = self.lang.as_deref().filter(|l| !l.is_empty()) {
@@ -174,6 +187,16 @@ pub struct State {
     pub chapter: Option<usize>,
     /// A-B 重播的起點、終點（秒）
     pub ab_loop: [Option<f64>; 2],
+    /// 字幕延遲（秒，正數 = 字幕晚一點出現）
+    pub sub_delay: f64,
+    /// 音訊延遲（秒，正數 = 聲音晚一點）
+    pub audio_delay: f64,
+    /// 主字幕、第二字幕的軌道編號（直接看 mpv 的 sid / secondary-sid，
+    /// 開了第二字幕時 track-list 的 selected 兩條都是 true，分不出哪條是主字幕）
+    pub sid: Option<i64>,
+    pub secondary_sid: Option<i64>,
+    /// 標籤（歌名、演出者、專輯…），鍵是 mpv 整理過的名稱：Title、Artist、Album…
+    pub metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl State {
@@ -182,12 +205,28 @@ impl State {
     }
 
     pub fn selected(&self, kind: TrackKind) -> Option<&Track> {
-        self.tracks_of(kind).find(|t| t.selected)
+        if kind == TrackKind::Sub
+            && let Some(id) = self.sid
+        {
+            return self.tracks_of(kind).find(|t| t.id == id);
+        }
+        // 第二字幕也是 selected；軌道編號各類分開算，所以只有字幕要排除第二字幕
+        self.tracks_of(kind)
+            .find(|t| t.selected && (kind != TrackKind::Sub || Some(t.id) != self.secondary_sid))
     }
 
     /// 有實際影像（不是只有專輯封面）
     pub fn has_video(&self) -> bool {
         self.tracks_of(TrackKind::Video).any(|t| !t.albumart)
+    }
+
+    /// 讀取標籤（不分大小寫），例如 `tag("artist")`
+    pub fn tag(&self, name: &str) -> Option<&str> {
+        self.metadata
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.trim().is_empty())
     }
 
     /// 某個時間點所在的章節（從 0 開始）。跳到章節後顯示的影格時間常常比章節時間早一點點
@@ -229,6 +268,11 @@ const OBSERVED: &[(&str, Format)] = &[
     // 沒設定時是 "no"，所以用字串讀
     ("ab-loop-a", Format::String),
     ("ab-loop-b", Format::String),
+    ("sub-delay", Format::Double),
+    ("audio-delay", Format::Double),
+    ("sid", Format::String),
+    ("secondary-sid", Format::String),
+    ("filtered-metadata", Format::String),
 ];
 
 /// VITASCOPE_DEBUG 的值 → 要 mpv 送出的記錄等級。
@@ -242,6 +286,46 @@ fn debug_log_level(value: Option<&str>) -> &'static str {
     }
 }
 
+/// 一條載入過的外掛字幕
+#[derive(Debug, Clone)]
+pub struct LoadedSub {
+    /// 交給 mpv 的檔案（文字字幕是轉成 UTF-8 的暫存檔）
+    pub load_path: String,
+    pub original: PathBuf,
+    /// 讀取時用的編碼（自動判斷或使用者指定）；圖形字幕是 None
+    pub encoding: Option<&'static str>,
+    /// 第一次載入時自動判斷出的編碼
+    pub detected: Option<&'static str>,
+    /// 編碼是使用者指定的（不是自動判斷）
+    pub forced: bool,
+}
+
+/// 加入外掛字幕的方式（mpv sub-add 的旗標）
+#[derive(Debug, Clone, Copy)]
+enum AddMode {
+    /// 加入但不選（自動載入的外掛字幕，由選字幕的規則決定）
+    Auto,
+    /// 加入並選上
+    Select,
+    /// 選上；同一個檔案已經加入過就選那一條，不重複加入
+    SelectExisting,
+}
+
+impl AddMode {
+    fn flag(self) -> &'static str {
+        match self {
+            AddMode::Auto => "auto",
+            AddMode::Select => "select",
+            AddMode::SelectExisting => "cached",
+        }
+    }
+}
+
+/// 延遲以毫秒為單位，連按 ±0.1 秒不會累積出 0.30000000000000004 這種數字
+fn round_ms(seconds: f64) -> f64 {
+    (seconds * 1000.0).round() / 1000.0
+}
+
 pub const MIN_SPEED: f64 = 0.25;
 pub const MAX_SPEED: f64 = 4.0;
 
@@ -253,6 +337,8 @@ pub struct Player {
     pub state: State,
     /// 這次開檔期間 mpv 回報的錯誤訊息（開檔失敗時拿來說明原因）
     recent_errors: Vec<String>,
+    /// 這次開檔載入的外掛字幕（轉碼後的檔案 ↔ 原始檔）
+    loaded_subs: Vec<LoadedSub>,
     auto_select_subs: bool,
     external_subs: bool,
     /// 最近一次開檔失敗的基本原因。mpv 的記錄訊息要等一般事件都取完才會送出，
@@ -301,6 +387,7 @@ impl Player {
                 ..Default::default()
             },
             recent_errors: Vec::new(),
+            loaded_subs: Vec::new(),
             auto_select_subs: opts.auto_select_subs,
             external_subs: opts.external_subs,
             failure: None,
@@ -396,9 +483,96 @@ impl Player {
         self.mpv.get_property::<i64>("chapter").ok()
     }
 
+    /// 字幕延遲（秒，正數 = 字幕晚一點出現）。主字幕、第二字幕一起調：
+    /// mpv 0.38 起第二字幕有自己的 secondary-sub-delay（0.37 沒有，sub-delay 本來就兩條一起動）
+    pub fn set_sub_delay(&self, seconds: f64) -> mpv::Result<()> {
+        let seconds = round_ms(seconds);
+        let _ = self.mpv.set_property("secondary-sub-delay", seconds);
+        self.mpv.set_property("sub-delay", seconds)
+    }
+
+    /// 套用字幕外觀（每一項都設定，各版本 mpv 的預設值不同）
+    pub fn apply_sub_style(&self, style: &crate::settings::SubStyle) {
+        for (name, value) in style.mpv_options() {
+            if let Err(e) = self.mpv.set_property(name, value.as_str()) {
+                eprintln!("[vitascope] 無法設定 {name}={value}：{e}");
+            }
+        }
+    }
+
+    /// 音訊延遲（秒，正數 = 聲音晚一點）
+    pub fn set_audio_delay(&self, seconds: f64) -> mpv::Result<()> {
+        self.mpv.set_property("audio-delay", round_ms(seconds))
+    }
+
+    /// 第二字幕（跟主字幕同時顯示，在畫面上方）；`None` = 關閉
+    pub fn set_secondary_sub(&self, id: Option<i64>) -> mpv::Result<()> {
+        match id {
+            Some(id) => self.mpv.set_property("secondary-sid", id),
+            None => self.mpv.set_property("secondary-sid", "no"),
+        }
+    }
+
+    /// 載入外部音軌檔並切換過去
+    pub fn add_audio(&self, path: &str) -> mpv::Result<()> {
+        self.mpv.command(&["audio-add", path, "select"])
+    }
+
+    /// 外掛字幕的原始檔與自動判斷出的編碼（`track` 是 mpv 的軌道；內嵌字幕回傳 None）
+    pub fn external_sub_info(&self, track: &Track) -> Option<&LoadedSub> {
+        let file = track.external_filename.as_deref()?;
+        self.loaded_subs.iter().find(|s| s.load_path == file)
+    }
+
+    /// 用指定的編碼重新載入一條外掛字幕（自動判斷猜錯、顯示亂碼時用）；`None` = 改回自動判斷。
+    /// 換成新的軌道並選上，舊的那條移除
+    pub fn reload_subtitle(
+        &mut self,
+        track_id: i64,
+        encoding: Option<&'static encoding_rs::Encoding>,
+    ) -> mpv::Result<()> {
+        // 軌道編號是各類分開算的（影片、音軌、字幕都有 1 號），要限定字幕
+        let Some(track) = self.state.tracks_of(TrackKind::Sub).find(|t| t.id == track_id).cloned() else {
+            return Ok(());
+        };
+        let Some(info) = self.external_sub_info(&track).cloned() else {
+            return Ok(());
+        };
+        let video = self
+            .state
+            .path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| info.original.clone());
+        let sub = subs::load_as(&info.original, &video, encoding).map_err(|e| mpv::Error {
+            code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
+            context: format!("無法讀取字幕 {}：{e}", info.original.display()),
+        })?;
+        // 用 select（不是 cached）：換成同樣內容的編碼時，cached 會選回舊的那條，接著就被移除了
+        self.add_external(&sub, AddMode::Select)?;
+        if let Some(last) = self.loaded_subs.last_mut() {
+            last.forced = encoding.is_some();
+        }
+        self.mpv.command(&["sub-remove", &track_id.to_string()])?;
+        self.refresh_tracks();
+        Ok(())
+    }
+
     /// 選擇軌道；`None` = 關閉這類軌道（例如關字幕）
     pub fn select_track(&self, kind: TrackKind, id: Option<i64>) -> mpv::Result<()> {
         let Some(prop) = kind.property() else { return Ok(()) };
+        // 把目前的第二字幕選成主字幕：兩條對調（mpv 不讓同一條同時當主字幕和第二字幕，直接設定會沒有反應）
+        if kind == TrackKind::Sub
+            && let Some(new) = id
+            && Some(new) == self.state.secondary_sid
+        {
+            self.mpv.set_property("secondary-sid", "no")?;
+            self.mpv.set_property("sid", new)?;
+            if let Some(old) = self.state.sid {
+                let _ = self.mpv.set_property("secondary-sid", old);
+            }
+            return Ok(());
+        }
         match id {
             Some(id) => self.mpv.set_property(prop, id),
             None => self.mpv.set_property(prop, "no"),
@@ -406,33 +580,103 @@ impl Player {
     }
 
     /// 載入外掛字幕並立刻顯示（拖放字幕檔、選單「載入字幕」）。編碼和語言一樣自動判斷
-    pub fn add_subtitle(&self, path: &str) -> mpv::Result<()> {
-        let sub_path = Path::new(path);
+    pub fn add_subtitle(&mut self, path: &str) -> mpv::Result<()> {
+        self.add_subtitle_as(path, true)
+    }
+
+    /// 載入外掛字幕；`select` = 選上它（已經載入過的同一個檔案就直接選那一條，不會重複加入）
+    pub fn add_subtitle_as(&mut self, path: &str, select: bool) -> mpv::Result<()> {
+        let mut sub_path = PathBuf::from(path);
+        // VobSub 是 .idx + .sub 一組：拖進來的是 .sub 時改用 .idx（.sub 不是文字字幕）
+        if sub_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("sub")) {
+            let idx = sub_path.with_extension("idx");
+            if idx.is_file() {
+                sub_path = idx;
+            }
+        }
         let video = self
             .state
             .path
             .as_deref()
             .map(PathBuf::from)
-            .unwrap_or_else(|| sub_path.to_path_buf());
-        match subs::load(sub_path, &video) {
-            Ok(sub) => self.add_external(&sub, true),
+            .unwrap_or_else(|| sub_path.clone());
+        let already = self
+            .loaded_subs
+            .iter()
+            .any(|s| crate::playlist::same_file(&s.original, &sub_path));
+        if already && !select {
+            return Ok(());
+        }
+        let mode = if select { AddMode::SelectExisting } else { AddMode::Auto };
+        match subs::load(&sub_path, &video) {
+            Ok(sub) => self.add_external(&sub, mode),
             // 讀不了（例如不是本機檔案）就直接交給 mpv
-            Err(_) => self.mpv.command(&["sub-add", path, "select"]),
+            Err(_) => self.mpv.command(&["sub-add", path, mode.flag()]),
         }
     }
 
-    fn add_external(&self, sub: &ExternalSub, select: bool) -> mpv::Result<()> {
+    fn add_external(&mut self, sub: &ExternalSub, mode: AddMode) -> mpv::Result<()> {
         let path = sub.load_path().map_err(|e| mpv::Error {
             code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
             context: format!("無法轉換字幕 {}：{e}", sub.path.display()),
         })?;
-        let path = path.to_string_lossy();
-        let flag = if select { "select" } else { "auto" };
-        let mut args = vec!["sub-add", &path, flag, &sub.title];
+        let path = path.to_string_lossy().into_owned();
+        // 記住轉碼後的檔案對應到哪個原始檔，之後才能用別的編碼重新載入
+        // 自動判斷出的編碼：用別的編碼重新載入時沿用，選單上才一直看得到原本判斷的結果
+        let detected = self
+            .loaded_subs
+            .iter()
+            .find(|s| crate::playlist::same_file(&s.original, &sub.path))
+            .and_then(|s| s.detected)
+            .or(sub.encoding);
+        self.loaded_subs.retain(|s| s.load_path != path);
+        self.loaded_subs.push(LoadedSub {
+            load_path: path.clone(),
+            original: sub.path.clone(),
+            encoding: sub.encoding,
+            detected,
+            forced: false,
+        });
+        let mut args = vec!["sub-add", &path, mode.flag(), &sub.title];
         if let Some(lang) = sub.lang.code() {
             args.push(lang);
         }
         self.mpv.command(&args)
+    }
+
+    /// 載入影片旁邊同名的外掛音軌（`.mka`）。用 `auto` 加入、不自動選：
+    /// 讓 mpv 照原本的方式選音軌（預設是影片內建的音軌）。mpv 自己的 audio-file-auto 會優先選外掛的，
+    /// 實際影片庫裡很多外掛音軌是另一種語言的配音，一開就換成配音不對
+    fn load_external_audio(&mut self) {
+        let Ok(path) = self.mpv.get_string("path") else { return };
+        if path.contains("://") {
+            return;
+        }
+        let tracks: Vec<Track> = self
+            .mpv
+            .get_string("track-list")
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        // 只有影片才找外掛音軌（開音樂檔時，同名的其他音樂檔不是它的音軌）
+        if !tracks.iter().any(|t| t.kind == TrackKind::Video && !t.albumart) {
+            return;
+        }
+        // 影片自己沒有音軌：選上第一個外掛音軌，不然會沒有聲音
+        let mut select_first = !tracks.iter().any(|t| t.kind == TrackKind::Audio && !t.external);
+        for audio in crate::formats::find_external_audio(Path::new(&path)) {
+            let file = audio.to_string_lossy();
+            // 不指定標題：保留 .mka 裡每條音軌自己的名稱（評論音軌、國語 5.1…）
+            let flag = if std::mem::take(&mut select_first) {
+                "select"
+            } else {
+                "auto"
+            };
+            if let Err(e) = self.mpv.command(&["audio-add", &file, flag]) {
+                self.recent_errors
+                    .push(format!("[audio] 無法載入 {}：{e}", audio.display()));
+            }
+        }
     }
 
     /// 找出並載入目前影片的外掛字幕
@@ -445,7 +689,7 @@ impl Player {
         for p in subs::find_external(&video) {
             let result = subs::load(&p, &video)
                 .map_err(|e| e.to_string())
-                .and_then(|sub| self.add_external(&sub, false).map_err(|e| e.to_string()));
+                .and_then(|sub| self.add_external(&sub, AddMode::Auto).map_err(|e| e.to_string()));
             if let Err(e) = result {
                 self.recent_errors.push(format!("[subs] 無法載入 {}：{e}", p.display()));
             }
@@ -554,6 +798,7 @@ impl Player {
                 self.state.last_error = None;
                 self.failure = None;
                 self.recent_errors.clear();
+                self.loaded_subs.clear();
                 Some(PlayerEvent::StartFile)
             }
             Event::FileLoaded => {
@@ -562,6 +807,7 @@ impl Player {
                 if self.external_subs {
                     self.load_external_subs();
                 }
+                self.load_external_audio();
                 if self.auto_select_subs {
                     self.choose_subtitle();
                 }
@@ -631,6 +877,17 @@ impl Player {
             "chapter" => s.chapter = value.as_i64().and_then(|c| usize::try_from(c).ok()),
             "ab-loop-a" => s.ab_loop[0] = value.as_str().and_then(|v| v.parse().ok()),
             "ab-loop-b" => s.ab_loop[1] = value.as_str().and_then(|v| v.parse().ok()),
+            "sub-delay" => s.sub_delay = value.as_f64().unwrap_or(0.0),
+            "audio-delay" => s.audio_delay = value.as_f64().unwrap_or(0.0),
+            // "no" / "auto" 之類的值 = 沒有選
+            "sid" => s.sid = value.as_str().and_then(|v| v.parse().ok()),
+            "secondary-sid" => s.secondary_sid = value.as_str().and_then(|v| v.parse().ok()),
+            "filtered-metadata" => {
+                s.metadata = value
+                    .as_str()
+                    .and_then(|j| serde_json::from_str(j).ok())
+                    .unwrap_or_default();
+            }
             _ => {}
         }
     }
@@ -744,7 +1001,37 @@ fn failure_reason(code: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{debug_log_level, display_size};
+    use super::{State, Track, TrackKind, debug_log_level, display_size};
+
+    #[test]
+    fn secondary_subtitle_id_does_not_hide_other_kinds() {
+        let audio: Track = serde_json::from_str(r#"{"id":1,"type":"audio","selected":true}"#).unwrap();
+        let sub: Track = serde_json::from_str(r#"{"id":1,"type":"sub","selected":true}"#).unwrap();
+        let state = State {
+            tracks: vec![audio, sub],
+            secondary_sid: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(state.selected(TrackKind::Audio).map(|t| t.id), Some(1));
+        assert!(
+            state.selected(TrackKind::Sub).is_none(),
+            "1 號字幕是第二字幕，不是主字幕"
+        );
+    }
+
+    #[test]
+    fn external_track_label_uses_the_file_name() {
+        let t: Track = serde_json::from_str(
+            r#"{"id":2,"type":"audio","title":"mka","external":true,"external-filename":"C:/動畫/S01E01.mka"}"#,
+        )
+        .unwrap();
+        assert!(t.label().starts_with("#2 S01E01.mka"), "{}", t.label());
+        let named: Track = serde_json::from_str(
+            r#"{"id":3,"type":"audio","title":"評論音軌","external":true,"external-filename":"C:/動畫/S01E01.mka"}"#,
+        )
+        .unwrap();
+        assert!(named.label().starts_with("#3 評論音軌"), "{}", named.label());
+    }
 
     #[test]
     fn debug_env_never_blocks_startup() {

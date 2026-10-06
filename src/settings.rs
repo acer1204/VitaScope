@@ -20,6 +20,105 @@ pub struct Settings {
     pub auto_next: bool,
     /// 再次開啟時從上次看到的地方繼續播放
     pub resume: bool,
+    /// 字幕外觀
+    pub subtitle: SubStyle,
+}
+
+/// 字幕外觀（文字字幕；勾選「也套用到 ASS」時連 ASS 字幕一起改）。
+/// 每一項都明確設定給 mpv：各版本 mpv 的預設值不同（例如字級 55 / 38），三個平台才會一樣
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubStyle {
+    /// 字型名稱；空字串 = 依作業系統選常見的中文字型
+    pub font: String,
+    /// 字級（以 720 像素高的畫面為準，mpv 會依畫面大小縮放）
+    pub size: f64,
+    /// 顏色 RGBA（不預乘透明度）
+    pub color: [u8; 4],
+    pub border_color: [u8; 4],
+    pub border_size: f64,
+    pub shadow: f64,
+    pub bold: bool,
+    /// 垂直位置：100 = 最下面，0 = 最上面
+    pub position: f64,
+    /// 也套用到 ASS 字幕（字幕組的特效、排版會被蓋掉）
+    pub override_ass: bool,
+}
+
+impl Default for SubStyle {
+    fn default() -> Self {
+        Self {
+            font: String::new(),
+            size: 42.0,
+            color: [255, 255, 255, 255],
+            border_color: [0, 0, 0, 255],
+            border_size: 2.5,
+            shadow: 1.0,
+            bold: false,
+            position: 100.0,
+            override_ass: false,
+        }
+    }
+}
+
+impl SubStyle {
+    /// 常見的中文字型（字型名稱, 顯示名稱）
+    pub fn font_choices() -> &'static [(&'static str, &'static str)] {
+        if cfg!(target_os = "windows") {
+            &[
+                ("Microsoft JhengHei", "微軟正黑體"),
+                ("Microsoft YaHei", "微軟雅黑"),
+                ("PMingLiU", "新細明體"),
+                ("DFKai-SB", "標楷體"),
+            ]
+        } else if cfg!(target_os = "macos") {
+            &[
+                ("PingFang TC", "蘋方-繁"),
+                ("Heiti TC", "黑體-繁"),
+                ("Songti TC", "宋體-繁"),
+                ("Kaiti TC", "楷體-繁"),
+            ]
+        } else {
+            &[
+                ("Noto Sans CJK TC", "Noto Sans CJK TC（思源黑體）"),
+                ("Noto Serif CJK TC", "Noto Serif CJK TC（思源宋體）"),
+                ("WenQuanYi Zen Hei", "文泉驛正黑"),
+            ]
+        }
+    }
+
+    /// 實際使用的字型：沒指定就用這個作業系統的第一個中文字型（沒裝的話 mpv 會自己找替代字型）
+    pub fn effective_font(&self) -> &str {
+        let font = self.font.trim();
+        if font.is_empty() {
+            Self::font_choices()[0].0
+        } else {
+            font
+        }
+    }
+
+    /// 對應的 mpv 選項。邊框用舊名稱 sub-border-*：新版 mpv 改名為 sub-outline-*，舊名稱仍然有效，
+    /// Linux 套件的 mpv 0.37 只認得舊名稱
+    pub fn mpv_options(&self) -> Vec<(&'static str, String)> {
+        // mpv 的顏色格式是 #AARRGGBB
+        let hex = |[r, g, b, a]: [u8; 4]| format!("#{a:02X}{r:02X}{g:02X}{b:02X}");
+        let yes_no = |b: bool| if b { "yes" } else { "no" }.to_owned();
+        vec![
+            ("sub-font", self.effective_font().to_owned()),
+            ("sub-font-size", format!("{}", self.size)),
+            ("sub-color", hex(self.color)),
+            ("sub-border-color", hex(self.border_color)),
+            ("sub-border-size", format!("{}", self.border_size)),
+            ("sub-shadow-offset", format!("{}", self.shadow)),
+            ("sub-shadow-color", "#80000000".to_owned()),
+            ("sub-bold", yes_no(self.bold)),
+            ("sub-pos", format!("{}", self.position)),
+            (
+                "sub-ass-override",
+                if self.override_ass { "force" } else { "scale" }.to_owned(),
+            ),
+        ]
+    }
 }
 
 impl Default for Settings {
@@ -30,6 +129,7 @@ impl Default for Settings {
             window: None,
             auto_next: true,
             resume: true,
+            subtitle: SubStyle::default(),
         }
     }
 }
@@ -96,5 +196,27 @@ mod tests {
         assert!(!s.muted);
         assert!(s.window.is_none());
         assert!(s.auto_next && s.resume, "新功能預設開啟");
+        assert_eq!(s.subtitle, SubStyle::default());
+    }
+
+    #[test]
+    fn subtitle_style_to_mpv_options() {
+        let style = SubStyle {
+            font: "  標楷體 ".into(),
+            color: [255, 200, 0, 255],
+            border_color: [0, 0, 0, 128],
+            bold: true,
+            override_ass: true,
+            ..SubStyle::default()
+        };
+        let opts: std::collections::HashMap<_, _> = style.mpv_options().into_iter().collect();
+        assert_eq!(opts["sub-font"], "標楷體");
+        assert_eq!(opts["sub-color"], "#FFFFC800");
+        assert_eq!(opts["sub-border-color"], "#80000000");
+        assert_eq!(opts["sub-bold"], "yes");
+        assert_eq!(opts["sub-ass-override"], "force");
+        assert_eq!(opts["sub-font-size"], "42");
+        // 沒指定字型：用作業系統的中文字型
+        assert_eq!(SubStyle::default().effective_font(), SubStyle::font_choices()[0].0);
     }
 }

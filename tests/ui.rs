@@ -971,3 +971,398 @@ fn wheel_over_video_changes_volume() {
     }
     step_until(&mut h, "觸控板 60 點：音量 95", |s| s.volume == 95.0);
 }
+
+// ───────────── L2：字幕與音訊 ─────────────
+
+#[test]
+fn delay_keys_and_menu() {
+    let mut h = playing_multitrack();
+    for _ in 0..3 {
+        h.key_press(egui::Key::CloseBracket);
+        h.step();
+    }
+    step_until(&mut h, "] 三次：字幕延遲 +0.3 秒", |s| {
+        close_to(s.sub_delay, 0.3)
+    });
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "[：字幕延遲 +0.2 秒", |s| close_to(s.sub_delay, 0.2));
+    h.key_press(egui::Key::Equals);
+    step_until(&mut h, "=：音訊延遲 +0.1 秒", |s| close_to(s.audio_delay, 0.1));
+    h.key_press(egui::Key::Minus);
+    h.step();
+    h.key_press(egui::Key::Minus);
+    step_until(&mut h, "- 兩次：音訊延遲 -0.1 秒", |s| {
+        close_to(s.audio_delay, -0.1)
+    });
+
+    // 字幕選單 → 字幕延遲 → 歸零（子選單點了不會關，可以連按）
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label_contains("字幕延遲").click();
+    h.run_steps(2);
+    h.get_by_label("+0.1 秒").click();
+    h.run_steps(2);
+    step_until(&mut h, "選單 +0.1：+0.3 秒", |s| close_to(s.sub_delay, 0.3));
+    h.get_by_label("歸零").click();
+    step_until(&mut h, "選單歸零", |s| close_to(s.sub_delay, 0.0));
+}
+
+#[test]
+fn secondary_subtitle_from_menu() {
+    let mut h = playing_multitrack(); // 繁體中文（chi）+ English（eng）
+    step_until(&mut h, "主字幕是繁中", |s| {
+        s.selected(TrackKind::Sub).and_then(|t| t.lang.as_deref()) == Some("chi")
+    });
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label_contains("第二字幕").click();
+    h.run_steps(2);
+    // 主字幕清單和第二字幕的子選單都有 English；子選單是後畫的那個
+    h.query_all_by_label_contains("English").last().unwrap().click();
+    step_until(&mut h, "第二字幕是英文、主字幕還是繁中", |s| {
+        let eng = s
+            .tracks_of(TrackKind::Sub)
+            .find(|t| t.lang.as_deref() == Some("eng"))
+            .map(|t| t.id);
+        s.secondary_sid.is_some()
+            && s.secondary_sid == eng
+            && s.selected(TrackKind::Sub).and_then(|t| t.lang.as_deref()) == Some("chi")
+    });
+    // 換檔時關掉第二字幕（每個檔案的軌道編號不一樣）
+    drop_file(&mut h, sample("common/mkv_h264_aac_srt.mkv"));
+    step_until(&mut h, "換檔後沒有第二字幕", |s| {
+        playing(s, "mkv_h264_aac_srt.mkv") && s.secondary_sid.is_none()
+    });
+}
+
+/// 讀出某段字幕（`from`–`to` 秒）顯示時的文字：跳到開頭、播放，在這段時間內讀 mpv 的 sub-text。
+/// 不能暫停後再讀：沒有畫面的測試模式下，暫停中跳轉不會更新字幕
+fn subtitle_text_between(h: &mut Harness<'_, VitascopeApp>, from: f64, to: f64) -> String {
+    for _ in 0..5 {
+        h.state().player().set_pause(false).unwrap();
+        h.state().player().seek_to(from, true).unwrap();
+        let start = Instant::now();
+        while start.elapsed() < TIMEOUT {
+            h.step();
+            let t = h.state().player().state.time_pos;
+            if t > from + 0.15 && t < to - 0.15 {
+                let text = h.state().player().get_string("sub-text").unwrap_or_default();
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            if t >= to {
+                break; // 錯過了，再跳一次
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    String::new()
+}
+
+#[test]
+fn subtitle_encoding_can_be_chosen_by_hand() {
+    // Big5 編碼的外掛字幕：自動判斷正確；手動改成 GBK 會變亂碼，再改回自動判斷又正常
+    let mut h = opened(sample("common/extsub_srt_big5.mp4"));
+    step_until(&mut h, "選上外掛字幕", |s| {
+        s.selected(TrackKind::Sub).is_some_and(|t| t.external)
+    });
+    assert_eq!(subtitle_text_between(&mut h, 1.5, 2.6), "影戲播放器測試");
+
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label_contains("字幕編碼").click();
+    h.run_steps(2);
+    h.get_by_label_contains("自動判斷（Big5）");
+    h.get_by_label_contains("GB18030").click();
+    h.run_steps(5);
+    let garbled = subtitle_text_between(&mut h, 1.5, 2.6);
+    assert!(!garbled.is_empty() && garbled != "影戲播放器測試", "{garbled}");
+    assert_eq!(
+        h.state().player().state.tracks_of(TrackKind::Sub).count(),
+        1,
+        "換編碼是取代原本那條字幕，不是多一條"
+    );
+
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label_contains("字幕編碼").click();
+    h.run_steps(2);
+    h.get_by_label_contains("自動判斷").click();
+    h.run_steps(5);
+    assert_eq!(subtitle_text_between(&mut h, 1.5, 2.6), "影戲播放器測試");
+}
+
+#[test]
+fn same_name_external_audio_is_loaded_but_not_selected() {
+    let mut h = opened(sample("common/mkv_extaudio.mkv")); // 旁邊有 mkv_extaudio.mka
+    step_until(&mut h, "載入外掛音軌", |s| {
+        s.tracks_of(TrackKind::Audio).count() == 2
+    });
+    let st = &h.state().player().state;
+    let ext = st.tracks_of(TrackKind::Audio).find(|t| t.external).expect("外掛音軌");
+    // .mka 裡的音軌沒有名稱：選單顯示檔名
+    assert!(ext.label().contains("mkv_extaudio.mka"), "{}", ext.label());
+    // 字幕組的外掛音軌常是另一種語言的配音：預設還是用影片內建的音軌
+    assert!(!st.selected(TrackKind::Audio).unwrap().external);
+
+    h.get_by_label("音軌").click();
+    h.run_steps(2);
+    h.get_by_label_contains("mkv_extaudio.mka").click();
+    step_until(&mut h, "選單切換到外掛音軌", |s| {
+        s.selected(TrackKind::Audio).is_some_and(|t| t.external)
+    });
+}
+
+#[test]
+fn audio_file_shows_cover_and_tags() {
+    let mut h = opened(sample("general/audio_mp3_cover.mp3"));
+    step_until(&mut h, "讀到標籤", |s| s.tag("artist") == Some("影戲樂團"));
+    assert!(
+        h.state().player().state.tracks_of(TrackKind::Video).any(|t| t.albumart),
+        "封面是專輯封面，不是影片"
+    );
+    h.run_steps(2);
+    h.get_by_label("測試歌曲");
+    h.get_by_label("影戲樂團");
+    h.get_by_label("範例專輯");
+}
+
+#[test]
+fn audio_file_without_cover_shows_title() {
+    let mut h = harness(Some(sample("general/audio_flac.flac")));
+    step_until(&mut h, "播放", |s| playing(s, "audio_flac.flac"));
+    h.run_steps(2);
+    h.get_by_label_contains("audio_flac.flac");
+}
+
+#[test]
+fn subtitle_style_window_applies_changes_and_typing_is_not_a_shortcut() {
+    let mut h = playing_multitrack();
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label("字幕外觀…").click();
+    h.run_steps(2);
+    h.get_by_label("粗體").click();
+    h.run_steps(2);
+    assert!(h.state().settings().subtitle.bold);
+    assert_eq!(h.state().player().get_string("sub-bold").unwrap(), "yes");
+
+    // 在字型欄位輸入字型名稱：C 不能變成「加快速度」
+    let field = h.get_by_role(egui::accesskit::Role::TextInput);
+    field.focus();
+    h.run_steps(2);
+    h.key_press(egui::Key::C);
+    h.get_by_role(egui::accesskit::Role::TextInput).type_text("Cambria");
+    h.run_steps(3);
+    assert_eq!(h.state().settings().subtitle.font, "Cambria");
+    assert_eq!(h.state().player().get_string("sub-font").unwrap(), "Cambria");
+    assert!(close_to(h.state().player().state.speed, 1.0), "輸入文字時快捷鍵要停用");
+
+    h.get_by_label("恢復預設").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().subtitle.bold);
+    assert_eq!(h.state().player().get_string("sub-bold").unwrap(), "no");
+}
+
+#[test]
+fn frame_stepping_to_the_end_does_not_switch_files() {
+    // 沒有音軌的影片：mpv 逐格時會短暫取消暫停，以前到結尾會被當成「播完」而換到下一個檔案
+    let dir = TempDir::new("frame-step-end");
+    let src = sample("common/mp4_h264_noaudio.mp4");
+    for name in ["a.mp4", "b.mp4"] {
+        std::fs::copy(&src, dir.0.join(name)).unwrap();
+    }
+    let mut h = harness_with(Some(dir.0.join("a.mp4")), Settings::default());
+    step_until(&mut h, "播放 a", |s| playing(s, "a.mp4") && s.time_pos > 0.0);
+    step_until_app(&mut h, "掃描到兩個檔案", |app| playlist_len(app) == 2);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.state().player().seek_to(2.6, true).unwrap();
+    step_until(&mut h, "跳到接近結尾", |s| s.time_pos > 2.5);
+    for _ in 0..30 {
+        h.key_press(egui::Key::Period);
+        wait_real(&mut h, 0.05);
+        if h.state().player().state.eof {
+            break;
+        }
+    }
+    step_until(&mut h, "逐格到結尾", |s| s.eof);
+    wait_real(&mut h, 0.5);
+    assert!(playing(&h.state().player().state, "a.mp4"), "暫停中逐格到結尾，不換檔");
+    // 按播放之後就是一般播放：從頭播到結尾會接下一個
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "播完接下一個", |s| playing(s, "b.mp4"));
+}
+
+#[test]
+fn dropping_video_with_subtitle_while_playing_opens_both() {
+    let dir = TempDir::new("drop-video-sub");
+    let video = dir.clip("新影片.mp4");
+    let srt = dir.0.join("另一個字幕.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:03,000\n拖放的字幕\n").unwrap();
+    let mut h = playing_multitrack();
+    for f in [&srt, &video] {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(
+        &mut h,
+        "打開拖進來的影片，並加上一起拖進來的字幕",
+        |s| {
+            playing(s, "新影片.mp4")
+                && s.tracks_of(TrackKind::Sub)
+                    .any(|t| t.external && t.title.as_deref().is_some_and(|title| title.contains("另一個字幕")))
+        },
+    );
+}
+
+#[test]
+fn clicking_the_video_to_close_a_control_bar_menu_does_not_pause() {
+    let mut h = playing_multitrack();
+    let video = h.get_by_label("影片畫面").rect();
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label("關閉字幕");
+    let outside = video.left_top() + egui::vec2(20.0, 20.0);
+    h.event(egui::Event::PointerMoved(outside));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: outside,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(3);
+    assert!(h.query_by_label("關閉字幕").is_none(), "選單應該關掉");
+    wait_real(&mut h, 0.4);
+    assert!(!h.state().player().state.paused, "關選單的那一下不算暫停");
+}
+
+#[test]
+fn dropping_a_season_gives_each_video_its_own_subtitle() {
+    let dir = TempDir::new("drop-season");
+    let mut files = Vec::new();
+    for ep in ["ep1", "ep2", "ep10"] {
+        files.push(dir.clip(&format!("{ep}.mp4")));
+        let srt = dir.0.join(format!("{ep}.srt"));
+        std::fs::write(&srt, format!("1\n00:00:00,000 --> 00:00:03,000\n{ep} 的字幕\n")).unwrap();
+        files.push(srt);
+    }
+    let mut h = harness(None);
+    h.step();
+    for f in &files {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(&mut h, "從 ep1 開始，只有自己的字幕", |s| {
+        playing(s, "ep1.mp4") && s.tracks_of(TrackKind::Sub).count() >= 1 && s.selected(TrackKind::Sub).is_some()
+    });
+    h.run_steps(5);
+    let st = &h.state().player().state;
+    let subs: Vec<String> = st
+        .tracks_of(TrackKind::Sub)
+        .map(|t| t.external_filename.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(subs.len(), 1, "ep1 不應該拿到 ep2、ep10 的字幕，也不能重複：{subs:?}");
+    assert_eq!(h.state().playlist().unwrap().len(), 3);
+}
+
+#[test]
+fn dropping_a_video_with_its_own_subtitle_does_not_duplicate_it() {
+    let dir = TempDir::new("drop-own-sub");
+    let video = dir.clip("影片.mp4");
+    let srt = dir.0.join("影片.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:03,000\n字幕\n").unwrap();
+    let mut h = harness(None);
+    h.step();
+    for f in [&video, &srt] {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(&mut h, "播放並選上字幕", |s| {
+        playing(s, "影片.mp4") && s.selected(TrackKind::Sub).is_some()
+    });
+    h.run_steps(5);
+    assert_eq!(h.state().player().state.tracks_of(TrackKind::Sub).count(), 1);
+    // 播放中再拖一次同一個字幕：選上原本那條，不會多一條
+    drop_file(&mut h, srt);
+    h.run_steps(5);
+    assert_eq!(h.state().player().state.tracks_of(TrackKind::Sub).count(), 1);
+}
+
+#[test]
+fn choosing_the_secondary_subtitle_as_primary_swaps_them() {
+    let mut h = playing_multitrack(); // 繁體中文（chi）+ English（eng）
+    let id_of = |s: &State, lang: &str| {
+        s.tracks_of(TrackKind::Sub)
+            .find(|t| t.lang.as_deref() == Some(lang))
+            .map(|t| t.id)
+    };
+    step_until(&mut h, "主字幕是繁中", |s| {
+        s.sid.is_some() && s.sid == id_of(s, "chi")
+    });
+    let eng = id_of(&h.state().player().state, "eng").unwrap();
+    h.state().player().set_secondary_sub(Some(eng)).unwrap();
+    step_until(&mut h, "第二字幕是英文", |s| s.secondary_sid == Some(eng));
+    // 在主字幕清單選英文：英文變主字幕、繁中變第二字幕
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.query_all_by_label_contains("English").next().unwrap().click();
+    step_until(&mut h, "兩條對調", |s| {
+        s.sid == Some(eng) && s.secondary_sid == id_of(s, "chi")
+    });
+}
+
+#[test]
+fn video_without_audio_selects_same_name_external_audio() {
+    let dir = TempDir::new("noaudio-mka");
+    let video = dir.0.join("無聲.mp4");
+    std::fs::copy(sample("common/mp4_h264_noaudio.mp4"), &video).unwrap();
+    std::fs::copy(sample("common/mkv_extaudio.mka"), dir.0.join("無聲.mka")).unwrap();
+    let mut h = harness(Some(video));
+    step_until(&mut h, "自動選上外掛音軌（不然沒有聲音）", |s| {
+        playing(s, "無聲.mp4") && s.selected(TrackKind::Audio).is_some_and(|t| t.external)
+    });
+}
+
+#[test]
+fn audio_files_do_not_load_other_audio_files_as_tracks() {
+    let dir = TempDir::new("audio-siblings");
+    let song = dir.0.join("歌.mp3");
+    std::fs::copy(sample("general/audio_mp3.mp3"), &song).unwrap();
+    std::fs::copy(sample("general/audio_flac.flac"), dir.0.join("歌.flac")).unwrap();
+    let mut h = harness(Some(song));
+    step_until(&mut h, "播放", |s| playing(s, "歌.mp3"));
+    h.run_steps(5);
+    assert_eq!(h.state().player().state.tracks_of(TrackKind::Audio).count(), 1);
+}
+
+#[test]
+fn frame_step_on_audio_only_file_keeps_playing() {
+    let mut h = harness(Some(sample("general/audio_flac.flac")));
+    step_until(&mut h, "播放", |s| playing(s, "audio_flac.flac") && s.time_pos > 0.0);
+    h.key_press(egui::Key::Period);
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused, "純音訊檔不能逐格，照常播放");
+}
+
+#[test]
+fn escape_closes_the_subtitle_style_window() {
+    let mut h = playing_multitrack();
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label("字幕外觀…").click();
+    h.run_steps(2);
+    h.get_by_label("恢復預設");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("恢復預設").is_none(), "Esc 關掉字幕外觀視窗");
+}

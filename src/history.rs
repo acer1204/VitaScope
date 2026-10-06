@@ -42,13 +42,21 @@ impl History {
     /// 讀取指定位置的紀錄；檔案不存在就從空的開始。
     /// 檔案壞了（例如寫到一半斷電）就改名成 history.json.bad 留著，不要被下一次存檔蓋掉
     pub fn load_from(path: PathBuf) -> Self {
-        let mut history = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                eprintln!("[vitascope] 播放紀錄格式錯誤，改名成 .bad 後重新開始：{e}");
+        let parsed = std::fs::read(&path).map(|bytes| serde_json::from_slice::<History>(&bytes));
+        let mut history = match parsed {
+            Ok(Ok(history)) => history,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            // 格式錯誤（包括不是 UTF-8）或讀不了：改名留著，不要被下一次存檔蓋掉
+            other => {
+                let why = match other {
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => e.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                eprintln!("[vitascope] 播放紀錄讀不了，改名成 .bad 後重新開始：{why}");
                 let _ = std::fs::rename(&path, path.with_extension("json.bad"));
                 Self::default()
-            }),
-            Err(_) => Self::default(),
+            }
         };
         history.path = Some(path);
         history
@@ -58,8 +66,8 @@ impl History {
     /// 同時開著好幾個播放器時，才不會互相蓋掉對方的紀錄
     pub fn update(&mut self, change: impl FnOnce(&mut History)) -> std::io::Result<()> {
         if let Some(path) = &self.path
-            && let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(disk) = serde_json::from_str::<History>(&text)
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(disk) = serde_json::from_slice::<History>(&bytes)
         {
             self.recent = disk.recent;
             self.positions = disk.positions;
@@ -84,7 +92,18 @@ impl History {
             )?;
             file.sync_all()?;
             drop(file);
-            std::fs::rename(&tmp, path)
+            // Windows 上另一個播放器剛好在讀這個檔案時，改名會暫時失敗；稍等再試
+            let mut result = std::fs::rename(&tmp, path);
+            for _ in 0..3 {
+                match &result {
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        result = std::fs::rename(&tmp, path);
+                    }
+                    _ => break,
+                }
+            }
+            result
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -236,6 +255,16 @@ mod tests {
         let disk = History::load_from(path.clone());
         assert_eq!(disk.recent, ["b.mkv", "a.mkv"]);
         assert_eq!(disk.resume_point("a.mkv"), Some(100.0));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn non_utf8_file_is_kept_aside_too() {
+        let path = temp_file("not-utf8");
+        std::fs::write(&path, [0xff, 0xfe, 0x00, 0x7b]).unwrap();
+        let h = History::load_from(path.clone());
+        assert!(h.recent.is_empty());
+        assert!(path.with_extension("json.bad").exists());
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
