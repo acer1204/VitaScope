@@ -217,6 +217,8 @@ jobs:
 
       - name: 介面測試（Linux，虛擬螢幕）
         if: runner.os == 'Linux'
+        env:
+          VITASCOPE_DEBUG: "1"
         run: |
           timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" \
             "$bin" "$TEST_VIDEO" --shot shot-linux.png --shot-delay 3 2>&1 | tee shot.log

@@ -244,7 +244,9 @@ impl Player {
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
-        mpv.request_log_messages("error")?;
+        // VITASCOPE_DEBUG=1：把 mpv 的警告與錯誤印到 stderr（排查顯示卡、驅動之類的問題）
+        let debug = std::env::var_os("VITASCOPE_DEBUG").is_some();
+        mpv.request_log_messages(if debug { "warn" } else { "error" })?;
         for (i, (name, format)) in OBSERVED.iter().enumerate() {
             mpv.observe(i as u64 + 1, name, *format)?;
         }
@@ -451,6 +453,9 @@ impl Player {
                 None
             }
             Event::Log { prefix, level, text } => {
+                if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+                    eprint!("[mpv/{level}] [{prefix}] {text}");
+                }
                 if matches!(level.as_str(), "error" | "fatal") {
                     if self.recent_errors.len() >= 8 {
                         self.recent_errors.remove(0);

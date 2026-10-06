@@ -93,6 +93,17 @@ impl VitascopeApp {
         let _ = player.set_volume(settings.volume);
         let _ = player.set_mute(settings.muted);
 
+        if let Some(gl) = &cc.gl {
+            use eframe::glow::HasContext;
+            // SAFETY: 建立 App 時 GL context 是 current
+            let (renderer, version) = unsafe {
+                (
+                    gl.get_parameter_string(glow::RENDERER),
+                    gl.get_parameter_string(glow::VERSION),
+                )
+            };
+            eprintln!("[vitascope] OpenGL：{renderer}（{version}）");
+        }
         let (video, fatal) = match &cc.get_proc_address {
             Some(gpa) => match VideoView::new(player.mpv().clone(), gpa.clone(), cc.egui_ctx.clone()) {
                 Ok(v) => (Some(v), None),
@@ -100,6 +111,9 @@ impl VitascopeApp {
             },
             None => (None, Some("無法初始化影片畫面：沒有 OpenGL context".into())),
         };
+        if let Some(msg) = &fatal {
+            eprintln!("[vitascope] {msg}");
+        }
 
         let mut app = Self {
             player,
