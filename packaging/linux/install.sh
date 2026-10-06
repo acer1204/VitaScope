@@ -24,11 +24,13 @@ refresh() {
 if [ "${1:-}" = "--uninstall" ]; then
     rm -f "$bin/vitascope" "$desktop"
     find "$data/icons/hicolor" \( -name "$APP_ID.png" -o -name "$APP_ID.svg" \) -exec rm -f {} + 2>/dev/null || true
-    # --default 設的預設程式（只刪影戲的，其他程式的設定不動）
+    # --default 設的預設程式（只刪影戲的，其他程式的設定不動）。有影戲的項目才改；
+    # 是捷徑的話（例如放在 dotfiles 裡）改它指到的檔案，不要把捷徑換成一般檔案
     mimeapps=${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list
-    if [ -f "$mimeapps" ]; then
-        id_re=$(printf '%s' "$APP_ID" | sed 's/\./\\./g')
-        sed -i -e "/=$id_re\.desktop;*\$/d" -e "s/$id_re\.desktop;//g" "$mimeapps"
+    id_re=$(printf '%s' "$APP_ID" | sed 's/\./\\./g')
+    if [ -f "$mimeapps" ] && grep -q "$id_re\.desktop" "$mimeapps"; then
+        target=$(readlink -f "$mimeapps")
+        sed -i -e "/=$id_re\.desktop;*\$/d" -e "s/$id_re\.desktop;//g" "$target"
     fi
     refresh
     echo "已移除。設定檔在 ~/.config/vitascope，不需要可以自行刪除。"

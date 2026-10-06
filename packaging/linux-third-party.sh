@@ -62,14 +62,16 @@ while IFS= read -r lib; do
   fi
 done < <(find "$appdir/usr/lib" -type f -name '*.so*' | sort)
 
-# copyright 檔參照的授權全文（GPL 要求附上全文）
+# copyright 檔參照的授權全文（GPL 要求附上全文）。句尾的「.」不是檔名的一部分（GFDL-1.3. → GFDL-1.3）
 licenses=0
 while IFS= read -r f; do
   if [ -e "$f" ]; then
     install -Dm644 "$(readlink -f "$f")" "$appdir$f"
     licenses=$((licenses + 1))
+  else
+    echo "::warning::copyright 檔參照的 $f 不存在"
   fi
-done < <(grep -rhoE '/usr/share/common-licenses/[A-Za-z0-9.+_-]+' "$doc" 2>/dev/null | sort -u)
+done < <(grep -rhoE '/usr/share/common-licenses/[A-Za-z0-9+_-]+([.][A-Za-z0-9+_-]+)*' "$doc" 2>/dev/null | sort -u)
 
 count=$(grep -c '^| `' "$out" || true)
 echo "列出 $count 個函式庫、附上 $licenses 份授權全文（$missing 個找不到來源）"

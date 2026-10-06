@@ -42,16 +42,17 @@ pub fn on_startup(
     current: &std::path::Path,
     exists: impl Fn(&std::path::Path) -> bool,
 ) -> OnStartup {
-    // Windows 的路徑不分大小寫
-    let same = |a: &std::path::Path, b: &std::path::Path| {
-        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-    };
     match registered {
-        Some(r) if same(r, current) => OnStartup::Adopt,
+        Some(r) if same_path(r, current) => OnStartup::Adopt,
         Some(r) if exists(r) => OnStartup::Keep,
         _ if setting => OnStartup::Register,
         _ => OnStartup::Keep,
     }
+}
+
+/// Windows 的路徑不分大小寫
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
 /// 登錄檔裡開啟指令的執行檔路徑：`"C:\…\vitascope.exe" "%1"` → `C:\…\vitascope.exe`
@@ -253,10 +254,17 @@ mod win {
 
     /// 加到「開啟檔案」選單、列在預設應用程式裡。可以重複呼叫（免安裝版搬到別的資料夾後再呼叫一次就更新路徑）
     pub fn register(exe: &Path, places: &Places) -> io::Result<()> {
+        let before = registered_exe(places);
         let result = write_registration(exe, places);
         if result.is_err() {
-            // 寫到一半失敗（例如某個副檔名的機碼被鎖住）：全部移除，不要留下只做一半、看起來像已經打開的關聯
-            unregister(places);
+            match before {
+                // 原本登錄的是另一個還在的執行檔（例如安裝版）：改回指向它，不要把能用的關聯整個刪掉
+                Some(other) if other.exists() && !super::same_path(&other, exe) => {
+                    let _ = write_registration(&other, places);
+                }
+                // 寫到一半失敗（例如某個副檔名的機碼被鎖住）：全部移除，不要留下只做一半、看起來像已經打開的關聯
+                _ => unregister(places),
+            }
         }
         result
     }

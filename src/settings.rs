@@ -246,15 +246,8 @@ impl Settings {
         let on_disk = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let merged = match (&current, &self.baseline, on_disk) {
-            (serde_json::Value::Object(now), Some(base), Some(serde_json::Value::Object(mut disk))) => {
-                for (key, value) in now {
-                    if base.get(key) != Some(value) || !disk.contains_key(key) {
-                        disk.insert(key.clone(), value.clone());
-                    }
-                }
-                serde_json::Value::Object(disk)
-            }
+        let merged = match (&self.baseline, on_disk) {
+            (Some(base), Some(disk)) => merge(&current, base, disk),
             _ => current.clone(),
         };
         if let Some(dir) = path.parent() {
@@ -269,6 +262,32 @@ impl Settings {
         std::fs::rename(tmp, path)?;
         self.baseline = Some(current);
         Ok(())
+    }
+}
+
+/// 三方合併：`now` 跟 `base` 不同的地方寫進 `disk`，其他的保留 `disk` 的。
+/// 物件（例如字幕外觀）逐項合併：兩個視窗各改了一項，兩項都留下
+fn merge(now: &serde_json::Value, base: &serde_json::Value, disk: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match (now, base, disk) {
+        (Value::Object(now), Value::Object(base), Value::Object(mut disk)) => {
+            for (key, value) in now {
+                let merged = match (base.get(key), disk.remove(key)) {
+                    (Some(b), Some(d)) => merge(value, b, d),
+                    // 檔案裡沒有（舊版的設定檔）、或上次讀的時候沒有：用現在的
+                    _ => value.clone(),
+                };
+                disk.insert(key.clone(), merged);
+            }
+            Value::Object(disk)
+        }
+        (now, base, disk) => {
+            if now != base {
+                now.clone()
+            } else {
+                disk
+            }
+        }
     }
 }
 
@@ -349,6 +368,23 @@ mod tests {
         let back = Settings::load_from(path);
         assert_eq!(back.seek_short, 3.0);
         assert_eq!(back.language, crate::i18n::Lang::En);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn subtitle_style_changes_from_two_windows_are_both_kept() {
+        let dir = std::env::temp_dir().join(format!("vitascope-settings-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.subtitle.size = 50.0;
+        a.save().unwrap();
+        b.subtitle.color = [255, 255, 0, 255];
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.subtitle.size, 50.0, "A 改的字級不能被 B 蓋回去");
+        assert_eq!(back.subtitle.color, [255, 255, 0, 255]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

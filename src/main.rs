@@ -227,6 +227,9 @@ fn refresh_file_associations(mut settings: Settings) -> Settings {
         OnStartup::Register => {
             if let Err(e) = assoc::register(&exe, &places) {
                 eprintln!("[vitascope] 無法更新檔案關聯：{e}");
+                // 不要每次啟動都重試一次（設定裡顯示為關閉，使用者可以自己再打開看錯誤訊息）
+                settings.file_associations = false;
+                let _ = settings.save();
             }
         }
         _ => {}

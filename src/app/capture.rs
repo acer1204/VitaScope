@@ -125,7 +125,8 @@ impl VitascopeApp {
         match self.player.screenshot_to_file(id, &tmp, subtitles) {
             Ok(()) => {
                 self.capture.pending.push((id, target, fix));
-                if wanted && !subtitles {
+                // 有字幕在顯示時才提醒（手機直拍的影片本來就要轉正，沒有字幕就不用說）
+                if wanted && !subtitles && self.player.state.sid.is_some() {
                     self.osd(crate::tr!(
                         "畫面旋轉或翻轉時，截圖不含字幕",
                         "Screenshots of a rotated or flipped picture leave out subtitles"

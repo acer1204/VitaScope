@@ -15,7 +15,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const MAGIC: &[u8; 4] = b"VTSC";
@@ -397,8 +397,11 @@ fn become_primary(ep: &Endpoint, lock: File, wake: Wake) -> Startup {
     };
     let closing = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    // 開始關閉時拿掉：之後就不會再有「回覆收到了、卻沒人開」的檔案
+    let inbox: Inbox = Arc::new(Mutex::new(Some(tx)));
     let (stopped_tx, stopped) = mpsc::channel();
     let flag = closing.clone();
+    let shared = inbox.clone();
     let spawned = std::thread::Builder::new()
         .name("vitascope-instance".into())
         .spawn(move || {
@@ -412,9 +415,9 @@ fn become_primary(ep: &Endpoint, lock: File, wake: Wake) -> Startup {
                     std::thread::sleep(Duration::from_millis(50));
                     continue;
                 };
-                let (tx, wake, flag) = (tx.clone(), wake.clone(), flag.clone());
+                let (inbox, wake) = (shared.clone(), wake.clone());
                 // 一個連線一個短命的執行緒：卡住的連線不會擋住別人
-                std::thread::spawn(move || serve(conn, &tx, &*wake, &flag));
+                std::thread::spawn(move || serve(conn, &inbox, &*wake));
             }
             drop(listener);
             let _ = stopped_tx.send(());
@@ -424,6 +427,7 @@ fn become_primary(ep: &Endpoint, lock: File, wake: Wake) -> Startup {
     }
     Startup::Primary(Primary {
         rx,
+        inbox,
         lock: Some(lock),
         closing,
         stopped,
@@ -431,16 +435,24 @@ fn become_primary(ep: &Endpoint, lock: File, wake: Wake) -> Startup {
     })
 }
 
-fn serve(mut conn: sys::Conn, tx: &mpsc::Sender<Request>, wake: &dyn Fn(), closing: &AtomicBool) {
+/// 收檔案的通道；主視窗開始關閉時換成 None
+type Inbox = Arc<Mutex<Option<mpsc::Sender<Request>>>>;
+
+fn serve(mut conn: sys::Conn, inbox: &Inbox, wake: &dyn Fn()) {
     if !conn.peer_is_same_user() {
         return;
     }
     let reply = match read_request(&mut conn) {
         Err(e) if e.kind() == io::ErrorKind::InvalidData => REJECT,
         Err(_) => return,
-        Ok(_) if closing.load(Ordering::SeqCst) => BUSY,
         Ok(req) => {
-            if tx.send(req).is_ok() {
+            // 檢查「是不是正在關閉」跟送出要一起做（中間被關閉的話，檔案會收了又沒人開）
+            let sent = inbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|tx| tx.send(req).is_ok());
+            if sent {
                 wake();
                 ACK
             } else {
@@ -455,6 +467,7 @@ fn serve(mut conn: sys::Conn, tx: &mpsc::Sender<Request>, wake: &dyn Fn(), closi
 /// 主視窗：收別人送來的檔案
 pub struct Primary {
     pub rx: mpsc::Receiver<Request>,
+    inbox: Inbox,
     lock: Option<File>,
     closing: Arc<AtomicBool>,
     stopped: mpsc::Receiver<()>,
@@ -466,12 +479,14 @@ impl Primary {
     /// 鎖先不放：設定、播放紀錄存好之前，新的主視窗不要讀
     pub fn stop_accepting(&self) {
         self.closing.store(true, Ordering::SeqCst);
+        // 這之後送來的都回「正在關閉」；之前收下的都已經在 rx 裡
+        self.inbox.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     /// 關閉時呼叫：放開鎖，之後啟動的程式自己當主視窗
     pub fn shutdown(&mut self) {
         let Some(lock) = self.lock.take() else { return };
-        self.closing.store(true, Ordering::SeqCst);
+        self.stop_accepting();
         // 自己連一次，把等待連線的執行緒叫醒
         let _ = sys::connect(&self.name);
         let _ = self.stopped.recv_timeout(Duration::from_millis(500));
