@@ -22,11 +22,11 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境）。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
-- **Linux**：需要有 libmpv.so.2 的發行版（例如 Ubuntu 24.04 以後）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
+- **Linux**：需要 glibc 2.39 以上與 libmpv.so.2（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
 
-播放器的「關於」（控制列的 ℹ 或 F1）可以檢查更新，有新版本時會開啟 Releases 頁面。
+播放器的「關於」（控制列的 ℹ 或 F1）可以檢查更新，有新版本時會開啟 Releases 頁面。各版本的改動見 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 設定檔與移除
 
@@ -128,6 +128,22 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 vitascope 影片.mp4 --shot 截圖.png [--shot-delay 秒] [--fullscreen]
 ```
 
+排查顯示或播放問題時可以用兩個環境變數：
+
+| 環境變數 | 作用 |
+|---|---|
+| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v` |
+| `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"` |
+
+Windows 的發佈版沒有主控台視窗，要把輸出存到檔案才看得到。請在「命令提示字元」（cmd）執行：
+
+```bat
+set VITASCOPE_DEBUG=1
+vitascope.exe 影片.mp4 2> log.txt
+```
+
+（PowerShell 不會把這類視窗程式的輸出導到檔案，記錄會是空的。）
+
 用自己的影片庫做大量測試（只讀取，不修改檔案）：
 
 ```bash
@@ -136,9 +152,10 @@ cargo run --release --example media_survey -- 檔案清單.tsv [--per-ext 200] [
 
 ## 發佈新版本
 
-1. 修改 `Cargo.toml` 的 `version`
+1. 修改 `Cargo.toml` 的 `version`，在 [CHANGELOG.md](CHANGELOG.md) 加上這個版本的段落（標題格式：`## v0.2.0 — 日期`）
 2. 推送同名標籤：`git tag v0.2.0 && git push origin v0.2.0`
-3. GitHub Actions 會編譯三個平台、打包並建立 Release（[.github/workflows/release.yml](.github/workflows/release.yml)）
+3. GitHub Actions 會編譯三個平台、打包並建立 Release（[.github/workflows/release.yml](.github/workflows/release.yml)），
+   發佈說明的「更新內容」取自 CHANGELOG.md 的對應段落
 
 標籤必須跟 `Cargo.toml` 的版本一致，否則發佈流程會中止。
 

@@ -16,7 +16,7 @@
 |---|---|---|
 | 語言 | Rust | 沿用 Zoetrope 的經驗與工具鏈 |
 | 介面 | egui / eframe（**glow / OpenGL 後端**） | 與 Zoetrope 同一套 UI 寫法；改用 glow 後端是為了和 mpv 的 OpenGL 渲染介面接起來 |
-| 播放引擎 | libmpv（`libmpv2` crate） | 解碼、硬體解碼、音畫同步、字幕渲染、HDR、串流全部由 mpv 處理 |
+| 播放引擎 | libmpv（`libmpv2-sys` 綁定 + 自己寫的安全包裝 `src/mpv/`） | 解碼、硬體解碼、音畫同步、字幕渲染、HDR、串流全部由 mpv 處理 |
 | 畫面輸出 | mpv render API → OpenGL FBO → egui 貼圖 | 影片畫面是 egui 裡的一張貼圖，控制列、OSD 直接疊在上面 |
 
 ### 為什麼看圖軟體和播放器的做法不同
@@ -57,7 +57,8 @@ src/
 | macOS | `brew install mpv` | 把 dylib 及相依函式庫打包進 `.app` |
 | Linux | 套件管理員安裝 `libmpv-dev` | 依賴系統 libmpv，或打包成 AppImage / Flatpak |
 
-授權：libmpv 是 LGPL（預設建置為 GPL），和 Zoetrope 採用的 AGPL 相容。
+授權：libmpv 本身可以建置成 LGPL，但發佈時附帶的 libmpv / FFmpeg 是 GPL 建置，所以影戲 VitaScope 採用 GPL-3.0-or-later。
+第三方元件的授權見 `packaging/THIRD-PARTY-NOTICES.md`。
 
 ---
 
@@ -313,13 +314,19 @@ src/
   驗證 mpv → FBO → 視窗的渲染路徑、版面、字幕位置。
 - **手動驗收清單**：每完成一個等級，三平台各跑一次（視窗、全螢幕、高 DPI、多螢幕、硬體解碼、拖放）。
 
+### 4.3 CI
+
+GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試（軟解）與單元測試。
+發佈流程另外在三平台打包、實際執行 `--version`，並在 macOS / Linux 用自動截圖確認影片畫面畫得出來
+（Linux 的虛擬螢幕是軟體繪圖，啟動三次、每次都要通過）。
+
 ### 4.4 目前的測試數量
 
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 92 個樣本（常見 31、通用 36、罕見 25） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 19 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 11 | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 21 | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 17（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
 | 硬體解碼 `tests/hwdec.rs`（需要 GPU） | 8 種編碼 | RTX 3090 通過 |
 
 ### 4.5 真實影片庫普查（`examples/media_survey.rs`）
@@ -335,10 +342,6 @@ src/
 | 外掛字幕編碼猜錯，整份變亂碼（GBK 被當成 BIG5） | 6 個檔案，其中 4 個看得到亂碼 | 自己判斷編碼（chardetng），轉成 UTF-8 再載入 |
 | 有繁中卻選到簡中（`Zh-TW..ass` 雙點、`big5.ass` 認不出來） | 73 個多字幕檔中 5 個 | 自己判斷繁簡（檔名標記 + 內容） |
 | ASS 少了 `[Script Info]` 標頭，mpv 打不開 | 1 個 | 自動補上標頭 |
-
-### 4.3 CI
-
-GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試（軟解）與單元測試。
 
 ---
 
@@ -362,7 +365,7 @@ GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試
 
 | # | 風險 | 對策 |
 |---|---|---|
-| R1 | macOS 打包 libmpv 及其相依 dylib 最麻煩 | 開發期先用 brew，L2 打包時再處理 |
+| R1 | macOS 打包 libmpv 及其相依 dylib 最麻煩 | 已解決：發佈流程用 dylibbundler 打包進 `.app`、重設 rpath，打包後實際執行檢查 |
 | R2 | macOS 已將 OpenGL 標為棄用 | 目前仍可正常使用（IINA 也是用 OpenGL 接 mpv），持續觀察 |
 | R3 | 部分 HDR / Dolby Vision 功能只有 mpv 的 gpu-next 渲染器支援，嵌入式 render API 是否支援要看 mpv 版本；egui 也還沒有 HDR 輸出 | L3 前先驗證；必要時 HDR 直通模式改用 mpv 原生視窗 |
 | R4 | Wayland 不支援把 mpv 嵌進子視窗（`wid`） | 本來就採用 render API，不受影響 |

@@ -1,6 +1,6 @@
 [package]
 name = "vitascope"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "影戲 — 跨平台影片播放器：libmpv 引擎 + egui 介面"
 authors = ["acer1204"]

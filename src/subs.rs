@@ -240,7 +240,9 @@ pub fn cache_dir() -> PathBuf {
             .or_else(|| home().map(|h| h.join(".cache")))
             .map(|d| d.join("vitascope"))
     };
-    base.unwrap_or_else(std::env::temp_dir).join("subs")
+    // 找不到使用者資料夾時才退回系統暫存資料夾，仍放在自己的子資料夾裡（clean_cache 只清這裡）
+    base.unwrap_or_else(|| std::env::temp_dir().join("vitascope"))
+        .join("subs")
 }
 
 /// 清掉超過一天的暫存字幕

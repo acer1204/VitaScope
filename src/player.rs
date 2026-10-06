@@ -203,6 +203,17 @@ const OBSERVED: &[(&str, Format)] = &[
     ("video-out-params", Format::String),
 ];
 
+/// VITASCOPE_DEBUG 的值 → 要 mpv 送出的記錄等級。
+/// 沒設定只收錯誤；1 之類的值 = 警告與錯誤（印到 stderr，排查顯示卡、驅動之類的問題）；
+/// 也可以直接寫 mpv 的記錄等級，例如 VITASCOPE_DEBUG=v。看不懂的值當成 1，除錯設定不能讓播放器開不起來
+fn debug_log_level(value: Option<&str>) -> &'static str {
+    const LEVELS: [&str; 7] = ["fatal", "error", "warn", "info", "v", "debug", "trace"];
+    match value {
+        None => "error",
+        Some(v) => LEVELS.into_iter().find(|level| *level == v).unwrap_or("warn"),
+    }
+}
+
 /// 字幕語言偏好：繁中優先，其次中文，再來英文
 const SUB_LANGS: &str = "zh-TW,zh-Hant,cht,tc,zht,zh-HK,zh,chi,zho,en,eng";
 
@@ -247,14 +258,7 @@ impl Player {
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
-        // VITASCOPE_DEBUG=1：把 mpv 的警告與錯誤印到 stderr（排查顯示卡、驅動之類的問題）；
-        // 也可以指定 mpv 的記錄等級，例如 VITASCOPE_DEBUG=v
-        let level = match std::env::var("VITASCOPE_DEBUG") {
-            Ok(v) if v == "1" || v.is_empty() => "warn".to_owned(),
-            Ok(v) => v,
-            Err(_) => "error".to_owned(),
-        };
-        mpv.request_log_messages(&level)?;
+        mpv.request_log_messages(debug_log_level(std::env::var("VITASCOPE_DEBUG").ok().as_deref()))?;
         for (i, (name, format)) in OBSERVED.iter().enumerate() {
             mpv.observe(i as u64 + 1, name, *format)?;
         }
@@ -661,7 +665,20 @@ fn failure_reason(code: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::display_size;
+    use super::{debug_log_level, display_size};
+
+    #[test]
+    fn debug_env_never_blocks_startup() {
+        assert_eq!(debug_log_level(None), "error");
+        assert_eq!(debug_log_level(Some("1")), "warn");
+        assert_eq!(debug_log_level(Some("")), "warn");
+        assert_eq!(debug_log_level(Some("v")), "v");
+        assert_eq!(debug_log_level(Some("trace")), "trace");
+        // mpv 不認得的值會讓 request_log_messages 失敗，播放器就開不起來
+        for odd in ["true", "yes", "0", "verbose", "V"] {
+            assert_eq!(debug_log_level(Some(odd)), "warn", "{odd}");
+        }
+    }
 
     #[test]
     fn display_size_accounts_for_gpu_rotation() {

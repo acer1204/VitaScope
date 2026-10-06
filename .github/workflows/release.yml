@@ -7,8 +7,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# 只有建立 Release 的工作需要寫入權限（在下面另外指定）
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -197,7 +198,10 @@ jobs:
           wait $pid || true
           kill $watcher 2>/dev/null || true
           cat shot.log
-          grep -q '非黑色像素' shot.log
+          pct=$(grep -o '非黑色像素 [0-9.]*' shot.log | awk '{print $2}')
+          echo "非黑色像素：${pct:-沒有截圖}%"
+          # 跟 Linux 一樣：全黑或只剩控制列代表影片沒畫出來（macOS 的測試機不穩定，失敗只顯示警告）
+          awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
 
       # ── Linux：執行檔，libmpv 用系統套件 ──
       - name: 打包（Linux）
@@ -253,6 +257,8 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
@@ -269,7 +275,17 @@ jobs:
           # Debian 12 的 glibc 是 2.36、Debian 13 是 2.41
           if printf '%s\n%s\n' "$glibc" 2.36 | sort -V -C; then debian=12; else debian=13; fi
 
-          cat > notes.md <<'EOF'
+          # CHANGELOG.md 裡這個版本的段落（「## v0.1.1 — 日期」到下一個「## 」之前）放在說明最前面
+          awk -v tag="$GITHUB_REF_NAME" '/^## / { if (found) exit; found = ($2 == tag); next } found' \
+            CHANGELOG.md > changes.md
+          if grep -q '[^[:space:]]' changes.md; then
+            { printf '## 更新內容\n'; cat changes.md; printf '\n'; } > notes.md
+          else
+            echo "::warning::CHANGELOG.md 沒有 $GITHUB_REF_NAME 的段落"
+            : > notes.md
+          fi
+
+          cat >> notes.md <<'EOF'
           ## 下載
 
           | 平台 | 檔案 | 使用方式 |
@@ -287,7 +303,7 @@ jobs:
           **Linux**：需要 glibc @GLIBC@ 以上與 libmpv.so.2（例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
           中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），開檔對話框需要 xdg-desktop-portal 或 zenity。
 
-          **授權**：影戲 VitaScope 以 GPL-3.0 授權。每個安裝包都附有 `LICENSE` 與第三方元件的授權聲明
+          **授權**：影戲 VitaScope 以 GPL-3.0-or-later 授權。每個安裝包都附有 `LICENSE` 與第三方元件的授權聲明
           （`THIRD-PARTY-NOTICES.md`、`THIRD-PARTY-RUST.html`；macOS 另有 `THIRD-PARTY-MACOS.md`）。
 
           完整功能與開發進度見 [ROADMAP.md](https://github.com/acer1204/VitaScope/blob/@TAG@/ROADMAP.md)。

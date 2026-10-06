@@ -5,7 +5,7 @@
 //! 介面重繪（例如滑鼠移過控制列）只把貼圖再畫一次，很便宜。
 //!
 //! 把貼圖畫到畫面上用的是一個小 shader，不用 `glBlitFramebuffer`：
-//! 視窗的 framebuffer 如果是多重取樣（MSAA，Linux 的 Mesa 常見），blit 過去會失敗，畫面一片黑。
+//! 視窗的 framebuffer 如果是多重取樣（MSAA，例如顯示卡驅動強制開啟反鋸齒），blit 過去會失敗，畫面一片黑。
 
 use crate::mpv::render::{GetProcAddress, RenderContext};
 use crate::mpv::{self, Mpv};

@@ -646,7 +646,7 @@ impl VitascopeApp {
         ui.label(egui::RichText::new(APP_NAME).size(32.0).color(Color32::from_gray(220)));
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("把影片拖放到這裡，或按 Ctrl+O 開啟檔案")
+            egui::RichText::new(format!("把影片拖放到這裡，或按 {OPEN_SHORTCUT} 開啟檔案"))
                 .size(16.0)
                 .color(Color32::from_gray(140)),
         );
@@ -711,7 +711,11 @@ impl VitascopeApp {
                 if ui.add(icon_button("⛶")).on_hover_text("全螢幕（F / Enter）").clicked() {
                     self.run(ui.ctx(), Action::ToggleFullscreen);
                 }
-                if ui.add(icon_button("🗁")).on_hover_text("開啟檔案（Ctrl+O）").clicked() {
+                if ui
+                    .add(icon_button("🗁"))
+                    .on_hover_text(format!("開啟檔案（{OPEN_SHORTCUT}）"))
+                    .clicked()
+                {
                     self.run(ui.ctx(), Action::Open);
                 }
                 if ui.add(icon_button("ℹ")).on_hover_text("關於影戲（F1）").clicked() {
@@ -943,6 +947,9 @@ impl eframe::App for VitascopeApp {
         [0.0, 0.0, 0.0, 1.0]
     }
 }
+
+/// 開檔快捷鍵的說明文字（macOS 用 Command 鍵）
+const OPEN_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
