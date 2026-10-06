@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>影戲 VitaScope：Rust 套件授權</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, "Microsoft JhengHei", "PingFang TC", sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
+  h1 { font-size: 1.6rem; }
+  .overview { columns: 2; padding-left: 1.2rem; }
+  .license { border-top: 1px solid #8884; padding-top: 1rem; margin-top: 1.5rem; }
+  .used-by { columns: 3; font-size: 0.9rem; padding-left: 1.2rem; }
+  pre { white-space: pre-wrap; font-size: 0.8rem; background: #8881; padding: 0.8rem; border-radius: 6px; }
+</style>
+</head>
+<body>
+<h1>影戲 VitaScope：Rust 套件授權</h1>
+<p>以下是 VitaScope 使用的 Rust 套件（包括 egui 內建的字型）與它們的授權條文，由 cargo-about 自動產生。
+VitaScope 本身的授權見 LICENSE；播放引擎 mpv / FFmpeg 等第三方元件見 THIRD-PARTY-NOTICES.md。</p>
+
+<h2>授權總覽</h2>
+<ul class="overview">
+{{#each overview}}
+  <li><a href="#{{id}}">{{name}}</a>（{{count}} 個套件）</li>
+{{/each}}
+</ul>
+
+<h2>授權條文</h2>
+{{#each licenses}}
+<section class="license">
+  <h3 id="{{id}}">{{name}}</h3>
+  <p>使用這份授權的套件：</p>
+  <ul class="used-by">
+  {{#each used_by}}
+    <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+  {{/each}}
+  </ul>
+  <pre>{{text}}</pre>
+</section>
+{{/each}}
+</body>
+</html>

@@ -451,9 +451,12 @@ impl VitascopeApp {
                 }
                 Some(UpdateStatus::Failed(e)) => {
                     ui.colored_label(Color32::from_rgb(0xff, 0x8a, 0x80), format!("檢查更新失敗：{e}"));
-                    if ui.button("再試一次").clicked() {
-                        start_check = true;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("再試一次").clicked() {
+                            start_check = true;
+                        }
+                        ui.hyperlink_to("開啟發佈頁面", update::RELEASES_URL);
+                    });
                 }
                 Some(UpdateStatus::Available { latest }) => {
                     ui.label(format!(
@@ -491,6 +494,10 @@ impl VitascopeApp {
         }
         if close || modal.should_close() {
             self.about_open = false;
+            // 下次打開時可以重新檢查（除非還在檢查中）
+            if status != Some(UpdateStatus::Checking) {
+                self.update_status = None;
+            }
         }
     }
 

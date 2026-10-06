@@ -78,10 +78,19 @@ pub fn check_blocking() -> UpdateStatus {
             Ok(body) => interpret(&body, current_version()),
             Err(e) => UpdateStatus::Failed(format!("讀取回應失敗：{e}")),
         },
-        // 沒有任何 Release 時，GitHub 回 404
-        Err(ureq::Error::StatusCode(404)) => UpdateStatus::NoRelease,
-        Err(ureq::Error::StatusCode(code)) => UpdateStatus::Failed(format!("GitHub 回應錯誤（HTTP {code}）")),
+        Err(ureq::Error::StatusCode(code)) => from_http_status(code),
         Err(e) => UpdateStatus::Failed(format!("無法連線到 GitHub：{e}")),
+    }
+}
+
+/// GitHub 回應錯誤碼時的說明
+fn from_http_status(code: u16) -> UpdateStatus {
+    match code {
+        // 沒有任何 Release 時，GitHub 回 404
+        404 => UpdateStatus::NoRelease,
+        // 未登入的查詢每小時限 60 次（以 IP 計算，公司或宿舍網路可能共用額度）
+        403 | 429 => UpdateStatus::Failed("GitHub 暫時限制查詢次數，請稍後再試，或直接開啟發佈頁面".into()),
+        _ => UpdateStatus::Failed(format!("GitHub 回應錯誤（HTTP {code}）")),
     }
 }
 
@@ -121,6 +130,18 @@ mod tests {
         let status = check_blocking();
         println!("GitHub 查詢結果：{status:?}");
         assert!(!matches!(status, UpdateStatus::Failed(_)), "{status:?}");
+    }
+
+    #[test]
+    fn explains_http_errors() {
+        assert_eq!(from_http_status(404), UpdateStatus::NoRelease);
+        for code in [403, 429] {
+            assert!(
+                matches!(from_http_status(code), UpdateStatus::Failed(m) if m.contains("限制")),
+                "{code}"
+            );
+        }
+        assert!(matches!(from_http_status(500), UpdateStatus::Failed(m) if m.contains("500")));
     }
 
     #[test]

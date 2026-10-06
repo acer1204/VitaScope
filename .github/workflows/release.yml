@@ -12,6 +12,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # 介面測試用的影片：mpv 內建的測試畫面，不需要任何檔案
+  TEST_VIDEO: "av://lavfi:testsrc2=size=640x360:rate=30:duration=20"
 
 jobs:
   build:
@@ -22,10 +24,13 @@ jobs:
         include:
           - name: windows-x64
             os: windows-latest
+          # macOS 14：Homebrew 的函式庫是為建置時的系統版本編譯的，
+          # 用較舊的機器打包，安裝包才能在較舊的 macOS 上執行（實際最低版本由下面的檢查算出）
           - name: macos-arm64
-            os: macos-latest
+            os: macos-14
+          # 固定版本：glibc 版本決定能在哪些發行版執行，不要跟著 ubuntu-latest 漂移
           - name: linux-x64
-            os: ubuntu-latest
+            os: ubuntu-24.04
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -55,6 +60,10 @@ jobs:
       - name: 安裝 Rust
         if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable
+      - name: 安裝 cargo-about（產生 Rust 套件授權清單）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
 
       - name: 安裝 libmpv（Windows）
         if: runner.os == 'Windows'
@@ -63,14 +72,21 @@ jobs:
       - name: 安裝 libmpv（macOS）
         if: runner.os == 'macOS'
         run: brew install mpv dylibbundler
-      - name: 安裝 libmpv（Linux）
+      - name: 安裝 libmpv 與介面測試用的虛擬螢幕（Linux）
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmpv-dev
+          sudo apt-get install -y libmpv-dev xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0
 
       - name: 編譯
         run: cargo build --release
+
+      - name: 授權聲明
+        shell: bash
+        run: |
+          mkdir -p notices
+          cp LICENSE packaging/THIRD-PARTY-NOTICES.md notices/
+          cargo about generate --fail about.hbs -o notices/THIRD-PARTY-RUST.html
 
       # ── Windows：exe + libmpv-2.dll，解壓就能用 ──
       - name: 打包（Windows）
@@ -82,11 +98,15 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item target/release/vitascope.exe $dir
           Copy-Item vendor/libmpv/windows-x64/libmpv-2.dll $dir
-          Copy-Item LICENSE, README.md $dir
+          Copy-Item README.md, notices/* $dir
           # 確認打包出來的程式能執行（--version 會載入 libmpv-2.dll）
           $out = & "$dir/vitascope.exe" --version | Out-String
           if ($LASTEXITCODE -ne 0) { throw "打包後的程式無法執行：$out" }
           Write-Host $out
+          # 記錄 libmpv-2.dll 依賴的 DLL（例如 vulkan-1.dll 需要顯示卡驅動提供）
+          if (Get-Command objdump -ErrorAction SilentlyContinue) {
+            objdump -p $dir/libmpv-2.dll | Select-String "DLL Name" | ForEach-Object { $_.Line.Trim() }
+          }
           Compress-Archive -Path $dir -DestinationPath "dist/$name.zip"
 
       # ── macOS：.app，libmpv 和相依的 dylib 都包進 Contents/Frameworks ──
@@ -95,26 +115,10 @@ jobs:
         run: |
           tag="${{ steps.version.outputs.tag }}"
           version="${tag#v}"
-          app="dist/VitaScope.app"
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks"
+          name="VitaScope-${tag}-macos-arm64"
+          app="dist/$name/VitaScope.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks" "$app/Contents/Resources"
           cp target/release/vitascope "$app/Contents/MacOS/"
-          cat > "$app/Contents/Info.plist" <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>CFBundleName</key><string>VitaScope</string>
-            <key>CFBundleDisplayName</key><string>影戲 VitaScope</string>
-            <key>CFBundleIdentifier</key><string>io.github.acer1204.vitascope</string>
-            <key>CFBundleExecutable</key><string>vitascope</string>
-            <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>${version}</string>
-            <key>CFBundleShortVersionString</key><string>${version}</string>
-            <key>LSMinimumSystemVersion</key><string>11.0</string>
-            <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
-          EOF
           # 把 libmpv 及其相依函式庫複製進 .app，並把載入路徑改成 .app 內部
           dylibbundler -od -b -x "$app/Contents/MacOS/vitascope" \
             -d "$app/Contents/Frameworks" -p @executable_path/../Frameworks/
@@ -133,6 +137,42 @@ jobs:
           for lib in "$app"/Contents/Frameworks/*.dylib; do
             reset_rpaths "$lib" "@loader_path" "/usr/lib/swift"
           done
+
+          # 最低系統需求 = 所有執行檔與函式庫要求的最高版本（不手寫，避免寫錯）
+          # （macOS 內建的 sort 不一定支援 -V，用「主.次.修訂」三欄數字排序）
+          vsort() { sort -t. -k1,1n -k2,2n -k3,3n; }
+          for f in "$app/Contents/MacOS/vitascope" "$app"/Contents/Frameworks/*.dylib; do
+            m=$(otool -l "$f" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; exit}')
+            echo "${m:-?} $(basename "$f")"
+          done | vsort > minos.txt
+          cat minos.txt
+          min_os=$(awk '$1 != "?" {print $1}' minos.txt | vsort | tail -1)
+          echo "最低需求：macOS $min_os"
+          echo "$min_os" > dist/macos-min-version.txt
+
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>VitaScope</string>
+            <key>CFBundleDisplayName</key><string>影戲 VitaScope</string>
+            <key>CFBundleIdentifier</key><string>io.github.acer1204.vitascope</string>
+            <key>CFBundleExecutable</key><string>vitascope</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>${version}</string>
+            <key>CFBundleShortVersionString</key><string>${version}</string>
+            <key>LSMinimumSystemVersion</key><string>${min_os}</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          # 授權：放在 .app 裡（跟著程式走），也放在 .app 旁邊（解壓縮就看得到）
+          cp notices/* "$app/Contents/Resources/"
+          bash packaging/macos-third-party.sh "$app"
+          cp notices/* "$app/Contents/Resources/THIRD-PARTY-MACOS.md" "dist/$name/"
+
           # 改過載入路徑的執行檔要重新簽章，否則 Apple Silicon 不讓它執行（ad-hoc 簽章，未經公證）
           codesign --force --deep --sign - "$app"
           # 確認 .app 不再參照 Homebrew 的路徑（使用者電腦上沒有），而且真的能執行
@@ -141,7 +181,23 @@ jobs:
             exit 1
           fi
           "$app/Contents/MacOS/vitascope" --version
-          ditto -c -k --keepParent "$app" "dist/VitaScope-${tag}-macos-arm64.zip"
+          ditto -c -k --keepParent "dist/$name" "dist/$name.zip"
+          echo "app=$app" >> "$GITHUB_ENV"
+
+      # 實際開視窗播放測試畫面並自動截圖（驗證 OpenGL + mpv 渲染路徑）。
+      # macOS 虛擬機的 OpenGL 支援不一定完整，只記錄結果、不擋發佈
+      - name: 介面測試（macOS）
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          "$app/Contents/MacOS/vitascope" "$TEST_VIDEO" --shot shot-macos.png --shot-delay 3 > shot.log 2>&1 &
+          pid=$!
+          ( sleep 90; kill -9 $pid 2>/dev/null ) &
+          watcher=$!
+          wait $pid || true
+          kill $watcher 2>/dev/null || true
+          cat shot.log
+          grep -q '非黑色像素' shot.log
 
       # ── Linux：執行檔，libmpv 用系統套件 ──
       - name: 打包（Linux）
@@ -149,9 +205,34 @@ jobs:
         run: |
           name="VitaScope-${{ steps.version.outputs.tag }}-linux-x64"
           mkdir -p "dist/$name"
-          cp target/release/vitascope LICENSE README.md "dist/$name/"
+          cp target/release/vitascope README.md notices/* "dist/$name/"
           "dist/$name/vitascope" --version
+          # 記錄執行需求：最低 glibc 版本、動態連結的函式庫
+          glibc=$(objdump -T "dist/$name/vitascope" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          echo "最低需求：glibc $glibc"
+          echo "$glibc" > dist/linux-glibc.txt
+          ldd "dist/$name/vitascope"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
+          echo "bin=dist/$name/vitascope" >> "$GITHUB_ENV"
+
+      - name: 介面測試（Linux，虛擬螢幕）
+        if: runner.os == 'Linux'
+        run: |
+          timeout 90 xvfb-run -a -s "-screen 0 1280x800x24" \
+            "$bin" "$TEST_VIDEO" --shot shot-linux.png --shot-delay 3 2>&1 | tee shot.log
+          pct=$(grep -o '非黑色像素 [0-9.]*' shot.log | awk '{print $2}')
+          echo "非黑色像素：${pct:-沒有截圖}%"
+          # 測試畫面是彩條，幾乎整個畫面都有顏色；全黑或只剩控制列代表影片沒畫出來
+          awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
+
+      - name: 上傳介面測試截圖
+        if: always() && runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          # 名稱不要以 64 結尾：Release 只下載 *-*64（安裝包）
+          name: gui-shot-${{ runner.os }}
+          path: shot-*.png
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
@@ -159,6 +240,7 @@ jobs:
           path: |
             dist/*.zip
             dist/*.tar.gz
+            dist/*.txt
           if-no-files-found: error
 
   release:
@@ -171,26 +253,44 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: assets
+          pattern: "*-*64"
           merge-multiple: true
       - name: 建立 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          macos_min=$(cat assets/macos-min-version.txt)
+          glibc=$(cat assets/linux-glibc.txt)
+          # Debian 12 的 glibc 是 2.36、Debian 13 是 2.41
+          if printf '%s\n%s\n' "$glibc" 2.36 | sort -V -C; then debian=12; else debian=13; fi
+
           cat > notes.md <<'EOF'
           ## 下載
 
           | 平台 | 檔案 | 使用方式 |
           |---|---|---|
-          | Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64.zip` | 解壓縮後執行 `vitascope.exe` |
-          | macOS 11 以上（Apple Silicon） | `VitaScope-*-macos-arm64.zip` | 解壓縮後把 `VitaScope.app` 拖到「應用程式」 |
-          | Linux（x64） | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `vitascope` |
+          | Windows 10 / 11（64 位元） | `VitaScope-@TAG@-windows-x64.zip` | 解壓縮後執行資料夾裡的 `vitascope.exe` |
+          | macOS @MACOS_MIN@ 以上（Apple Silicon） | `VitaScope-@TAG@-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
+          | Linux（x64） | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `vitascope` |
 
-          **macOS**：這個版本沒有經過 Apple 公證，第一次開啟時請在 Finder 對 `VitaScope.app` 按右鍵 →「打開」，
-          或在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
+          **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」。
+          需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境，一般電腦裝好顯示卡驅動就有）。
 
-          完整功能與開發進度見 [ROADMAP.md](https://github.com/acer1204/VitaScope/blob/main/ROADMAP.md)。
+          **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，
+          在下方按「仍要打開」；也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
+
+          **Linux**：需要 glibc @GLIBC@ 以上與 libmpv.so.2（例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
+          中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），開檔對話框需要 xdg-desktop-portal 或 zenity。
+
+          **授權**：影戲 VitaScope 以 GPL-3.0 授權。每個安裝包都附有 `LICENSE` 與第三方元件的授權聲明
+          （`THIRD-PARTY-NOTICES.md`、`THIRD-PARTY-RUST.html`；macOS 另有 `THIRD-PARTY-MACOS.md`）。
+
+          完整功能與開發進度見 [ROADMAP.md](https://github.com/acer1204/VitaScope/blob/@TAG@/ROADMAP.md)。
           EOF
-          gh release create "$GITHUB_REF_NAME" assets/* \
+          sed -i -e "s/@TAG@/$GITHUB_REF_NAME/g" -e "s/@MACOS_MIN@/$macos_min/g" \
+                 -e "s/@GLIBC@/$glibc/g" -e "s/@DEBIAN@/$debian/g" notes.md
+          cat notes.md
+          gh release create "$GITHUB_REF_NAME" assets/*.zip assets/*.tar.gz \
             --title "影戲 VitaScope $GITHUB_REF_NAME" \
             --notes-file notes.md \
             --generate-notes

@@ -54,11 +54,26 @@ impl AutoShot {
                 Ok(()) => eprintln!("[vitascope] 截圖已存到 {}", self.path.display()),
                 Err(e) => eprintln!("[vitascope] 截圖存檔失敗：{e}"),
             }
+            // CI 用這行判斷畫面是否真的畫出來（全黑代表 OpenGL / 影片渲染失敗）
+            eprintln!("[vitascope] 截圖統計：非黑色像素 {:.1}%", non_black_percent(&image));
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
             ctx.request_repaint();
         }
     }
+}
+
+/// 非黑色像素（任一色版 > 16）的比例
+fn non_black_percent(image: &egui::ColorImage) -> f64 {
+    if image.pixels.is_empty() {
+        return 0.0;
+    }
+    let lit = image
+        .pixels
+        .iter()
+        .filter(|c| c.r() > 16 || c.g() > 16 || c.b() > 16)
+        .count();
+    lit as f64 * 100.0 / image.pixels.len() as f64
 }
 
 fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {

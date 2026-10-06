@@ -64,14 +64,7 @@ fn main() -> eframe::Result {
         ..Options::default()
     }) {
         Ok(p) => p,
-        Err(e) => {
-            rfd::MessageDialog::new()
-                .set_level(rfd::MessageLevel::Error)
-                .set_title(APP_NAME)
-                .set_description(format!("無法啟動播放引擎 libmpv：\n{e}"))
-                .show();
-            std::process::exit(1);
-        }
+        Err(e) => fatal(&format!("無法啟動播放引擎 libmpv：\n{e}")),
     };
 
     let settings = Settings::load();
@@ -93,12 +86,30 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "VitaScope",
         options,
         Box::new(move |cc| {
             let _ = egui_ctx.set(cc.egui_ctx.clone());
             Ok(Box::new(VitascopeApp::new(cc, player, settings, launch)))
         }),
-    )
+    );
+    // 發佈版沒有主控台，視窗開不起來（例如顯示卡不支援 OpenGL 3）時要用對話框告訴使用者
+    if let Err(e) = &result {
+        fatal(&format!(
+            "無法開啟播放器視窗：\n{e}\n\n請確認顯示卡驅動程式已安裝，並支援 OpenGL 3.0 以上。"
+        ));
+    }
+    result
+}
+
+/// 印出錯誤（給從終端機啟動的情況）並顯示對話框，然後結束
+fn fatal(message: &str) -> ! {
+    eprintln!("[vitascope] {message}");
+    rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(APP_NAME)
+        .set_description(message)
+        .show();
+    std::process::exit(1)
 }

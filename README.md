@@ -14,11 +14,28 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 | 平台 | 檔案 | 使用方式 |
 |---|---|---|
-| Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64.zip` | 解壓縮後執行 `vitascope.exe` |
-| macOS 11 以上（Apple Silicon） | `VitaScope-*-macos-arm64.zip` | 解壓縮後把 `VitaScope.app` 拖到「應用程式」；未經 Apple 公證，第一次請按右鍵 →「打開」 |
-| Linux（x64） | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（`sudo apt install libmpv2` 或 `sudo dnf install mpv-libs`） |
+| Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64.zip` | 解壓縮後執行資料夾裡的 `vitascope.exe` |
+| macOS（Apple Silicon，最低版本見各版本的發佈說明） | `VitaScope-*-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
+| Linux（x64） | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `vitascope` |
+
+- **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」。
+  需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境）。
+- **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
+  也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
+- **Linux**：需要有 libmpv.so.2 的發行版（例如 Ubuntu 24.04 以後）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
+  開檔對話框需要 xdg-desktop-portal 或 zenity。
 
 播放器的「關於」（控制列的 ℹ 或 F1）可以檢查更新，有新版本時會開啟 Releases 頁面。
+
+### 設定檔與移除
+
+程式本身不需要安裝，刪掉資料夾即可移除。另外會建立這些資料：
+
+| 平台 | 設定（音量、視窗位置） | 字幕轉碼暫存 |
+|---|---|---|
+| Windows | `%APPDATA%\Vitascope\settings.json` | `%LOCALAPPDATA%\VitaScope\subs` |
+| macOS | `~/Library/Application Support/Vitascope/settings.json` | `~/Library/Caches/VitaScope/subs` |
+| Linux | `~/.config/vitascope/settings.json` | `~/.cache/vitascope/subs` |
 
 ## 功能（L1）
 
@@ -41,12 +58,12 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 |---|---|
 | 空白鍵 | 播放 / 暫停 |
 | ← / → | 後退 / 前進 5 秒 |
-| Ctrl + ← / → | 後退 / 前進 30 秒 |
+| Ctrl（macOS：⌘）+ ← / → | 後退 / 前進 30 秒 |
 | ↑ / ↓ | 音量 ±5 |
 | M | 靜音 |
 | F、Enter、雙擊畫面 | 全螢幕 |
 | Esc | 離開全螢幕 |
-| Ctrl + O | 開啟檔案 |
+| Ctrl（macOS：⌘）+ O | 開啟檔案 |
 | F1 | 關於 / 檢查更新 |
 | 單擊畫面 | 播放 / 暫停 |
 

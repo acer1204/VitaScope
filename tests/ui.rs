@@ -374,6 +374,38 @@ fn update_available_asks_then_opens_releases_page() {
 }
 
 #[test]
+fn reopening_about_allows_checking_again() {
+    let mut h = harness(None);
+    h.step();
+    h.key_press(egui::Key::F1);
+    h.run_steps(2);
+    h.state_mut()
+        .set_update_status(vitascope::update::UpdateStatus::UpToDate {
+            latest: "v0.1.0".into(),
+        });
+    h.run_steps(2);
+    h.get_by_label_contains("已經是最新版本");
+    h.get_by_label("關閉").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::F1);
+    h.run_steps(2);
+    h.get_by_label("檢查更新");
+}
+
+#[test]
+fn update_failure_offers_releases_page() {
+    let mut h = harness(None);
+    h.step();
+    h.key_press(egui::Key::F1);
+    h.run_steps(2);
+    h.state_mut()
+        .set_update_status(vitascope::update::UpdateStatus::Failed("測試".into()));
+    h.run_steps(2);
+    h.get_by_label("再試一次");
+    h.get_by_label("開啟發佈頁面");
+}
+
+#[test]
 fn update_available_no_just_dismisses() {
     let mut h = harness(None);
     h.step();
