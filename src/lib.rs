@@ -9,6 +9,7 @@ pub mod app;
 pub mod autoshot;
 pub mod fonts;
 pub mod formats;
+pub mod geometry;
 pub mod history;
 pub mod mpv;
 pub mod player;

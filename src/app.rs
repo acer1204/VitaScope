@@ -2,6 +2,7 @@
 
 use crate::autoshot::AutoShot;
 use crate::formats;
+use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
 use crate::player::{MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
@@ -67,6 +68,29 @@ enum Action {
     LoadSubtitle,
     LoadAudio,
     SubtitleStyle,
+    /// 視窗置頂（開 / 關）
+    ToggleOnTop,
+    /// 畫面比例：依序切換 / 指定（None = 原始比例）
+    AspectCycle,
+    SetAspect(Option<usize>),
+    /// 裁切：依序切換 / 指定（None = 不裁切）
+    CropCycle,
+    SetCrop(Option<usize>),
+    /// 填滿視窗（裁掉黑邊）
+    ToggleFill,
+    /// 縮放（log2 的增減）/ 重設
+    Zoom(f64),
+    ZoomReset,
+    /// 移動畫面（影片大小的比例）/ 置中
+    Pan(f64, f64),
+    PanCenter,
+    /// 順時針轉 90° / 指定角度
+    RotateCw,
+    SetRotate(u32),
+    /// 翻轉：true = 左右、false = 上下
+    Flip(bool),
+    /// 畫面的調整全部還原
+    ResetView,
 }
 
 pub struct VitascopeApp {
@@ -148,6 +172,15 @@ pub struct VitascopeApp {
     pending_auto_next: bool,
     /// 這一幀開始時是否有選單開著（點畫面關選單時，不要順便暫停）
     popup_open_at_start: bool,
+    /// 畫面調整（長寬比、裁切、縮放、旋轉、翻轉）；換檔時還原
+    geometry: Geometry,
+    /// 這個檔案原本的顯示比例（已含檔案本身的旋轉）與畫面輸出的旋轉，換長寬比、裁切時的基準
+    natural: Option<(f64, i64)>,
+    /// 長寬比、裁切、旋轉改了之後，等新的畫面尺寸出來再調整視窗高度
+    refit_pending: bool,
+    /// 已經送出開新檔、新檔案還沒開始：這段期間舊檔案的事件不能拿來補設畫面調整
+    ///（mpv 換檔時會先把畫面選項還原，補設的話會帶到新檔案）
+    switching_file: bool,
 }
 
 /// 啟動參數
@@ -242,6 +275,10 @@ impl VitascopeApp {
             pending_subs: None,
             pending_auto_next: false,
             popup_open_at_start: false,
+            geometry: Geometry::default(),
+            natural: None,
+            refit_pending: false,
+            switching_file: false,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -279,6 +316,11 @@ impl VitascopeApp {
         &self.settings
     }
 
+    /// 目前的畫面調整（介面測試用）
+    pub fn geometry(&self) -> &Geometry {
+        &self.geometry
+    }
+
     // ───────────── 操作 ─────────────
 
     fn open(&mut self, path: &Path) {
@@ -309,6 +351,7 @@ impl VitascopeApp {
         }
         self.video_click_time = None;
         self.pending_auto_next = false;
+        self.switching_file = true;
         // 開新檔一律從播放開始（mpv 會沿用上一個檔案的暫停狀態）；A-B 重播也會沿用，要清掉
         let _ = self.player.set_pause(false);
         let _ = self.player.clear_ab_loop();
@@ -540,6 +583,94 @@ impl VitascopeApp {
             }
             Action::LoadSubtitle if loaded => self.load_file_dialog(true),
             Action::SubtitleStyle => self.sub_style_open = true,
+            Action::AspectCycle if loaded => {
+                let next = geometry::cycle(self.geometry.aspect, ASPECTS.len());
+                self.set_aspect(next);
+            }
+            Action::SetAspect(aspect) if loaded => self.set_aspect(aspect),
+            Action::CropCycle if loaded => {
+                let next = geometry::cycle(self.geometry.crop, CROPS.len());
+                self.set_crop(next);
+            }
+            Action::SetCrop(crop) if loaded => self.set_crop(crop),
+            Action::ToggleFill if loaded => {
+                self.geometry.fill = !self.geometry.fill;
+                let _ = self
+                    .player
+                    .mpv()
+                    .set_property("panscan", if self.geometry.fill { 1.0 } else { 0.0 });
+                self.osd(if self.geometry.fill {
+                    "填滿視窗：開啟"
+                } else {
+                    "填滿視窗：關閉"
+                });
+            }
+            Action::Zoom(delta) if loaded => {
+                self.geometry.zoom = geometry::zoom_after(self.geometry.zoom, delta);
+                let _ = self.player.mpv().set_property("video-zoom", self.geometry.zoom);
+                self.osd(format!("縮放 {:.0}%", self.geometry.zoom_percent()));
+            }
+            Action::ZoomReset if loaded => {
+                self.geometry.zoom = 0.0;
+                self.geometry.pan = [0.0, 0.0];
+                self.apply_zoom_and_pan();
+                self.osd("縮放 100%");
+            }
+            Action::Pan(dx, dy) if loaded => {
+                self.geometry.pan = [
+                    geometry::pan_after(self.geometry.pan[0], dx),
+                    geometry::pan_after(self.geometry.pan[1], dy),
+                ];
+                self.apply_zoom_and_pan();
+                self.osd("移動畫面");
+            }
+            Action::PanCenter if loaded => {
+                self.geometry.pan = [0.0, 0.0];
+                self.apply_zoom_and_pan();
+                self.osd("畫面置中");
+            }
+            Action::RotateCw if loaded => self.set_rotate((self.geometry.rotate + 90) % 360),
+            Action::SetRotate(deg) if loaded => self.set_rotate(deg),
+            Action::Flip(horizontal) if loaded => {
+                let on = if horizontal {
+                    self.geometry.hflip = !self.geometry.hflip;
+                    self.geometry.hflip
+                } else {
+                    self.geometry.vflip = !self.geometry.vflip;
+                    self.geometry.vflip
+                };
+                self.apply_flip(horizontal);
+                let name = if horizontal { "左右翻轉" } else { "上下翻轉" };
+                self.osd(format!("{name}：{}", if on { "開啟" } else { "關閉" }));
+            }
+            Action::ResetView if loaded => {
+                let had_shape =
+                    self.geometry.aspect.is_some() || self.geometry.crop.is_some() || self.geometry.rotate != 0;
+                let (hflip, vflip) = (self.geometry.hflip, self.geometry.vflip);
+                self.geometry = Geometry::default();
+                let _ = self.player.mpv().set_property("panscan", 0.0);
+                self.apply_zoom_and_pan();
+                if hflip {
+                    self.apply_flip(true);
+                }
+                if vflip {
+                    self.apply_flip(false);
+                }
+                if had_shape {
+                    self.sync_shape(true);
+                }
+                self.osd("畫面已重設");
+            }
+            Action::ToggleOnTop => {
+                self.settings.always_on_top = !self.settings.always_on_top;
+                self.apply_window_level(ctx);
+                self.save_settings();
+                self.osd(if self.settings.always_on_top {
+                    "視窗置頂：開啟"
+                } else {
+                    "視窗置頂：關閉"
+                });
+            }
             Action::LoadAudio if loaded => self.load_file_dialog(false),
             Action::Restart if loaded && st.seekable => {
                 let _ = self.player.seek_to(0.0, true);
@@ -578,6 +709,117 @@ impl VitascopeApp {
             Ok(()) => self.osd(format!("載入{kind}：{}", file_name(&path))),
             Err(e) => self.osd(format!("無法載入{kind}：{e}")),
         }
+    }
+
+    fn set_aspect(&mut self, aspect: Option<usize>) {
+        self.geometry.aspect = aspect;
+        self.sync_shape(true);
+        self.osd(format!("畫面比例：{}", self.geometry.aspect_label()));
+    }
+
+    fn set_crop(&mut self, crop: Option<usize>) {
+        self.geometry.crop = crop;
+        self.sync_shape(true);
+        let label = self.geometry.crop_label();
+        self.osd(if crop.is_some() {
+            format!("裁切：{label}")
+        } else {
+            label.to_owned()
+        });
+    }
+
+    fn set_rotate(&mut self, deg: u32) {
+        self.geometry.rotate = deg % 360;
+        self.sync_shape(true);
+        // 用濾鏡翻轉時（軟體繪圖），濾鏡在旋轉之前翻：轉了 90° 之後左右、上下要對調
+        if self.flip_with_filter() {
+            if self.geometry.hflip {
+                self.apply_flip(true);
+            }
+            if self.geometry.vflip {
+                self.apply_flip(false);
+            }
+        }
+        self.osd(format!("旋轉 {}°", self.geometry.rotate));
+    }
+
+    fn apply_zoom_and_pan(&self) {
+        let mpv = self.player.mpv();
+        let _ = mpv.set_property("video-zoom", self.geometry.zoom);
+        let _ = mpv.set_property("video-pan-x", self.geometry.pan[0]);
+        let _ = mpv.set_property("video-pan-y", self.geometry.pan[1]);
+    }
+
+    /// 軟體繪圖的簡化流程不跑著色器，翻轉改用 vf 濾鏡
+    fn flip_with_filter(&self) -> bool {
+        self.player.get_string("gpu-dumb-mode").is_ok_and(|v| v == "yes")
+    }
+
+    fn apply_flip(&mut self, horizontal: bool) {
+        let on = if horizontal {
+            self.geometry.hflip
+        } else {
+            self.geometry.vflip
+        };
+        let quarter = self.geometry.rotate % 180 == 90;
+        if let Err(e) = self.player.set_flip(horizontal, on, self.flip_with_filter(), quarter) {
+            self.osd(format!("無法翻轉畫面：{e}"));
+        }
+    }
+
+    /// 長寬比、裁切、旋轉（會讓 mpv 重新設定畫面的選項）：依目前的模型算出 mpv 的值，有變才設定。
+    /// 旋轉改了之後影格的方向也變了，裁切要等新的畫面參數出來再算一次，所以畫面設定好時（VideoReconfig）也會呼叫。
+    /// 回傳是否有送出改變（還會再收到一次 VideoReconfig）
+    fn sync_shape(&mut self, user_changed: bool) -> bool {
+        let Some(out) = self.player.out_params() else {
+            return false;
+        };
+        let g = self.geometry.clone();
+        let (natural_aspect, natural_rotate) = self.natural.unwrap_or_else(|| {
+            let [w, h] = self.player.state.video_size.unwrap_or([out.dw, out.dh]);
+            (w as f64 / h.max(1) as f64, out.rotate)
+        });
+        let total_rotate = (natural_rotate + i64::from(g.rotate)).rem_euclid(360) as u32;
+        let mut changed = false;
+        changed |= self
+            .player
+            .set_option_if_changed("video-rotate", &g.rotate.to_string())
+            .unwrap_or(false);
+        let aspect = g.aspect.map(|i| geometry::aspect_override(ASPECTS[i].1, total_rotate));
+        changed |= self.player.set_aspect_override(aspect).unwrap_or(false);
+        let crop = match g.crop {
+            None => String::new(),
+            Some(i) => {
+                // 畫面上整張影片的比例：選了長寬比就是那個比例，不然是原本的比例（轉 90° 時倒過來）
+                let display = match g.aspect {
+                    Some(a) => ASPECTS[a].1,
+                    None if g.rotate % 180 == 90 => 1.0 / natural_aspect,
+                    None => natural_aspect,
+                };
+                let frame = geometry::Frame {
+                    w: out.w as f64,
+                    h: out.h as f64,
+                    rotate: out.rotate.rem_euclid(360) as u32,
+                };
+                geometry::crop_value(frame, geometry::crop_edges(display, CROPS[i].1))
+            }
+        };
+        changed |= self.player.set_option_if_changed("video-crop", &crop).unwrap_or(false);
+        if changed && user_changed {
+            // 畫面形狀變了：等新的尺寸出來，視窗寬度不變、高度跟著調
+            self.refit_pending = true;
+            self.video_reconfigured = false;
+        }
+        changed
+    }
+
+    fn apply_window_level(&self, ctx: &egui::Context) {
+        let level = if self.settings.always_on_top {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
     }
 
     fn set_speed(&mut self, speed: f64) {
@@ -637,7 +879,13 @@ impl VitascopeApp {
                 self.was_playing = false;
                 self.resume_after_drag = false;
                 self.frame_stepping = false;
+                self.stepping_unpaused_since = None;
                 self.resume_target = None;
+                // 畫面調整是每個檔案各自的（mpv 那邊由 reset-on-next-file 還原）
+                self.geometry = Geometry::default();
+                self.natural = None;
+                self.refit_pending = false;
+                self.switching_file = false;
                 self.pending_auto_next = false;
                 // 自動存檔從開檔起重新計時（不然停在起始畫面很久再開檔，第一幀就會存到 0）
                 self.last_autosave = Instant::now();
@@ -645,7 +893,20 @@ impl VitascopeApp {
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
             // 新檔案的影像設定好了，尺寸才是新的
-            PlayerEvent::VideoReconfig => self.video_reconfigured = true,
+            PlayerEvent::VideoReconfig => {
+                // 第一次設定好畫面時（還沒有任何調整）記下原本的比例，之後換長寬比、裁切都以它為準
+                if self.natural.is_none()
+                    && self.geometry.is_default()
+                    && let (Some([w, h]), Some(out)) = (self.player.state.video_size, self.player.out_params())
+                {
+                    self.natural = Some((w as f64 / h.max(1) as f64, out.rotate));
+                }
+                // 有調整的話依新的畫面參數再對一次（例如旋轉之後要重算裁切）；有改就再等下一次
+                let resent = !self.switching_file && !self.geometry.is_default() && self.sync_shape(false);
+                if !resent {
+                    self.video_reconfigured = true;
+                }
+            }
             PlayerEvent::PlaybackRestart => {
                 if let Some(shot) = &mut self.autoshot {
                     shot.arm();
@@ -795,6 +1056,24 @@ impl VitascopeApp {
                     actions.push(action);
                 }
             };
+            // Alt + 方向鍵要排在沒有修飾鍵的方向鍵前面：egui 比對時會忽略多按的 Alt
+            key(Modifiers::ALT, Key::ArrowLeft, Action::Pan(-PAN_STEP, 0.0));
+            key(Modifiers::ALT, Key::ArrowRight, Action::Pan(PAN_STEP, 0.0));
+            key(Modifiers::ALT, Key::ArrowUp, Action::Pan(0.0, -PAN_STEP));
+            key(Modifiers::ALT, Key::ArrowDown, Action::Pan(0.0, PAN_STEP));
+            key(Modifiers::ALT, Key::K, Action::RotateCw);
+            key(Modifiers::ALT, Key::Backspace, Action::ResetView);
+            // 裁切用 Ctrl（macOS 也是 Control 鍵）：Cmd+Q 是結束程式
+            key(Modifiers::CTRL, Key::Q, Action::CropCycle);
+            key(Modifiers::COMMAND, Key::Z, Action::Flip(true));
+            key(Modifiers::COMMAND, Key::P, Action::Flip(false));
+            key(Modifiers::COMMAND, Key::T, Action::ToggleOnTop);
+            key(Modifiers::COMMAND, Key::Num5, Action::PanCenter);
+            key(Modifiers::COMMAND, Key::F6, Action::AspectCycle);
+            key(Modifiers::NONE, Key::A, Action::AspectCycle);
+            key(Modifiers::NONE, Key::Num9, Action::Zoom(ZOOM_STEP));
+            key(Modifiers::NONE, Key::Num1, Action::Zoom(-ZOOM_STEP));
+            key(Modifiers::NONE, Key::Num5, Action::ZoomReset);
             key(Modifiers::COMMAND, Key::O, Action::Open);
             key(Modifiers::COMMAND, Key::ArrowLeft, Action::Seek(-30.0));
             key(Modifiers::COMMAND, Key::ArrowRight, Action::Seek(30.0));
@@ -925,6 +1204,11 @@ impl VitascopeApp {
 
     /// 新檔案的影片尺寸確定後，把視窗調整成影片比例（不超過螢幕的 80%）
     fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.refit_pending && !self.fit_window_pending && self.video_reconfigured {
+            self.refit_pending = false;
+            self.refit_height(ctx);
+            return;
+        }
         if !self.fit_window_pending || !self.video_reconfigured {
             return;
         }
@@ -954,6 +1238,28 @@ impl VitascopeApp {
         let target = vec2(width, size.y + self.controls_height);
         eprintln!("[vitascope] 視窗配合影片 {w}×{h} → {:.0}×{:.0}", target.x, target.y);
         ctx.send_viewport_cmd(ViewportCommand::InnerSize(target));
+    }
+
+    /// 長寬比、裁切、旋轉改了：視窗寬度不變，高度配合新的比例（不超過螢幕）
+    fn refit_height(&mut self, ctx: &egui::Context) {
+        let Some([w, h]) = self.player.state.video_size else {
+            return;
+        };
+        let (fullscreen, maximized, monitor) = ctx.input(|i| {
+            (
+                i.viewport().fullscreen.unwrap_or(false),
+                i.viewport().maximized.unwrap_or(false),
+                i.viewport().monitor_size,
+            )
+        });
+        let content = ctx.content_rect();
+        if fullscreen || maximized || w <= 0 || h <= 0 {
+            return;
+        }
+        let max_height = monitor.map_or(f32::INFINITY, |m| m.y * 0.9);
+        let width = content.width();
+        let height = (width * h as f32 / w as f32 + self.controls_height).min(max_height);
+        ctx.send_viewport_cmd(ViewportCommand::InnerSize(vec2(width, height)));
     }
 
     /// 測試用：直接設定檢查更新的結果（不連網）
@@ -1316,6 +1622,11 @@ impl VitascopeApp {
             );
         }
 
+        // Ctrl / Cmd + 滾輪、觸控板捏合：縮放畫面
+        let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
+        if response.hovered() && (zoom_delta - 1.0).abs() > 1e-3 {
+            self.run(ui.ctx(), Action::Zoom(f64::from(zoom_delta.log2())));
+        }
         // 滑鼠滾輪調音量（比照 PotPlayer）
         let steps = self.wheel_steps(ui.ctx(), response.hovered());
         if steps != 0 {
@@ -1455,9 +1766,16 @@ impl VitascopeApp {
         ui.separator();
         self.track_menu(ui, TrackKind::Audio, "音軌");
         self.track_menu(ui, TrackKind::Sub, "字幕");
+        if let Some(a) = self.view_menu(ui) {
+            action = Some(a);
+        }
         ui.separator();
         if menu_item(ui, true, "全螢幕", "F") {
             action = Some(Action::ToggleFullscreen);
+        }
+        let on_top = egui::Button::selectable(self.settings.always_on_top, "視窗置頂").shortcut_text(ON_TOP_SHORTCUT);
+        if ui.add(on_top).clicked() {
+            action = Some(Action::ToggleOnTop);
         }
         if menu_item(ui, true, "關於影戲", "F1") {
             action = Some(Action::About);
@@ -1670,6 +1988,98 @@ impl VitascopeApp {
         if ui.add(icon_button(icon)).on_hover_text("靜音（M）").clicked() {
             self.run(ui.ctx(), Action::ToggleMute);
         }
+    }
+
+    /// 右鍵選單的「畫面」：長寬比、裁切、縮放、移動、旋轉、翻轉。沒有影像（純音訊）時停用
+    fn view_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let st = &self.player.state;
+        let has_video = st.loaded && st.has_video();
+        let g = self.geometry.clone();
+        let mut action = None;
+        ui.add_enabled_ui(has_video, |ui| {
+            ui.menu_button("畫面", |ui| {
+                ui.menu_button(format!("畫面比例（{}）", g.aspect_label()), |ui| {
+                    if ui.selectable_label(g.aspect.is_none(), "原始比例").clicked() {
+                        action = Some(Action::SetAspect(None));
+                    }
+                    for (i, (label, _)) in ASPECTS.iter().enumerate() {
+                        if ui.selectable_label(g.aspect == Some(i), *label).clicked() {
+                            action = Some(Action::SetAspect(Some(i)));
+                        }
+                    }
+                    ui.separator();
+                    ui.weak(format!("A 或 {ASPECT_SHORTCUT} 依序切換"));
+                });
+                ui.menu_button(format!("裁切（{}）", g.crop_label()), |ui| {
+                    if ui.selectable_label(g.crop.is_none(), "不裁切").clicked() {
+                        action = Some(Action::SetCrop(None));
+                    }
+                    for (i, (label, _)) in CROPS.iter().enumerate() {
+                        if ui
+                            .selectable_label(g.crop == Some(i), format!("裁成 {label}"))
+                            .clicked()
+                        {
+                            action = Some(Action::SetCrop(Some(i)));
+                        }
+                    }
+                    ui.separator();
+                    if ui.selectable_label(g.fill, "填滿視窗（裁掉黑邊）").clicked() {
+                        action = Some(Action::ToggleFill);
+                    }
+                    ui.weak(format!("{CROP_SHORTCUT} 依序切換"));
+                });
+                ui.separator();
+                if menu_item(ui, true, "放大", "9") {
+                    action = Some(Action::Zoom(ZOOM_STEP));
+                }
+                if menu_item(ui, true, "縮小", "1") {
+                    action = Some(Action::Zoom(-ZOOM_STEP));
+                }
+                if menu_item(ui, true, &format!("重設縮放（{:.0}%）", g.zoom_percent()), "5") {
+                    action = Some(Action::ZoomReset);
+                }
+                ui.menu_button("移動畫面", |ui| {
+                    for (label, key, dx, dy) in [
+                        ("左移", "←", -PAN_STEP, 0.0),
+                        ("右移", "→", PAN_STEP, 0.0),
+                        ("上移", "↑", 0.0, -PAN_STEP),
+                        ("下移", "↓", 0.0, PAN_STEP),
+                    ] {
+                        if menu_item(ui, true, label, &format!("{ALT_KEY}+{key}")) {
+                            action = Some(Action::Pan(dx, dy));
+                        }
+                    }
+                    ui.separator();
+                    if menu_item(ui, true, "置中", PAN_CENTER_SHORTCUT) {
+                        action = Some(Action::PanCenter);
+                    }
+                });
+                ui.separator();
+                ui.menu_button(format!("旋轉（{}°）", g.rotate), |ui| {
+                    for (deg, label) in [(0, "不旋轉"), (90, "順時針 90°"), (180, "180°"), (270, "逆時針 90°")]
+                    {
+                        if ui.selectable_label(g.rotate == deg, label).clicked() {
+                            action = Some(Action::SetRotate(deg));
+                        }
+                    }
+                    ui.separator();
+                    ui.weak(format!("{ALT_KEY}+K 依序旋轉"));
+                });
+                let hflip = egui::Button::selectable(g.hflip, "左右翻轉（鏡像）").shortcut_text(FLIP_H_SHORTCUT);
+                if ui.add(hflip).clicked() {
+                    action = Some(Action::Flip(true));
+                }
+                let vflip = egui::Button::selectable(g.vflip, "上下翻轉").shortcut_text(FLIP_V_SHORTCUT);
+                if ui.add(vflip).clicked() {
+                    action = Some(Action::Flip(false));
+                }
+                ui.separator();
+                if menu_item(ui, !g.is_default(), "重設畫面", &format!("{ALT_KEY}+Backspace")) {
+                    action = Some(Action::ResetView);
+                }
+            });
+        });
+        action
     }
 
     /// 控制列與右鍵選單的「字幕」「音軌」選單：選軌道、延遲、載入檔案；字幕另有第二字幕、編碼、外觀
@@ -2087,13 +2497,17 @@ fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
             .layout(Layout::top_down(Align::Center)),
     );
     let prefix = if has_cover { "" } else { "♪  " };
-    ui.label(
-        egui::RichText::new(format!("{prefix}{title}"))
-            .size(22.0)
-            .color(Color32::from_gray(230)),
+    // 不能選取文字：可選取的文字會攔下滑鼠點擊，點在歌名上就不能暫停、開右鍵選單
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!("{prefix}{title}"))
+                .size(22.0)
+                .color(Color32::from_gray(230)),
+        )
+        .selectable(false),
     );
     for d in details {
-        ui.label(egui::RichText::new(d).size(16.0).color(Color32::from_gray(170)));
+        ui.add(egui::Label::new(egui::RichText::new(d).size(16.0).color(Color32::from_gray(170))).selectable(false));
     }
 }
 
@@ -2105,6 +2519,19 @@ fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bo
     }
     ui.add_enabled(enabled, button).clicked()
 }
+
+/// 畫面相關的快捷鍵說明（macOS 的按鍵名稱不一樣）
+const ALT_KEY: &str = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+const CROP_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "Control+Q"
+} else {
+    "Ctrl+Q"
+};
+const ASPECT_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+F6" } else { "Ctrl+F6" };
+const FLIP_H_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+Z" } else { "Ctrl+Z" };
+const FLIP_V_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+P" } else { "Ctrl+P" };
+const PAN_CENTER_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+5" } else { "Ctrl+5" };
+const ON_TOP_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+T" } else { "Ctrl+T" };
 
 /// 跳章節的快捷鍵說明
 const CHAPTER_SHORTCUT: &str = if cfg!(target_os = "macos") {

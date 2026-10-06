@@ -22,6 +22,11 @@ pub struct Settings {
     pub resume: bool,
     /// 字幕外觀
     pub subtitle: SubStyle,
+    /// 視窗置頂（蓋在其他視窗上面）
+    pub always_on_top: bool,
+    /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
+    #[serde(skip)]
+    path: Option<PathBuf>,
 }
 
 /// 字幕外觀（文字字幕；勾選「也套用到 ASS」時連 ASS 字幕一起改）。
@@ -130,6 +135,8 @@ impl Default for Settings {
             auto_next: true,
             resume: true,
             subtitle: SubStyle::default(),
+            always_on_top: false,
+            path: None,
         }
     }
 }
@@ -149,16 +156,21 @@ impl Settings {
         config_dir().map(|d| d.join("settings.json"))
     }
 
-    /// 讀取設定；檔案不存在或格式錯誤就用預設值
+    /// 讀取設定；檔案不存在或格式錯誤就用預設值。之後 `save` 會存回同一個檔案
     pub fn load() -> Self {
-        Self::path()
+        let path = Self::path();
+        let mut settings: Self = path
+            .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.path = path;
+        settings
     }
 
+    /// 存檔；不是從檔案讀進來的設定（例如自動測試用的預設值）不寫檔
     pub fn save(&self) -> std::io::Result<()> {
-        let path = Self::path().ok_or_else(|| std::io::Error::other("找不到設定資料夾"))?;
+        let Some(path) = self.path.clone() else { return Ok(()) };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -197,6 +209,13 @@ mod tests {
         assert!(s.window.is_none());
         assert!(s.auto_next && s.resume, "新功能預設開啟");
         assert_eq!(s.subtitle, SubStyle::default());
+    }
+
+    #[test]
+    fn default_settings_never_write_to_disk() {
+        let s = Settings::default();
+        assert!(s.path.is_none());
+        s.save().unwrap();
     }
 
     #[test]

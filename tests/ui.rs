@@ -5,7 +5,7 @@
 
 use eframe::egui;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vitascope::app::{Launch, VitascopeApp};
@@ -28,13 +28,9 @@ fn sample(rel: &str) -> PathBuf {
 
 fn harness(file: Option<PathBuf>) -> Harness<'static, VitascopeApp> {
     // 樣本資料夾裡有很多檔案，播完自動接下一個會讓測試換到別的檔案；需要的測試再自己打開
-    harness_with(
-        file,
-        Settings {
-            auto_next: false,
-            ..Settings::default()
-        },
-    )
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    harness_with(file, settings)
 }
 
 fn harness_with(file: Option<PathBuf>, settings: Settings) -> Harness<'static, VitascopeApp> {
@@ -685,11 +681,9 @@ fn resumes_where_it_left_off() {
 #[test]
 fn resume_can_be_turned_off() {
     let long = sample("common/mp4_long.mp4");
-    let settings = Settings {
-        resume: false,
-        auto_next: false,
-        ..Settings::default()
-    };
+    let mut settings = Settings::default();
+    settings.resume = false;
+    settings.auto_next = false;
     let mut h = harness_with(Some(long.clone()), settings);
     step_until(&mut h, "開始播放", |s| {
         playing(s, "mp4_long.mp4") && s.time_pos > 0.0
@@ -1365,4 +1359,163 @@ fn escape_closes_the_subtitle_style_window() {
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
     assert!(h.query_by_label("恢復預設").is_none(), "Esc 關掉字幕外觀視窗");
+}
+
+// ───────────── L2：畫面 ─────────────
+
+/// 這一幀送給視窗的指令
+fn viewport_commands(h: &Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    h.output()
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|v| v.commands.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn always_on_top_from_context_menu() {
+    let mut h = playing_multitrack();
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("視窗置頂").click();
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
+        "{cmds:?}"
+    );
+    assert!(h.state().settings().always_on_top);
+}
+
+fn ratio(s: &State) -> f64 {
+    s.video_size.map_or(0.0, |[w, h]| w as f64 / h as f64)
+}
+
+fn prop(h: &Harness<'_, VitascopeApp>, name: &str) -> String {
+    h.state().player().get_string(name).unwrap_or_default()
+}
+
+#[test]
+fn aspect_key_cycles_and_reset_restores() {
+    let mut h = opened(sample("common/mp4_h264_aac.mp4")); // 320x240（4:3）
+    assert!((ratio(&h.state().player().state) - 4.0 / 3.0).abs() < 0.01);
+    h.key_press(egui::Key::A);
+    step_until(&mut h, "A：16:9", |s| (ratio(s) - 16.0 / 9.0).abs() < 0.02);
+    assert_eq!(h.state().geometry().aspect, Some(0));
+    h.key_press(egui::Key::A);
+    step_until(&mut h, "再按 A：4:3", |s| (ratio(s) - 4.0 / 3.0).abs() < 0.02);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::Backspace);
+    step_until(&mut h, "Alt+Backspace：回到原始比例", |s| {
+        (ratio(s) - 4.0 / 3.0).abs() < 0.01
+    });
+    assert!(h.state().geometry().is_default());
+    // 原始比例寫回 mpv 回報的預設值（0.37 是 -1、新版是 -2），不能是 0（像素當成正方形）
+    let aspect: f64 = prop(&h, "video-aspect-override").parse().unwrap();
+    assert!(aspect < 0.0, "{aspect}");
+}
+
+#[test]
+fn crop_key_cuts_to_the_chosen_shape() {
+    let mut h = playing_multitrack(); // 640x360（16:9）
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    h.run_steps(2);
+    assert_eq!(
+        h.state().geometry().crop,
+        Some(0),
+        "第一下：裁成 16:9（本來就是，不變）"
+    );
+    h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
+    step_until(&mut h, "第二下：裁成 4:3", |s| s.video_size == Some([480, 360]));
+    assert_eq!(prop(&h, "video-crop"), "480x360+80+0");
+}
+
+#[test]
+fn rotate_key_turns_the_picture_and_keeps_the_crop_shape() {
+    let mut h = playing_multitrack(); // 640x360
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
+    step_until(&mut h, "Alt+K：轉 90°，變直的", |s| {
+        s.video_size == Some([360, 640])
+    });
+    assert_eq!(h.state().geometry().rotate, 90);
+    // 轉了之後再裁成 4:3：畫面上看起來是 4:3
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("畫面 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label_contains("裁切").click();
+    h.run_steps(2);
+    h.get_by_label("裁成 4:3").click();
+    step_until(&mut h, "旋轉後裁成 4:3", |s| (ratio(s) - 4.0 / 3.0).abs() < 0.02);
+}
+
+#[test]
+fn zoom_and_pan_keys() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::Num9);
+    h.run_steps(2);
+    assert_eq!(prop(&h, "video-zoom"), "0.100000");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::ArrowRight);
+    h.run_steps(2);
+    assert_eq!(prop(&h, "video-pan-x"), "0.050000");
+    // Alt+→ 是移動畫面，不能同時被當成「前進 5 秒」
+    let t = h.state().player().state.time_pos;
+    assert!(t < 4.0, "沒有跳轉：{t}");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Num5);
+    h.run_steps(2);
+    assert_eq!(prop(&h, "video-pan-x"), "0.000000");
+    h.key_press(egui::Key::Num5);
+    h.run_steps(2);
+    assert_eq!(prop(&h, "video-zoom"), "0.000000");
+}
+
+#[test]
+fn flip_keys_toggle_the_flip_shader() {
+    let mut h = playing_multitrack();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert!(
+        prop(&h, "glsl-shaders").contains("hflip.glsl"),
+        "{}",
+        prop(&h, "glsl-shaders")
+    );
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
+    h.run_steps(2);
+    assert!(prop(&h, "glsl-shaders").contains("vflip.glsl"));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert!(!prop(&h, "glsl-shaders").contains("hflip.glsl"), "再按一次取消");
+}
+
+#[test]
+fn opening_another_file_resets_the_view() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::A);
+    h.key_press(egui::Key::Num9);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    assert!(!h.state().geometry().is_default());
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "換檔", |s| {
+        playing(s, "mp4_h264_aac.mp4") && s.video_size.is_some()
+    });
+    h.run_steps(3);
+    assert!(h.state().geometry().is_default());
+    assert_eq!(prop(&h, "video-zoom"), "0.000000");
+    assert!(prop(&h, "glsl-shaders").is_empty(), "{}", prop(&h, "glsl-shaders"));
+    step_until(&mut h, "新檔案是原本的 4:3", |s| {
+        (ratio(s) - 4.0 / 3.0).abs() < 0.01
+    });
+    let aspect: f64 = prop(&h, "video-aspect-override").parse().unwrap();
+    assert!(aspect < 0.0, "長寬比回到原始比例：{aspect}");
+}
+
+#[test]
+fn view_menu_is_disabled_for_audio_only_files() {
+    let mut h = harness(Some(sample("general/audio_flac.flac")));
+    step_until(&mut h, "播放", |s| playing(s, "audio_flac.flac"));
+    h.run_steps(2);
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    let view = h.get_by_label_contains("畫面 ⏵");
+    assert!(view.accesskit_node().is_disabled(), "純音訊檔沒有畫面可以調整");
 }

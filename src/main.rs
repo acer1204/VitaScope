@@ -84,6 +84,9 @@ fn main() -> eframe::Result {
             .with_position(g.pos)
             .with_maximized(g.maximized);
     }
+    if settings.always_on_top {
+        viewport = viewport.with_always_on_top();
+    }
     let options = eframe::NativeOptions {
         viewport,
         // mpv 的 render API 只支援 OpenGL

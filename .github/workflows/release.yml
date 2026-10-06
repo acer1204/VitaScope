@@ -75,6 +75,8 @@ jobs:
         run: brew install mpv dylibbundler
       - name: 安裝 libmpv 與介面測試用的虛擬螢幕（Linux）
         if: runner.os == 'Linux'
+        # 套件伺服器偶爾卡住，預設要等 6 小時才會逾時
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y libmpv-dev xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0

@@ -326,6 +326,26 @@ fn round_ms(seconds: f64) -> f64 {
     (seconds * 1000.0).round() / 1000.0
 }
 
+/// 換檔時還原的畫面選項（翻轉用的是 vf 與 glsl-shaders）
+const GEOMETRY_OPTIONS: &str =
+    "video-aspect-override,video-crop,video-rotate,video-zoom,video-pan-x,video-pan-y,panscan,vf,glsl-shaders";
+
+/// 畫面輸出收到的影格參數（`video-out-params`）
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+pub struct OutParams {
+    /// 影格大小（裁切、旋轉之前）
+    #[serde(default)]
+    pub w: i64,
+    #[serde(default)]
+    pub h: i64,
+    /// 顯示大小（已套用裁切與長寬比，旋轉之前）
+    pub dw: i64,
+    pub dh: i64,
+    /// 畫面輸出還要做的旋轉（順時針）
+    #[serde(default)]
+    pub rotate: i64,
+}
+
 pub const MIN_SPEED: f64 = 0.25;
 pub const MAX_SPEED: f64 = 4.0;
 
@@ -364,6 +384,8 @@ impl Player {
             // 網站影片（yt-dlp）屬於 L3，先關掉避免開檔時意外呼叫外部程式
             ("ytdl", "no"),
             ("audio-client-name", "VitaScope"),
+            // 畫面調整（長寬比、裁切、縮放、旋轉、翻轉）每個檔案各自的：換檔時 mpv 自動還原，不會閃一下
+            ("reset-on-next-file", GEOMETRY_OPTIONS),
         ];
         if opts.headless {
             options.push(("ao", "null"));
@@ -476,6 +498,77 @@ impl Player {
     /// 跳到第 `index` 個章節（從 0 開始）
     pub fn seek_chapter(&self, index: usize) -> mpv::Result<()> {
         self.mpv.set_property("chapter", index as i64)
+    }
+
+    /// 畫面輸出目前的影格參數（直接讀，不等屬性通知）
+    pub fn out_params(&self) -> Option<OutParams> {
+        let json = self.mpv.get_string("video-out-params").ok()?;
+        serde_json::from_str(&json)
+            .ok()
+            .filter(|p: &OutParams| p.w > 0 && p.h > 0)
+    }
+
+    /// 「原始比例」：mpv 的 video-aspect-override 預設值（0.37 是 -1、0.40 起是 -2，不能寫 "no"）
+    pub fn aspect_default(&self) -> String {
+        self.mpv
+            .get_string("option-info/video-aspect-override/default-value")
+            .unwrap_or_else(|_| "-1".to_owned())
+    }
+
+    /// 設定一個畫面選項（字串值）；跟目前的值一樣就不設，免得 mpv 又重新設定一次畫面
+    pub fn set_option_if_changed(&self, name: &str, value: &str) -> mpv::Result<bool> {
+        if self.mpv.get_string(name).ok().as_deref() == Some(value) {
+            return Ok(false);
+        }
+        self.mpv.set_property(name, value)?;
+        Ok(true)
+    }
+
+    /// 長寬比（旋轉之前整張影格的比例）；None = 原始比例
+    pub fn set_aspect_override(&self, value: Option<f64>) -> mpv::Result<bool> {
+        let current = self
+            .mpv
+            .get_string("video-aspect-override")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok());
+        let wanted = match value {
+            Some(v) => v,
+            None => self.aspect_default().parse().unwrap_or(-1.0),
+        };
+        if current.is_some_and(|c| (c - wanted).abs() < 1e-4) {
+            return Ok(false);
+        }
+        self.mpv
+            .set_property("video-aspect-override", format!("{wanted:.6}").as_str())?;
+        Ok(true)
+    }
+
+    /// 翻轉。`use_filter` = 用 vf 濾鏡（軟體繪圖的簡化流程不跑著色器）；
+    /// 濾鏡在旋轉之前翻，轉了 90° / 270° 時左右、上下要對調
+    pub fn set_flip(&self, horizontal: bool, on: bool, use_filter: bool, quarter_turn: bool) -> mpv::Result<()> {
+        let label = if horizontal { "@vs-hflip" } else { "@vs-vflip" };
+        if use_filter {
+            let _ = self.mpv.command(&["vf", "remove", label]);
+            if on {
+                let filter = if horizontal != quarter_turn { "hflip" } else { "vflip" };
+                self.mpv.command(&["vf", "add", &format!("{label}:{filter}")])?;
+            }
+            return Ok(());
+        }
+        let path = crate::geometry::flip_shader_path(horizontal).map_err(|e| mpv::Error {
+            code: libmpv2_sys::mpv_error_MPV_ERROR_GENERIC,
+            context: format!("無法寫出翻轉用的著色器：{e}"),
+        })?;
+        let path = path.to_string_lossy();
+        let listed = self
+            .mpv
+            .get_string("glsl-shaders")
+            .is_ok_and(|list| list.contains(path.as_ref()));
+        match (on, listed) {
+            (true, false) => self.mpv.command(&["change-list", "glsl-shaders", "append", &path]),
+            (false, true) => self.mpv.command(&["change-list", "glsl-shaders", "remove", &path]),
+            _ => Ok(()),
+        }
     }
 
     /// 目前的章節，直接問 mpv（剛跳完章節時也是新的值，連按才會累加）；-1 = 第一章之前
@@ -967,13 +1060,6 @@ impl Player {
 /// dw/dh 已套用像素比例；如果旋轉交給 GPU 處理（rotate 是 90 或 270），還要交換寬高。
 /// 用濾鏡旋轉時（例如 headless），濾鏡之後的 rotate 已經是 0、寬高也已交換。
 fn display_size(json: &str) -> Option<[i64; 2]> {
-    #[derive(Deserialize)]
-    struct OutParams {
-        dw: i64,
-        dh: i64,
-        #[serde(default)]
-        rotate: i64,
-    }
     let p: OutParams = serde_json::from_str(json).ok()?;
     if p.dw <= 0 || p.dh <= 0 {
         return None;
