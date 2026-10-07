@@ -21,12 +21,20 @@ RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 export APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1   # runner 不保證有 FUSE；libmpv.so.2 已經 strip 過
 [[ -f $vendor/lib/libmpv.so.2 ]] || die "找不到 $vendor/lib/libmpv.so.2，請先執行 bash scripts/fetch-libmpv.sh"
 work=$(mktemp -d); app=$work/AppDir
+mkdir -p "$(dirname "$out")"
 ld=$work/linuxdeploy; runtime=$work/runtime-x86_64
 curl -sSfL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"; echo "$LINUXDEPLOY_SHA256  $ld" | sha256sum -c -; chmod +x "$ld"
 curl -sSfL --retry 3 -o "$runtime" "$RUNTIME_URL"; echo "$RUNTIME_SHA256  $runtime" | sha256sum -c -
 # libpulse、libva、OpenSSL 要跟使用者的系統（音效伺服器、顯示卡驅動、安全性更新）一致：每次執行 linuxdeploy 都要排除
 excl=(--exclude-library 'libpulse.so*' --exclude-library 'libva.so*' --exclude-library 'libva-drm.so*'
-      --exclude-library 'libssl.so*' --exclude-library 'libcrypto.so*')
+      --exclude-library 'libssl.so*' --exclude-library 'libcrypto.so*'
+      # 只有系統的 fontconfig（FreeType）、libxcb 才用到的函式庫：使用者的系統有那些函式庫，就一定有這些
+      --exclude-library 'libpng16.so*' --exclude-library 'libbrotli*.so*' --exclude-library 'libbz2.so*'
+      --exclude-library 'libXau.so*' --exclude-library 'libXdmcp.so*' --exclude-library 'libbsd.so*' --exclude-library 'libmd.so*')
+# linuxdeploy 用 ldd 找相依，連間接相依都會列出來：
+# - 先找到本專案建置的 libmpv.so.2（runner 上另外裝著 Ubuntu 的 libmpv2，給 tar.gz）
+# - libpulse、libva 讓它看替身：不然真品背後的 libsndfile、libsystemd… 會被當成相依包進來
+ldpath=$vendor/lib:$vendor/fallback/pulse:$vendor/fallback/va:$vendor/fallback/va-drm
 
 doc=$app/usr/share/doc/vitascope
 mkdir -p "$app/usr/share/metainfo" "$doc" "$app/usr/lib/fallback"
@@ -35,8 +43,7 @@ appstreamcli validate --no-net "$app/usr/share/metainfo/$id.appdata.xml"
 cp "$repo/README.md" "$doc/"
 if [[ -n $notices ]]; then cp "$notices"/* "$doc/"; else cp "$repo/LICENSE" "$repo/packaging/THIRD-PARTY-NOTICES.md" "$doc/"; fi
 icons=$work/icons; mkdir -p "$icons"; cp "$repo/packaging/icons/icon-256.png" "$icons/$id.png"
-# runner 上另外裝著 Ubuntu 的 libmpv2（給 tar.gz）：linuxdeploy 用 ldd 找相依，LD_LIBRARY_PATH 讓它找到本專案建置的那一份
-LD_LIBRARY_PATH=$vendor/lib "$ld" --appdir "$app" --executable "$bin" \
+LD_LIBRARY_PATH=$ldpath "$ld" --appdir "$app" --executable "$bin" \
   --desktop-file "$pkg/$id.desktop" --icon-file "$icons/$id.png" --custom-apprun "$pkg/AppRun" \
   --library "$sys/libxkbcommon-x11.so.0" "${excl[@]}"
 bid() { readelf -n "$1" | awk '/Build ID/ {print $3}'; }
@@ -53,7 +60,8 @@ AppImage 檔案開頭的執行環境是 [AppImage/type2-runtime](https://github.
 （$RUNTIME_URL，SHA-256 \`$RUNTIME_SHA256\`；MIT），其中靜態連結了 libfuse3（LGPL-2.1）、squashfuse（BSD-2-Clause）、
 zstd、zlib 與 musl（MIT）。原始碼與確切版本見上面的連結。
 EOF
-( cd "$(dirname "$out")" && LDAI_OUTPUT=$(basename "$out") LDAI_RUNTIME_FILE=$runtime "$ld" --appdir "$app" "${excl[@]}" --output appimage )
+( cd "$(dirname "$out")" && LD_LIBRARY_PATH=$ldpath LDAI_OUTPUT=$(basename "$out") LDAI_RUNTIME_FILE=$runtime \
+    "$ld" --appdir "$app" "${excl[@]}" --output appimage )
 # usr/lib 只能有這些（第一次執行後定案）
 got=$(cd "$app/usr/lib" && find . -name '*.so*' \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)
 want=$(printf '%s\n' fallback/pulse/libpulse.so.0 fallback/va-drm/libva-drm.so.2 fallback/va/libva.so.2 \
