@@ -27,8 +27,14 @@ export GIT_CEILING_DIRECTORIES=$ROOT   # 原始碼沒有 .git；別讓 FFmpeg �
 pin() { jq -r --arg n "$1" ".components[] | select(.name == \$n) | .$2" "$PINS"; }
 die() { echo "::error::$*"; exit 1; }
 group() { echo "::group::$*"; }; endgroup() { echo "::endgroup::"; }
-src() { local d=$WORK/src/$1; rm -rf "$d"; mkdir -p "$d"
-        tar -xf "$BUNDLE/upstream/$(pin "$1" file)" -C "$d" --strip-components=1; echo "$d"; }
+src() { local d=$WORK/src/$1 p; rm -rf "$d"; mkdir -p "$d"
+        tar -xf "$BUNDLE/upstream/$(pin "$1" file)" -C "$d" --strip-components=1
+        # 建置用的修正檔（build/patches/<元件>-*.patch，說明在每個檔案開頭）
+        for p in "$BUNDLE"/build/patches/"$1"-*.patch; do
+          [[ -e $p ]] || continue
+          patch -p1 -N -s -d "$d" < "$p" >&2 || die "$1：修正檔 ${p##*/} 套用失敗"
+        done
+        echo "$d"; }
 
 cat > "$WORK/cross.ini" <<EOF
 [binaries]
@@ -130,7 +136,7 @@ meson_build mpv "$s" --default-library=shared \
   -Dgl=enabled -Dgl-win32=enabled -Dgl-dxinterop=enabled \
   -Dd3d-hwaccel=enabled -Dd3d9-hwaccel=enabled -Dgl-dxinterop-d3d9=enabled -Dcuda-hwaccel=enabled -Dcuda-interop=enabled
 features=$(sed -n 's/.*List of enabled features: //p' "$WORK/build/mpv/meson-logs/meson-log.txt" | head -1)
-want='cuda-hwaccel cuda-interop d3d-hwaccel d3d9-hwaccel dos-paths ffmpeg ffnvcodec gl gl-dxinterop gl-dxinterop-d3d9 gl-win32 glob glob-win32 libass libavdevice libplacebo vector wasapi win32 win32-desktop win32-threads zimg zimg-st428 zlib'
+want='cuda-hwaccel cuda-interop d3d-hwaccel d3d9-hwaccel dos-paths dxgi-debug-d3d11 ffmpeg ffnvcodec gl gl-dxinterop gl-dxinterop-d3d9 gl-win32 glob glob-win32 libass libavdevice libplacebo vector wasapi win32 win32-desktop win32-threads zimg zimg-st428 zlib'
 [[ $features == "$want" ]] || die "mpv 的功能跟預期不同：$features"; endgroup
 
 group 打包與檢查

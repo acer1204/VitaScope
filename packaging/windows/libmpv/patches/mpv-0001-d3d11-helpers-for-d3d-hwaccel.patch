@@ -1,0 +1,23 @@
+從 d3d-hwaccel 也編譯 d3d11_helpers.c（影戲的建置只用 D3D11 硬體解碼，不開 D3D11 畫面輸出）
+
+mpv 6c092d978b 的 meson.build 只在開 d3d11、egl-angle-win32 或 vulkan 時才加入 d3d11_helpers.c，
+但 d3d-hwaccel 編譯的 video/filter/vf_d3d11vpp.c 也用到它（DXGI_DEBUG_D3D11、d3d11_get_csp_name），
+只開 d3d-hwaccel 時會編譯、連結失敗。開 d3d11 畫面輸出又需要 shaderc 與 SPIRV-Cross，影戲用不到。
+
+--- a/meson.build
++++ b/meson.build
+@@ -1433,6 +1433,14 @@
+                      'video/filter/vf_d3d11vpp.c')
+ endif
+ 
++# vf_d3d11vpp.c uses d3d11_helpers, which is otherwise only built together with
++# the d3d11, egl-angle-win32 or vulkan outputs; build it for d3d-hwaccel alone too.
++if features['d3d-hwaccel'] and not (features['d3d11'] or features['egl-angle-win32'] or
++                                    (features['vulkan'] and win32))
++    sources += files('video/out/gpu/d3d11_helpers.c')
++    features += {'dxgi-debug-d3d11': cc.has_header_symbol('d3d11sdklayers.h', 'DXGI_DEBUG_D3D11')}
++endif
++
+ amf = cc.has_header('AMF/core/Factory.h', required:
+     get_option('amf').require(features['d3d-hwaccel']))
+ features += {'amf': amf}

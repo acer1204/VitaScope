@@ -77,7 +77,7 @@ cat "$dest/upstream/SHA256SUMS"
 cp "$pins" "$here/requirements.txt" "$dest/"
 cp "$here/README-SOURCE.md" "$dest/README.md"
 cp "$here/build.sh" "$here/notices.py" "$repo/.github/workflows/libmpv-windows.yml" "$dest/build/"
-cp -r "$here/toolchain-licenses" "$dest/build/"
+cp -r "$here/toolchain-licenses" "$here/patches" "$dest/build/"
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner --format=gnu \
     -C "$out" -cf - "$id-src" | xz -T1 -6 > "$out/$id-src.tar.xz"
 ls -l "$out/$id-src.tar.xz"

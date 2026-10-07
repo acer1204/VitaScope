@@ -5,6 +5,7 @@
 - `pins.json`：每個元件的版本、下載位置與 SHA-256 / git commit，以及編譯器（llvm-mingw）的版本
 - `upstream/`：各元件的原始碼（官方發佈的壓縮檔，或指定 commit 的 `git archive`），`SHA256SUMS` 是它們的雜湊
 - `build/build.sh`：建置腳本（mpv 以 `-Dgpl=false`、FFmpeg 以 LGPL 選項建置，靜態連結成一個 DLL）
+- `build/patches/`：建置時套用的修正檔（每個檔案開頭說明原因）
 - `build/notices.py`：產生元件清單 `THIRD-PARTY-WINDOWS.md`
 - `build/libmpv-windows.yml`：GitHub Actions 的建置流程（主機工具的版本、執行順序）
 - `build/toolchain-licenses/`：靜態連結進 DLL 的編譯器執行庫（LLVM、mingw-w64）的授權條文

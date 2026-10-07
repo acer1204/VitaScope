@@ -26,7 +26,7 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，連同下表的函�
 
 ## 對應原始碼
 
-- 全部元件的原始碼（與建置時用的檔案逐位元相同）、建置腳本與設定：`{src}`，附在每個使用這個 DLL 的影戲版本的
+- 全部元件的原始碼（與建置時用的檔案逐位元相同）、建置腳本、設定與修正檔（`build/patches/`）：`{src}`，附在每個使用這個 DLL 的影戲版本的
   Release 上，也在 {rel}。解開後執行 `bash build/build.sh <llvm-mingw 目錄> <輸出目錄>` 可重新建置。
 - 編譯器：[llvm-mingw {tc['version']}]({tc['url']})（SHA-256 `{tc['sha256']}`；{tc['llvm']}、mingw-w64 `{tc['mingw_w64'][:12]}`、UCRT）。
   它的 libc++、libunwind、compiler-rt 與 mingw-w64 執行庫有一部分靜態連結在 DLL 裡，原始碼在 {rel}。
