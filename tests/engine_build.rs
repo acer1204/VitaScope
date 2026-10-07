@@ -13,6 +13,9 @@ fn list(p: &Player, prop: &str, key: &str) -> Vec<String> {
         .filter_map(|e| e[key].as_str().map(str::to_owned))
         .collect()
 }
+fn has_protocol(p: &Player, name: &str) -> bool {
+    p.get_string("protocol-list").unwrap().split(',').any(|x| x == name)
+}
 #[test]
 fn decoders_demuxers_protocols_filters() {
     let p = engine();
@@ -56,9 +59,8 @@ fn decoders_demuxers_protocols_filters() {
     for d in ["hls", "mpegts", "rtsp", "flv", "avi", "asf", "ogg"] {
         assert!(demux.contains(d), "缺少 {d} 分離器");
     }
-    let protos = p.get_string("protocol-list").unwrap();
-    for x in ["file", "http", "https", "tls", "tcp", "crypto", "udp", "rtmp"] {
-        assert!(protos.split(',').any(|y| y == x), "缺少 {x} 協定");
+    for x in ["file", "http", "https", "tls", "tcp", "udp", "rtmp"] {
+        assert!(has_protocol(&p, x), "缺少 {x} 協定");
     }
     for f in ["rotate", "hflip", "vflip", "bwdif", "crop", "scale"] {
         p.mpv()
@@ -95,6 +97,8 @@ fn vendored_libmpv_matches_its_manifest() {
     assert_eq!(p.get_string("mpv-version").unwrap(), format!("mpv v{}", ver("mpv")));
     assert_eq!(p.get_string("ffmpeg-version").unwrap(), ver("ffmpeg"));
     assert!(p.get_string("mpv-configuration").unwrap().contains("gpl=false"));
+    // 加密的 HLS（AES-128）；Ubuntu 的 FFmpeg 沒有，所以只要求本專案建置的
+    assert!(has_protocol(&p, "crypto"), "缺少 crypto 協定");
     assert_eq!(list(&p, "encoder-list", "driver"), ["png"]);
     assert!(!list(&p, "decoder-list", "driver").iter().any(|d| d.contains("zvbi")));
 }

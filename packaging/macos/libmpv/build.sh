@@ -144,7 +144,7 @@ meson_build mpv "$s" --default-library=shared \
   -Dgl=enabled -Dplain-gl=enabled -Dvideotoolbox-gl=enabled
 features=$(grep -m1 'List of enabled features: ' "$WORK/build/mpv/meson-logs/meson-log.txt" | sed 's/.*List of enabled features: //')
 # 第一次成功建置後依實際結果定案（同 Windows）
-want='bsd-fstatfs coreaudio darwin ffmpeg gl glob glob-posix libass libavdevice libdl libplacebo mac-thread-name posix vector videotoolbox-gl zimg zimg-st428 zlib'
+want='bsd-fstatfs coreaudio darwin ffmpeg gl glob glob-posix libass libavdevice libdl libplacebo mac-thread-name posix posix-shm vector videotoolbox-gl zimg zimg-st428 zlib'
 [[ $features == "$want" ]] || die "mpv 的功能跟預期不同：$features"; endgroup
 
 group 打包與檢查

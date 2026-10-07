@@ -129,7 +129,7 @@ meson_build mpv "$s" --default-library=shared -Dc_link_args="$LINK" -Dcpp_link_a
   -Dgl=enabled -Dplain-gl=enabled -Dvaapi=enabled -Dvaapi-drm=enabled \
   -Dcuda-hwaccel=enabled -Dcuda-interop=enabled -Dpulse=enabled -Dalsa=enabled
 features=$(grep -m1 'List of enabled features: ' "$WORK/build/mpv/meson-logs/meson-log.txt" | sed 's/.*List of enabled features: //')
-want='alsa cuda-hwaccel cuda-interop ffmpeg ffnvcodec gl glibc-thread-name glob glob-posix libass libavdevice libdl libplacebo linux-fstatfs posix pthread-condattr-setclock pulse vaapi vaapi-drm vector vt.h zimg zimg-st428 zlib'
+want='alsa clone cuda-hwaccel cuda-interop ffmpeg ffnvcodec gl glibc-thread-name glob glob-posix libass libavdevice libdl libplacebo linux-fstatfs memrchr posix posix-shm ppoll pthread-condattr-setclock pulse vaapi vaapi-drm vector vt.h zimg zimg-st428 zlib'
 [[ $features == "$want" ]] || die "mpv 的功能跟預期不同：$features"   # 第一次成功建置後定案
 for f in x11 wayland drm egl pipewire jack vdpau vulkan cplugins; do
   [[ " $features " != *" $f "* ]] || die "不該啟用 $f"; done; endgroup
