@@ -151,8 +151,10 @@ strip --strip-unneeded "$so"
 readelf -dW "$so" > "$OUT/dynamic.txt"
 sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' "$OUT/dynamic.txt" | sort > "$OUT/needed.txt"
 cat "$OUT/needed.txt"
-diff "$OUT/needed.txt" <(printf '%s\n' libasound.so.2 libc.so.6 libcrypto.so.3 libfontconfig.so.1 libgcc_s.so.1 libm.so.6 \
-  libpulse.so.0 libssl.so.3 libstdc++.so.6 libva-drm.so.2 libva.so.2 | sort) || die "libmpv.so.2 依賴的系統函式庫跟預期不同"
+# ld-linux-x86-64.so.2：用到執行緒區域變數（__tls_get_addr）時會直接依賴 glibc 的動態載入器
+diff "$OUT/needed.txt" <(printf '%s\n' ld-linux-x86-64.so.2 libasound.so.2 libc.so.6 libcrypto.so.3 libfontconfig.so.1 \
+  libgcc_s.so.1 libm.so.6 libpulse.so.0 libssl.so.3 libstdc++.so.6 libva-drm.so.2 libva.so.2 | sort) \
+  || die "libmpv.so.2 依賴的系統函式庫跟預期不同"
 grep -q '(SONAME).*\[libmpv\.so\.2\]' "$OUT/dynamic.txt" || die "SONAME 不是 libmpv.so.2"
 ! grep -qE '\((RPATH|RUNPATH)\)' "$OUT/dynamic.txt" || die "libmpv.so.2 不該有 RPATH / RUNPATH"
 [[ $(readelf -lW "$so" | awk '$1 == "GNU_STACK" {print $7}') == RW ]] || die "堆疊不能可執行（glibc 2.41 起拒絕載入）"
