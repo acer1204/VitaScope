@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 組 Linux AppImage：影戲執行檔＋本專案建置的 libmpv.so.2（vendor/libmpv/linux-x64/，bash scripts/fetch-libmpv.sh 下載）。
 #   bash packaging/linux/build-appimage.sh <vitascope 執行檔> <版本（純數字）> <輸出 .AppImage> [授權聲明資料夾]
-# 在 ubuntu-24.04 上執行：winit 用 dlopen 載入的 libxkbcommon-x11 取自這台機器的 Ubuntu 套件。
+# 在 ubuntu-24.04 上執行：winit、glutin 用 dlopen 載入的視窗函式庫（libxkbcommon-x11、libXcursor…）取自這台機器的 Ubuntu 套件。
 # 另外寫出 <輸出資料夾>/appimage-glibc.txt（AppImage 需要的最低 glibc）。
 set -Eeuo pipefail
 # 任何一步失敗都印出是哪一行、哪個指令；錯誤訊息一律寫到 stderr（stdout 被導到檔案時也看得到）
@@ -28,9 +28,10 @@ curl -sSfL --retry 3 -o "$runtime" "$RUNTIME_URL"; echo "$RUNTIME_SHA256  $runti
 # libpulse、libva、OpenSSL 要跟使用者的系統（音效伺服器、顯示卡驅動、安全性更新）一致：每次執行 linuxdeploy 都要排除
 excl=(--exclude-library 'libpulse.so*' --exclude-library 'libva.so*' --exclude-library 'libva-drm.so*'
       --exclude-library 'libssl.so*' --exclude-library 'libcrypto.so*'
-      # 只有系統的 fontconfig（FreeType）、libxcb 才用到的函式庫：使用者的系統有那些函式庫，就一定有這些
+      # 只有系統的 fontconfig（FreeType）、libxcb、libwayland-client 才用到的函式庫：使用者的系統有那些函式庫，就一定有這些
       --exclude-library 'libpng16.so*' --exclude-library 'libbrotli*.so*' --exclude-library 'libbz2.so*'
-      --exclude-library 'libXau.so*' --exclude-library 'libXdmcp.so*' --exclude-library 'libbsd.so*' --exclude-library 'libmd.so*')
+      --exclude-library 'libXau.so*' --exclude-library 'libXdmcp.so*' --exclude-library 'libbsd.so*' --exclude-library 'libmd.so*'
+      --exclude-library 'libffi.so*')
 # linuxdeploy 用 ldd 找相依，連間接相依都會列出來：
 # - 先找到本專案建置的 libmpv.so.2（runner 上另外裝著 Ubuntu 的 libmpv2，給 tar.gz）
 # - libpulse、libva 讓它看替身：不然真品背後的 libsndfile、libsystemd… 會被當成相依包進來
@@ -43,9 +44,13 @@ appstreamcli validate --no-net "$app/usr/share/metainfo/$id.appdata.xml"
 cp "$repo/README.md" "$doc/"
 if [[ -n $notices ]]; then cp "$notices"/* "$doc/"; else cp "$repo/LICENSE" "$repo/packaging/THIRD-PARTY-NOTICES.md" "$doc/"; fi
 icons=$work/icons; mkdir -p "$icons"; cp "$repo/packaging/icons/icon-256.png" "$icons/$id.png"
+# winit、glutin 執行時才載入（dlopen）的視窗函式庫，ldd 看不到，要明講。libX11、libX11-xcb、libwayland-client、
+# libEGL、libGL 依 AppImage 的慣例用系統的（excludelist），其餘的最小安裝不一定有（例如乾淨的 Debian 13 沒有 libXcursor、libXi）
+libs=()
+for l in libxkbcommon-x11.so.0 libXcursor.so.1 libXi.so.6 libwayland-cursor.so.0 libwayland-egl.so.1; do libs+=(--library "$sys/$l"); done
 LD_LIBRARY_PATH=$ldpath "$ld" --appdir "$app" --executable "$bin" \
   --desktop-file "$pkg/$id.desktop" --icon-file "$icons/$id.png" --custom-apprun "$pkg/AppRun" \
-  --library "$sys/libxkbcommon-x11.so.0" "${excl[@]}"
+  "${libs[@]}" "${excl[@]}"
 bid() { readelf -n "$1" | awk '/Build ID/ {print $3}'; }
 [[ $(bid "$app/usr/lib/libmpv.so.2") == "$(bid "$vendor/lib/libmpv.so.2")" ]] || die "AppImage 裡的 libmpv.so.2 不是 vendor 的那一份"
 cp -r "$vendor/fallback/." "$app/usr/lib/fallback/"
@@ -65,7 +70,8 @@ EOF
 # usr/lib 只能有這些（第一次執行後定案）
 got=$(cd "$app/usr/lib" && find . -name '*.so*' \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)
 want=$(printf '%s\n' fallback/pulse/libpulse.so.0 fallback/va-drm/libva-drm.so.2 fallback/va/libva.so.2 \
-       libmpv.so.2 libxcb-xkb.so.1 libxkbcommon-x11.so.0 libxkbcommon.so.0 | LC_ALL=C sort)
+       libmpv.so.2 libxcb-xkb.so.1 libxkbcommon-x11.so.0 libxkbcommon.so.0 libXcursor.so.1 libXext.so.6 libXfixes.so.3 \
+       libXi.so.6 libXrender.so.1 libwayland-cursor.so.0 libwayland-egl.so.1 | LC_ALL=C sort)
 [[ $got == "$want" ]] || die "AppImage 的 usr/lib 跟預期不同：$(echo $got)"
 glibc=$(find "$app" -type f \( -name '*.so*' -o -path '*/usr/bin/*' \) -exec objdump -T {} + 2>/dev/null \
         | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)

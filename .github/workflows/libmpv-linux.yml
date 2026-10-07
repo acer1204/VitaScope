@@ -148,11 +148,11 @@ jobs:
           rm -rf "$dest"; mkdir -p "$dest"
           tar -xJf "built/$ID.tar.xz" -C "$dest"
           find "$dest" -type f -exec touch {} +
-      - name: 測試需要的套件（ffmpeg 只用來產生樣本；也帶進 libva2、libpulse0）
+      - name: 測試需要的套件（ffmpeg 只用來產生樣本，也帶進 libva2、libpulse0；視窗函式庫要給 AppImage 包進去）
         timeout-minutes: 10
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 appstream
+          sudo apt-get install -y ffmpeg xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1 appstream
       - run: python scripts/gen_samples.py
       - name: 測試
         run: cargo test --all-targets -- --nocapture
