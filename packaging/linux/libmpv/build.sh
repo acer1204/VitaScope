@@ -145,7 +145,7 @@ ln -s libmpv.so.2 "$pkg/lib/libmpv.so"
 cp "$PREFIX/include/mpv/"*.h "$pkg/include/mpv/"
 # 系統提供的函式庫要真的是動態連結：這些符號在 libmpv 裡必須是「未定義、由系統的 .so 提供」
 undef=$(nm -D --undefined-only "$so" | awk '{print $2}' | sed 's/@.*//')
-for s in SSL_CTX_new FcInit snd_pcm_open pa_threaded_mainloop_new vaInitialize vaGetDisplayDRM; do
+for s in SSL_CTX_new FcInitLoadConfig snd_pcm_open pa_threaded_mainloop_new vaInitialize vaGetDisplayDRM; do
   grep -qx "$s" <<<"$undef" || die "$s 不是由系統函式庫提供（被靜態連結了，或沒用到）"; done
 strip --strip-unneeded "$so"
 readelf -dW "$so" > "$OUT/dynamic.txt"
