@@ -69,9 +69,10 @@ for so, (sub, entries, note) in STUBS.items():
         sys.exit(f"libmpv.so.2 沒有用到 {so}：替身清單要更新")
     if lost := entries - names:
         sys.exit(f"{so} 的進入點 {sorted(lost)} 不在 libmpv.so.2 用到的函式裡：替身要重新檢查")
+    # 有版本的符號放進同名的版本節點；沒有版本的（libva 大部分的函式）不寫進版本描述檔，
+    # 連結器給它基本版本，跟原函式庫一樣（libva 只有 vaCreateSurfaces 有版本）
     versions = sorted({v for _, v in syms if v})
-    if versions and any(v is None for _, v in syms):
-        sys.exit(f"{so}：有的符號有版本、有的沒有")
+    unversioned = any(v is None for _, v in syms)
     c = ["#include <stdio.h>", "#include <stdlib.h>",
          "static void unsupported(const char *name) {",
          f'    fprintf(stderr, "vitascope：{so} 的替身不支援 %s（請安裝系統的 {so}）\\n", name);',
@@ -91,11 +92,13 @@ for so, (sub, entries, note) in STUBS.items():
         if versions:
             m = Path(t) / "stub.map"
             m.write_text("".join(f"{v} {{\n  global:\n" + "".join(f"    {n};\n" for n, vv in syms if vv == v)
-                                 + ("  local: *;\n" if i == 0 else "") + "};\n" for i, v in enumerate(versions)),
+                                 + ("  local: *;\n" if i == 0 and not unversioned else "") + "};\n"
+                                 for i, v in enumerate(versions)),
                          encoding="utf-8")
             cmd.append(f"-Wl,--version-script,{m}")
         subprocess.run(cmd, check=True)
-    print(f"{sub}/{so}：{len(names)} 個函式（{'、'.join(versions) or '無符號版本'}），回傳 NULL 的進入點 {sorted(entries) or '無'}")
+    vers = versions + (["無版本"] if unversioned else [])
+    print(f"{sub}/{so}：{len(names)} 個函式（{'、'.join(vers)}），回傳 NULL 的進入點 {sorted(entries) or '無'}")
 
 # 只靠替身也要載入得了（所有符號立即解析）
 env = dict(os.environ, LD_BIND_NOW="1", LD_LIBRARY_PATH=":".join(str(out / s) for s, _, _ in STUBS.values()))
