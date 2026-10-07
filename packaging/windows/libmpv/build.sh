@@ -3,7 +3,9 @@
 # 只用原始碼包裡的檔案，不連網路（代理指向不存在的位址，誤下載會直接失敗）。
 #   bash <原始碼包>/build/build.sh <llvm-mingw 目錄> <輸出目錄>
 # 主機需要：/opt/vsbuild 可寫入、jq、python3、meson、ninja、nasm、pkg-config、make、autoconf、automake、libtool、zip
-set -euo pipefail
+set -Eeuo pipefail
+# 任何一步失敗都印出是哪一行、哪個指令（CI 的紀錄裡才找得到原因）
+trap 'echo "::error::build.sh 第 $LINENO 行失敗（exit $?）：$BASH_COMMAND"' ERR
 BUNDLE=$(cd "$(dirname "$0")/.." && pwd)
 TOOLCHAIN=$(realpath "$1"); OUT=$(realpath -m "$2")
 PINS=$BUNDLE/pins.json
