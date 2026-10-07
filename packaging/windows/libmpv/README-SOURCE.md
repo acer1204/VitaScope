@@ -24,4 +24,5 @@
 
 建置過程不連網路。編譯器執行庫（libc++、libunwind、compiler-rt、mingw-w64）的原始碼另外附在同一個 Release。
 
-授權：整個 DLL 依 LGPL-2.1-or-later 散布；各元件的授權見 `THIRD-PARTY-WINDOWS.md` 與 `licenses/`。
+授權：整個 DLL 依 LGPL-2.1-or-later 散布。各元件的授權條文在 `upstream/` 各自的原始碼裡；元件清單 `THIRD-PARTY-WINDOWS.md` 與整理好的
+`licenses/` 在建置結果 `vitascope-libmpv-win64-rN.zip` 裡（同一個 Release）。

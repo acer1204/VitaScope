@@ -139,7 +139,7 @@ printf '%s\n' "$(pin mpv version)" > "$s/MPV_VERSION"   # 原始碼包沒有 .gi
 echo '_mpv_*' > "$WORK/mpv.exp"   # 只匯出 mpv_*：靜態連結的 FFmpeg、libplacebo、libass… 的符號不對外
 meson_build mpv "$s" --default-library=shared \
   -Dc_link_args="-mmacosx-version-min=$DT -lc++ -Wl,-exported_symbols_list,$WORK/mpv.exp -Wl,-dead_strip_dylibs" \
-  -Dauto_features=disabled -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dtests=false -Dfuzzers=false -Dbuild-date=false -Dlua=disabled \
+  -Db_lundef=true -Dauto_features=disabled -Dgpl=false -Dlibmpv=true -Dcplayer=false -Dtests=false -Dfuzzers=false -Dbuild-date=false -Dlua=disabled \
   -Dvector=enabled -Dzlib=enabled -Dzimg=enabled -Dlibavdevice=enabled -Dcoreaudio=enabled \
   -Dgl=enabled -Dplain-gl=enabled -Dvideotoolbox-gl=enabled
 features=$(grep -m1 'List of enabled features: ' "$WORK/build/mpv/meson-logs/meson-log.txt" | sed 's/.*List of enabled features: //')
@@ -176,6 +176,9 @@ for f in _mpv_create _mpv_initialize _mpv_free _mpv_render_context_create _mpv_r
   grep -qx "$f" "$OUT/exports.txt" || die "沒有匯出 $f"; done
 ! grep -v '^_mpv_' "$OUT/exports.txt" || die "匯出了 mpv_ 以外的符號"
 nm -m "$d" | grep 'weak external' > "$OUT/weak-imports.txt" || true   # 比 $DT 新的 API（記錄下來看）
+# 不能有執行時才查找的符號（mpv 預設 b_lundef=false，連結時不報錯，用到時才中止）；所有符號要立刻解析得了
+! nm -m -u "$d" | grep 'dynamically looked up' || die "dylib 有執行時才查找的符號"
+python3 -c 'import ctypes, os, sys; ctypes.CDLL(sys.argv[1], mode=os.RTLD_NOW)' "$d" || die "dylib 無法立即解析所有符號（RTLD_NOW）"
 for s in libzvbi libx264 libx265; do ! grep -qa "$s" "$d" || die "dylib 裡出現 $s"; done
 # 授權條文：直接取自建置用的原始碼（.h 只取開頭的授權註解）
 jq -c '.components[]' "$PINS" | while read -r c; do

@@ -31,4 +31,5 @@
 
 建置過程不連網路。dylib 只依賴 macOS 內建的函式庫與 framework（清單在輸出的 `BUILDINFO.txt`）。
 
-授權：整個 dylib 依 LGPL-2.1-or-later 散布；各元件的授權見 `THIRD-PARTY-MACOS.md` 與 `licenses/`。
+授權：整個 dylib 依 LGPL-2.1-or-later 散布。各元件的授權條文在 `upstream/` 各自的原始碼裡；元件清單 `THIRD-PARTY-MACOS.md` 與整理好的
+`licenses/` 在建置結果 `vitascope-libmpv-macos-arm64-rN.zip` 裡（同一個 Release）。

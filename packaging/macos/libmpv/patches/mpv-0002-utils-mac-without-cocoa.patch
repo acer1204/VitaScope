@@ -1,0 +1,23 @@
+沒有 Cocoa 的 libmpv 也編譯 osdep/utils-mac.c（CoreAudio 音訊輸出會用到）
+
+mpv 6c092d978b 的 meson.build 只在啟用 Cocoa 時編譯 osdep/utils-mac.c，但 CoreAudio 音訊輸出
+（ao_coreaudio_*.c）也呼叫裡面的 cfstr_from_cstr / cfstr_get_cstr。mpv 預設 b_lundef=false，
+連結時不會報錯，dylib 留下兩個執行時才查找的符號：指定音訊裝置或開啟詳細記錄時，播放有聲音的影片就會中止。
+utils-mac.c 只用到 CoreFoundation（CoreAudio 本來就連結）。
+
+--- a/meson.build
++++ b/meson.build
+@@ -440,6 +440,13 @@
+     main_fn_source = files('osdep/main-fn-mac.c')
+ endif
+ 
++# Modified for VitaScope (2026-10): utils-mac.c (CFString helpers) is also used by the CoreAudio
++# audio output, which a libmpv build without Cocoa still compiles. Without it the
++# dylib links with cfstr_from_cstr / cfstr_get_cstr left undefined (b_lundef=false) and aborts at runtime.
++if darwin and not features['cocoa']
++    sources += files('osdep/utils-mac.c')
++endif
++
+ if posix
+     if not get_option('fuzzers') and cc.has_function('fork', prefix : '#include <unistd.h>')
+         sources += files('osdep/subprocess-posix.c')

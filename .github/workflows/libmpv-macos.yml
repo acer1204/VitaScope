@@ -172,6 +172,17 @@ jobs:
       - name: 硬體解碼（只記錄結果：GitHub 的 macOS 虛擬機不一定有 VideoToolbox）
         continue-on-error: true
         run: cargo test --test hwdec -- --ignored --nocapture
+      # r1 的 dylib 少了 osdep/utils-mac.c，開詳細記錄時 CoreAudio 輸出一啟動就中止；建置時的符號檢查才是把關，這裡實際走一次
+      - name: 有聲音的影片＋詳細記錄（CoreAudio；虛擬機不一定有音訊裝置，只記錄結果）
+        continue-on-error: true
+        env:
+          VITASCOPE_DEBUG: v
+        run: |
+          ./target/release/vitascope samples/generated/common/mp4_h264_aac.mp4 --shot audio.png --shot-delay 3 > audio.log 2>&1 &
+          pid=$!; ( sleep 90; kill -9 $pid 2>/dev/null ) & w=$!
+          rc=0; wait $pid || rc=$?; kill $w 2>/dev/null || true
+          grep -iE "coreaudio|\[ao|symbol not found|非黑色像素" audio.log | head -40
+          echo "exit $rc"; exit $rc
 
   publish:
     name: 發佈

@@ -28,4 +28,5 @@
 `setup-base.sh` 從 Ubuntu 的 apt 快照（`snapshot.ubuntu.com`）安裝套件；之後的建置不連網路。
 glibc、OpenSSL、fontconfig、ALSA、PulseAudio、libva 用使用者系統的（動態連結），不包含在這裡。
 
-授權：整個 libmpv.so.2 依 LGPL-2.1-or-later 散布；各元件的授權見 `THIRD-PARTY-LINUX.md` 與 `licenses/`。
+授權：整個 libmpv.so.2 依 LGPL-2.1-or-later 散布。各元件的授權條文在 `upstream/` 各自的原始碼裡；元件清單 `THIRD-PARTY-LINUX.md` 與整理好的
+`licenses/` 在建置結果 `vitascope-libmpv-linux-x64-rN.tar.xz` 裡（同一個 Release）。
