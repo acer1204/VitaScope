@@ -141,7 +141,7 @@ want='cuda-hwaccel cuda-interop d3d-hwaccel d3d9-hwaccel dos-paths dxgi-debug-d3
 
 group 打包與檢查
 diff <(cd "$PREFIX/lib" && ls *.a | sort) <(printf '%s\n' libass.a libavcodec.a libavdevice.a libavfilter.a libavformat.a \
-  libavutil.a libdav1d.a libfreetype.a libfribidi.a libharfbuzz.a libmpv.dll.a libplacebo.a libswresample.a libswscale.a \
+  libavutil.a libdav1d.a libfreetype.a libfribidi.a libharfbuzz.a liblinebreak.a libmpv.dll.a libplacebo.a libswresample.a libswscale.a \
   libunibreak.a libz.a libzimg.a | sort) || die "prefix 裡的函式庫跟預期不同"
 pkg=$OUT/$ID; mkdir -p "$pkg/include/mpv" "$pkg/licenses"
 cp "$PREFIX/bin/libmpv-2.dll" "$PREFIX/lib/libmpv.dll.a" "$pkg/"; cp "$PREFIX/include/mpv/"*.h "$pkg/include/mpv/"
