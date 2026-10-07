@@ -10,6 +10,7 @@
 - `build/stubs.py`：產生 AppImage 的替身函式庫（系統沒有 libpulse、libva 時用）
 - `build/patches/`：建置時套用的修正檔（每個檔案開頭說明原因）
 - `build/notices.py`：產生元件清單 `THIRD-PARTY-LINUX.md`
+- `build/ffmpeg_notices.py`：從 FFmpeg 實際編譯的檔案找出帶 MIT / BSD 等寬鬆授權聲明的原始碼，附上聲明原文（`licenses/ffmpeg/permissive/`）
 - `build/libmpv-linux.yml`：GitHub Actions 的建置流程（執行順序）
 
 ## 重新建置

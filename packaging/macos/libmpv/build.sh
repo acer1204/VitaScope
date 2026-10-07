@@ -107,9 +107,22 @@ STL_LIBS=-lc++ autotools_build zimg "$s" --disable-testapp --disable-example --d
 group libplacebo
 meson_build libplacebo "$(src libplacebo)" \
   -D{vulkan,vk-proc-addr,opengl,gl-proc-addr,d3d11,glslang,shaderc,lcms,libdovi,unwind,xxhash}=disabled -Ddovi=enabled -D{demos,tests,bench,fuzz}=false; endgroup
+group libxml2
+# DASH（FFmpeg 的 dash 分離器）只用到核心的樹狀 API；minimum 關掉其他模組。執行緒要開：多個 mpv（縮圖、片段輸出）可能同時解析
+# meson.build 會執行 git describe（主機沒有 git 時 meson 直接失敗）；GIT_CEILING_DIRECTORIES 讓它找不到儲存庫，版本字串不帶 -GIT…
+meson_build libxml2 "$(src libxml2)" -Dminimum=true -Dthreads=enabled \
+  -D{c14n,catalog,debugging,docs,history,html,http,iconv,icu,iso8859x,legacy,modules,output,pattern,push,python,reader,readline,regexps,relaxng,sax1,schemas,schematron,thread-alloc,tls,valid,writer,xinclude,xpath,xptr,zlib}=disabled; endgroup
 
+# FFmpeg 要編進去的編碼器、封裝格式、協定、濾鏡（三個平台相同，說明見 Windows 的 build.sh）；建置後逐一確認都有啟用
+ENCODERS=png,gif,ac3
+MUXERS=spdif,matroska,matroska_audio,webm,mov,mp4,ipod,mpegts,adts,gif,mp3,flac,ogg,opus,wav
+PROTOCOLS=file,data,crypto,http,https,httpproxy,tcp,tls,udp,rtp,rtmp,rtmps,rtmpt,ftp,mmsh,mmst,rtmpts,srtp
+FILTERS=buffer,buffersink,abuffer,abuffersink,format,aformat,null,anull,scale,aresample,rotate,hflip,vflip,crop,xstack,bwdif,testsrc2
+FILTERS=$FILTERS,equalizer,bass,treble,acompressor,alimiter,dynaudnorm,speechnorm,loudnorm,pan,fps,split,palettegen,paletteuse,transpose
+FILTERS=$FILTERS,zscale,tonemap
 group ffmpeg
 s=$(src ffmpeg); b=$WORK/build/ffmpeg; mkdir -p "$b"
+# --disable-demuxer=imf：--enable-libxml2 也會打開 IMF 分離器，用不到（多一個解析 XML 的入口）
 ( cd "$b" && { "$s/configure" --prefix="$PREFIX" \
     --arch=aarch64 --target-os=darwin --cc=clang --cxx=clang++ --objcc=clang \
     --pkg-config=pkg-config --pkg-config-flags=--static \
@@ -117,20 +130,28 @@ s=$(src ffmpeg); b=$WORK/build/ffmpeg; mkdir -p "$b"
     --extra-ldflags="-mmacosx-version-min=$DT" \
     --enable-static --disable-shared --disable-programs --disable-doc --disable-debug \
     --disable-autodetect --enable-pthreads --disable-iconv \
-    --enable-zlib --enable-securetransport --enable-libdav1d --enable-videotoolbox \
-    --disable-encoders --enable-encoder=png --disable-muxers --enable-muxer=spdif \
+    --enable-zlib --enable-securetransport --enable-libdav1d --enable-libxml2 --enable-libzimg --disable-demuxer=imf \
+    --enable-videotoolbox \
+    --disable-encoders --enable-encoder="$ENCODERS" --disable-muxers --enable-muxer="$MUXERS" \
     --disable-devices --enable-indev=lavfi \
-    --disable-protocols --enable-protocol=file,data,crypto,http,https,httpproxy,tcp,tls,udp,rtp,rtmp,rtmps,rtmpt \
-    --disable-filters --enable-filter=buffer,buffersink,abuffer,abuffersink,format,aformat,null,anull,scale,aresample,rotate,hflip,vflip,crop,xstack,bwdif,testsrc2 \
+    --disable-protocols --enable-protocol="$PROTOCOLS" \
+    --disable-filters --enable-filter="$FILTERS" \
     || { tail -n 80 ffbuild/config.log; exit 1; }; } && make -j"$JOBS" && make install ) 2>&1 | tee "$OUT/logs/build-ffmpeg.log"
 cfg=$(cat "$b/config.h" "$b/config_components.h")
 for want in 'CONFIG_GPL 0' 'CONFIG_VERSION3 0' 'CONFIG_NONFREE 0' 'FFMPEG_LICENSE "LGPL version 2.1 or later"' \
             'CONFIG_LIBZVBI 0' 'CONFIG_OPENSSL 0' 'CONFIG_GNUTLS 0' 'CONFIG_SECURETRANSPORT 1' 'CONFIG_LIBDAV1D 1' 'CONFIG_ZLIB 1' \
             'HAVE_PTHREADS 1' 'CONFIG_VIDEOTOOLBOX 1' 'CONFIG_AUDIOTOOLBOX 0' 'CONFIG_AVFOUNDATION_INDEV 0' \
             'CONFIG_H264_VIDEOTOOLBOX_HWACCEL 1' 'CONFIG_HEVC_VIDEOTOOLBOX_HWACCEL 1' 'CONFIG_VP9_VIDEOTOOLBOX_HWACCEL 1' \
-            'CONFIG_AV1_VIDEOTOOLBOX_HWACCEL 1' 'CONFIG_PNG_ENCODER 1' 'CONFIG_LAVFI_INDEV 1' 'CONFIG_TESTSRC2_FILTER 1' \
-            'CONFIG_HTTPS_PROTOCOL 1' 'CONFIG_HLS_DEMUXER 1'; do
+            'CONFIG_AV1_VIDEOTOOLBOX_HWACCEL 1' 'CONFIG_LAVFI_INDEV 1' 'CONFIG_HLS_DEMUXER 1' \
+            'CONFIG_LIBXML2 1' 'CONFIG_LIBZIMG 1' 'CONFIG_DASH_DEMUXER 1' 'CONFIG_IMF_DEMUXER 0' 'CONFIG_AAC_ADTSTOASC_BSF 1' \
+            'CONFIG_H264_MP4TOANNEXB_BSF 1' 'CONFIG_HEVC_MP4TOANNEXB_BSF 1' 'CONFIG_VP9_SUPERFRAME_BSF 1' 'CONFIG_EQ_FILTER 0'; do
   grep -qxF "#define $want" <<<"$cfg" || die "FFmpeg 設定不符：缺少 #define $want"
+done
+for k in ENCODER:$ENCODERS MUXER:$MUXERS PROTOCOL:$PROTOCOLS FILTER:$FILTERS; do
+  for n in $(tr ',' ' ' <<<"${k#*:}"); do
+    case $n in buffer|buffersink|abuffer|abuffersink) continue ;; esac   # 永遠編進去，沒有 CONFIG_ 巨集
+    grep -qxF "#define CONFIG_$(tr a-z A-Z <<<"$n")_${k%%:*} 1" <<<"$cfg" || die "FFmpeg 設定不符：$n 沒有啟用"
+  done
 done; endgroup
 
 group mpv
@@ -150,7 +171,7 @@ want='bsd-fstatfs coreaudio darwin ffmpeg gl glob glob-posix libass libavdevice 
 group 打包與檢查
 diff <(cd "$PREFIX/lib" && ls *.a | sort) <(printf '%s\n' libass.a libavcodec.a libavdevice.a libavfilter.a libavformat.a \
   libavutil.a libdav1d.a libfreetype.a libfribidi.a libharfbuzz.a liblinebreak.a libplacebo.a libswresample.a libswscale.a \
-  libunibreak.a libz.a libzimg.a | sort) || die "prefix 裡的函式庫跟預期不同"
+  libunibreak.a libxml2.a libz.a libzimg.a | sort) || die "prefix 裡的函式庫跟預期不同"
 # 每個目的檔的最低系統版本都要是 $DT（比它新的 API 只在較新的 macOS 才有）
 for a in "$PREFIX"/lib/*.a; do otool -l "$a" | awk '/LC_BUILD_VERSION/ {b=1} b && /minos/ {print $2; b=0}'; done | sort -u > "$OUT/object-minos.txt"
 [[ $(cat "$OUT/object-minos.txt") == "$DT" ]] || die "有目的檔的最低版本不是 $DT：$(tr '\n' ' ' < "$OUT/object-minos.txt")"
@@ -170,7 +191,8 @@ codesign --force --sign - "$d"; codesign --verify --strict "$d"   # strip 會讓
 otool -L "$d" | tail -n +3 | awk '{print $1}' | sort > "$OUT/imports.txt"
 cat "$OUT/imports.txt"
 ! grep -vE '^(/usr/lib/|/System/Library/Frameworks/)' "$OUT/imports.txt" || die "依賴了 macOS 沒有內建的函式庫"
-! grep -E '/libz\.|/libiconv\.|/libssl|/libcrypto' "$OUT/imports.txt" || die "用到了系統的 zlib / iconv / OpenSSL（應該是靜態連結的 zlib、SecureTransport）"
+! grep -E '/libz\.|/libiconv\.|/libssl|/libcrypto|/libxml2\.' "$OUT/imports.txt" \
+  || die "用到了系統的 zlib / iconv / OpenSSL / libxml2（應該是靜態連結的 zlib、libxml2 與 SecureTransport）"
 nm -gU "$d" | awk '{print $3}' | sort > "$OUT/exports.txt"
 for f in _mpv_create _mpv_initialize _mpv_free _mpv_render_context_create _mpv_render_context_render; do
   grep -qx "$f" "$OUT/exports.txt" || die "沒有匯出 $f"; done
@@ -180,12 +202,15 @@ nm -m "$d" | grep 'weak external' > "$OUT/weak-imports.txt" || true   # 比 $DT 
 ! nm -m -u "$d" | grep 'dynamically looked up' || die "dylib 有執行時才查找的符號"
 python3 -c 'import ctypes, os, sys; ctypes.CDLL(sys.argv[1], mode=os.RTLD_NOW)' "$d" || die "dylib 無法立即解析所有符號（RTLD_NOW）"
 for s in libzvbi libx264 libx265; do ! grep -qa "$s" "$d" || die "dylib 裡出現 $s"; done
-# 授權條文：直接取自建置用的原始碼（.h 只取開頭的授權註解）
+# FFmpeg 裡帶 MIT / BSD 等寬鬆授權聲明的檔案（從實際編譯的目的檔找）：聲明原文放 licenses/ffmpeg/permissive/
+python3 "$BUNDLE/build/ffmpeg_notices.py" "$WORK/src/ffmpeg" "$WORK/build/ffmpeg" "$pkg/licenses/ffmpeg/permissive"
+# 授權條文：直接取自建置用的原始碼（.h、.c 只取開頭的授權註解；.c 保留路徑，加上 .txt）
 jq -c '.components[]' "$PINS" | while read -r c; do
   n=$(jq -r .name <<<"$c")
   jq -r '.license_files[]' <<<"$c" | while read -r f; do
     mkdir -p "$(dirname "$pkg/licenses/$n/$f")"
     if [[ $f == *.h ]]; then sed -n '1,/\*\//p' "$WORK/src/$n/$f" > "$pkg/licenses/$n/LICENSE.txt"
+    elif [[ $f == *.c ]]; then sed -n '1,/\*\//p' "$WORK/src/$n/$f" > "$pkg/licenses/$n/$f.txt"
     else cp "$WORK/src/$n/$f" "$pkg/licenses/$n/$f"; fi
   done
 done

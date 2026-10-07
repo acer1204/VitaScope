@@ -8,6 +8,7 @@
 - `build/build.sh`：建置腳本（mpv 以 `-Dgpl=false`、FFmpeg 以 LGPL 選項建置，靜態連結成一個 dylib）
 - `build/patches/`：建置時套用的修正檔（每個檔案開頭說明原因）
 - `build/notices.py`：產生元件清單 `THIRD-PARTY-MACOS.md`
+- `build/ffmpeg_notices.py`：從 FFmpeg 實際編譯的檔案找出帶 MIT / BSD 等寬鬆授權聲明的原始碼，附上聲明原文（`licenses/ffmpeg/permissive/`）
 - `build/libmpv-macos.yml`：GitHub Actions 的建置流程（主機工具的版本、執行順序）
 
 ## 重新建置

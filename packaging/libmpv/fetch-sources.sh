@@ -86,7 +86,7 @@ for f in "$here"/*; do   # 平台的建置腳本、修正檔、stubs.py…（Win
   case ${f##*/} in pins.json|README-SOURCE.md|requirements.txt|fetch-sources.sh|notices.py) continue ;; esac
   cp -r "$f" "$dest/build/"
 done
-cp "$shared/notices.py" "$repo/$workflow" "$dest/build/"
+cp "$shared/notices.py" "$shared/ffmpeg_notices.py" "$repo/$workflow" "$dest/build/"
 tar --sort=name --mtime="@$epoch" --owner=0 --group=0 --numeric-owner --format=gnu \
     -C "$out" -cf - "$id-src" | xz -T1 -6 > "$out/$id-src.tar.xz"
 ls -l "$out/$id-src.tar.xz"

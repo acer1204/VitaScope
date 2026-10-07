@@ -1,6 +1,6 @@
 {
   "platform": "linux-x64",
-  "build_id": "r1",
+  "build_id": "r2",
   "source_date_epoch": 1791223993,
   "workflow": ".github/workflows/libmpv-linux.yml",
   "base": {
@@ -11,7 +11,7 @@
       "nasm": "2.16.01-1build1", "libssl-dev": "3.0.13-0ubuntu3.16", "libfontconfig-dev": "2.15.0-1.1ubuntu2",
       "libasound2-dev": "1.2.11-1ubuntu0.3", "libpulse-dev": "1:16.1+dfsg1-2ubuntu10.1", "libva-dev": "2.20.0-2ubuntu0.2"
     },
-    "tools": ["binutils", "make", "pkgconf", "autoconf", "automake", "libtool", "patch", "python3", "python3-venv", "file", "xz-utils"]
+    "tools": ["binutils", "make", "pkgconf", "autoconf", "automake", "libtool", "patch", "python3", "python3-venv", "file", "xz-utils", "git"]
   },
   "components": [
     {
@@ -144,6 +144,20 @@
         "3rdparty/fast_float/LICENSE-MIT",
         "3rdparty/Vulkan-Headers/LICENSE.md",
         "3rdparty/Vulkan-Headers/LICENSES/MIT.txt"
+      ]
+    },
+    {
+      "name": "libxml2",
+      "version": "2.15.4",
+      "kind": "tarball",
+      "url": "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz",
+      "sha256": "98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821",
+      "file": "libxml2-2.15.4.tar.xz",
+      "license": "MIT AND ISC-Veillard",
+      "license_files": [
+        "Copyright",
+        "dict.c",
+        "list.c"
       ]
     },
     {

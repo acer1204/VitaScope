@@ -1,6 +1,6 @@
 {
   "platform": "macos-arm64",
-  "build_id": "r2",
+  "build_id": "r3",
   "source_date_epoch": 1791223993,
   "workflow": ".github/workflows/libmpv-macos.yml",
   "toolchain": {
@@ -127,6 +127,20 @@
         "3rdparty/fast_float/LICENSE-MIT",
         "3rdparty/Vulkan-Headers/LICENSE.md",
         "3rdparty/Vulkan-Headers/LICENSES/MIT.txt"
+      ]
+    },
+    {
+      "name": "libxml2",
+      "version": "2.15.4",
+      "kind": "tarball",
+      "url": "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz",
+      "sha256": "98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821",
+      "file": "libxml2-2.15.4.tar.xz",
+      "license": "MIT AND ISC-Veillard",
+      "license_files": [
+        "Copyright",
+        "dict.c",
+        "list.c"
       ]
     },
     {

@@ -1,0 +1,19 @@
+DASH 分離器解析完 MPD 後不再呼叫 xmlCleanupParser()
+
+FFmpeg 9.0.2 的 libavformat/dashdec.c 每解析一次 MPD（包括直播時定期重新讀取）就呼叫 xmlCleanupParser()，
+釋放 libxml2 的全域狀態。libxml2 自己的文件（threads.c）寫明這個函式不是執行緒安全的，呼叫之後也不能再用
+libxml2 的任何函式。影戲同時有好幾個 mpv（播放、縮圖、片段輸出），可能同時在解析 DASH 的 MPD：
+一個清掉全域狀態時另一個正在解析，會當掉或卡住（2、8 個執行緒的測試每次都重現）。
+libxml2 2.9.11 起不需要手動清理，拿掉這一行即可。
+
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -1432,5 +1432,7 @@
+         /*free the document */
+         xmlFreeDoc(doc);
+-        xmlCleanupParser();
++        /* Modified for VitaScope (2026-10): no xmlCleanupParser() here. It frees libxml2's global
++         * state and is not thread-safe; another demuxer (or another mpv instance) may be parsing
++         * at the same time. libxml2 >= 2.9.11 needs no manual cleanup. */
+         xmlFreeNode(mpd_baseurl_node);
+     }

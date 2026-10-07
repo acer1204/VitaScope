@@ -4,6 +4,7 @@
 輸出：
   samples/generated/<tier>/<id>.<ext>   外掛字幕放在影片旁邊、同檔名
   samples/generated/manifest.json       測試程式（tests/formats.rs）讀這份清單比對預期結果
+  samples/generated/general/dash_h264_aac/manifest.mpd   本機的 DASH（不在 manifest.json；tests/engine_build.rs 用）
 
 用法：
   python scripts/gen_samples.py                 # 產生全部等級
@@ -520,6 +521,45 @@ def generate(s: Sample, sub_src: dict[str, Path], font: Path | None, tmp: Path) 
     return None
 
 
+# ───────────── DASH（本機的 MPD + 片段）─────────────
+# 播放引擎的 DASH 分離器測試用（tests/engine_build.rs）。不放進 manifest.json：
+# 舊的播放引擎沒有 DASH 分離器，格式矩陣（tests/formats.rs）會把它當成失敗。
+# 片段用 dashenc 預設的 .m4s 檔名：FFmpeg 的 DASH 分離器只開副檔名是 m4s、mp4… 的本機片段
+DASH_DIR = OUT / "general" / "dash_h264_aac"
+
+
+def has_dash_muxer() -> bool:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-h", "muxer=dash"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return r.returncode == 0 and "Muxer dash" in r.stdout
+
+
+def generate_dash(force: bool) -> str | None:
+    """產生 general/dash_h264_aac/manifest.mpd；成功或略過回傳 None，失敗回傳錯誤訊息。"""
+    mpd = DASH_DIR / "manifest.mpd"
+    if mpd.exists() and not force:
+        print("  略過  general dash_h264_aac（已存在）")
+        return None
+    if not has_dash_muxer():
+        print("  略過  general dash_h264_aac（這個 ffmpeg 沒有 dash 封裝格式）")
+        return None
+    # 舊的片段要清掉（片段數量可能不同）
+    shutil.rmtree(DASH_DIR, ignore_errors=True)
+    DASH_DIR.mkdir(parents=True)
+    # 在輸出資料夾裡執行、只給檔名：Windows 的路徑是反斜線，dashenc 認不出資料夾，片段會寫到目前的資料夾
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", f"testsrc2=size=320x240:rate=24:duration={DUR}",
+                        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={DUR}",
+                        "-map", "0:v", "-map", "1:a", *X264, "-g", "24", *AAC,
+                        "-f", "dash", "-seg_duration", "1", mpd.name],
+                       cwd=DASH_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0 or not mpd.exists():
+        shutil.rmtree(DASH_DIR, ignore_errors=True)
+        return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"ffmpeg exit {r.returncode}"
+    print("  完成  general dash_h264_aac")
+    return None
+
+
 def manifest_entry(s: Sample) -> dict:
     e = {
         "id": s.id,
@@ -575,6 +615,12 @@ def main() -> int:
                 print(f"  失敗  {s.tier:<7} {s.id}: {err}")
             else:
                 print(f"  完成  {s.tier:<7} {s.id}")
+
+    dash_error = generate_dash(args.force) if args.tier in ("all", "general") else None
+    if dash_error:
+        print(f"  失敗  general dash_h264_aac: {dash_error}")
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::warning::這個平台的 FFmpeg 產生不了 DASH 樣本：{dash_error}")
 
     # manifest 只列出實際存在的樣本，測試程式不必再處理「產生失敗」的情況
     entries = [manifest_entry(s) for s in all_samples if s.path.exists()]

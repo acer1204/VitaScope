@@ -104,29 +104,58 @@ make -C "$(src nv-codec-headers)" PREFIX="$PREFIX" install; endgroup
 group libplacebo
 meson_build libplacebo "$(src libplacebo)" \
   -D{vulkan,vk-proc-addr,opengl,gl-proc-addr,d3d11,glslang,shaderc,lcms,libdovi,unwind,xxhash}=disabled -Ddovi=enabled -D{demos,tests,bench,fuzz}=false; endgroup
+group libxml2
+# DASH（FFmpeg 的 dash 分離器）只用到核心的樹狀 API；minimum 關掉其他模組。執行緒要開：多個 mpv（縮圖、片段輸出）可能同時解析
+# meson.build 會執行 git describe（主機沒有 git 時 meson 直接失敗）；GIT_CEILING_DIRECTORIES 讓它找不到儲存庫，版本字串不帶 -GIT…
+meson_build libxml2 "$(src libxml2)" -Dminimum=true -Dthreads=enabled \
+  -D{c14n,catalog,debugging,docs,history,html,http,iconv,icu,iso8859x,legacy,modules,output,pattern,push,python,reader,readline,regexps,relaxng,sax1,schemas,schematron,thread-alloc,tls,valid,writer,xinclude,xpath,xptr,zlib}=disabled; endgroup
 
+# FFmpeg 要編進去的編碼器、封裝格式、協定、濾鏡（三個平台相同）；建置後逐一確認都有啟用
+#   gif、ac3、palettegen…：轉 GIF、AC-3 即時編碼輸出；matroska…wav：片段輸出（不重新編碼）
+#   equalizer…pan：等化器、音量正規化、夜間模式、自訂聲道；zscale、tonemap：輸出時 HDR 轉 SDR
+ENCODERS=png,gif,ac3
+MUXERS=spdif,matroska,matroska_audio,webm,mov,mp4,ipod,mpegts,adts,gif,mp3,flac,ogg,opus,wav
+PROTOCOLS=file,data,crypto,http,https,httpproxy,tcp,tls,udp,rtp,rtmp,rtmps,rtmpt,ftp,mmsh,mmst,rtmpts,srtp
+FILTERS=buffer,buffersink,abuffer,abuffersink,format,aformat,null,anull,scale,aresample,rotate,hflip,vflip,crop,xstack,bwdif,testsrc2
+FILTERS=$FILTERS,equalizer,bass,treble,acompressor,alimiter,dynaudnorm,speechnorm,loudnorm,pan,fps,split,palettegen,paletteuse,transpose
+FILTERS=$FILTERS,zscale,tonemap
 group ffmpeg
 s=$(src ffmpeg); b=$WORK/build/ffmpeg; mkdir -p "$b"
+# LIBXML_STATIC：libxml2 是靜態連結的，標頭不能宣告成 dllimport（否則 dashdec.o 參照 __imp_xml*）
+# --disable-demuxer=imf：--enable-libxml2 也會打開 IMF 分離器，用不到（多一個解析 XML 的入口）
 ( cd "$b" && { "$s/configure" --prefix="$PREFIX" \
     --target-os=mingw32 --arch=x86_64 --enable-cross-compile --cross-prefix=$HOST- \
     --cc=$HOST-clang --cxx=$HOST-clang++ --ar=llvm-ar --ranlib=llvm-ranlib --nm=llvm-nm --strip=llvm-strip \
-    --pkg-config=pkg-config --pkg-config-flags=--static --extra-cflags="$MAP" \
+    --pkg-config=pkg-config --pkg-config-flags=--static --extra-cflags="$MAP -DLIBXML_STATIC" \
     --enable-static --disable-shared --disable-programs --disable-doc --disable-debug \
     --disable-autodetect --enable-w32threads --disable-iconv \
-    --enable-zlib --enable-schannel --enable-libdav1d \
+    --enable-zlib --enable-schannel --enable-libdav1d --enable-libxml2 --enable-libzimg --disable-demuxer=imf \
     --enable-d3d11va --enable-dxva2 --enable-ffnvcodec --enable-cuda --enable-nvdec \
-    --disable-encoders --enable-encoder=png --disable-muxers --enable-muxer=spdif \
+    --disable-encoders --enable-encoder="$ENCODERS" --disable-muxers --enable-muxer="$MUXERS" \
     --disable-devices --enable-indev=lavfi \
-    --disable-protocols --enable-protocol=file,data,crypto,http,https,httpproxy,tcp,tls,udp,rtp,rtmp,rtmps,rtmpt \
-    --disable-filters --enable-filter=buffer,buffersink,abuffer,abuffersink,format,aformat,null,anull,scale,aresample,rotate,hflip,vflip,crop,xstack,bwdif,testsrc2 \
+    --disable-protocols --enable-protocol="$PROTOCOLS" \
+    --disable-filters --enable-filter="$FILTERS" \
     || { tail -n 80 ffbuild/config.log; exit 1; }; } && make -j"$JOBS" && make install )
 cfg=$(cat "$b/config.h" "$b/config_components.h")
 for want in 'CONFIG_GPL 0' 'CONFIG_VERSION3 0' 'CONFIG_NONFREE 0' 'FFMPEG_LICENSE "LGPL version 2.1 or later"' \
             'CONFIG_LIBZVBI 0' 'CONFIG_OPENSSL 0' 'CONFIG_SCHANNEL 1' 'CONFIG_LIBDAV1D 1' 'CONFIG_ZLIB 1' 'HAVE_W32THREADS 1' \
             'CONFIG_D3D11VA 1' 'CONFIG_DXVA2 1' 'CONFIG_NVDEC 1' 'CONFIG_HEVC_NVDEC_HWACCEL 1' 'CONFIG_AV1_D3D11VA_HWACCEL 1' \
-            'CONFIG_PNG_ENCODER 1' 'CONFIG_LAVFI_INDEV 1' 'CONFIG_TESTSRC2_FILTER 1' 'CONFIG_HTTPS_PROTOCOL 1' 'CONFIG_HLS_DEMUXER 1'; do
+            'CONFIG_LAVFI_INDEV 1' 'CONFIG_HLS_DEMUXER 1' \
+            'CONFIG_LIBXML2 1' 'CONFIG_LIBZIMG 1' 'CONFIG_DASH_DEMUXER 1' 'CONFIG_IMF_DEMUXER 0' 'CONFIG_AAC_ADTSTOASC_BSF 1' \
+            'CONFIG_H264_MP4TOANNEXB_BSF 1' 'CONFIG_HEVC_MP4TOANNEXB_BSF 1' 'CONFIG_VP9_SUPERFRAME_BSF 1' 'CONFIG_EQ_FILTER 0'; do
   grep -qxF "#define $want" <<<"$cfg" || die "FFmpeg 設定不符：缺少 #define $want"
-done; endgroup
+done
+for k in ENCODER:$ENCODERS MUXER:$MUXERS PROTOCOL:$PROTOCOLS FILTER:$FILTERS; do
+  for n in $(tr ',' ' ' <<<"${k#*:}"); do
+    case $n in buffer|buffersink|abuffer|abuffersink) continue ;; esac   # 永遠編進去，沒有 CONFIG_ 巨集
+    grep -qxF "#define CONFIG_$(tr a-z A-Z <<<"$n")_${k%%:*} 1" <<<"$cfg" || die "FFmpeg 設定不符：$n 沒有啟用"
+  done
+done
+# 先寫到檔案再找（管線裡 grep -q 提早結束時 llvm-nm 會收到 SIGPIPE，pipefail 下反而誤判成通過）
+llvm-nm "$b/libavformat/dashdec.o" > "$WORK/dashdec-nm.txt"
+grep -q 'xmlReadMemory' "$WORK/dashdec-nm.txt" || die "dashdec.o 沒有參照 libxml2（llvm-nm 的輸出不對）"
+! grep -q '__imp_xml' "$WORK/dashdec-nm.txt" || die "dashdec.o 以 dllimport 參照 libxml2（少了 LIBXML_STATIC）"
+endgroup
 
 group mpv
 s=$(src mpv)
@@ -145,7 +174,7 @@ want='cuda-hwaccel cuda-interop d3d-hwaccel d3d9-hwaccel dos-paths dxgi-debug-d3
 group 打包與檢查
 diff <(cd "$PREFIX/lib" && ls *.a | sort) <(printf '%s\n' libass.a libavcodec.a libavdevice.a libavfilter.a libavformat.a \
   libavutil.a libdav1d.a libfreetype.a libfribidi.a libharfbuzz.a liblinebreak.a libmpv.dll.a libplacebo.a libswresample.a libswscale.a \
-  libunibreak.a libz.a libzimg.a | sort) || die "prefix 裡的函式庫跟預期不同"
+  libunibreak.a libxml2.a libz.a libzimg.a | sort) || die "prefix 裡的函式庫跟預期不同"
 pkg=$OUT/$ID; mkdir -p "$pkg/include/mpv" "$pkg/licenses"
 cp "$PREFIX/bin/libmpv-2.dll" "$PREFIX/lib/libmpv.dll.a" "$pkg/"; cp "$PREFIX/include/mpv/"*.h "$pkg/include/mpv/"
 llvm-strip --strip-all "$pkg/libmpv-2.dll"
@@ -158,12 +187,17 @@ for f in mpv_create mpv_initialize mpv_free mpv_render_context_create mpv_render
   grep -qx "$f" "$OUT/exports.txt" || die "沒有匯出 $f"; done
 ! grep -v '^mpv_' "$OUT/exports.txt" || die "匯出了 mpv_ 以外的符號"
 for s in libzvbi libx264 libx265; do ! grep -qa "$s" "$dll" || die "DLL 裡出現 $s"; done
-# 授權條文：直接取自建置用的原始碼（.h 只取開頭的授權註解）
+# FFmpeg 裡帶 MIT / BSD 等寬鬆授權聲明的檔案（從實際編譯的目的檔找）：聲明原文放 licenses/ffmpeg/permissive/
+python3 "$BUNDLE/build/ffmpeg_notices.py" "$WORK/src/ffmpeg" "$WORK/build/ffmpeg" "$pkg/licenses/ffmpeg/permissive"
+# 授權條文：直接取自建置用的原始碼（.h、.c 只取開頭的授權註解；.c 保留路徑，加上 .txt）
 jq -c '.components[]' "$PINS" | while read -r c; do
   n=$(jq -r .name <<<"$c")
   jq -r '.license_files[]' <<<"$c" | while read -r f; do
-    if [[ $f == *.h ]]; then mkdir -p "$pkg/licenses/$n"; sed -n '1,/\*\//p' "$WORK/src/$n/$f" > "$pkg/licenses/$n/LICENSE.txt"
-    else install -D -m 644 "$WORK/src/$n/$f" "$pkg/licenses/$n/$f"; fi
+    case $f in
+      *.h) mkdir -p "$pkg/licenses/$n"; sed -n '1,/\*\//p' "$WORK/src/$n/$f" > "$pkg/licenses/$n/LICENSE.txt" ;;
+      *.c) mkdir -p "$(dirname "$pkg/licenses/$n/$f")"; sed -n '1,/\*\//p' "$WORK/src/$n/$f" > "$pkg/licenses/$n/$f.txt" ;;
+      *) install -D -m 644 "$WORK/src/$n/$f" "$pkg/licenses/$n/$f" ;;
+    esac
   done
 done
 cp -r "$BUNDLE/build/toolchain-licenses/." "$pkg/licenses/"

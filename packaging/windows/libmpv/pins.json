@@ -1,5 +1,5 @@
 {
-  "build_id": "r1",
+  "build_id": "r2",
   "source_date_epoch": 1791223993,
   "toolchain": {
     "name": "llvm-mingw", "version": "20260922",
@@ -49,6 +49,10 @@
                     "3rdparty/Vulkan-Headers": "450bd2232225d6c7728a4108055ac2e37cef6475"},
      "file": "libplacebo-7.360.1.tar", "license": "LGPL-2.1-or-later AND MIT AND (Apache-2.0 OR MIT)",
      "license_files": ["LICENSE", "3rdparty/fast_float/LICENSE-MIT", "3rdparty/Vulkan-Headers/LICENSE.md", "3rdparty/Vulkan-Headers/LICENSES/MIT.txt"]},
+    {"name": "libxml2", "version": "2.15.4", "kind": "tarball",
+     "url": "https://download.gnome.org/sources/libxml2/2.15/libxml2-2.15.4.tar.xz",
+     "sha256": "98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821",
+     "file": "libxml2-2.15.4.tar.xz", "license": "MIT AND ISC-Veillard", "license_files": ["Copyright", "dict.c", "list.c"]},
     {"name": "ffmpeg", "version": "9.0.2", "kind": "git",
      "url": "https://github.com/FFmpeg/FFmpeg.git", "commit": "946fcce07b6dcd0331c8cc609192aeff5e1924f8",
      "file": "ffmpeg-9.0.2.tar", "license": "LGPL-2.1-or-later", "license_files": ["LICENSE.md", "COPYING.LGPLv2.1"]},
