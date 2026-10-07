@@ -10,12 +10,18 @@ env:
 
 jobs:
   test:
-    name: 測試（${{ matrix.os }}）
+    name: 測試（${{ matrix.os }}${{ matrix.libmpv && '，AppImage 的 libmpv' || '' }}）
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          # AppImage 內含的 libmpv（本專案建置）；上面的 ubuntu-latest 測系統的 libmpv（tar.gz 用的）
+          - os: ubuntu-24.04
+            libmpv: vendor
     runs-on: ${{ matrix.os }}
+    env:
+      VITASCOPE_LIBMPV: ${{ matrix.libmpv }}
     steps:
       - uses: actions/checkout@v5
 
@@ -29,6 +35,9 @@ jobs:
         if: runner.os != 'Windows'
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # 兩個 Linux 工作連結的 libmpv 不同，不共用快取
+          key: ${{ matrix.libmpv }}
 
       - uses: actions/setup-python@v6
         with:
@@ -41,10 +50,18 @@ jobs:
         timeout-minutes: 10
         run: |
           sudo apt-get update
-          sudo apt-get install -y libmpv-dev ffmpeg
+          if [ "$VITASCOPE_LIBMPV" = vendor ]; then
+            bash scripts/fetch-libmpv.sh
+            sudo apt-get install -y ffmpeg   # 也帶進 libva2、libpulse0
+          else
+            sudo apt-get install -y libmpv-dev ffmpeg
+          fi
       - name: 安裝 libmpv 與 FFmpeg（macOS）
         if: runner.os == 'macOS'
-        run: brew install mpv ffmpeg
+        run: |
+          bash scripts/fetch-libmpv.sh
+          # FFmpeg 只用來產生測試樣本（Homebrew 的 FFmpeg dylib 跟靜態連結在 libmpv 裡的互不干擾）
+          brew install ffmpeg
       - name: 安裝 libmpv 與 FFmpeg（Windows）
         if: runner.os == 'Windows'
         shell: pwsh

@@ -42,7 +42,17 @@
 
 - 文字字幕（SRT 等；ASS 字幕不受影響）的預設外觀改成三個平台一致：微軟正黑體 / 蘋方 / Noto Sans CJK TC、
   字級 42、邊框 2.5、淡陰影（Linux 上字比以前小，Windows / macOS 稍大）；可在字幕選單「字幕外觀…」調整。
-- Windows 安裝包附上 `libmpv-2.dll` 內含的每個元件的授權條文（`licenses\`）與確切的原始碼版本（`THIRD-PARTY-WINDOWS.md`）。
+- **播放引擎改由本專案從原始碼建置**（Windows 的 `libmpv-2.dll`、macOS 的 `libmpv.2.dylib`、AppImage 的 `libmpv.so.2`）：
+  mpv 與 FFmpeg 以 LGPL 選項建置、所有元件固定版本，不含與 GPL-3.0 不相容的元件。安裝包附各元件的授權條文與版本清單，
+  Release 附完整對應原始碼（`vitascope-libmpv-*-src.tar.xz`）。
+  - Windows：不再需要 Vulkan 執行環境。
+  - macOS：安裝包裡的函式庫從 48 個 Homebrew 函式庫變成一個 `libmpv.2.dylib`，只依賴 macOS 內建的函式庫；
+    最低系統需求從 macOS 14 降到 macOS 11。
+  - Linux AppImage（這一版新增）：內含的播放引擎只有一個 `libmpv.so.2`；OpenSSL 3（HTTPS 串流會檢查憑證）、PulseAudio、
+    libva 用系統的，系統沒有 PulseAudio 或 libva 時照樣能播（音訊改走 ALSA、改用軟體解碼）。tar.gz 照舊使用系統的 libmpv。
+  - 跟之前 Windows / macOS 版用的引擎相比，不再支援（有些原本只有其中一個平台支援）：Teletext 字幕、DASH 串流（`.mpd`）、
+    DVD / 藍光（ISO 或資料夾）、壓縮檔（zip / rar）裡的影片、AVS2 / AVS3 影像、MOD / XM 等音樂模組、日本數位電視的 ARIB 字幕、SRT / SFTP / FTP / MMS 串流協定、
+    mpv 的 Lua / JavaScript 腳本。DASH 與藍光在之後做「開啟網址」、「DVD / 藍光」功能時再加回（見 ROADMAP）。
 
 ### 修正
 

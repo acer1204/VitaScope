@@ -54,12 +54,19 @@ src/
 
 | 平台 | 開發時 | 發佈時 |
 |---|---|---|
-| Windows | 下載 libmpv 開發包（`libmpv-2.dll`） | dll 跟著執行檔一起放 |
-| macOS | `brew install mpv` | 把 dylib 及相依函式庫打包進 `.app` |
-| Linux | 套件管理員安裝 `libmpv-dev` | 依賴系統 libmpv，或打包成 AppImage / Flatpak |
+| Windows | `pwsh scripts/fetch-libmpv.ps1`（本專案建置的 `libmpv-2.dll`） | dll 跟著執行檔一起放 |
+| macOS | `bash scripts/fetch-libmpv.sh`（本專案建置的 `libmpv.2.dylib`） | 放進 `.app` 的 `Contents/Frameworks`（只依賴 macOS 內建的函式庫） |
+| Linux | 套件管理員安裝 `libmpv-dev` | tar.gz 依賴系統 libmpv；AppImage 內含本專案建置的 `libmpv.so.2` |
 
-授權：libmpv 本身可以建置成 LGPL，但發佈時附帶的 libmpv / FFmpeg 是 GPL 建置，所以影戲 VitaScope 採用 GPL-3.0-or-later。
-第三方元件的授權見 `packaging/THIRD-PARTY-NOTICES.md`。
+三個平台的 libmpv 都由本專案從原始碼建置（`.github/workflows/libmpv-*.yml`）：每個元件固定版本並核對雜湊，
+建置兩次確認逐位元相同，發佈成 prerelease `libmpv-<平台>-rN`，連同完整對應原始碼。版本與建置腳本在
+`packaging/<平台>/libmpv/`，三個平台共同的元件版本必須一致（`packaging/libmpv/check-pins.sh`）。
+自建的 libmpv 只開影戲目前用得到的解碼器、濾鏡、封裝格式、協定；之後的功能需要更多時（例如 DASH 要 libxml2、
+錄製要 muxer），把元件或選項加進 pins.json / build.sh，build_id 加一，重新建置三個平台。
+
+授權：影戲 VitaScope 採用 GPL-3.0-or-later。內含的 libmpv 以 LGPL 選項建置（mpv `-Dgpl=false`、FFmpeg 不加 GPL 選項），
+整體是 LGPL-2.1-or-later，不含與 GPL-3.0 不相容的元件，也不會限制影戲本身的授權。原則：別人建置的函式庫有授權或來源問題時，
+自己從固定版本的原始碼建置，優先選 LGPL / 寬鬆授權的元件。第三方元件的授權見 `packaging/THIRD-PARTY-NOTICES.md`。
 
 ---
 
@@ -114,7 +121,7 @@ src/
 | 罕見 | DNxHD / DNxHR、CineForm | 專業剪輯中介檔 |
 | 罕見 | 無損編碼：FFV1、HuffYUV、Lagarith、UtVideo | 錄影、保存 |
 | 罕見 | 舊式：Sorenson、VP6、Cinepak、Indeo、MS Video 1 | 1990–2000 年代 |
-| 罕見 | AVS2 / AVS3、Bink | 中國標準、遊戲影片 |
+| 罕見 | AVS2 / AVS3、Bink | 中國標準、遊戲影片（AVS2 / AVS3 目前不支援：要 davs2 / uavs3d，自建的 libmpv 不含） |
 
 ### 2.3 音訊編碼
 
@@ -145,7 +152,7 @@ src/
 | 通用 | WebVTT（`.vtt`） | 網頁、串流 |
 | 通用 | SAMI（`.smi`） | 韓國、舊台灣下載常見 |
 | 罕見 | MicroDVD（影格制 `.sub`）、SubViewer、MPL2、TTML / DFXP、LRC | |
-| 罕見 | DVB 字幕、Teletext、EIA-608 / 708 隱藏字幕 | 電視錄影、美國串流內嵌 |
+| 罕見 | DVB 字幕、Teletext、EIA-608 / 708 隱藏字幕 | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含） |
 
 ### 2.5 畫面特性
 
@@ -288,8 +295,8 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 功能
 - [ ] 自訂快捷鍵（提供 PotPlayer 風格的預設組）
 - [ ] 書籤：在檔案中標記時間點並命名
-- [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`）
-- [ ] 網站影片（透過 yt-dlp），可選畫質
+- [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；本專案建置的 libmpv 要先加上 libxml2，MIT）
+- [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
 - [ ] 線上搜尋字幕（OpenSubtitles API）
 - [ ] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF
 - [ ] 縮圖總覽圖匯出（thumbnail sheet）
@@ -306,7 +313,8 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 - [ ] 自家外掛 API
 - [ ] 補幀：mpv interpolation（平滑運動）、VapourSynth（SVP、RIFE）
 - [ ] 串流錄製（邊看邊存，不重新編碼）
-- [ ] DVD / 藍光：ISO 或資料夾，依標題播放（不含光碟選單）
+- [ ] DVD / 藍光：ISO 或資料夾，依標題播放（不含光碟選單）。藍光要在 libmpv 加上 libbluray（LGPL）；
+  DVD 要 libdvdnav / libdvdread（GPL-2.0-or-later，libmpv 會變成 GPL，跟影戲本身相容，但要另外決定）
 - [ ] 擷取裝置：視訊鏡頭、擷取卡
 - [ ] 網路來源：SMB、FTP、WebDAV 瀏覽，DLNA
 - [ ] 遠端控制（手機網頁遙控）
@@ -344,7 +352,10 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 
 ### 4.3 CI
 
-GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試（軟解）與單元測試。
+GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試（軟解）與單元測試；Ubuntu 跑兩次，
+分別用系統的 libmpv（tar.gz）與 AppImage 內含的 libmpv。三個平台的 libmpv 各有自己的建置流程（`libmpv-*.yml`）：
+用新建置的 libmpv 跑完整的測試（macOS、Linux 另外實際開視窗截圖），發佈時一定要同時建置兩次、確認逐位元相同（`repro_check`），
+比對通過才發佈成 prerelease。
 發佈流程另外在三平台打包、實際執行 `--version`，並在 macOS / Linux 用自動截圖確認影片畫面畫得出來
 （Linux 的虛擬螢幕是軟體繪圖，啟動三次、每次都要通過）。安裝程式也實際跑過：Windows 安裝 → 執行 → 檢查登錄檔 →
 解除安裝 → 確認清乾淨；macOS 掛載 `.dmg` 檢查簽章並執行；Linux 的 AppImage 在本機與乾淨的 Debian 13 容器各播放一次，
@@ -397,12 +408,14 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 
 | # | 風險 | 對策 |
 |---|---|---|
-| R1 | macOS 打包 libmpv 及其相依 dylib 最麻煩 | 已解決：發佈流程用 dylibbundler 打包進 `.app`、重設 rpath，打包後實際執行檢查 |
+| R1 | macOS 打包 libmpv 及其相依 dylib 最麻煩 | 已解決：改用本專案建置的單一 `libmpv.2.dylib`（只依賴 macOS 內建的函式庫），打包後實際執行檢查 |
 | R2 | macOS 已將 OpenGL 標為棄用 | 目前仍可正常使用（IINA 也是用 OpenGL 接 mpv），持續觀察 |
 | R3 | 部分 HDR / Dolby Vision 功能只有 mpv 的 gpu-next 渲染器支援，嵌入式 render API 是否支援要看 mpv 版本；egui 也還沒有 HDR 輸出 | L3 前先驗證；必要時 HDR 直通模式改用 mpv 原生視窗 |
 | R4 | Wayland 不支援把 mpv 嵌進子視窗（`wid`） | 本來就採用 render API，不受影響 |
 | R5 | 上次的視窗位置在已拔掉的螢幕上時，視窗可能開在看不到的地方 | 尚未處理（延到 L3）。目前只處理視窗配合影片後超出主螢幕的情況（v0.2.0）；egui 拿不到所有螢幕的位置，要從 winit 取 |
 | R6 | 全螢幕時字幕上移只對文字字幕（SRT 等）有效，ASS 字幕有自己的版面 | 觀察實際使用情況再決定是否處理 |
+| R7 | macOS 的最低需求降到 macOS 11，但只在 GitHub 的 macOS 15 / 26 虛擬機測過，沒有在 11–14 的實機上跑過 | 建置時檢查每個目的檔的最低版本都是 11.0、記錄用到的較新 API（weak imports）；有使用者回報再處理 |
+| R8 | AppImage 的 PulseAudio、libva 用系統的，系統沒有時換成只有函式名稱的替身（音訊改走 ALSA、硬體解碼改用軟體解碼） | CI 在沒有這兩個函式庫的 Debian 13 容器實際播放，並強制走到替身的進入點 |
 
 ## 7. 開發中學到的事
 
@@ -459,8 +472,14 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   不然只會播到最後一個。
 - **解除安裝程式只會移除自己寫的登錄機碼**：安裝後才在程式裡打開的檔案關聯，要讓解除安裝程式呼叫程式自己移除
   （`vitascope --unregister-associations`）。
-- **AppImage 刻意不包的函式庫（excludelist），在乾淨的系統上不一定有**：libmpv 直接連結的 JACK、PipeWire，
-  和 winit 用 dlopen 載入的 libxkbcommon-x11，缺了就啟動失敗。只在 CI 機器上測看不出來，要在乾淨的容器再跑一次。
+- **AppImage 刻意不包的函式庫（excludelist），在乾淨的系統上不一定有**：winit 用 dlopen 載入的 libxkbcommon-x11，
+  缺了就啟動失敗。只在 CI 機器上測看不出來，要在乾淨的容器再跑一次。要跟系統一致的函式庫（PulseAudio、libva）不包進去，
+  系統沒有時改用只有函式名稱的替身（`packaging/linux/libmpv/stubs.py`），讓 libmpv 載入得了。
+- **用檔名問 dpkg「這是哪個套件」會認錯**：AppImage 裡本專案建置的 `libmpv.so.2`、替身函式庫，跟 Ubuntu 套件的檔名一樣，
+  `dpkg -S` 會把它們算成 Ubuntu 的 libmpv2、libpulse0；列授權清單時要先略過這些檔案。
+- **別人建置的函式庫要逐一查授權**：用來播放的 Windows 版 libmpv-2.dll 裡有 GPL-2.0-only 的 libzvbi，
+  跟 GPL-3.0 的 FFmpeg、Apache-2.0 的 OpenSSL 不相容，散布出去就違反授權。改成自己從原始碼建置 LGPL 的 libmpv，
+  只放影戲用得到的元件，每個元件固定版本、核對雜湊，Release 附完整對應原始碼。
 - **Git Bash 會把 `/D…` 之類的參數當成路徑轉換掉**：Inno Setup 的 ISCC 要在 PowerShell 或 cmd 執行。
 - **好幾個視窗共用一個設定檔時，關閉的那個不能把整份舊設定寫回去**：存檔時只寫這個視窗上次讀檔或存檔之後改過的設定，
   其他的保留檔案裡現在的值。新版寫的、這版讀不懂的設定也要保留（只有讀不懂的那一項用預設值）。

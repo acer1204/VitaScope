@@ -10,6 +10,7 @@ pub const AUTHOR_URL: &str = "https://github.com/acer1204";
 pub const REPO_URL: &str = "https://github.com/acer1204/VitaScope";
 pub const RELEASES_URL: &str = "https://github.com/acer1204/VitaScope/releases";
 pub const LICENSE_URL: &str = "https://github.com/acer1204/VitaScope/blob/main/LICENSE";
+pub const NOTICES_URL: &str = "https://github.com/acer1204/VitaScope/blob/main/packaging/THIRD-PARTY-NOTICES.md";
 const LATEST_API: &str = "https://api.github.com/repos/acer1204/VitaScope/releases/latest";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

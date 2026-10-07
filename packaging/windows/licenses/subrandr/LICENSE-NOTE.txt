@@ -1,4 +1,0 @@
-https://raw.githubusercontent.com/afishhh/subrandr/eaf47d947e754565fe60e88ffe9665a2a32b18d5/README.md (License section, lines 146-148)
-### License
-
-subrandr is available under the Mozilla Public License 2.0, see [LICENSE](https://github.com/afishhh/subrandr/blob/master/LICENSE) for details. Unless stated otherwise all files in this repository are covered by this license.

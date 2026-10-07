@@ -165,6 +165,8 @@ pub struct VitascopeApp {
     update_status: Option<Arc<Mutex<UpdateStatus>>>,
     /// 「關於」裡顯示的播放引擎版本
     engine_versions: String,
+    /// 播放引擎是 LGPL 建置（本專案建置的 libmpv；Linux tar.gz 用的系統 libmpv 依發行版而定）
+    engine_lgpl: bool,
     /// 最近開啟的檔案、續播位置
     history: History,
     /// 同資料夾的播放清單（開網址時沒有）
@@ -392,6 +394,7 @@ impl VitascopeApp {
             about_open: false,
             update_status: None,
             engine_versions: String::new(),
+            engine_lgpl: false,
             history: launch.history,
             playlist: launch.playlist.clone(),
             was_eof: false,
@@ -448,6 +451,10 @@ impl VitascopeApp {
             &app.player.get_string("mpv-version").unwrap_or_default(),
             &app.player.get_string("ffmpeg-version").unwrap_or_default(),
         );
+        app.engine_lgpl = app
+            .player
+            .get_string("mpv-configuration")
+            .is_ok_and(|c| c.contains("gpl=false"));
         if launch.files.is_empty() {
             // 沒有要開檔：截的是起始畫面，現在就開始計時
             if let Some(shot) = &mut app.autoshot {
@@ -1855,6 +1862,11 @@ impl VitascopeApp {
                     ui.label(crate::tr!("播放引擎", "Engine"));
                     ui.label(&self.engine_versions);
                     ui.end_row();
+                    if self.engine_lgpl {
+                        ui.label(crate::tr!("引擎授權", "Engine license"));
+                        ui.hyperlink_to("LGPL-2.1-or-later", update::NOTICES_URL);
+                        ui.end_row();
+                    }
                 });
             ui.add_space(4.0);
             ui.label(

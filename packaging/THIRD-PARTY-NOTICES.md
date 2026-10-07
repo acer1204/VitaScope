@@ -5,41 +5,49 @@
 
 ## 播放引擎：mpv 與 FFmpeg
 
-| 平台 | 內含方式 | 來源與版本 |
-|---|---|---|
-| Windows | `libmpv-2.dll`：mpv 與其相依函式庫（FFmpeg、libass、libplacebo、FreeType、HarfBuzz…）靜態連結成一個 DLL | 由 [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) 建置（tag `20261006`、建置腳本 commit `05a60b3cfd04e3e3b89918f4a27f3dde2935dff2`）。每個元件的原始碼與確切版本逐一列在同資料夾的 `THIRD-PARTY-WINDOWS.md`，各自的授權條文在 `licenses/` |
-| macOS | `VitaScope.app/Contents/Frameworks/*.dylib` | Homebrew 套件，逐一列在 `VitaScope.app/Contents/Resources/THIRD-PARTY-MACOS.md`，各自的授權檔在 `Contents/Resources/licenses/` |
-| Linux（tar.gz） | 不內含，使用系統安裝的 libmpv | 各發行版的套件 |
-| Linux（AppImage） | AppImage 的 `usr/lib`：Ubuntu 24.04 的 libmpv、FFmpeg 及其相依函式庫；檔案開頭的 AppImage 執行環境 | 逐一列在 AppImage 的 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`（二進位套件、原始碼套件與確切版本，以及執行環境 type2-runtime 的版本），各自的 copyright 檔在 `usr/share/doc/<套件>/`，參照的授權全文在 `usr/share/common-licenses/` |
+Windows、macOS 與 Linux AppImage 內含的播放引擎（libmpv）由本專案從原始碼建置：mpv 以 `-Dgpl=false`、
+FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定版本並核對雜湊，連同相依函式庫靜態連結成一個函式庫，
+整體依 **LGPL-2.1-or-later** 散布。建置流程在本儲存庫的 `.github/workflows/libmpv-*.yml`，
+建置結果發佈在 prerelease `libmpv-<平台>-rN`（不是影戲的版本）。
 
-Windows 的 `libmpv-2.dll` 以 GPL 選項建置（FFmpeg 使用 `--enable-gpl --enable-version3`，並含 x264、x265 等 GPL 元件），
-整體依 **GPL-3.0-or-later** 散布。建置腳本大多不固定各元件的版本（建置時取各分支的最新版），所以每個元件在那次建置時的
-確切 commit 另外整理在 `THIRD-PARTY-WINDOWS.md`；建置方式與修正檔在建置腳本的
-[`05a60b3`](https://github.com/shinchiro/mpv-winbuild-cmake/tree/05a60b3cfd04e3e3b89918f4a27f3dde2935dff2) 版。
+| 平台 | 內含方式 | 元件清單與授權條文 |
+|---|---|---|
+| Windows | 程式資料夾的 `libmpv-2.dll`（prerelease `libmpv-win64-r1`） | 同資料夾的 `THIRD-PARTY-WINDOWS.md`、`licenses/` |
+| macOS | `VitaScope.app/Contents/Frameworks/libmpv.2.dylib`（prerelease `libmpv-macos-arm64-r1`；只依賴 macOS 內建的函式庫） | `VitaScope.app/Contents/Resources/THIRD-PARTY-MACOS.md`、`Contents/Resources/licenses/` |
+| Linux（tar.gz） | 不內含，使用系統安裝的 libmpv | 各發行版的套件 |
+| Linux（AppImage） | `usr/lib/libmpv.so.2`（prerelease `libmpv-linux-x64-r1`）；另有 winit / glutin 執行時載入的 Ubuntu 24.04 視窗函式庫（libxkbcommon、libxkbcommon-x11、libxcb-xkb、libXcursor、libXi、libXext、libXfixes、libXrender、libwayland-cursor、libwayland-egl）、系統沒有 PulseAudio / libva 時用的替身函式庫，以及檔案開頭的 AppImage 執行環境 | AppImage 的 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`、`licenses/`；Ubuntu 套件的 copyright 檔在 `usr/share/doc/<套件>/`，參照的授權全文在 `usr/share/common-licenses/` |
 
 主要元件的授權：
 
 | 元件 | 授權 | 原始碼 |
 |---|---|---|
-| mpv | GPL-2.0-or-later（以 GPL 選項建置） | https://github.com/mpv-player/mpv |
-| FFmpeg | GPL-3.0-or-later（以 GPL 選項建置） | https://ffmpeg.org/download.html |
-| libass | ISC | https://github.com/libass/libass |
+| mpv | LGPL-2.1-or-later（以 `-Dgpl=false` 建置） | https://github.com/mpv-player/mpv |
+| FFmpeg | LGPL-2.1-or-later（不含 GPL 選項） | https://ffmpeg.org/download.html |
 | libplacebo | LGPL-2.1-or-later | https://code.videolan.org/videolan/libplacebo |
+| libass | ISC | https://github.com/libass/libass |
 | FreeType | FreeType License（FTL） | https://freetype.org |
 | HarfBuzz | MIT | https://github.com/harfbuzz/harfbuzz |
 | FriBidi | LGPL-2.1-or-later | https://github.com/fribidi/fribidi |
-| x264 | GPL-2.0-or-later | https://code.videolan.org/videolan/x264 |
-| x265 | GPL-2.0-or-later | https://bitbucket.org/multicoreware/x265_git |
+| libunibreak | Zlib | https://github.com/adah1972/libunibreak |
 | dav1d | BSD-2-Clause | https://code.videolan.org/videolan/dav1d |
-| uchardet | MPL-1.1 / GPL-2.0 / LGPL-2.1 | https://gitlab.freedesktop.org/uchardet/uchardet |
+| zimg | WTFPL | https://github.com/sekrit-twc/zimg |
+| zlib | Zlib | https://zlib.net |
+| nv-codec-headers（Windows、Linux） | MIT | https://github.com/FFmpeg/nv-codec-headers |
 
-完整清單見各平台的清單檔：Windows 的 `THIRD-PARTY-WINDOWS.md`、macOS 的 `THIRD-PARTY-MACOS.md`、AppImage 的 `THIRD-PARTY-LINUX.md`。
+各元件的確切版本、下載位置與雜湊列在各平台的清單檔。
+
+可以把內含的 libmpv 換成自己修改、重新建置的版本（相同的 libmpv C API）：
+
+- Windows：替換程式資料夾（安裝版在 `%LOCALAPPDATA%\Programs\VitaScope`）裡的 `libmpv-2.dll`。
+- macOS：替換 `VitaScope.app/Contents/Frameworks/libmpv.2.dylib`，再執行 `codesign --force --deep --sign - VitaScope.app` 重新簽章。
+- Linux AppImage：用 `--appimage-extract` 解開後替換 `squashfs-root/usr/lib/libmpv.so.2`，或執行時用 `LD_LIBRARY_PATH` 指向自己建置的版本。
 
 ## 原始碼取得
 
 - **影戲 VitaScope**：https://github.com/acer1204/VitaScope ，每個版本都有同名的 tag。
-- **第三方元件**：各平台清單檔裡列出的原始碼位置與確切版本（Windows：上游儲存庫的 commit 與建置腳本；
-  macOS：上游原始碼與 Homebrew 的建置配方；AppImage：Ubuntu 的原始碼套件與版本）。
+- **播放引擎（libmpv）**：完整對應原始碼（各元件原始碼、修正檔、建置腳本與設定）是每個 Release 附的
+  `vitascope-libmpv-<平台>-rN-src.tar.xz`，也在對應的 prerelease `libmpv-<平台>-rN`。
+- **AppImage 內含的 Ubuntu 套件**：`THIRD-PARTY-LINUX.md` 列出原始碼套件與確切版本（`apt-get source` 或 Launchpad 取得）。
 - 如果任何連結失效、無法取得某個版本安裝包所含元件的對應原始碼，請到
   https://github.com/acer1204/VitaScope/issues 提出，我們會提供完整的對應原始碼。
   只要該版本的安裝包還在提供下載，這個承諾就有效（之後也至少再三年）。

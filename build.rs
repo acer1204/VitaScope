@@ -1,13 +1,14 @@
 //! 連結 libmpv。
 //!
-//! - Windows：使用 vendor/libmpv/windows-x64/（scripts/fetch-libmpv.ps1 下載），
+//! - Windows：使用 vendor/libmpv/windows-x64/（pwsh scripts/fetch-libmpv.ps1 下載），
 //!   並把 libmpv-2.dll 放到執行檔旁邊，`cargo run` 和 `cargo test` 才找得到。
-//! - macOS：Homebrew 安裝的 mpv（`brew install mpv`）。
-//! - Linux：系統套件（`libmpv-dev` / `mpv-libs-devel`）。
+//! - macOS（Apple Silicon）：vendor/libmpv/macos-arm64/（bash scripts/fetch-libmpv.sh 下載）；Intel Mac 用 Homebrew 的 mpv。
+//!   `VITASCOPE_LIBMPV=system` 改用 Homebrew 的 mpv（只供本機實驗；發佈版一定用 vendor 的）。
+//! - Linux：系統套件（`libmpv-dev` / `mpv-libs-devel`），tar.gz 用的就是這個。
+//!   `VITASCOPE_LIBMPV=vendor` 改用 vendor/libmpv/linux-x64/（AppImage 內含的那一份，bash scripts/fetch-libmpv.sh 下載）。
 //!
-//! macOS、Linux 設 `VITASCOPE_LIBMPV=vendor` 時改用本專案建置的 libmpv：vendor/libmpv/macos-arm64/、
-//! vendor/libmpv/linux-x64/（.github/workflows/libmpv-macos.yml、libmpv-linux.yml 建置）。
-//! 用本專案建置的 libmpv 時，`VITASCOPE_LIBMPV_MANIFEST` 指向它的 components.json（tests/engine_build.rs 用來核對版本）。
+//! vendor/ 的 libmpv 都是本專案從原始碼建置的（.github/workflows/libmpv-*.yml）。用它們時，
+//! `VITASCOPE_LIBMPV_MANIFEST` 指向它的 components.json（tests/engine_build.rs 用來核對版本）。
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -15,19 +16,21 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=VITASCOPE_LIBMPV");
-    let vendor = env::var("VITASCOPE_LIBMPV").as_deref() == Ok("vendor");
+    let choice = env::var("VITASCOPE_LIBMPV").unwrap_or_default();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     match target_os.as_str() {
         "windows" => windows(),
-        "macos" if vendor => vendored("macos-arm64", "libmpv.2.dylib", "libmpv.dylib"),
-        "macos" => homebrew(),
-        "linux" if vendor => vendored("linux-x64", "lib/libmpv.so.2", "libmpv.so"),
+        // 本專案只建置 Apple Silicon 版的 libmpv；Intel Mac 用 Homebrew 的 mpv
+        "macos" if choice == "system" || target_arch != "aarch64" => homebrew(),
+        "macos" => vendored("macos-arm64", "libmpv.2.dylib", "libmpv.dylib"),
+        "linux" if choice == "vendor" => vendored("linux-x64", "lib/libmpv.so.2", "libmpv.so"),
         _ => {} // Linux：libmpv 在系統預設的函式庫路徑
     }
 }
 
-/// Homebrew 安裝的 mpv
+/// Homebrew 安裝的 mpv（只供本機實驗）
 fn homebrew() {
     for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
         if Path::new(prefix).join("libmpv.dylib").exists() {
@@ -65,8 +68,13 @@ fn windows() {
     println!("cargo:rerun-if-changed={}", vendor.display());
 
     let dll = vendor.join("libmpv-2.dll");
-    if !dll.exists() {
-        panic!("找不到 {}\n請先執行：pwsh scripts/fetch-libmpv.ps1", dll.display());
+    let components = vendor.join("components.json");
+    // 沒有 components.json 的是之前用的別人建置的 DLL（含與 GPL-3.0 不相容的元件），不能再用
+    if !dll.exists() || !components.exists() {
+        panic!(
+            "{} 裡沒有本專案建置的 libmpv（還沒下載，或是舊版）\n請執行：pwsh scripts/fetch-libmpv.ps1",
+            vendor.display()
+        );
     }
     // 連結和執行都從 OUT_DIR 取用：
     // - mingw 的 ld 打不開非 ASCII 路徑（專案在「桌面」底下），OUT_DIR 在純 ASCII 的 target 目錄
@@ -85,11 +93,7 @@ fn windows() {
     if let Some(profile_dir) = out_dir.ancestors().nth(3) {
         place(&dll, &profile_dir.join("libmpv-2.dll"));
     }
-    // 本專案建置的 DLL 才有（之前用的是別人建置的）
-    let components = vendor.join("components.json");
-    if components.exists() {
-        println!("cargo:rustc-env=VITASCOPE_LIBMPV_MANIFEST={}", components.display());
-    }
+    println!("cargo:rustc-env=VITASCOPE_LIBMPV_MANIFEST={}", components.display());
     resources(&manifest, &out_dir);
 }
 

@@ -16,18 +16,18 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 |---|---|---|
 | Windows 10 / 11（64 位元） | `VitaScope-*-windows-x64-setup.exe`（建議） | 執行安裝程式。不需要系統管理員，裝在 `%LOCALAPPDATA%\Programs\VitaScope`；可勾選加入影音檔的「開啟檔案」選單 |
 | | `VitaScope-*-windows-x64.zip`（免安裝） | 解壓縮後執行資料夾裡的 `vitascope.exe` |
-| macOS（Apple Silicon，最低版本見各版本的發佈說明） | `VitaScope-*-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
+| macOS 11 以上（Apple Silicon） | `VitaScope-*-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
 | | `VitaScope-*-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
 | Linux（x64） | `VitaScope-*-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv |
 | | `VitaScope-*-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `./install.sh` 加入應用程式選單（`./install.sh --default` 同時設成預設播放器），或直接執行 `vitascope` |
 
 - **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」
-  （開啟「智慧型應用程式控制」的 Windows 11 會直接擋下）。需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3 與 Vulkan 執行環境）。
+  （開啟「智慧型應用程式控制」的 Windows 11 會直接擋下）。需要已安裝顯示卡驅動程式（播放引擎需要 OpenGL 3）。
   Windows 不允許程式自己設成預設播放器：到「設定 → 應用程式 → 預設應用程式」選影戲，或在影戲的「設定 → 系統」按「選擇預設播放器…」。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
 - **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2 與 libxkbcommon-x11（一般桌面都有；AppImage 已內含）。
-  AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
+  AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）與 OpenSSL 3（libssl3，桌面系統都有）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
 
@@ -206,7 +206,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 ## 建置
 
-需要 [Rust](https://rustup.rs/)（stable）和 libmpv。
+需要 [Rust](https://rustup.rs/)（stable）和 libmpv。Windows 與 macOS 用本專案從原始碼建置的 libmpv
+（`.github/workflows/libmpv-*.yml`，發佈在 prerelease `libmpv-<平台>-rN`），用下面的腳本下載並核對雜湊。
 
 ### Windows
 
@@ -222,9 +223,11 @@ cargo run --release
 ### macOS
 
 ```bash
-brew install mpv
+bash scripts/fetch-libmpv.sh    # 下載 libmpv 到 vendor/libmpv/macos-arm64/
 cargo run --release
 ```
+
+只想在本機試 Homebrew 的 mpv：`brew install mpv` 後加 `VITASCOPE_LIBMPV=system`（發佈版一定用上面那一份）。
 
 ### Linux
 
@@ -232,6 +235,8 @@ cargo run --release
 sudo apt install libmpv-dev      # Fedora：sudo dnf install mpv-libs-devel
 cargo run --release
 ```
+
+AppImage 用的是本專案建置的 libmpv；要用它測試：`bash scripts/fetch-libmpv.sh && VITASCOPE_LIBMPV=vendor cargo test`。
 
 ## 測試
 
@@ -320,14 +325,15 @@ src/
 
 packaging/
 ├─ icons/        各尺寸圖示、.ico、.icns（`cargo run --example make_icon` 產生）
-├─ windows/      執行檔的圖示與版本資訊（.rc）、Inno Setup 安裝程式（.iss）
-├─ macos/        .app 的 Info.plist（檔案關聯、圖示）
-└─ linux/        .desktop 檔、AppStream 中繼資料、install.sh、AppImage 的 AppRun
+├─ libmpv/       三個平台共用的 libmpv 建置腳本（原始碼包、元件清單）
+├─ windows/      執行檔的圖示與版本資訊（.rc）、Inno Setup 安裝程式（.iss）、libmpv/（Windows 版 libmpv 的版本與建置腳本）
+├─ macos/        .app 的 Info.plist（檔案關聯、圖示）、libmpv/（macOS 版）
+└─ linux/        .desktop 檔、AppStream 中繼資料、install.sh、AppImage 的 AppRun 與組裝腳本、libmpv/（AppImage 用）
 ```
 
 ## 授權
 
 [GPL-3.0-or-later](LICENSE)。
 
-使用的 libmpv（[shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake) 建置）
-採用 GPL 授權，所以本專案也採用 GPL。
+安裝包內含的 libmpv（mpv 與 FFmpeg 等）由本專案從原始碼建置，依 LGPL-2.1-or-later 散布，不會限制影戲本身的授權；
+各元件的版本、授權與對應原始碼見 [packaging/THIRD-PARTY-NOTICES.md](packaging/THIRD-PARTY-NOTICES.md)。

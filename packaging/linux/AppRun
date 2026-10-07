@@ -2,22 +2,11 @@
 # 影戲 VitaScope AppImage 啟動腳本
 HERE="$(dirname "$(readlink -f "$0")")"
 
-# 舊的打包方式（用 Ubuntu 的 libmpv）會把 libva 包進來，它的驅動路徑寫死成 /usr/lib/x86_64-linux-gnu/dri；
-# Fedora / openSUSE 在 /usr/lib64/dri、Arch 在 /usr/lib/dri。可用冒號列多個
-if [ -e "$HERE/usr/lib/libva.so.2" ] && [ -z "${LIBVA_DRIVERS_PATH:-}" ]; then
-  for d in /usr/lib/x86_64-linux-gnu/dri /usr/lib64/dri /usr/lib/dri; do
-    [ -d "$d" ] && LIBVA_DRIVERS_PATH="${LIBVA_DRIVERS_PATH:+$LIBVA_DRIVERS_PATH:}$d"
-  done
-  [ -n "${LIBVA_DRIVERS_PATH:-}" ] && export LIBVA_DRIVERS_PATH
-fi
-
 # libpulse（音效伺服器的用戶端）與 libva（載入顯示卡驅動）要跟系統同版本，所以用系統的；
-# 系統沒有才用 usr/lib/fallback 的替身：只讓 libmpv 載入得了（音訊改走 ALSA、硬體解碼改用軟體解碼）。
-# jack、pipewire 是舊的打包方式的備用函式庫（系統沒有時用包進來的真品）
+# 系統沒有才用 usr/lib/fallback 的替身：只讓 libmpv 載入得了（音訊改走 ALSA、硬體解碼改用軟體解碼）
 ldconfig_bin=$(command -v ldconfig || echo /sbin/ldconfig)
 cache=$("$ldconfig_bin" -p 2>/dev/null || true)
-for pair in pulse:libpulse.so.0 va:libva.so.2 va-drm:libva-drm.so.2 jack:libjack.so.0 pipewire:libpipewire-0.3.so.0; do
-  [ -d "$HERE/usr/lib/fallback/${pair%%:*}" ] || continue
+for pair in pulse:libpulse.so.0 va:libva.so.2 va-drm:libva-drm.so.2; do
   if ! printf '%s\n' "$cache" | grep -q "^[[:space:]]*${pair#*:} (libc6,x86-64)"; then
     LD_LIBRARY_PATH="$HERE/usr/lib/fallback/${pair%%:*}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export LD_LIBRARY_PATH
