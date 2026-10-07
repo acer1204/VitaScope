@@ -126,7 +126,7 @@ jobs:
           # libmpv-2.dll 內含的每個元件：確切的原始碼版本與授權條文
           Copy-Item packaging/windows/THIRD-PARTY-WINDOWS.md $dir
           Copy-Item -Recurse packaging/windows/licenses "$dir/licenses"
-          $empty = Get-ChildItem "$dir/licenses" -Directory | Where-Object { -not (Get-ChildItem $_.FullName -File) }
+          $empty = Get-ChildItem "$dir/licenses" -Directory | Where-Object { -not (Get-ChildItem $_.FullName -File -Recurse) }
           if ($empty) { throw "這些元件沒有授權檔：$($empty.Name -join ', ')" }
           # 確認打包出來的程式能執行（--version 會載入 libmpv-2.dll）
           $out = & "$dir/vitascope.exe" --version | Out-String

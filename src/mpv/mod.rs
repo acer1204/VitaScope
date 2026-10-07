@@ -207,6 +207,9 @@ pub enum Event {
 type Callback = Box<dyn Fn() + Send + Sync + 'static>;
 
 /// 一個 mpv 播放核心。mpv 的 client API 是執行緒安全的，所以可以 Send + Sync。
+/// 只在有 Lua 的 libmpv 才有的選項（影戲都是把它們關掉）
+const SCRIPT_OPTIONS: &[&str] = &["osc", "ytdl", "load-scripts", "load-stats-overlay"];
+
 pub struct Mpv {
     handle: NonNull<sys::mpv_handle>,
     wakeup: Option<Box<Callback>>,
@@ -242,9 +245,11 @@ impl Mpv {
             let (n, v) = (cstring(name), cstring(value));
             let code = unsafe { sys::mpv_set_option_string(mpv.raw(), n.as_ptr(), v.as_ptr()) };
             // 不同建置的 libmpv 選項不完全相同（例如沒編 Lua 就沒有 osc、ytdl），
-            // 沒有的選項略過即可，不影響播放
+            // 沒有的選項略過即可，不影響播放。Lua 腳本相關的選項本來就是要關掉的，不用提示
             if code == sys::mpv_error_MPV_ERROR_OPTION_NOT_FOUND {
-                eprintln!("[vitascope] 這個 libmpv 沒有選項 {name}，略過");
+                if !SCRIPT_OPTIONS.contains(name) {
+                    eprintln!("[vitascope] 這個 libmpv 沒有選項 {name}，略過");
+                }
                 continue;
             }
             check(code, || {
