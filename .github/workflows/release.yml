@@ -181,7 +181,7 @@ jobs:
             if (-not (Test-Path "$app\$f")) { throw "安裝後沒有 $f" }
           }
           $n = (Get-ChildItem "$app\licenses" -File -Recurse).Count
-          if ($n -ne (Get-ChildItem "$dir\licenses" -File -Recurse).Count) { throw "安裝後的 licenses 少了檔案（$n 個）" }
+          if ($n -ne (Get-ChildItem "dist\$name\licenses" -File -Recurse).Count) { throw "安裝後的 licenses 少了檔案（$n 個）" }
           $keys = 'HKCU:\Software\Classes\VitaScope.Video\shell\open\command',
                   'HKCU:\Software\Classes\Applications\vitascope.exe',
                   'HKCU:\Software\VitaScope\Capabilities'
