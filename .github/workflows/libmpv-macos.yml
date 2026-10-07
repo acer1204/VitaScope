@@ -1,0 +1,214 @@
+name: libmpv（macOS）
+
+# macOS（Apple Silicon）版播放引擎 libmpv.2.dylib：自己從原始碼建置（mpv -Dgpl=false + FFmpeg LGPL、每個元件固定版本
+# 並核對雜湊、只依賴 macOS 內建的函式庫），連同完整對應原始碼發佈成 prerelease libmpv-macos-arm64-<build_id>，
+# 給 scripts/fetch-libmpv.sh 下載。版本在 packaging/macos/libmpv/pins.json（共同元件跟其他平台一致）；改了就把 build_id 加一。
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 建置與測試通過後發佈成 prerelease
+        type: boolean
+        default: false
+      repro_check:
+        description: 建置兩次，確認 libmpv.2.dylib 逐位元相同
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libmpv-macos
+  cancel-in-progress: false
+
+env:
+  TEST_VIDEO: "av://lavfi:testsrc2=size=640x360:rate=30:duration=20"
+
+jobs:
+  sources:
+    name: 原始碼包
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      id: ${{ steps.id.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: id
+        run: echo "id=vitascope-libmpv-$(jq -r '"\(.platform)-\(.build_id)"' packaging/macos/libmpv/pins.json)" >> "$GITHUB_OUTPUT"
+      - name: 各平台的共同元件一致、建置機器跟 pins.json 一致
+        run: |
+          bash packaging/libmpv/check-pins.sh
+          grep -qF "runs-on: $(jq -r .toolchain.runner packaging/macos/libmpv/pins.json)" .github/workflows/libmpv-macos.yml
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/libmpv-sources
+          key: libmpv-sources-macos-${{ hashFiles('packaging/macos/libmpv/pins.json') }}
+      - name: 取得並核對每個元件的原始碼
+        run: bash packaging/libmpv/fetch-sources.sh packaging/macos/libmpv ~/.cache/libmpv-sources "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-src
+          path: ${{ runner.temp }}/out/${{ steps.id.outputs.id }}-src.tar.xz
+          compression-level: 0
+          if-no-files-found: error
+
+  build:
+    name: 建置（${{ matrix.copy }}）
+    needs: sources
+    strategy:
+      matrix:
+        copy: ${{ fromJSON(inputs.repro_check && '[1, 2]' || '[1]') }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      ID: ${{ needs.sources.outputs.id }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-src
+          path: ${{ runner.temp }}
+      - name: 主機工具
+        timeout-minutes: 15
+        run: |
+          sudo mkdir -p /opt/vsbuild && sudo chown "$USER" /opt/vsbuild
+          tar -xf "$RUNNER_TEMP/$ID-src.tar.xz" -C /opt/vsbuild
+          echo "DEVELOPER_DIR=$(jq -r .toolchain.developer_dir "/opt/vsbuild/$ID-src/pins.json")" >> "$GITHUB_ENV"
+          brew install autoconf automake libtool
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --only-binary=:all: --require-hashes -r "/opt/vsbuild/$ID-src/requirements.txt"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: 建置
+        run: bash "/opt/vsbuild/$ID-src/build/build.sh" "$RUNNER_TEMP/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-macos-arm64-${{ matrix.copy }}
+          path: |
+            ${{ runner.temp }}/dist/*.zip
+            ${{ runner.temp }}/dist/SHA256SUMS
+            ${{ runner.temp }}/dist/imports.txt
+            ${{ runner.temp }}/dist/exports.txt
+            ${{ runner.temp }}/dist/weak-imports.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libmpv-logs-${{ matrix.copy }}
+          path: ${{ runner.temp }}/dist/logs/
+          if-no-files-found: ignore
+
+  reproducible:
+    name: 兩次建置是否相同
+    if: inputs.repro_check
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libmpv-macos-arm64-*
+          path: r
+      - run: diff r/libmpv-macos-arm64-1/SHA256SUMS r/libmpv-macos-arm64-2/SHA256SUMS && cat r/libmpv-macos-arm64-1/SHA256SUMS
+
+  test:
+    name: 測試（${{ matrix.os }}）
+    needs: [sources, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      ID: ${{ needs.sources.outputs.id }}
+      VITASCOPE_LIBMPV: vendor
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-macos-arm64-1
+          path: built
+      - name: 換上新建置的 libmpv
+        run: |
+          dest=vendor/libmpv/macos-arm64
+          rm -rf "$dest"; mkdir -p "$dest"
+          unzip -q "built/$ID.zip" -d "$dest"
+          find "$dest" -type f -exec touch {} +
+          echo "MACOSX_DEPLOYMENT_TARGET=$(jq -r .deployment_target "$dest/components.json")" >> "$GITHUB_ENV"
+          ls -l "$dest/libmpv.2.dylib"
+      - name: 安裝 FFmpeg（只用來產生測試樣本）
+        run: brew install ffmpeg
+      - run: python scripts/gen_samples.py
+      - name: 測試
+        run: cargo test --all-targets -- --nocapture
+      - name: 版本
+        run: |
+          cargo build --release
+          ./target/release/vitascope --version | tee v.txt
+          m=vendor/libmpv/macos-arm64/components.json
+          grep -qx "mpv v$(jq -r '.components[] | select(.name=="mpv") | .version' $m)" v.txt
+          grep -qx "FFmpeg $(jq -r '.components[] | select(.name=="ffmpeg") | .version' $m)" v.txt
+      - name: 介面測試（macOS 虛擬機的 OpenGL 不一定完整，只記錄結果）
+        continue-on-error: true
+        run: |
+          ./target/release/vitascope "$TEST_VIDEO" --shot shot.png --shot-delay 3 > shot.log 2>&1 &
+          pid=$!; ( sleep 90; kill -9 $pid 2>/dev/null ) & w=$!
+          wait $pid || true; kill $w 2>/dev/null || true; cat shot.log
+          pct=$(grep -o '非黑色像素 [0-9.]*' shot.log | awk '{print $2}')
+          awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
+      - name: 硬體解碼（只記錄結果：GitHub 的 macOS 虛擬機不一定有 VideoToolbox）
+        continue-on-error: true
+        run: cargo test --test hwdec -- --ignored --nocapture
+
+  publish:
+    name: 發佈
+    if: inputs.publish
+    needs: [sources, build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      ID: ${{ needs.sources.outputs.id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-src
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-macos-arm64-1
+          path: built
+      - name: 建立 prerelease
+        run: |
+          tag=${ID#vitascope-}
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::$tag 已經發佈過；改了 pins.json 要把 build_id 加一"; exit 1
+          fi
+          cp "built/$ID.zip" assets/
+          (cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          p=packaging/macos/libmpv/pins.json
+          mpv=$(jq -r '.components[] | select(.name=="mpv") | .version' $p)
+          ffmpeg=$(jq -r '.components[] | select(.name=="ffmpeg") | .version' $p)
+          dt=$(jq -r .toolchain.deployment_target $p)
+          cat > notes.md <<EOF
+          macOS（Apple Silicon）版影戲 VitaScope 使用的播放引擎 \`libmpv.2.dylib\`。**這不是影戲的新版本**，一般使用者請下載最新的影戲版本。
+
+          - mpv $mpv（\`-Dgpl=false\`）、FFmpeg $ffmpeg（LGPL）；最低系統版本 macOS $dt；其餘元件與版本見 zip 裡的 \`THIRD-PARTY-MACOS.md\`
+          - 授權：LGPL-2.1-or-later，各元件的授權條文在 zip 的 \`licenses/\`
+          - \`$ID.zip\`：libmpv.2.dylib、include/mpv、授權聲明、BUILDINFO.txt
+          - \`$ID-src.tar.xz\`：完整對應原始碼（各元件原始碼、修正檔、建置腳本與設定），在 Apple Silicon 的 macOS 上 \`bash build/build.sh <輸出>\` 可重新建置
+          - 建置紀錄：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          gh release create "$tag" assets/* --prerelease --latest=false --target "$GITHUB_SHA" \
+            --title "libmpv.2.dylib（macOS arm64）$tag" --notes-file notes.md

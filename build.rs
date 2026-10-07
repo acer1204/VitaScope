@@ -4,27 +4,59 @@
 //!   並把 libmpv-2.dll 放到執行檔旁邊，`cargo run` 和 `cargo test` 才找得到。
 //! - macOS：Homebrew 安裝的 mpv（`brew install mpv`）。
 //! - Linux：系統套件（`libmpv-dev` / `mpv-libs-devel`）。
+//!
+//! macOS、Linux 設 `VITASCOPE_LIBMPV=vendor` 時改用本專案建置的 libmpv：vendor/libmpv/macos-arm64/、
+//! vendor/libmpv/linux-x64/（.github/workflows/libmpv-macos.yml、libmpv-linux.yml 建置）。
+//! 用本專案建置的 libmpv 時，`VITASCOPE_LIBMPV_MANIFEST` 指向它的 components.json（tests/engine_build.rs 用來核對版本）。
 
 use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=VITASCOPE_LIBMPV");
+    let vendor = env::var("VITASCOPE_LIBMPV").as_deref() == Ok("vendor");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "windows" => windows(),
-        "macos" => {
-            for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
-                if Path::new(prefix).join("libmpv.dylib").exists() {
-                    println!("cargo:rustc-link-search=native={prefix}");
-                    // /opt/homebrew/lib 不在 dyld 的預設搜尋路徑，開發版執行檔要記住位置
-                    println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}");
-                }
-            }
-        }
+        "macos" if vendor => vendored("macos-arm64", "libmpv.2.dylib", "libmpv.dylib"),
+        "macos" => homebrew(),
+        "linux" if vendor => vendored("linux-x64", "lib/libmpv.so.2", "libmpv.so"),
         _ => {} // Linux：libmpv 在系統預設的函式庫路徑
     }
+}
+
+/// Homebrew 安裝的 mpv
+fn homebrew() {
+    for prefix in ["/opt/homebrew/lib", "/usr/local/lib"] {
+        if Path::new(prefix).join("libmpv.dylib").exists() {
+            println!("cargo:rustc-link-search=native={prefix}");
+            // /opt/homebrew/lib 不在 dyld 的預設搜尋路徑，開發版執行檔要記住位置
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{prefix}");
+        }
+    }
+}
+
+/// 本專案建置的 libmpv（macOS、Linux AppImage 用的那一份）：放到 OUT_DIR，以 -lmpv 連結，執行時從 rpath 找。
+/// 打包時再換成 .app / AppImage 裡的位置
+fn vendored(platform: &str, file: &str, link_name: &str) {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let vendor = manifest.join("vendor/libmpv").join(platform);
+    println!("cargo:rerun-if-changed={}", vendor.display());
+    let lib = vendor.join(file);
+    if !lib.exists() {
+        panic!("找不到 {}\n請先執行：bash scripts/fetch-libmpv.sh", lib.display());
+    }
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    place(&lib, &out_dir.join(lib.file_name().unwrap())); // 執行時 dyld / ld.so 找的名字（install name / SONAME）
+    place(&lib, &out_dir.join(link_name)); // -lmpv 找的名字
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out_dir.display());
+    println!(
+        "cargo:rustc-env=VITASCOPE_LIBMPV_MANIFEST={}",
+        vendor.join("components.json").display()
+    );
 }
 
 fn windows() {
@@ -52,6 +84,11 @@ fn windows() {
     place(&dll, &out_dir.join("libmpv-2.dll"));
     if let Some(profile_dir) = out_dir.ancestors().nth(3) {
         place(&dll, &profile_dir.join("libmpv-2.dll"));
+    }
+    // 本專案建置的 DLL 才有（之前用的是別人建置的）
+    let components = vendor.join("components.json");
+    if components.exists() {
+        println!("cargo:rustc-env=VITASCOPE_LIBMPV_MANIFEST={}", components.display());
     }
     resources(&manifest, &out_dir);
 }
@@ -92,7 +129,7 @@ fn resources(manifest: &Path, out_dir: &Path) {
     }
 }
 
-/// 優先建立硬連結（dll 約 120 MB，複製太慢），跨磁碟時才複製。
+/// 優先建立硬連結（libmpv 有幾十 MB，複製太慢），跨磁碟時才複製。
 fn place(src: &Path, dst: &Path) {
     if let (Ok(a), Ok(b)) = (src.metadata(), dst.metadata())
         && a.len() == b.len()

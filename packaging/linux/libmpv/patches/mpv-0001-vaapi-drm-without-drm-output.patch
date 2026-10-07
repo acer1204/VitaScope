@@ -1,0 +1,21 @@
+VA-API 硬體解碼不再連帶要求 KMS 畫面輸出（libdrm、libdisplay-info）
+
+mpv 6c092d978b 的 vaapi-drm 要求 drm 功能，而 drm 功能是 KMS 畫面輸出（vo_drm），需要 libdrm 與 libdisplay-info。
+但 vaapi-drm 實際只在 video/vaapi.c 開 /dev/dri/renderD128、呼叫 libva-drm 的 vaGetDisplayDRM，以及在
+hwdec_vaapi.c 讀 render API 傳進來的 DRM 參數；兩處都不用 libdrm。改成只要求 libva。
+
+--- a/meson.build
++++ b/meson.build
+@@ -1478,8 +1478,11 @@
+ 
+ libva = dependency('libva', version: '>= 1.1.0', required: get_option('vaapi'))
+ 
++# Modified for VitaScope (2026-10): vaapi-drm only opens a render node and calls
++# vaGetDisplayDRM (video/vaapi.c), so it needs libva-drm, not the KMS output
++# (libdrm + libdisplay-info) that the drm feature builds.
+ vaapi_drm = dependency('libva-drm', version: '>= 1.1.0', required:
+-    get_option('vaapi-drm').require(libva.found() and features['drm']))
++    get_option('vaapi-drm').require(libva.found()))
+ features += {'vaapi-drm': vaapi_drm.found()}
+ if features['vaapi-drm']
+     dependencies += vaapi_drm

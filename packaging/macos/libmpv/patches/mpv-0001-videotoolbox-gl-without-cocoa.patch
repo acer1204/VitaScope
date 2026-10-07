@@ -1,0 +1,28 @@
+VideoToolbox 的 OpenGL 互通（零複製硬體解碼）在沒有 Cocoa / Swift 的 libmpv 也啟用
+
+mpv 6c092d978b 的 meson.build 只在 gl-cocoa（需要 Cocoa，而 Cocoa 又需要 Swift）或 ios-gl 時編譯
+hwdec_mac_gl.c。影戲用 libmpv 的 render API，OpenGL（CGL）context 由影戲自己建立，hwdec_mac_gl.c 只需要
+目前的 CGL context 與 OpenGL、IOSurface、CoreVideo 三個 framework。不改的話只剩 videotoolbox-copy
+（每一格解碼後從 GPU 複製回 CPU 再上傳）。
+
+--- a/meson.build
++++ b/meson.build
+@@ -1545,11 +1545,17 @@
+     sources += files('video/out/opengl/hwdec_vdpau.c')
+ endif
+ 
++# Modified for VitaScope (2026-10): also allow videotoolbox-gl in a libmpv build with
++# plain-gl and no Cocoa/Swift. The host application owns the CGL context and passes it
++# through the render API; hwdec_mac_gl.c only needs the frameworks below.
+ videotoolbox_gl = get_option('videotoolbox-gl').require(
+-    features['gl-cocoa'] or features['ios-gl'],
++    features['gl-cocoa'] or features['ios-gl'] or (darwin and features['gl']),
+     error_message: 'gl-cocoa nor ios-gl could be found!',
+ )
+ features += {'videotoolbox-gl': videotoolbox_gl.allowed()}
++if features['videotoolbox-gl'] and not features['gl-cocoa'] and not features['ios-gl']
++    dependencies += dependency('appleframeworks', modules: ['OpenGL', 'IOSurface', 'CoreVideo'])
++endif
+ corevideo = dependency('appleframeworks', modules: ['CoreVideo'], required:
+     get_option('videotoolbox-pl').require(darwin))
+ videotoolbox_pl = get_option('videotoolbox-pl').require(

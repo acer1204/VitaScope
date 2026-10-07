@@ -71,14 +71,14 @@ fn decoders_demuxers_protocols_filters() {
         "缺少 png 編碼器（截圖）"
     );
 }
-#[cfg(windows)]
+/// 本專案建置的 libmpv（Windows、macOS、AppImage 的那一份）：版本與建置選項要跟它的 components.json 一致
 #[test]
-fn windows_libmpv_matches_its_manifest() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/libmpv/windows-x64/components.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
+fn vendored_libmpv_matches_its_manifest() {
+    let Some(path) = option_env!("VITASCOPE_LIBMPV_MANIFEST") else {
         eprintln!("略過：不是本專案建置的 libmpv");
         return;
     };
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("讀不到 {path}：{e}"));
     let m: serde_json::Value = serde_json::from_str(&text).unwrap();
     let ver = |n: &str| {
         m["components"]

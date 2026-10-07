@@ -2,7 +2,9 @@
 # 列出 AppImage 裡包進去的函式庫屬於哪個 Ubuntu 套件（原始碼套件、版本），並補齊授權檔：
 # - 每個套件的 copyright 檔（linuxdeploy 會放大部分，手動放進去的備用函式庫沒有）
 # - copyright 檔參照的授權全文（/usr/share/common-licenses/GPL-2 之類，AppImage 裡原本沒有）
-# 用法：packaging/linux-third-party.sh AppDir 輸出.md
+# 用法：packaging/linux-third-party.sh AppDir 輸出.md [略過的檔案（相對於 usr/lib，可用萬用字元）…]
+#   本專案自己建置的 libmpv.so.2、替身函式庫不是 Ubuntu 套件，要略過（不然 dpkg 會照檔名錯認成 Ubuntu 的套件）。
+#   輸出檔已經有內容（例如 libmpv 的元件清單）時接在後面。
 #
 # 在建置 AppImage 的同一台機器上執行（要查 dpkg 的資料庫）。找不到來源的函式庫會讓這個腳本失敗：
 # 發佈的安裝包一定要列得出每個函式庫的原始碼版本（GPL 的要求）。
@@ -10,12 +12,18 @@
 set -euo pipefail
 appdir="$1"
 out="$2"
+shift 2
+skip=("$@")
 doc="$appdir/usr/share/doc"
 
 # shellcheck source=/dev/null
 . /etc/os-release
-cat > "$out" <<EOF
-# Linux AppImage 內含的函式庫
+if [ ! -s "$out" ]; then
+  echo "# Linux AppImage 內含的函式庫" > "$out"
+fi
+cat >> "$out" <<EOF
+
+## 其他函式庫（${PRETTY_NAME} 的套件）
 
 以下函式庫來自 ${PRETTY_NAME} 的套件，位於 AppImage 的 \`usr/lib\`。
 各套件的授權（Debian 格式的 copyright 檔）在 AppImage 的 \`usr/share/doc/<套件>/copyright\`；
@@ -45,6 +53,11 @@ owner() {
 
 missing=0
 while IFS= read -r lib; do
+  rel=${lib#"$appdir/usr/lib/"}
+  for pat in "${skip[@]}"; do
+    # shellcheck disable=SC2053 # pat 是萬用字元
+    [[ $rel == $pat ]] && continue 2
+  done
   name=$(basename "$lib")
   pkg=$(owner "$name" || true)
   if [ -z "$pkg" ]; then

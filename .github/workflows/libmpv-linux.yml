@@ -1,0 +1,237 @@
+name: libmpv（Linux）
+
+# Linux AppImage 版播放引擎 libmpv.so.2（x86_64）：自己從原始碼建置（mpv -Dgpl=false + FFmpeg LGPL、每個元件固定版本
+# 並核對雜湊；glibc、OpenSSL、fontconfig、ALSA、PulseAudio、libva 用使用者系統的），連同完整對應原始碼發佈成
+# prerelease libmpv-linux-x64-<build_id>，給 scripts/fetch-libmpv.sh 下載。建置環境是 digest 固定的 Ubuntu 24.04 容器
+# 加上固定日期的 apt 快照。版本在 packaging/linux/libmpv/pins.json（共同元件跟其他平台一致）；改了就把 build_id 加一。
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 建置與測試通過後發佈成 prerelease
+        type: boolean
+        default: false
+      repro_check:
+        description: 建置兩次，確認 libmpv.so.2 逐位元相同
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libmpv-linux
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TEST_VIDEO: "av://lavfi:testsrc2=size=640x360:rate=30:duration=20"
+
+jobs:
+  sources:
+    name: 原始碼包
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      id: ${{ steps.id.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: id
+        run: echo "id=vitascope-libmpv-$(jq -r '"\(.platform)-\(.build_id)"' packaging/linux/libmpv/pins.json)" >> "$GITHUB_OUTPUT"
+      - name: 各平台的共同元件一致、建置容器跟 pins.json 一致
+        run: |
+          bash packaging/libmpv/check-pins.sh
+          grep -qF "container: $(jq -r .base.image packaging/linux/libmpv/pins.json)" .github/workflows/libmpv-linux.yml
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/libmpv-sources
+          key: libmpv-sources-linux-${{ hashFiles('packaging/linux/libmpv/pins.json') }}
+      - name: 取得並核對每個元件的原始碼
+        run: bash packaging/libmpv/fetch-sources.sh packaging/linux/libmpv ~/.cache/libmpv-sources "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-src
+          path: ${{ runner.temp }}/out/${{ steps.id.outputs.id }}-src.tar.xz
+          compression-level: 0
+          if-no-files-found: error
+
+  build:
+    name: 建置（${{ matrix.copy }}）
+    needs: sources
+    strategy:
+      matrix:
+        copy: ${{ fromJSON(inputs.repro_check && '[1, 2]' || '[1]') }}
+    runs-on: ubuntu-24.04
+    # 跟 pins.json 的 base.image 相同（sources 工作會核對）
+    container: ubuntu:noble-20260917@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+    timeout-minutes: 120
+    env:
+      ID: ${{ needs.sources.outputs.id }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-src
+          path: /opt/src
+      - name: 建置環境（固定日期的 apt 快照、固定版本的套件）
+        timeout-minutes: 20
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends jq xz-utils ca-certificates >/dev/null
+          mkdir -p /opt/vsbuild && tar -xJf "/opt/src/$ID-src.tar.xz" -C /opt/vsbuild
+          bash "/opt/vsbuild/$ID-src/build/setup-base.sh" "/opt/vsbuild/$ID-src/pins.json"
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install --only-binary=:all: --require-hashes -r "/opt/vsbuild/$ID-src/requirements.txt"
+          echo /opt/venv/bin >> "$GITHUB_PATH"
+      - name: 建置
+        # 輸出放固定的 /opt/dist：容器裡的工作，runner.temp 給的是主機上的路徑
+        run: bash "/opt/vsbuild/$ID-src/build/build.sh" /opt/dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libmpv-linux-x64-${{ matrix.copy }}
+          path: |
+            /opt/dist/*.tar.xz
+            /opt/dist/SHA256SUMS
+            /opt/dist/needed.txt
+            /opt/dist/exports.txt
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: libmpv-logs-${{ matrix.copy }}
+          path: /opt/dist/logs/
+          if-no-files-found: ignore
+
+  reproducible:
+    name: 兩次建置是否相同
+    if: inputs.repro_check
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: libmpv-linux-x64-*
+          path: r
+      - run: diff r/libmpv-linux-x64-1/SHA256SUMS r/libmpv-linux-x64-2/SHA256SUMS && cat r/libmpv-linux-x64-1/SHA256SUMS
+
+  test:
+    name: 測試（Ubuntu 24.04 與乾淨的 Debian 13）
+    needs: [sources, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      ID: ${{ needs.sources.outputs.id }}
+      VITASCOPE_LIBMPV: vendor
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-linux-x64-1
+          path: built
+      - name: 換上新建置的 libmpv
+        run: |
+          dest=vendor/libmpv/linux-x64
+          rm -rf "$dest"; mkdir -p "$dest"
+          tar -xJf "built/$ID.tar.xz" -C "$dest"
+          find "$dest" -type f -exec touch {} +
+      - name: 測試需要的套件（ffmpeg 只用來產生樣本；也帶進 libva2、libpulse0）
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 appstream
+      - run: python scripts/gen_samples.py
+      - name: 測試
+        run: cargo test --all-targets -- --nocapture
+      - name: 版本
+        run: |
+          cargo build --release
+          ./target/release/vitascope --version | tee v.txt
+          m=vendor/libmpv/linux-x64/components.json
+          grep -qx "mpv v$(jq -r '.components[] | select(.name=="mpv") | .version' $m)" v.txt
+          grep -qx "FFmpeg $(jq -r '.components[] | select(.name=="ffmpeg") | .version' $m)" v.txt
+      - name: 介面測試（虛擬螢幕，llvmpipe 的 OpenGL）
+        env:
+          VITASCOPE_DEBUG: "1"
+        run: |
+          for v in "$TEST_VIDEO" samples/generated/common/mp4_h264_aac.mp4; do
+            timeout 60 xvfb-run -a -s "-screen 0 1280x800x24" ./target/release/vitascope "$v" --shot s.png --shot-delay 3 </dev/null 2>&1 | tee s.log
+            p=$(grep -o '非黑色像素 [0-9.]*' s.log | awk '{print $2}'); echo "$v：${p:-沒有截圖}%"
+            awk -v p="${p:-0}" 'BEGIN { exit !(p > 60) }'
+          done
+      - name: AppImage（本機與乾淨的 Debian 13，包括兩個替身的進入點）
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          bash packaging/linux/build-appimage.sh target/release/vitascope 0.0.0 dist/test.AppImage
+          dist/test.AppImage --version
+          docker run --rm -e APPIMAGE_EXTRACT_AND_RUN=1 -e TEST_VIDEO -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/samples/generated/common:/samples:ro" debian:trixie-slim bash -ec '
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends xvfb xauth libgl1 libegl1 libgl1-mesa-dri libasound2t64 libfontconfig1 >/dev/null
+            ! ldconfig -p | grep -E "libpulse\.so\.0|libva\.so\.2"   # 這個容器刻意沒有，要走替身
+            cp /dist/test.AppImage /tmp/app; chmod +x /tmp/app
+            /tmp/app --version
+            shot() { timeout 60 xvfb-run -a /tmp/app "$1" --shot /tmp/s.png --shot-delay 3 </dev/null 2>&1 | tee /tmp/log
+                     p=$(grep -o "非黑色像素 [0-9.]*" /tmp/log | awk "{print \$2}"); echo "Debian 13：${p:-沒有截圖}%"
+                     awk -v p="${p:-0}" "BEGIN { exit !(p > 60) }"; }
+            shot "$TEST_VIDEO"
+            # 強制走到兩個進入點：PulseAudio 輸出、VA-API（/dev/null 開得起來，交給 vaGetDisplayDRM）
+            VITASCOPE_MPV_OPTS="ao=pulse hwdec=vaapi-copy vaapi-device=/dev/null" shot /samples/mp4_h264_aac.mp4
+            grep -q "系統沒有 libpulse.so.0" /tmp/log
+            grep -q "系統沒有 libva" /tmp/log
+            ! grep -q "替身不支援" /tmp/log'
+
+  publish:
+    name: 發佈
+    if: inputs.publish
+    needs: [sources, build, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      ID: ${{ needs.sources.outputs.id }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-src
+          path: assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: libmpv-linux-x64-1
+          path: built
+      - name: 建立 prerelease
+        run: |
+          tag=${ID#vitascope-}
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::error::$tag 已經發佈過；改了 pins.json 要把 build_id 加一"; exit 1
+          fi
+          cp "built/$ID.tar.xz" assets/
+          (cd assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          p=packaging/linux/libmpv/pins.json
+          mpv=$(jq -r '.components[] | select(.name=="mpv") | .version' $p)
+          ffmpeg=$(jq -r '.components[] | select(.name=="ffmpeg") | .version' $p)
+          glibc=$(tar -xOJf "built/$ID.tar.xz" ./BUILDINFO.txt | grep -m1 '^符號版本最高' | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//')
+          cat > notes.md <<EOF
+          Linux AppImage 版影戲 VitaScope 使用的播放引擎 \`libmpv.so.2\`（x86_64）。**這不是影戲的新版本**，一般使用者請下載最新的影戲版本。
+
+          - mpv $mpv（\`-Dgpl=false\`）、FFmpeg $ffmpeg（LGPL）；其餘元件與版本見壓縮檔裡的 \`THIRD-PARTY-LINUX.md\`
+          - 需要系統的 glibc ${glibc} 以上、OpenSSL 3、fontconfig、ALSA；系統沒有 PulseAudio 用戶端或 libva 時用 \`fallback/\` 的替身
+          - 授權：LGPL-2.1-or-later，各元件的授權條文在壓縮檔的 \`licenses/\`
+          - \`$ID.tar.xz\`：lib/libmpv.so.2、include/mpv、替身函式庫、授權聲明、BUILDINFO.txt
+          - \`$ID-src.tar.xz\`：完整對應原始碼（各元件原始碼、修正檔、建置腳本與設定），在 pins.json 指定的 Ubuntu 24.04 容器裡可重新建置
+          - 建置紀錄：$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          EOF
+          gh release create "$tag" assets/* --prerelease --latest=false --target "$GITHUB_SHA" \
+            --title "libmpv.so.2（Linux x64）$tag" --notes-file notes.md
