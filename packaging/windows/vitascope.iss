@@ -92,6 +92,8 @@ Source: "{#SourceDir}\libmpv-2.dll";  DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\LICENSE";       DestDir: "{app}"
 Source: "{#SourceDir}\README.md";     DestDir: "{app}"
 Source: "{#SourceDir}\THIRD-PARTY-*"; DestDir: "{app}"
+; libmpv-2.dll 內含的每個元件的授權條文
+Source: "{#SourceDir}\licenses\*";   DestDir: "{app}\licenses"; Flags: recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#ExeName}"

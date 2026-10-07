@@ -1,0 +1,135 @@
+https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/README.md (License section) and header excerpts of compiled library sources (Source/Lib, third_party/fastfeat) at commit 1394731134e0ca891e11db3cd98144d1aa9a7b72
+
+## License
+
+Up to v0.8.7, SVT-AV1 is licensed under the BSD-2-clause license and the
+Alliance for Open Media Patent License 1.0. See [LICENSE](LICENSE-BSD2.md) and
+[PATENTS](PATENTS.md) for details. Starting from v0.9, SVT-AV1 is licensed
+under the BSD-3-clause clear license and the Alliance for Open Media Patent
+License 1.0. See [LICENSE](LICENSE.md) and [PATENTS](PATENTS.md) for details.
+
+Header licences found in the encoder library sources (x86 build, from a scan of the commit's archive):
+  * BSD 3-Clause Clear License + AOMedia Patent License 1.0 (LICENSE.md, PATENTS.md) - repository licence, e.g. Source/Lib/Codec/coding_loop.c
+  * BSD 2 Clause License + AOMedia Patent License 1.0 (LICENSE-BSD2.md, PATENTS.md) - most older files (Intel Corporation, Netflix, Meta Platforms, Psychovisual Experts Group, Alliance for Open Media headers), e.g. Source/Lib/ASM_AVX2/blend_a64_mask_avx2.c
+  * BSD-2-Clause (VideoLAN and dav1d authors; Two Orioles, LLC; Matthias Dressel) - dav1d-derived Source/Lib/ASM_AVX2/itx_avx2.asm, itx16_avx2.asm, mc_avx2.asm, mc16_avx2.asm, itx_hbd.h, itx_lbd.h
+  * ISC-style (x264 project) - Source/Lib/ASM_AVX2/dav1d_x86inc.asm, Source/Lib/ASM_SSE2/x86inc.asm
+  * MIT (Peter Goldsborough) - Source/Lib/Codec/vector.c, vector.h
+  * BSD-3-Clause (Edward Rosten) - third_party/fastfeat (always linked: TARGET_OBJECTS:FASTFEAT), see third_party/fastfeat/LICENSE
+  * MIT (Intel/Cisco, safestringlib) - third_party/safestringlib, compiled only if the toolchain lacks strcpy_s/strncpy_s/strnlen_s (CMakeLists.txt lines 549-573); see third_party/safestringlib/LICENSE
+
+---- https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/Source/Lib/ASM_AVX2/blend_a64_mask_avx2.c (header) ----
+/*
+ * Copyright(c) 2019 Intel Corporation
+ * Copyright (c) 2018, Alliance for Open Media. All rights reserved
+ *
+ * This source code is subject to the terms of the BSD 2 Clause License and
+ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
+ * was not distributed with this source code in the LICENSE file, you can
+ * obtain it at https://www.aomedia.org/license/software-license. If the Alliance for Open
+ * Media Patent License 1.0 was not distributed with this source code in the
+ * PATENTS file, you can obtain it at https://www.aomedia.org/license/patent-license.
+ */
+
+---- https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/Source/Lib/ASM_AVX2/itx_avx2.asm (header) ----
+; Copyright © 2018-2021, VideoLAN and dav1d authors
+; Copyright © 2018, Two Orioles, LLC
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met:
+;
+; 1. Redistributions of source code must retain the above copyright notice, this
+;    list of conditions and the following disclaimer.
+;
+; 2. Redistributions in binary form must reproduce the above copyright notice,
+;    this list of conditions and the following disclaimer in the documentation
+;    and/or other materials provided with the distribution.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+; ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+; WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+; DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+; ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+; (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+; ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+; (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+; SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+---- https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/Source/Lib/ASM_AVX2/itx16_avx2.asm (header, copyright lines) ----
+; Copyright © 2021, VideoLAN and dav1d authors
+; Copyright © 2021, Two Orioles, LLC
+; Copyright © 2021, Matthias Dressel
+; All rights reserved.
+
+---- https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/Source/Lib/ASM_SSE2/x86inc.asm (header) ----
+;*****************************************************************************
+;* x86inc.asm: x264asm abstraction layer
+;*****************************************************************************
+;* Copyright (C) 2005-2016 x264 project
+;*
+;* Authors: Loren Merritt <lorenm@u.washington.edu>
+;*          Anton Mitrofanov <BugMaster@narod.ru>
+;*          Fiona Glaser <fiona@x264.com>
+;*          Henrik Gramner <henrik@gramner.com>
+;*
+;* Permission to use, copy, modify, and/or distribute this software for any
+;* purpose with or without fee is hereby granted, provided that the above
+;* copyright notice and this permission notice appear in all copies.
+;*
+;* THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+;* WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+;* MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+;* ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+;* WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+;* ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+;* OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+;*****************************************************************************
+
+
+---- https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/Source/Lib/ASM_AVX2/dav1d_x86inc.asm (header) ----
+;*****************************************************************************
+;* x86inc.asm: x86 abstraction layer
+;*****************************************************************************
+;* Copyright (C) 2005-2022 x264 project
+;*
+;* Authors: Loren Merritt <lorenm@u.washington.edu>
+;*          Henrik Gramner <henrik@gramner.com>
+;*          Anton Mitrofanov <BugMaster@narod.ru>
+;*          Fiona Glaser <fiona@x264.com>
+;*
+;* Permission to use, copy, modify, and/or distribute this software for any
+;* purpose with or without fee is hereby granted, provided that the above
+;* copyright notice and this permission notice appear in all copies.
+;*
+;* THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+;* WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+;* MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+;* ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+;* WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+;* ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+;* OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+;*****************************************************************************
+
+---- https://gitlab.com/AOMediaCodec/SVT-AV1/-/raw/1394731134e0ca891e11db3cd98144d1aa9a7b72/Source/Lib/Codec/vector.c (header) ----
+/*
+The MIT License(MIT)
+Copyright(c) 2016 Peter Goldsborough
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files(the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions :
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/

@@ -1,0 +1,77 @@
+https://raw.githubusercontent.com/KhronosGroup/SPIRV-Cross/aa217aeb6c9f0ace7a0ab233b28807edf45eb165/spirv_cross.cpp (license header; same SPDX header 'Apache-2.0 OR MIT' is used by all spirv_*.cpp/.hpp/.h library sources)
+
+/*
+ * Copyright 2015-2021 Arm Limited
+ * SPDX-License-Identifier: Apache-2.0 OR MIT
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * At your option, you may choose to accept this material under either:
+ *  1. The Apache License, Version 2.0, found at <http://www.apache.org/licenses/LICENSE-2.0>, or
+ *  2. The MIT License, found at <http://opensource.org/licenses/MIT>.
+ */
+
+Copyright holders named in the headers of the compiled library sources (spirv_*.cpp/.hpp/.h at this commit):
+  Copyright 2015-2021 Arm Limited  (spirv_cross, spirv_glsl, spirv_cpp, spirv_cfg, spirv_parser, spirv_cross_parsed_ir, spirv_cross_util, spirv_common)
+  Copyright 2019-2021 Hans-Kristian Arntzen  (spirv_cross_c)
+  Copyright 2016-2021 Robert Konrad  (spirv_hlsl)
+  Copyright 2016-2021 The Brenwill Workshop Ltd.  (spirv_msl)
+  Copyright 2018-2021 Bradley Austin Davis  (spirv_reflect)
+
+Bundled Khronos headers (see .reuse/dep5 -> LicenseRef-KhronosFreeUse, SPDX MIT-Khronos-old):
+
+https://raw.githubusercontent.com/KhronosGroup/SPIRV-Cross/aa217aeb6c9f0ace7a0ab233b28807edf45eb165/spirv.hpp (header)
+// Copyright: 2014-2024 The Khronos Group Inc.
+// License: MIT
+// 
+// MODIFICATIONS TO THIS FILE MAY MEAN IT NO LONGER ACCURATELY REFLECTS
+// KHRONOS STANDARDS. THE UNMODIFIED, NORMATIVE VERSIONS OF KHRONOS
+// SPECIFICATIONS AND HEADER INFORMATION ARE LOCATED AT
+// https://www.khronos.org/registry/
+
+https://raw.githubusercontent.com/KhronosGroup/SPIRV-Cross/aa217aeb6c9f0ace7a0ab233b28807edf45eb165/GLSL.std.450.h (header)
+/*
+ * Copyright 2014-2016,2021 The Khronos Group, Inc.
+ * SPDX-License-Identifier: MIT
+ *
+ * MODIFICATIONS TO THIS FILE MAY MEAN IT NO LONGER ACCURATELY REFLECTS KHRONOS
+ * STANDARDS. THE UNMODIFIED, NORMATIVE VERSIONS OF KHRONOS SPECIFICATIONS AND
+ * HEADER INFORMATION ARE LOCATED AT https://www.khronos.org/registry/
+*/
+
+https://raw.githubusercontent.com/KhronosGroup/SPIRV-Cross/aa217aeb6c9f0ace7a0ab233b28807edf45eb165/NonSemanticShaderDebugInfo100.h (header)
+// Copyright (c) 2018-2024 The Khronos Group Inc.
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and/or associated documentation files (the "Materials"),
+// to deal in the Materials without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Materials, and to permit persons to whom the
+// Materials are furnished to do so, subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Materials.
+// 
+// MODIFICATIONS TO THIS FILE MAY MEAN IT NO LONGER ACCURATELY REFLECTS KHRONOS
+// STANDARDS. THE UNMODIFIED, NORMATIVE VERSIONS OF KHRONOS SPECIFICATIONS AND
+// HEADER INFORMATION ARE LOCATED AT https://www.khronos.org/registry/ 
+// 
+// THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+// THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM,OUT OF OR IN CONNECTION WITH THE MATERIALS OR THE USE OR OTHER DEALINGS
+// IN THE MATERIALS.

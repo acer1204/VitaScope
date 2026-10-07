@@ -6,7 +6,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 > 名稱取自 1896 年第一台在戲院成功商業放映的放映機 Vitascope。
 > 「影戲」是清末民初對電影的稱呼。姊妹作是看圖軟體 [Zoetrope 走馬燈](https://github.com/acer1204/Zoetrope)。
 
-目前進度：**L1 基本播放已完成，L2 日常主力進行中**，做到哪裡見下方的[功能清單](#功能清單)；完整規劃見 [ROADMAP.md](ROADMAP.md)。
+目前進度：**L1 基本播放、L2 日常主力已完成**（v0.2.0），接下來是 L3 進階調校；做到哪裡見下方的[功能清單](#功能清單)，完整規劃見 [ROADMAP.md](ROADMAP.md)。
 
 ## 下載
 
@@ -26,7 +26,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   Windows 不允許程式自己設成預設播放器：到「設定 → 應用程式 → 預設應用程式」選影戲，或在影戲的「設定 → 系統」按「選擇預設播放器…」。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
-- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2。
+- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2 與 libxkbcommon-x11（一般桌面都有；AppImage 已內含）。
   AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
@@ -40,13 +40,14 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - **macOS**：把 `VitaScope.app` 丟到垃圾桶。
 - **Linux**：AppImage 直接刪除；用 `install.sh` 安裝的，執行 `./install.sh --uninstall`。
 
-程式另外會建立這些資料（移除程式時保留，不需要可以自己刪）：
+程式另外會建立這些資料。設定與播放紀錄在移除程式時保留，不需要可以自己刪；
+暫存資料夾在 Windows 安裝版解除安裝時會一併刪除，其他情況也可以自己刪：
 
-| 平台 | 設定、播放紀錄、播放清單 | 字幕轉碼暫存 |
+| 平台 | 設定、播放紀錄、播放清單 | 暫存（字幕轉碼、翻轉用的著色器等） |
 |---|---|---|
-| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\subs` |
-| macOS | `~/Library/Application Support/Vitascope/` | `~/Library/Caches/VitaScope/subs` |
-| Linux | `~/.config/vitascope/` | `~/.cache/vitascope/subs` |
+| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\` |
+| macOS | `~/Library/Application Support/Vitascope/` | `~/Library/Caches/VitaScope/` |
+| Linux | `~/.config/vitascope/` | `~/.cache/vitascope/` |
 
 截圖預設存在系統「圖片」資料夾裡的 `VitaScope`，不會隨程式刪除。
 
@@ -71,7 +72,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] 記住音量、視窗位置與大小
 - [x] 「常見」格式三平台全數通過自動測試
 
-### L2 日常主力（進行中）
+### L2 日常主力（已完成）
 
 播放控制
 - [x] 播放清單：同資料夾的影片依檔名排序（第 2 集在第 10 集前面），播完自動接下一個；PgUp / PgDn 切換
@@ -88,7 +89,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 字幕與音訊
 - [x] 字幕外觀：字型、大小、顏色、邊框、陰影、位置、粗體（字幕選單 →「字幕外觀…」）
 - [x] 字幕時間軸偏移（同步）、手動指定字幕編碼（自動判斷猜錯、顯示亂碼時）
-- [x] 載入字幕檔、音軌檔（選單或拖放；可以跟影片一起拖放）
+- [x] 載入字幕檔（選單或拖放；可以跟影片一起拖放）、音軌檔（選單）
 - [x] 雙字幕（主字幕 + 第二字幕同時顯示，第二字幕在畫面上方）
 - [x] 音訊延遲調整
 - [x] 自動載入同名的外掛音軌（`.mka`），預設仍用影片內建的音軌
@@ -134,7 +135,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [ ] 播放清單：隨機、重複、播完後動作
 - [ ] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
 - [ ] 深色 / 淺色主題、迷你播放器、子母畫面
-- [ ] 「罕見」格式盡力支援（目前自動測試已全數通過）
+- [ ] 「罕見」格式盡力支援（Windows / macOS 的自動測試全數通過；Linux CI 的 FFmpeg 6.1 做不出 MKV 旋轉樣本，只列在報告裡）
 
 ### L4 擴充與專業（未開始）
 
@@ -172,7 +173,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | . / , | 逐格前進 / 後退 |
 | [ / ] | 字幕提早 / 延後 0.1 秒（換檔時歸零） |
 | - / =（或 +） | 聲音提早 / 延後 0.1 秒 |
-| A（或 Ctrl+F6） | 畫面比例：原始 → 16:9 → 4:3 → 16:10 → 1.85:1 → 2.35:1 |
+| A（或 Ctrl（macOS：⌘）+ F6） | 畫面比例：原始 → 16:9 → 4:3 → 16:10 → 1.85:1 → 2.35:1 |
 | Ctrl+Q（macOS 也是 Control） | 裁切：不裁 → 16:9 → 4:3 → 1.85:1 → 2.35:1 |
 | 9 / 1 / 5 | 放大 / 縮小 / 恢復 100%（Ctrl 或 ⌘ + 滾輪、觸控板捏合也可以縮放） |
 | Alt（macOS：Option）+ 方向鍵 | 移動畫面；Ctrl（⌘）+ 5 置中 |
@@ -196,7 +197,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 ## 支援格式
 
 格式分為「常見 / 通用 / 罕見」三級，詳見 [ROADMAP.md 第 2 節](ROADMAP.md#2-格式支援分級)。
-目前自動測試涵蓋 **97 個樣本，三個等級全數通過**；另外用一個約 1.4 萬部動畫的影片庫抽樣 626 個檔案實測，
+目前自動測試涵蓋 **98 個樣本**（常見、通用全數通過；罕見只在 Linux 有一項因 FFmpeg 版本舊做不出樣本）；另外用一個約 1.4 萬部動畫的影片庫抽樣 626 個檔案實測，
 **全部能播放**（含 RMVB、VC-1、Hi10P、PGS 字幕等）。例如：
 
 - **常見**：MP4、MKV、WebM、MOV、AVI；H.264（含 Hi10P）、HEVC（含 10-bit、4K）、AV1、VP9；AAC、MP3、Opus、AC-3、FLAC；SRT、ASS、mov_text
@@ -291,9 +292,10 @@ cargo run --release --example media_survey -- 檔案清單.tsv [--per-ext 200] [
 
 ```
 src/
-├─ main.rs       進入點、命令列參數（`vitascope [檔案…] [--fullscreen] [--new-window]`）
+├─ main.rs       進入點、命令列參數（`vitascope [檔案…] [--fullscreen] [--new-window] [--version]`；
+│                另有開發用的 `--shot`、解除安裝程式用的 `--unregister-associations`）
 ├─ app.rs        播放器視窗：控制列、快捷鍵、全螢幕、OSD
-├─ app/          視窗的各個部分：播放清單面板、媒體資訊、擷取畫面、進度條預覽縮圖
+├─ app/          視窗的各個部分：播放清單面板、設定視窗、媒體資訊、擷取畫面、進度條預覽縮圖
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
 ├─ player.rs     播放器核心：mpv 屬性與事件 → Rust 狀態（介面和測試共用）
 ├─ mpv/          libmpv 的安全包裝（client API、render API：OpenGL 與軟體繪圖）

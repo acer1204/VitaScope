@@ -1,0 +1,56 @@
+https://code.videolan.org/videolan/x264/-/raw/0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee/x264.h
+(license header excerpt, lines 1-26 of x264.h at commit 0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee; COPYING holds the GPLv2 text, the 'or (at your option) any later version' grant is stated in the source headers)
+
+/*****************************************************************************
+ * x264.h: x264 public header
+ *****************************************************************************
+ * Copyright (C) 2003-2025 x264 project
+ *
+ * Authors: Laurent Aimar <fenrir@via.ecp.fr>
+ *          Loren Merritt <lorenm@u.washington.edu>
+ *          Fiona Glaser <fiona@x264.com>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02111, USA.
+ *
+ * This program is also available under a commercial proprietary license.
+ * For more information, contact us at licensing@x264.com.
+ *****************************************************************************/
+
+==============================================================================
+https://code.videolan.org/videolan/x264/-/raw/0480cb05fa188d37ae87e8f4fd8f1aea3711f7ee/extras/cl.h
+(license header of extras/cl.h; extras/cl_platform.h carries the same license text (only comment-border and spacing differ). These Khronos OpenCL headers are included by common/opencl.h when x264 is configured with OpenCL, which configure enables by default for Windows targets; the build script does not pass --disable-opencl. SPDX: MIT-Khronos-old)
+
+/*******************************************************************************
+ * Copyright (c) 2008 - 2012 The Khronos Group Inc.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and/or associated documentation files (the
+ * "Materials"), to deal in the Materials without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Materials, and to
+ * permit persons to whom the Materials are furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Materials.
+ *
+ * THE MATERIALS ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * MATERIALS OR THE USE OR OTHER DEALINGS IN THE MATERIALS.
+ ******************************************************************************/

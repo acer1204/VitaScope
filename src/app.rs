@@ -686,10 +686,13 @@ impl VitascopeApp {
     }
 
     fn open_dialog(&mut self) {
+        // 播放清單檔（.m3u / .m3u8）也可以從這裡開
+        let mut exts = formats::all_media();
+        exts.extend(formats::PLAYLIST);
         let mut dialog = self
             .file_dialog()
             .set_title(crate::tr!("開啟影片", "Open video"))
-            .add_filter(crate::tr!("影音檔案", "Media files"), &formats::all_media())
+            .add_filter(crate::tr!("影音檔案", "Media files"), &exts)
             .add_filter(crate::tr!("所有檔案", "All files"), &["*"]);
         if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
             dialog = dialog.set_directory(dir);

@@ -123,6 +123,11 @@ jobs:
           Copy-Item target/release/vitascope.exe $dir
           Copy-Item vendor/libmpv/windows-x64/libmpv-2.dll $dir
           Copy-Item README.md, notices/* $dir
+          # libmpv-2.dll 內含的每個元件：確切的原始碼版本與授權條文
+          Copy-Item packaging/windows/THIRD-PARTY-WINDOWS.md $dir
+          Copy-Item -Recurse packaging/windows/licenses "$dir/licenses"
+          $empty = Get-ChildItem "$dir/licenses" -Directory | Where-Object { -not (Get-ChildItem $_.FullName -File) }
+          if ($empty) { throw "這些元件沒有授權檔：$($empty.Name -join ', ')" }
           # 確認打包出來的程式能執行（--version 會載入 libmpv-2.dll）
           $out = & "$dir/vitascope.exe" --version | Out-String
           if ($LASTEXITCODE -ne 0) { throw "打包後的程式無法執行：$out" }
@@ -387,6 +392,15 @@ jobs:
           "$ld" --appdir AppDir
           # 第三方授權：包進去的每個函式庫來自哪個 Ubuntu 原始碼套件、版本，以及授權全文
           bash packaging/linux-third-party.sh AppDir AppDir/usr/share/doc/vitascope/THIRD-PARTY-LINUX.md
+          # AppImage 開頭的執行環境（靜態連結 libfuse3 等）
+          cat >> AppDir/usr/share/doc/vitascope/THIRD-PARTY-LINUX.md <<EOF
+
+          ## AppImage 執行環境
+
+          AppImage 檔案開頭的執行環境是 [AppImage/type2-runtime](https://github.com/AppImage/type2-runtime)
+          （$RUNTIME_URL，SHA-256 \`$RUNTIME_SHA256\`；MIT），其中靜態連結了 libfuse3（LGPL-2.1）、squashfuse（BSD-2-Clause）、
+          zstd、zlib 與 musl（MIT）。原始碼與確切版本見上面的連結。
+          EOF
           # 第三階段：產生 AppImage
           out="VitaScope-${{ steps.version.outputs.tag }}-linux-x86_64.AppImage"
           LDAI_OUTPUT="$out" LDAI_RUNTIME_FILE="$runtime" "$ld" --appdir AppDir --output appimage
@@ -502,7 +516,7 @@ jobs:
           | macOS @MACOS_MIN@ 以上（Apple Silicon） | `VitaScope-@TAG@-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
           | | `VitaScope-@TAG@-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
           | Linux（x64） | `VitaScope-@TAG@-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv；需要 glibc @APPIMAGE_GLIBC@ 以上 |
-          | | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `install.sh` 加入應用程式選單（`install.sh --default` 設成預設播放器），或直接執行 `vitascope` |
+          | | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `./install.sh` 加入應用程式選單（`./install.sh --default` 設成預設播放器），或直接執行 `./vitascope` |
 
           **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」
           （開啟「智慧型應用程式控制」的 Windows 11 會直接擋下，沒有「仍要執行」可按）。
@@ -514,7 +528,7 @@ jobs:
 
           **Linux**：tar.gz 需要 glibc @GLIBC@ 以上與 libmpv.so.2（例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
           AppImage 需要 FUSE（大多數桌面發行版都有；沒有的話加 `--appimage-extract-and-run` 執行）。
-          兩者都需要 libxkbcommon-x11（一般桌面都有）；中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），
+          tar.gz 另外需要 libxkbcommon-x11（一般桌面都有；AppImage 已內含）；中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），
           開檔對話框需要 xdg-desktop-portal 或 zenity。
 
           **授權**：影戲 VitaScope 以 GPL-3.0-or-later 授權。每個安裝包都附有 `LICENSE` 與第三方元件的授權聲明

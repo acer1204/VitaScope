@@ -1,0 +1,38 @@
+https://github.com/shinchiro/mpv-winbuild-cmake/blob/05a60b3cfd04e3e3b89918f4a27f3dde2935dff2/packages/luajit-0001-add-win32-utf-8-filesystem-functions.patch
+Build-script patch applied to openresty/luajit2 (git am --3way) by mpv-winbuild-cmake commit 05a60b3cfd04e3e3b89918f4a27f3dde2935dff2.
+Patch header excerpt:
+From cf7f58d2446353750f54bd1380509d0842fe9440 Mon Sep 17 00:00:00 2001
+From: shinchiro <shinchiro@users.noreply.github.com>
+Date: Tue, 25 Jul 2023 22:53:21 +0800
+Subject: [PATCH] Add win32 UTF-8 filesystem functions
+
+Taken from https://github.com/wm4/libinsanity
+---
+ src/Makefile           |   2 +-
+ src/Makefile.dep       |   3 +-
+ src/lib_io.c           |   1 +
+ src/lib_os.c           |   1 +
+ src/lib_package.c      |   1 +
+ src/lj_clib.c          |   1 +
+ src/lj_fs_io.c         | 582 +++++++++++++++++++++++++++++++++++++++++
+ src/lj_fs_io.h         |  60 +++++
+ src/lj_fs_io_replace.h |  50 ++++
+ src/lj_load.c          |   1 +
+ src/lj_trace.c         |   1 +
+ src/ljamalg.c          |   1 +
+ 12 files changed, 702 insertions(+), 2 deletions(-)
+ create mode 100644 src/lj_fs_io.c
+ create mode 100644 src/lj_fs_io.h
+ create mode 100644 src/lj_fs_io_replace.h
+
+diff --git a/src/Makefile b/src/Makefile
+
+The three files added by the patch (src/lj_fs_io.c, src/lj_fs_io.h, src/lj_fs_io_replace.h) begin only with:
+    // This file is copyrighted.
+and carry no license grant. The patch says it was taken from https://github.com/wm4/libinsanity, which no
+longer exists on GitHub; the mirror https://github.com/catmirrors/libinsanity (branches master, old-master)
+does not contain these win32 filesystem files. The functions (lin_stat/lin_fstat/hstat/get_file_ids_win8/
+lin_open/lin_fopen/lin_opendir/lin_getenv ...) mirror mpv's osdep/io.c win32 wrappers (mp_stat, mp_fopen, ...),
+which mpv licenses LGPL-2.1-or-later; that origin is an inference, not stated in the files.
+
+The rest of LuaJIT is covered by COPYRIGHT (MIT; Lua 5.1/5.2 MIT; dlmalloc public domain).

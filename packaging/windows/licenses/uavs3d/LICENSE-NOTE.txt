@@ -1,0 +1,14 @@
+https://raw.githubusercontent.com/uavs3/uavs3d/0e20d2c291853f196c68922a264bcd8471d75b68/README.md (license section, lines 10-13)
+# license
+  Copyright reserved by “Peking University Shenzhen Graduate School”, “Peng Cheng Laboratory”, and “Guangdong Bohua UHD Innovation Corporation” <br><br>
+  This program is a free software. You can redistribute it and/or modify it under the terms of the BSD 3-clause license. <br>
+  For more details, please view the file "COPYING" in the project.
+
+Observation (not an upstream statement): 42 of 47 x86/common source files under source/ carry the BSD-3-Clause header naming
+Peking University Shenzhen Graduate School, Peng Cheng Laboratory and Guangdong Bohua UHD Innovation Corporation.
+Five files have no licence header: source/decore/contributor.h, threadpool.c, threadpool.h, win32thread.c, win32thread.h.
+source/decore/win32thread.c (compiled only on _WIN32, i.e. in this Windows build) closely follows x264's common/win32thread.c
+(https://code.videolan.org/videolan/x264/-/blob/master/common/win32thread.c, 'Copyright (C) 2010-2025 x264 project', GPL-2.0-or-later):
+same comments ('number of times to spin a thread about to block on a locked mutex...', '_beginthreadex requires that the start routine is __stdcall'),
+same structure, with the spin-count macro renamed AVS2_SPIN_COUNT (suggesting it came via the AVS2 decoders xavs2/davs2).
+threadpool.c similarly uses x264-style CHECKED_MALLOC/XCHG macros. The repository declares BSD-3-Clause for the whole project.

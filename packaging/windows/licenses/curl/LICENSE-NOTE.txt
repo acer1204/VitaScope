@@ -1,0 +1,45 @@
+https://github.com/curl/curl/tree/24ff74fa8db2dd84b2acd190a1bcc04b7d69e1e7/lib (verbatim header excerpts of the library files that are not under the plain curl license)
+
+--- lib/curlx/inet_ntop.c (https://github.com/curl/curl/blob/24ff74fa8db2dd84b2acd190a1bcc04b7d69e1e7/lib/curlx/inet_ntop.c)
+/*
+ * Copyright (C) 1996-2022  Internet Software Consortium.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND INTERNET SOFTWARE CONSORTIUM
+ * DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
+ * INTERNET SOFTWARE CONSORTIUM BE LIABLE FOR ANY SPECIAL, DIRECT,
+ * INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING
+ * FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+ * NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION
+ * WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ *
+ * SPDX-License-Identifier: ISC
+ */
+
+--- lib/curlx/inet_pton.c (https://github.com/curl/curl/blob/24ff74fa8db2dd84b2acd190a1bcc04b7d69e1e7/lib/curlx/inet_pton.c)
+/* This is from the BIND 4.9.4 release, modified to compile by itself */
+
+/* Copyright (c) Internet Software Consortium.
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND INTERNET SOFTWARE CONSORTIUM DISCLAIMS
+ * ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL INTERNET SOFTWARE
+ * CONSORTIUM BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL
+ * DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR
+ * PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS
+ * ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS
+ * SOFTWARE.
+ *
+ * SPDX-License-Identifier: ISC
+ */
+
+--- lib/vssh/vssh.c (https://github.com/curl/curl/blob/24ff74fa8db2dd84b2acd190a1bcc04b7d69e1e7/lib/vssh/vssh.c)
+Header line: " * SPDX-License-Identifier: curl AND ISC" (no separate ISC notice text in the file; the ISC text is LICENSES/ISC.txt).
