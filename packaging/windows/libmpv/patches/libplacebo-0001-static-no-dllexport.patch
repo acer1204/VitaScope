@@ -1,0 +1,17 @@
+libplacebo 編成靜態函式庫時不要把 pl_* 標成 dllexport
+
+libplacebo 7.360.1 的 src/meson.build 不論共用或靜態函式庫都定義 PL_EXPORT（__declspec(dllexport)），
+靜態連結進 libmpv-2.dll 後，DLL 會多匯出 470 個 pl_* 函式。靜態建置改定義 PL_STATIC（PL_API 為空）。
+
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -245,7 +245,8 @@
+ ### Main library build process
+ inc = include_directories('./include')
+ lib = library('placebo', sources,
+-  c_args: ['-DPL_EXPORT'],
++  # A static libplacebo linked into another DLL must not export pl_* from it
++  c_args: get_option('default_library') == 'static' ? ['-DPL_STATIC'] : ['-DPL_EXPORT'],
+   install: true,
+   dependencies: build_deps + glad_dep,
+   soversion: apiver,
