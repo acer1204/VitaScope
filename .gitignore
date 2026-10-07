@@ -9,3 +9,6 @@
 # 測試樣本（用 scripts/gen-samples 產生；外部樣本不進版控）
 /samples/generated/
 /samples/external/
+
+# Python 的快取（執行或檢查腳本時產生）
+__pycache__/
