@@ -5,7 +5,8 @@
 # 主機需要：/opt/vsbuild 可寫入、jq、python3、meson、ninja、nasm、pkg-config、make、autoconf、automake、libtool、zip
 set -Eeuo pipefail
 # 任何一步失敗都印出是哪一行、哪個指令（CI 的紀錄裡才找得到原因）
-trap 'echo "::error::build.sh 第 $LINENO 行失敗（exit $?）：$BASH_COMMAND"' ERR
+# 錯誤訊息一律寫到 stderr：stdout 被導到檔案（例如 BUILDINFO.txt）時也看得到
+trap 'echo "::error::build.sh 第 $LINENO 行失敗（exit $?）：$BASH_COMMAND" >&2' ERR
 BUNDLE=$(cd "$(dirname "$0")/.." && pwd)
 TOOLCHAIN=$(realpath "$1"); OUT=$(realpath -m "$2")
 PINS=$BUNDLE/pins.json
@@ -27,7 +28,7 @@ export no_proxy='' NO_PROXY=''
 export GIT_CEILING_DIRECTORIES=$ROOT   # 原始碼沒有 .git；別讓 FFmpeg 的 version.sh 找到上層儲存庫
 
 pin() { jq -r --arg n "$1" ".components[] | select(.name == \$n) | .$2" "$PINS"; }
-die() { echo "::error::$*"; exit 1; }
+die() { echo "::error::$*" >&2; exit 1; }
 group() { echo "::group::$*"; }; endgroup() { echo "::endgroup::"; }
 src() { local d=$WORK/src/$1 p; rm -rf "$d"; mkdir -p "$d"
         tar -xf "$BUNDLE/upstream/$(pin "$1" file)" -C "$d" --strip-components=1
@@ -137,7 +138,7 @@ meson_build mpv "$s" --default-library=shared \
   -Dwin32-threads=enabled -Dvector=enabled -Dwasapi=enabled -Dzlib=enabled -Dzimg=enabled -Dlibavdevice=enabled \
   -Dgl=enabled -Dgl-win32=enabled -Dgl-dxinterop=enabled \
   -Dd3d-hwaccel=enabled -Dd3d9-hwaccel=enabled -Dgl-dxinterop-d3d9=enabled -Dcuda-hwaccel=enabled -Dcuda-interop=enabled
-features=$(sed -n 's/.*List of enabled features: //p' "$WORK/build/mpv/meson-logs/meson-log.txt" | head -1)
+features=$(grep -m1 'List of enabled features: ' "$WORK/build/mpv/meson-logs/meson-log.txt" | sed 's/.*List of enabled features: //')
 want='cuda-hwaccel cuda-interop d3d-hwaccel d3d9-hwaccel dos-paths dxgi-debug-d3d11 ffmpeg ffnvcodec gl gl-dxinterop gl-dxinterop-d3d9 gl-win32 glob glob-win32 libass libavdevice libplacebo vector wasapi win32 win32-desktop win32-threads zimg zimg-st428 zlib'
 [[ $features == "$want" ]] || die "mpv 的功能跟預期不同：$features"; endgroup
 
@@ -170,7 +171,10 @@ python3 "$BUNDLE/build/notices.py" "$PINS" "$pkg"
 { echo "$ID"
   echo "toolchain: $(jq -r '.toolchain | "\(.name) \(.version) sha256:\(.sha256)"' "$PINS")"
   echo "runner: ${ImageOS:-} ${ImageVersion:-}"
-  for t in "$CC" meson ninja nasm pkg-config python3 autoconf automake libtoolize; do printf '%s: ' "$t"; "$t" --version 2>&1 | head -1; done
+  # 不用「| head -1」：讀到第一行就關掉管線，有些工具會當成寫入錯誤而失敗
+  for t in "$CC" meson ninja nasm pkg-config python3 autoconf automake libtoolize; do
+    v=$("$t" --version 2>&1); printf '%s: %s\n' "$t" "${v%%$'\n'*}"
+  done
   echo; echo "FFmpeg configure: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"$/\1/p' "$b/config.h")"
   echo; echo "mpv enabled features: $features"
   echo; (cd "$pkg" && sha256sum libmpv-2.dll libmpv.dll.a)
