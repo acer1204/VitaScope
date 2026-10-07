@@ -33,6 +33,11 @@ jobs:
     outputs:
       id: ${{ steps.id.outputs.id }}
     steps:
+      - name: 發佈前一定要確認兩次建置逐位元相同
+        if: inputs.publish && !inputs.repro_check
+        run: |
+          echo "::error::發佈時要同時勾選 repro_check（建置兩次，確認逐位元相同）"
+          exit 1
       - uses: actions/checkout@v5
       - id: id
         run: echo "id=vitascope-libmpv-$(jq -r '"\(.platform)-\(.build_id)"' packaging/macos/libmpv/pins.json)" >> "$GITHUB_OUTPUT"
@@ -171,7 +176,7 @@ jobs:
   publish:
     name: 發佈
     if: inputs.publish
-    needs: [sources, build, test]
+    needs: [sources, build, test, reproducible]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
