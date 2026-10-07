@@ -18,12 +18,17 @@ LINUXDEPLOY_SHA256=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270
 # AppImage 開頭的執行環境也釘住版本（不指定會下載會變動的 continuous）
 RUNTIME_URL=https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
 RUNTIME_SHA256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+RUNTIME_COMMIT=dd6cebedcbddde9c82f89b011e8e1d40b6e43868   # 20251108 這個 tag 指向的 commit（授權聲明寫原始碼位置用）
 export APPIMAGE_EXTRACT_AND_RUN=1 NO_STRIP=1   # runner 不保證有 FUSE；libmpv.so.2 已經 strip 過
 [[ -f $vendor/lib/libmpv.so.2 ]] || die "找不到 $vendor/lib/libmpv.so.2，請先執行 bash scripts/fetch-libmpv.sh"
 work=$(mktemp -d); app=$work/AppDir
 mkdir -p "$(dirname "$out")"
-ld=$work/linuxdeploy; runtime=$work/runtime-x86_64
+ld=$work/linuxdeploy.AppImage; runtime=$work/runtime-x86_64
 curl -sSfL --retry 3 -o "$ld" "$LINUXDEPLOY_URL"; echo "$LINUXDEPLOY_SHA256  $ld" | sha256sum -c -; chmod +x "$ld"
+# 解開來用：最後一步要直接呼叫裡面的 AppImage 外掛
+( cd "$work" && "$ld" --appimage-extract >/dev/null )
+ld=$work/squashfs-root/AppRun; plugin=$work/squashfs-root/usr/bin/linuxdeploy-plugin-appimage
+[[ -x $ld && -x $plugin ]] || die "linuxdeploy 解開後找不到 AppRun 或 linuxdeploy-plugin-appimage"
 curl -sSfL --retry 3 -o "$runtime" "$RUNTIME_URL"; echo "$RUNTIME_SHA256  $runtime" | sha256sum -c -
 # libpulse、libva、OpenSSL 要跟使用者的系統（音效伺服器、顯示卡驅動、安全性更新）一致：每次執行 linuxdeploy 都要排除
 excl=(--exclude-library 'libpulse.so*' --exclude-library 'libva.so*' --exclude-library 'libva-drm.so*'
@@ -51,9 +56,18 @@ for l in libxkbcommon-x11.so.0 libXcursor.so.1 libXi.so.6 libwayland-cursor.so.0
 LD_LIBRARY_PATH=$ldpath "$ld" --appdir "$app" --executable "$bin" \
   --desktop-file "$pkg/$id.desktop" --icon-file "$icons/$id.png" --custom-apprun "$pkg/AppRun" \
   "${libs[@]}" "${excl[@]}"
-bid() { readelf -n "$1" | awk '/Build ID/ {print $3}'; }
-[[ $(bid "$app/usr/lib/libmpv.so.2") == "$(bid "$vendor/lib/libmpv.so.2")" ]] || die "AppImage 裡的 libmpv.so.2 不是 vendor 的那一份"
+# linuxdeploy 會替 usr/lib 的每個函式庫加上 RUNPATH=$ORIGIN（patchelf）。本專案建置的 libmpv.so.2 換回原檔，
+# 跟 prerelease 的檔案逐位元相同（它依賴的都是系統的函式庫或替身，不需要 RUNPATH）；替身最後才放進去，不經過 linuxdeploy
+cp "$vendor/lib/libmpv.so.2" "$app/usr/lib/libmpv.so.2"
 cp -r "$vendor/fallback/." "$app/usr/lib/fallback/"
+same_as_vendor() { # AppDir 的 usr/lib → 跟 vendor 逐位元比對 libmpv.so.2 與替身
+  cmp "$1/libmpv.so.2" "$vendor/lib/libmpv.so.2" || die "AppImage 裡的 libmpv.so.2 跟 prerelease 的不同"
+  local f
+  for f in "$vendor"/fallback/*/*; do
+    cmp "$1/fallback/${f#"$vendor/fallback/"}" "$f" || die "AppImage 裡的替身 ${f#"$vendor/"} 跟 prerelease 的不同"
+  done
+}
+same_as_vendor "$app/usr/lib"
 # 授權：libmpv.so.2 的元件清單與條文 → 其餘 Ubuntu 套件 → AppImage 執行環境
 cp "$vendor/THIRD-PARTY-LINUX.md" "$doc/"; cp -r "$vendor/licenses" "$doc/licenses"
 bash "$repo/packaging/linux-third-party.sh" "$app" "$doc/THIRD-PARTY-LINUX.md" libmpv.so.2 'fallback/*'
@@ -61,12 +75,17 @@ cat >> "$doc/THIRD-PARTY-LINUX.md" <<EOF
 
 ## AppImage 執行環境
 
-AppImage 檔案開頭的執行環境是 [AppImage/type2-runtime](https://github.com/AppImage/type2-runtime)
-（$RUNTIME_URL，SHA-256 \`$RUNTIME_SHA256\`；MIT），其中靜態連結了 libfuse3（LGPL-2.1）、squashfuse（BSD-2-Clause）、
-zstd、zlib 與 musl（MIT）。原始碼與確切版本見上面的連結。
+AppImage 檔案開頭的執行環境是 [AppImage/type2-runtime](https://github.com/AppImage/type2-runtime) 的 20251108 版
+（commit \`$RUNTIME_COMMIT\`；$RUNTIME_URL，SHA-256 \`$RUNTIME_SHA256\`；MIT）。其中靜態連結了 libfuse 3.15.0（LGPL-2.1，
+含 type2-runtime 的修正檔）、squashfuse 0.5.2（BSD-2-Clause），以及 Alpine Linux 3.21 的 zstd（BSD-3-Clause 或 GPL-2.0）、
+zlib（Zlib）與 musl（MIT）。建置腳本與修正檔：https://github.com/AppImage/type2-runtime/tree/$RUNTIME_COMMIT
+（\`scripts/\`、\`patches/\`；各元件的下載位置與 SHA-256 寫在 \`scripts/common/install-dependencies.sh\`）。
 EOF
-( cd "$(dirname "$out")" && LD_LIBRARY_PATH=$ldpath LDAI_OUTPUT=$(basename "$out") LDAI_RUNTIME_FILE=$runtime \
-    "$ld" --appdir "$app" "${excl[@]}" --output appimage )
+# 直接用 AppImage 外掛打包：再跑一次 linuxdeploy（--output appimage）又會改動 libmpv.so.2 與替身
+( cd "$(dirname "$out")" && LDAI_OUTPUT=$(basename "$out") LDAI_RUNTIME_FILE=$runtime "$plugin" --appdir "$app" )
+# 打包好的 AppImage 裡也要是原檔
+( cd "$work" && rm -rf squashfs-root && "$out" --appimage-extract 'usr/lib/*' >/dev/null )
+same_as_vendor "$work/squashfs-root/usr/lib"
 # usr/lib 只能有這些（第一次執行後定案）
 got=$(cd "$app/usr/lib" && find . -name '*.so*' \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)
 want=$(printf '%s\n' fallback/pulse/libpulse.so.0 fallback/va-drm/libva-drm.so.2 fallback/va/libva.so.2 \

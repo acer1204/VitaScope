@@ -12,10 +12,10 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定�
 
 | 平台 | 內含方式 | 元件清單與授權條文 |
 |---|---|---|
-| Windows | 程式資料夾的 `libmpv-2.dll`（prerelease `libmpv-win64-r1`） | 同資料夾的 `THIRD-PARTY-WINDOWS.md`、`licenses/` |
-| macOS | `VitaScope.app/Contents/Frameworks/libmpv.2.dylib`（prerelease `libmpv-macos-arm64-r1`；只依賴 macOS 內建的函式庫） | `VitaScope.app/Contents/Resources/THIRD-PARTY-MACOS.md`、`Contents/Resources/licenses/` |
+| Windows | 程式資料夾的 `libmpv-2.dll`（prerelease `libmpv-win64-rN`，確切的 rN 見清單檔） | 同資料夾的 `THIRD-PARTY-WINDOWS.md`、`licenses/` |
+| macOS | `VitaScope.app/Contents/Frameworks/libmpv.2.dylib`（prerelease `libmpv-macos-arm64-rN`；只依賴 macOS 內建的函式庫） | `VitaScope.app/Contents/Resources/THIRD-PARTY-MACOS.md`、`Contents/Resources/licenses/` |
 | Linux（tar.gz） | 不內含，使用系統安裝的 libmpv | 各發行版的套件 |
-| Linux（AppImage） | `usr/lib/libmpv.so.2`（prerelease `libmpv-linux-x64-r1`）；另有 winit / glutin 執行時載入的 Ubuntu 24.04 視窗函式庫（libxkbcommon、libxkbcommon-x11、libxcb-xkb、libXcursor、libXi、libXext、libXfixes、libXrender、libwayland-cursor、libwayland-egl）、系統沒有 PulseAudio / libva 時用的替身函式庫，以及檔案開頭的 AppImage 執行環境 | AppImage 的 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`、`licenses/`；Ubuntu 套件的 copyright 檔在 `usr/share/doc/<套件>/`，參照的授權全文在 `usr/share/common-licenses/` |
+| Linux（AppImage） | `usr/lib/libmpv.so.2`（prerelease `libmpv-linux-x64-rN`）；另有 winit / glutin 執行時載入的 Ubuntu 24.04 視窗函式庫（libxkbcommon、libxkbcommon-x11、libxcb-xkb、libXcursor、libXi、libXext、libXfixes、libXrender、libwayland-cursor、libwayland-egl）、系統沒有 PulseAudio / libva 時用的替身函式庫，以及檔案開頭的 AppImage 執行環境 | AppImage 的 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`、`licenses/`；Ubuntu 套件的 copyright 檔在 `usr/share/doc/<套件>/`（參照到的授權全文如果有，在 `usr/share/common-licenses/`） |
 
 主要元件的授權：
 
@@ -26,10 +26,10 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定�
 | libplacebo | LGPL-2.1-or-later | https://code.videolan.org/videolan/libplacebo |
 | libass | ISC | https://github.com/libass/libass |
 | FreeType | FreeType License（FTL） | https://freetype.org |
-| HarfBuzz | MIT | https://github.com/harfbuzz/harfbuzz |
+| HarfBuzz | MIT-Modern-Variant AND MIT | https://github.com/harfbuzz/harfbuzz |
 | FriBidi | LGPL-2.1-or-later | https://github.com/fribidi/fribidi |
 | libunibreak | Zlib | https://github.com/adah1972/libunibreak |
-| dav1d | BSD-2-Clause | https://code.videolan.org/videolan/dav1d |
+| dav1d | BSD-2-Clause AND ISC | https://code.videolan.org/videolan/dav1d |
 | zimg | WTFPL | https://github.com/sekrit-twc/zimg |
 | zlib | Zlib | https://zlib.net |
 | nv-codec-headers（Windows、Linux） | MIT | https://github.com/FFmpeg/nv-codec-headers |
@@ -51,6 +51,11 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定�
 - 如果任何連結失效、無法取得某個版本安裝包所含元件的對應原始碼，請到
   https://github.com/acer1204/VitaScope/issues 提出，我們會提供完整的對應原始碼。
   只要該版本的安裝包還在提供下載，這個承諾就有效（之後也至少再三年）。
+
+## Windows 執行檔的編譯器執行庫
+
+Windows 的 `vitascope.exe` 以 MinGW-w64（GCC）編譯，靜態連結了 mingw-w64 的執行庫（授權條文在 `licenses/mingw-w64/`）
+與 GCC 的執行庫（GCC Runtime Library Exception，沒有另外的散布條件）。
 
 ## Rust 套件與內建字型
 

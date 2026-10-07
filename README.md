@@ -336,4 +336,5 @@ packaging/
 [GPL-3.0-or-later](LICENSE)。
 
 安裝包內含的 libmpv（mpv 與 FFmpeg 等）由本專案從原始碼建置，依 LGPL-2.1-or-later 散布，不會限制影戲本身的授權；
-各元件的版本、授權與對應原始碼見 [packaging/THIRD-PARTY-NOTICES.md](packaging/THIRD-PARTY-NOTICES.md)。
+各元件的版本、授權與對應原始碼見 [packaging/THIRD-PARTY-NOTICES.md](packaging/THIRD-PARTY-NOTICES.md)
+（安裝包裡是程式旁邊的 `THIRD-PARTY-NOTICES.md`）。

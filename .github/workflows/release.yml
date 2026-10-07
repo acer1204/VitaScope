@@ -139,6 +139,11 @@ jobs:
           $out = & "$dir/vitascope.exe" --version | Out-String
           if ($LASTEXITCODE -ne 0) { throw "打包後的程式無法執行：$out" }
           Write-Host $out
+          # 用的是本專案建置的 libmpv-2.dll（版本跟 components.json 一致）
+          $m = Get-Content vendor/libmpv/windows-x64/components.json -Raw | ConvertFrom-Json
+          $ver = { param($n) ($m.components | Where-Object name -eq $n).version }
+          if ($out -notmatch "(?m)^mpv v$([regex]::Escape((& $ver 'mpv')))\r?$") { throw "mpv 版本跟 components.json 不同" }
+          if ($out -notmatch "(?m)^FFmpeg $([regex]::Escape((& $ver 'ffmpeg')))\r?$") { throw "FFmpeg 版本跟 components.json 不同" }
           # 圖示與版本資訊有沒有嵌進去（檔案總管、工作管理員顯示的名稱）
           $info = (Get-Item "$dir/vitascope.exe").VersionInfo
           Write-Host "FileDescription=$($info.FileDescription) FileVersion=$($info.FileVersion)"
@@ -171,6 +176,12 @@ jobs:
           $out = & "$app\vitascope.exe" --version | Out-String
           if ($LASTEXITCODE -ne 0) { throw "安裝後無法執行：$out" }
           Write-Host $out
+          # 授權檔要跟程式一起裝上
+          foreach ($f in 'LICENSE', 'THIRD-PARTY-NOTICES.md', 'THIRD-PARTY-RUST.html', 'THIRD-PARTY-WINDOWS.md') {
+            if (-not (Test-Path "$app\$f")) { throw "安裝後沒有 $f" }
+          }
+          $n = (Get-ChildItem "$app\licenses" -File -Recurse).Count
+          if ($n -ne (Get-ChildItem "$dir\licenses" -File -Recurse).Count) { throw "安裝後的 licenses 少了檔案（$n 個）" }
           $keys = 'HKCU:\Software\Classes\VitaScope.Video\shell\open\command',
                   'HKCU:\Software\Classes\Applications\vitascope.exe',
                   'HKCU:\Software\VitaScope\Capabilities'
@@ -479,7 +490,7 @@ jobs:
           | | `VitaScope-@TAG@-windows-x64.zip`（免安裝） | 解壓縮後執行資料夾裡的 `vitascope.exe` |
           | macOS @MACOS_MIN@ 以上（Apple Silicon） | `VitaScope-@TAG@-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
           | | `VitaScope-@TAG@-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
-          | Linux（x64） | `VitaScope-@TAG@-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv；需要 glibc @APPIMAGE_GLIBC@ 以上與 OpenSSL 3（libssl3，桌面系統都有） |
+          | Linux（x64） | `VitaScope-@TAG@-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv；需要 glibc @APPIMAGE_GLIBC@ 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）與 OpenSSL 3（桌面系統都有） |
           | | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `./install.sh` 加入應用程式選單（`./install.sh --default` 設成預設播放器），或直接執行 `./vitascope` |
 
           **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」
@@ -499,7 +510,8 @@ jobs:
           （`THIRD-PARTY-NOTICES.md`、`THIRD-PARTY-RUST.html`；Windows 另有 `THIRD-PARTY-WINDOWS.md`，macOS 另有 `THIRD-PARTY-MACOS.md`，
           AppImage 另有 `usr/share/doc/vitascope/THIRD-PARTY-LINUX.md`）。
           Windows 的 `libmpv-2.dll`、macOS 的 `libmpv.2.dylib`、AppImage 的 `libmpv.so.2` 由本專案從原始碼建置，依 LGPL-2.1-or-later 散布；
-          完整對應原始碼為本頁的 `vitascope-libmpv-*-src.tar.xz`。
+          完整對應原始碼為本頁的 `vitascope-libmpv-*-src.tar.xz`。AppImage 開頭的執行環境（AppImage/type2-runtime，內含 LGPL-2.1 的 libfuse）
+          的版本與原始碼位置寫在 AppImage 裡的 `THIRD-PARTY-LINUX.md`。
 
           完整功能與開發進度見 [ROADMAP.md](https://github.com/acer1204/VitaScope/blob/@TAG@/ROADMAP.md)。
           EOF

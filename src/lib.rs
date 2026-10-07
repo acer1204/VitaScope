@@ -25,6 +25,7 @@ pub mod playlist;
 pub mod screenshot;
 pub mod settings;
 pub mod subs;
+pub mod syscmd;
 pub mod thumbs;
 pub mod update;
 pub mod video;

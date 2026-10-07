@@ -339,7 +339,7 @@ pub fn open_folder(dir: &Path) -> std::io::Result<()> {
     } else {
         "xdg-open"
     };
-    std::process::Command::new(program).arg(dir).spawn().map(|_| ())
+    crate::syscmd::command(program).arg(dir).spawn().map(|_| ())
 }
 
 #[cfg(test)]

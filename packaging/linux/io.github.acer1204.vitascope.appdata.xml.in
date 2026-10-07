@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- AppImage 的 AppStream 中繼資料（發佈流程把 @VERSION@、@DATE@ 換成實際的值，
+<!-- AppImage 的 AppStream 中繼資料（發佈流程把版本與日期的預留位置換成實際的值，
      放到 AppDir/usr/share/metainfo/io.github.acer1204.vitascope.appdata.xml） -->
 <component type="desktop-application">
   <id>io.github.acer1204.vitascope</id>

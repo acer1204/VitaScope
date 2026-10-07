@@ -477,6 +477,10 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   系統沒有時改用只有函式名稱的替身（`packaging/linux/libmpv/stubs.py`），讓 libmpv 載入得了。
 - **用檔名問 dpkg「這是哪個套件」會認錯**：AppImage 裡本專案建置的 `libmpv.so.2`、替身函式庫，跟 Ubuntu 套件的檔名一樣，
   `dpkg -S` 會把它們算成 Ubuntu 的 libmpv2、libpulse0；列授權清單時要先略過這些檔案。
+- **mpv 預設允許共用函式庫留下未定義的符號**（meson 的 `b_lundef=false`）：macOS 版少編譯一個檔案（`osdep/utils-mac.c`）時連結照樣成功，
+  選了音訊裝置、播到有聲音的影片才中止，自動測試的影片沒有聲音所以沒抓到。建置時要禁止（`-Db_lundef=true`），並用 `RTLD_NOW` 載入一次。
+- **linuxdeploy 會改動它整理的每個函式庫**（用 patchelf 加 RUNPATH）：要跟發佈的檔案逐位元相同的（本專案建置的 libmpv.so.2、替身），
+  要換回原檔，最後打包也不能再交給 linuxdeploy（直接用它內附的 AppImage 外掛），並逐位元比對。
 - **別人建置的函式庫要逐一查授權**：用來播放的 Windows 版 libmpv-2.dll 裡有 GPL-2.0-only 的 libzvbi，
   跟 GPL-3.0 的 FFmpeg、Apache-2.0 的 OpenSSL 不相容，散布出去就違反授權。改成自己從原始碼建置 LGPL 的 libmpv，
   只放影戲用得到的元件，每個元件固定版本、核對雜湊，Release 附完整對應原始碼。

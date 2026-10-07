@@ -41,7 +41,7 @@ fn fontconfig_lookup() -> Option<PathBuf> {
     if cfg!(target_os = "windows") {
         return None;
     }
-    let out = std::process::Command::new("fc-list")
+    let out = crate::syscmd::command("fc-list")
         .args(["-f", "%{file}\n", ":lang=zh-tw"])
         .output()
         .ok()?;

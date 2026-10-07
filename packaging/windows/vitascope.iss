@@ -48,7 +48,8 @@ DefaultDirName={autopf}\VitaScope
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0
+; libmpv-2.dll 用到 Windows 10 1607 才有的 API（AdjustWindowRectExForDpi、GetSystemMetricsForDpi）
+MinVersion=10.0.14393
 ; 安裝 / 解除安裝結束時通知檔案總管重新整理關聯與圖示
 ChangesAssociations=yes
 ; 影戲開著時先請使用者關掉（程式啟動時建立這個 mutex，見 src/main.rs）；
@@ -154,6 +155,10 @@ Filename: "{app}\{#ExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flag
 [UninstallRun]
 ; 安裝後才在程式裡打開的檔案關聯，安裝程式沒有記錄；讓程式自己全部移除（也會關掉設定裡的選項）
 Filename: "{app}\{#ExeName}"; Parameters: "--unregister-associations"; Flags: runhidden waituntilterminated; RunOnceId: "UnregisterAssociations"
+
+[InstallDelete]
+; 授權條文跟著 libmpv-2.dll 一起換：升級時先清掉，元件拿掉後不會留下舊的條文
+Type: filesandordirs; Name: "{app}\licenses"
 
 [UninstallDelete]
 ; %LOCALAPPDATA%\VitaScope 都是暫存（轉碼後的字幕、翻轉用的著色器、單一執行個體的鎖定檔）；

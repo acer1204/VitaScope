@@ -51,7 +51,7 @@
   - Linux AppImage（這一版新增）：內含的播放引擎只有一個 `libmpv.so.2`；OpenSSL 3（HTTPS 串流會檢查憑證）、PulseAudio、
     libva 用系統的，系統沒有 PulseAudio 或 libva 時照樣能播（音訊改走 ALSA、改用軟體解碼）。tar.gz 照舊使用系統的 libmpv。
   - 跟之前 Windows / macOS 版用的引擎相比，不再支援（有些原本只有其中一個平台支援）：Teletext 字幕、DASH 串流（`.mpd`）、
-    DVD / 藍光（ISO 或資料夾）、壓縮檔（zip / rar）裡的影片、AVS2 / AVS3 影像、MOD / XM 等音樂模組、日本數位電視的 ARIB 字幕、SRT / SFTP / FTP / MMS 串流協定、
+    DVD / 藍光（ISO 或資料夾）、壓縮檔（zip / rar）裡的影片、AVS2 / AVS3 影像、MOD / XM 等音樂模組、日本數位電視的 ARIB 字幕、SRT（Secure Reliable Transport）/ SFTP / FTP / MMS 串流協定、
     mpv 的 Lua / JavaScript 腳本。DASH 與藍光在之後做「開啟網址」、「DVD / 藍光」功能時再加回（見 ROADMAP）。
 
 ### 修正

@@ -8,9 +8,9 @@
 # 版本固定在下面的 tag 與 SHA-256（取自該 release 的 SHA256SUMS），更新時一起改。（macOS 內建的 bash 3.2 也能跑）
 set -euo pipefail
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64) plat=macos-arm64; tag=libmpv-macos-arm64-r1; ext=zip
-    sha=adb3f1cab124830c8f1d3c67b498f1fe650a2a1ed26dc98d01c70aae9f5e80b3
-    src_sha=f69356109c198b08cdcd2ac42514ef1533c1d8da5f70faf04bf0b693e1adef6f ;;
+  Darwin-arm64) plat=macos-arm64; tag=libmpv-macos-arm64-r2; ext=zip
+    sha=8bf980f3d202ec4d063c00b4a5b5fa9d72e9f56434923202fdc457a5c5155991
+    src_sha=cf3fcd16a05c842ce2eb4c0f693b45c1381ba27935d7155ae220c7b7cba70341 ;;
   Linux-x86_64) plat=linux-x64; tag=libmpv-linux-x64-r1; ext=tar.xz
     sha=317a28bdf0cbbdeef03ad94b4319b5db6558393f214798b36a9454688351818e
     src_sha=bec1f62bc646344458974424635b4a9457ffdab8af4143ec54f6b6ffc4d7e311 ;;

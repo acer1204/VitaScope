@@ -26,8 +26,7 @@ cat >> "$out" <<EOF
 ## 其他函式庫（${PRETTY_NAME} 的套件）
 
 以下函式庫來自 ${PRETTY_NAME} 的套件，位於 AppImage 的 \`usr/lib\`。
-各套件的授權（Debian 格式的 copyright 檔）在 AppImage 的 \`usr/share/doc/<套件>/copyright\`；
-其中參照的 \`/usr/share/common-licenses/…\`（GPL-2、LGPL-2.1 等全文）在 AppImage 的 \`usr/share/common-licenses/\`。
+各套件的授權（Debian 格式的 copyright 檔）在 AppImage 的 \`usr/share/doc/<套件>/copyright\`。
 原始碼可用 \`apt-get source <原始碼套件>=<版本>\` 取得，或到 https://launchpad.net/ubuntu/+source/<原始碼套件>/<版本> 下載。
 
 | 函式庫 | 二進位套件 | 原始碼套件 | 版本 |
@@ -86,6 +85,9 @@ while IFS= read -r f; do
   fi
 done < <(grep -rhoE '/usr/share/common-licenses/[A-Za-z0-9+_-]+([.][A-Za-z0-9+_-]+)*' "$doc" 2>/dev/null | sort -u)
 
+if [ "$licenses" -gt 0 ]; then
+  printf '\ncopyright 檔參照的 `/usr/share/common-licenses/…`（GPL-2、LGPL-2.1 等全文）在 AppImage 的 `usr/share/common-licenses/`。\n' >> "$out"
+fi
 count=$(grep -c '^| `' "$out" || true)
 echo "列出 $count 個函式庫、附上 $licenses 份授權全文（$missing 個找不到來源）"
 [ "$missing" -eq 0 ]
