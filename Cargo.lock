@@ -3269,6 +3269,7 @@ dependencies = [
  "libc",
  "libmpv2-sys",
  "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "png",
  "raw-window-handle",
@@ -3277,6 +3278,7 @@ dependencies = [
  "serde_json",
  "ureq",
  "windows-sys 0.61.2",
+ "x11-dl",
 ]
 
 [[package]]

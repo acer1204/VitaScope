@@ -42,6 +42,7 @@ ureq = "3"
 # 單一執行個體：具名管道、使用者 SID（只讓同一個使用者連線）、把前景交給已開啟的視窗
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
@@ -51,6 +52,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
+    "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -60,12 +62,19 @@ windows-sys = { version = "0.61", features = [
 # 單一執行個體：確認放 socket 的資料夾是自己的（geteuid）
 libc = "0.2"
 
+# Linux（X11）：啟動時查有哪些螢幕（上次的視窗位置在拔掉的螢幕上時不還原）；winit 本來就用它
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+x11-dl = "2.21"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+# 啟動時查有哪些螢幕（NSScreen）
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen"] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSAppleEventDescriptor",
     "NSAppleEventManager",
+    "NSEnumerator",
     "NSNotification",
     "NSString",
     "NSURL",

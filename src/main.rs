@@ -157,10 +157,19 @@ fn main() -> eframe::Result {
         viewport = viewport.with_icon(icon);
     }
     if let Some(g) = settings.window {
-        viewport = viewport
-            .with_inner_size(g.size)
-            .with_position(g.pos)
-            .with_maximized(g.maximized);
+        viewport = viewport.with_inner_size(g.size).with_maximized(g.maximized);
+        // 上次的位置在已經拔掉的螢幕上（或解析度變小了）時不還原，交給系統擺：不然視窗會開在看不到的地方
+        match vitascope::screens::areas() {
+            Some(areas) if !vitascope::screens::title_bar_visible(g.pos, g.size[0], &areas) => {
+                if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+                    eprintln!(
+                        "[vitascope] 上次的視窗位置 {:?} 不在任何螢幕上，改由系統決定（螢幕：{areas:?}）",
+                        g.pos
+                    );
+                }
+            }
+            _ => viewport = viewport.with_position(g.pos),
+        }
     }
     if settings.always_on_top {
         viewport = viewport.with_always_on_top();

@@ -22,6 +22,7 @@ pub mod mediainfo;
 pub mod mpv;
 pub mod player;
 pub mod playlist;
+pub mod screens;
 pub mod screenshot;
 pub mod settings;
 pub mod subs;
