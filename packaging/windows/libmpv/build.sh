@@ -87,7 +87,9 @@ group libass
 meson_build libass "$(src libass)" -Dfontconfig=disabled -Ddirectwrite=enabled -Dcoretext=disabled -Dlibunibreak=enabled \
   -Dasm=enabled -Drequire-system-font-provider=true -D{test,compare,profile,fuzz,checkasm}=disabled; endgroup
 group zimg
-s=$(src zimg); ( cd "$s" && ./autogen.sh ); STL_LIBS=-lc++ autotools_build "$s" --disable-testapp --disable-example --disable-unit-test; endgroup
+# zimg 3.0.6 的 api/zimg.cpp 用了 std::exception_ptr 卻沒有 #include <exception>（舊的標準函式庫會間接引入），
+# 新版 libc++ 不再間接引入：用編譯選項補上，原始碼不改
+s=$(src zimg); ( cd "$s" && ./autogen.sh ); STL_LIBS=-lc++ autotools_build "$s" --disable-testapp --disable-example --disable-unit-test   "CXXFLAGS=-O2 $MAP -include exception"; endgroup
 group nv-codec-headers
 make -C "$(src nv-codec-headers)" PREFIX="$PREFIX" install; endgroup
 group libplacebo
