@@ -8,8 +8,11 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use vitascope::app::{Launch, VitascopeApp};
+use vitascope::app::{Launch, PlatformProbe, VitascopeApp};
+use vitascope::pacing::{Plan, Reason, SmoothMode};
 use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
+use vitascope::power::PowerSource;
+use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::Settings;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -2665,4 +2668,215 @@ fn extra_options_count_as_user_overrides() {
     h.step();
     assert!(h.state().player().user_overrides().contains("deband"));
     assert_eq!(prop(&h, "deband"), "yes");
+}
+
+// ───────────── 流暢播放：偵測螢幕更新率與電源（只計算、只顯示） ─────────────
+
+/// 假的螢幕與電源（自動測試沒有真的視窗，查不到）
+struct FakePlatform {
+    hz: Option<f64>,
+    power: PowerSource,
+}
+
+impl PlatformProbe for FakePlatform {
+    fn refresh_rate(&self) -> Option<Refresh> {
+        self.hz.map(|hz| Refresh {
+            hz,
+            source: RefreshSource::DisplayConfig,
+        })
+    }
+    fn monitor_key(&self) -> Option<u64> {
+        Some(1)
+    }
+    fn power(&self) -> PowerSource {
+        self.power
+    }
+    fn remote_session(&self) -> bool {
+        false
+    }
+}
+
+/// 開一個影片，指定流暢播放的設定與假的螢幕（None = 跟真正的自動測試一樣沒有）；等到開始播放
+fn playing_with_platform(platform: Option<FakePlatform>, smooth: SmoothMode) -> Harness<'static, VitascopeApp> {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.smooth = smooth;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            platform: platform.map(|p| Box::new(p) as Box<dyn PlatformProbe>),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "開始播放", |s| {
+        s.loaded && !s.paused && s.time_pos > 0.0 && !s.tracks.is_empty()
+    });
+    h.run_steps(3);
+    h
+}
+
+/// 這一版只計算：mpv 的同步設定一個都不能變
+fn sync_options_untouched(h: &Harness<'_, VitascopeApp>) {
+    for name in ["video-sync", "display-fps-override"] {
+        let default = prop(h, &format!("option-info/{name}/default-value"));
+        assert_eq!(prop(h, name), default, "{name} 不能被改掉");
+    }
+    assert_eq!(prop(h, "video-sync"), "audio");
+    assert!(!h.state().player().state.display_sync_active);
+}
+
+#[test]
+fn pacing_status_with_fake_probe() {
+    let mut h = playing_with_platform(
+        Some(FakePlatform {
+            hz: Some(119.88),
+            power: PowerSource::Ac,
+        }),
+        SmoothMode::Auto,
+    );
+    let status = h.state().pacing_status().clone();
+    assert_eq!(
+        status.plan,
+        Some(Plan::Display {
+            hz: 119.88,
+            vdrop: false
+        }),
+        "{status:?}"
+    );
+    assert_eq!(status.refresh.map(|r| r.hz), Some(119.88));
+    assert_eq!(status.power, PowerSource::Ac);
+    assert!(!status.applied);
+    assert_eq!(status.describe(), "可以使用：119.880 Hz（尚未啟用）");
+    sync_options_untouched(&h);
+    // 開檔時通知了防呆（「跟不上」只算這個檔案）
+    assert_eq!(h.state().pacing_guard_file(), 1);
+    // 媒體資訊面板的「播放流暢度」
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("播放流暢度");
+    h.get_by_label_contains("螢幕更新率：119.880 Hz（QueryDisplayConfig）");
+    h.get_by_label_contains("電源：接上電源");
+    h.get_by_label_contains("流暢播放：可以使用：119.880 Hz");
+    sync_options_untouched(&h);
+}
+
+#[test]
+fn fake_probe_battery() {
+    let h = playing_with_platform(
+        Some(FakePlatform {
+            hz: Some(119.88),
+            power: PowerSource::Battery,
+        }),
+        SmoothMode::Auto,
+    );
+    let status = h.state().pacing_status();
+    assert_eq!(status.plan, Some(Plan::Audio(Reason::Battery)), "{status:?}");
+    assert_eq!(status.describe(), "未使用：使用電池中");
+    sync_options_untouched(&h);
+    // 「一直開」：用電池也會用
+    let h = playing_with_platform(
+        Some(FakePlatform {
+            hz: Some(119.88),
+            power: PowerSource::Battery,
+        }),
+        SmoothMode::Always,
+    );
+    assert!(matches!(h.state().pacing_status().plan, Some(Plan::Display { .. })));
+    sync_options_untouched(&h);
+}
+
+#[test]
+fn no_probe_no_refresh() {
+    // 預設設定（流暢播放關）
+    let h = playing_with_platform(None, SmoothMode::default());
+    let status = h.state().pacing_status();
+    assert_eq!(status.plan, Some(Plan::Audio(Reason::Setting)), "{status:?}");
+    assert_eq!(status.refresh, None);
+    sync_options_untouched(&h);
+    // 打開了，但自動測試的視窗查不到更新率
+    let mut h = playing_with_platform(None, SmoothMode::Auto);
+    let status = h.state().pacing_status();
+    assert_eq!(status.plan, Some(Plan::Audio(Reason::NoRefresh)), "{status:?}");
+    assert_eq!(status.describe(), "未使用：偵測不到這個螢幕的更新率");
+    sync_options_untouched(&h);
+    // 複製媒體資訊也有這幾行
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    click_context_item(&mut h, "複製媒體資訊");
+    let copied = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+        .expect("有複製到剪貼簿");
+    assert!(
+        copied.contains("播放流暢度")
+            && copied.contains("螢幕更新率：偵測不到")
+            && copied.contains("流暢播放：未使用：偵測不到這個螢幕的更新率"),
+        "{copied}"
+    );
+}
+
+#[test]
+fn pacing_status_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.smooth = SmoothMode::Auto;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            platform: Some(Box::new(FakePlatform {
+                hz: None,
+                power: PowerSource::Unknown,
+            })),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "開始播放", |s| s.loaded && s.time_pos > 0.0);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label_contains("Smoothness");
+    h.get_by_label_contains("Refresh rate: not detected");
+    h.get_by_label_contains("Power: Unknown (treated as plugged in)");
+    h.get_by_label_contains("Smooth playback: Not in use: can't detect this screen's refresh rate");
+}
+
+#[test]
+fn user_sync_options_stand_down() {
+    // VITASCOPE_MPV_OPTS（Options.extra）自己指定了同步方式或更新率：流暢播放完全不管，使用者的值留著
+    for (name, value) in [("video-sync", "desync"), ("display-fps-override", "59.940000")] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.smooth = SmoothMode::Auto;
+        let mut h = harness_launch_with(
+            Options {
+                extra: vec![(name.into(), value.into())],
+                ..Options::headless()
+            },
+            Launch {
+                files: vec![sample("common/mkv_multitrack.mkv")],
+                platform: Some(Box::new(FakePlatform {
+                    hz: Some(119.88),
+                    power: PowerSource::Ac,
+                })),
+                ..Default::default()
+            },
+            settings,
+        );
+        step_until(&mut h, "開始播放", |s| {
+            s.loaded && s.time_pos > 0.0 && !s.tracks.is_empty()
+        });
+        h.run_steps(3);
+        let status = h.state().pacing_status();
+        assert_eq!(status.plan, Some(Plan::Untouched), "{name}：{status:?}");
+        assert_eq!(status.describe(), "已由 VITASCOPE_MPV_OPTS 指定");
+        assert_eq!(prop(&h, name), value, "{name}");
+    }
 }

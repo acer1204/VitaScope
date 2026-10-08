@@ -11,6 +11,22 @@ use std::sync::Arc;
 /// 取得 OpenGL 函式位址的函式（eframe 的 `CreationContext::get_proc_address`）。
 pub type GetProcAddress = Arc<dyn Fn(&CStr) -> *const c_void + Send + Sync>;
 
+/// 下一個影格的資訊（`MPV_RENDER_PARAM_NEXT_FRAME_INFO`）：決定這一輪要不要先等一下再取影格
+/// （見 `pacing::defer`）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameInfo {
+    /// 有影格要顯示
+    pub present: bool,
+    /// 只是重繪同一格（例如視窗大小變了）
+    pub redraw: bool,
+    /// 重複顯示上一格（顯示同步時一格顯示好幾次更新）
+    pub repeat: bool,
+    /// mpv 要我們等垂直同步（顯示同步中）：馬上畫，不用等
+    pub block_vsync: bool,
+    /// 應該顯示的時間，mpv 原始的值（`mp_time_ns` 單位；0 = 沒有指定）
+    pub target_raw: i64,
+}
+
 pub struct RenderContext {
     ctx: *mut sys::mpv_render_context,
     // mpv 可能在之後（例如第一次啟用硬體解碼時）才查詢 GL 函式，

@@ -45,7 +45,13 @@ impl VitascopeApp {
             });
         }
         let cache = self.info_cache.as_ref().expect("剛讀過");
-        mediainfo::sections(&cache.info, &cache.live)
+        let mut sections = mediainfo::sections(&cache.info, &cache.live);
+        // 螢幕更新率、電源、流暢播放的狀態（跟著每一幀更新，不用快取）
+        sections.push((
+            crate::tr!("播放流暢度", "Smoothness"),
+            self.pacing_status().info_lines(),
+        ));
+        sections
     }
 
     /// 畫在影片畫面的左上角（不接收滑鼠，點下去還是暫停 / 播放）

@@ -2,6 +2,7 @@
 
 mod capture;
 mod info_panel;
+mod pacing;
 mod playlist_panel;
 mod preview;
 mod settings_window;
@@ -29,6 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub use pacing::{PacingStatus, PlatformProbe};
 
 pub const APP_NAME: &str = "影戲 VitaScope";
 
@@ -272,6 +275,8 @@ pub struct VitascopeApp {
     picture_defaults: PictureDefaults,
     /// 已送出、還沒回覆的非同步設定：指令編號 → 選項名稱（失敗時提示用）
     async_pending: HashMap<u64, String>,
+    /// 流暢播放：螢幕更新率、電源、決定
+    pacing: pacing::PacingCtl,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -324,6 +329,8 @@ pub struct Launch {
     pub persist_playlist: bool,
     /// 單一執行個體：自己是主視窗時，收別的程式送來的檔案
     pub instance: Option<crate::instance::Primary>,
+    /// 查螢幕更新率、電源的方法；None = 問作業系統（自動測試沒有視窗，查不到）
+    pub platform: Option<Box<dyn PlatformProbe>>,
 }
 
 impl VitascopeApp {
@@ -378,6 +385,17 @@ impl VitascopeApp {
         if let Some(msg) = &fatal {
             eprintln!("[vitascope] {msg}");
         }
+        let owner = Owner::from_creation(cc);
+        // 自動測試沒有真的視窗（沒有 handle），查不到更新率，跟以前一樣播放
+        let probe = launch
+            .platform
+            .or_else(|| owner.map(|o| Box::new(pacing::RealProbe::new(o.window)) as Box<dyn PlatformProbe>));
+        let user_sync = mpv_opts_override(&player, "video-sync") || mpv_opts_override(&player, "display-fps-override");
+        let pacing = pacing::PacingCtl::new(
+            probe,
+            user_sync,
+            crate::pacing::parse_overrides(std::env::var("VITASCOPE_PACING").ok().as_deref()),
+        );
 
         let mut app = Self {
             player,
@@ -443,7 +461,7 @@ impl VitascopeApp {
             attention_at: None,
             playlist_follow: None,
             playlist_view: (0.0, 0.0),
-            owner: Owner::from_creation(cc),
+            owner,
             was_fullscreen: false,
             reapply_level_at: None,
             settings_open: false,
@@ -457,6 +475,7 @@ impl VitascopeApp {
             caps: EngineCaps::default(),
             picture_defaults: PictureDefaults::default(),
             async_pending: HashMap::new(),
+            pacing,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -1398,6 +1417,7 @@ impl VitascopeApp {
                 // 自動存檔從開檔起重新計時（不然停在起始畫面很久再開檔，第一幀就會存到 0）
                 self.last_autosave = Instant::now();
                 self.file_gen += 1;
+                self.pacing.start_file(self.file_gen);
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
             PlayerEvent::CommandReply { id, error } => match crate::player::async_key(id) {
@@ -1444,6 +1464,8 @@ impl VitascopeApp {
                 }
             }
             PlayerEvent::PlaybackRestart => {
+                // 跳轉完成（開檔後開始播放也是）：流暢播放的量測重新開始
+                self.pacing.seeked();
                 if let Some(shot) = &mut self.autoshot {
                     shot.arm();
                 }
@@ -1452,6 +1474,7 @@ impl VitascopeApp {
                     self.seek_released = false;
                 }
             }
+            PlayerEvent::Seek => self.pacing.seeked(),
             PlayerEvent::EndFile { error, .. } => {
                 self.fit_window_pending = false;
                 self.seek_drag = None;
@@ -3185,6 +3208,10 @@ impl eframe::App for VitascopeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         for ev in self.player.poll() {
             self.on_player_event(ev);
+        }
+        // 視窗出現之後才有螢幕可查
+        if self.frames >= 2 {
+            self.pacing_tick(ctx);
         }
         self.poll_playlist_scan();
         self.poll_screenshots(ctx);

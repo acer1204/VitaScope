@@ -24,6 +24,7 @@ pub mod pacing;
 pub mod picture;
 pub mod player;
 pub mod playlist;
+pub mod power;
 pub mod screens;
 pub mod screenshot;
 pub mod settings;
