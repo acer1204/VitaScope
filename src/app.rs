@@ -878,6 +878,10 @@ impl VitascopeApp {
             // 不會有 StartFile 了：舊檔案照樣在播，畫面調整要繼續同步；濾鏡鏈照舊檔案的音軌
             self.switching_file = false;
             self.sound_file_loaded();
+        } else {
+            // 再取消一次暫停：舊檔案播完停在最後一格時（keep-open 會暫停），開檔前的取消暫停
+            // 會被 mpv 在 loadfile 生效前又暫停回去，新檔案就停著不播。loadfile 之後舊檔案已經在結束，不會再暫停
+            let _ = self.player.set_pause(false);
         }
     }
 

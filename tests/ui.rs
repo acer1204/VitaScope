@@ -6592,3 +6592,18 @@ fn loading_a_passthrough_audio_file_clears_the_eq_chain() {
     assert_eq!(prop(&h, "af"), "");
     assert_eq!(disabled_filters(&h), Vec::<String>::new());
 }
+
+#[test]
+fn dropping_a_file_after_the_end_plays_it() {
+    // 播完停在最後一格（keep-open 會暫停）之後拖進新檔：新檔要直接播放，不能沿用暫停
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    let _ = h.state().player().seek_to(1e9, true);
+    step_until(&mut h, "播完停在最後一格", |s| s.eof && s.paused);
+    drop_file(&mut h, sample("common/mkv_multitrack.mkv"));
+    step_until(&mut h, "新檔開始播放", |s| playing(s, "mkv_multitrack.mkv"));
+    wait_real(&mut h, 0.5);
+    assert!(!h.state().player().state.paused, "新檔不應該是暫停的");
+}
