@@ -6,12 +6,13 @@
   samples/generated/manifest.json       測試程式（tests/formats.rs）讀這份清單比對預期結果
   samples/generated/general/dash_h264_aac/manifest.mpd   本機的 DASH（不在 manifest.json；tests/engine_build.rs 用）
   samples/generated/pacing/pan_23976.mkv  流暢播放的實機測試（tests/pacing_window.rs）；只有 --tier pacing 才產生
+  samples/generated/pacing/pan_4k10.mkv   同上，4K 10-bit（軟體解碼、GPU 畫一格比較久）
 
 用法：
   python scripts/gen_samples.py                 # 產生全部等級
   python scripts/gen_samples.py --tier common   # 只產生「常見」
   python scripts/gen_samples.py --force         # 已存在也重新產生
-  python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p 平移影片（約 20 MB，CI 不需要）
+  python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p、4K 平移影片（約 20 MB + 50 MB，CI 不需要）
 
 需要 FFmpeg 7.1 以上的 full build（VVC 樣本需要 libvvenc）。
 FFmpeg 無法編碼的格式（VC-1、RV40、PGS、Dolby Vision…）請把公開樣本放到 samples/external/。
@@ -566,31 +567,42 @@ def generate_dash(force: bool) -> str | None:
 # 1920×1080、23.976 fps、20 秒：每格往左平移 16 像素，左上角是影格編號。
 # 卡頓（某一格多停一次更新）在平移的畫面上最明顯；tests/pacing_window.rs 用 mpv 的記錄算每格顯示幾次更新
 PACING = OUT / "pacing" / "pan_23976.mkv"
+# 同上，3840×2160 10-bit H.264、16 秒：顯示卡不能硬體解碼（軟體解碼，render 要上傳大貼圖），
+# GPU 畫一格比較久；比較畫面輸出挑時間取影格時 GPU 來不來得及（tests/pacing_window.rs）
+PACING_4K = OUT / "pacing" / "pan_4k10.mkv"
 
 
 def generate_pacing(force: bool) -> str | None:
-    if PACING.exists() and not force:
-        print("  略過  pacing  pan_23976（已存在）")
+    err = generate_pan(PACING, 1920, 1080, 20, ["-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"], force)
+    if err:
+        return err
+    return generate_pan(PACING_4K, 3840, 2160, 16, ["-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p10le"],
+                        force)
+
+
+def generate_pan(out: Path, w: int, h: int, secs: int, enc: list[str], force: bool) -> str | None:
+    if out.exists() and not force:
+        print(f"  略過  pacing  {out.stem}（已存在）")
         return None
-    PACING.parent.mkdir(parents=True, exist_ok=True)
-    pan = r"crop=1920:1080:x='mod(n*16\,1920)':y=0"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pan = rf"crop={w}:{h}:x='mod(n*{w // 120}\,{w})':y=0"
     font = find_font()
     cwd = None
     if font is not None:
         # 在字型的資料夾裡執行、只給檔名：Windows 路徑的「C:」在濾鏡參數裡要跳脫
         cwd = font.parent
-        pan += (f",drawtext=fontfile={font.name}:text='%{{frame_num}}':fontsize=120:fontcolor=white"
+        pan += (f",drawtext=fontfile={font.name}:text='%{{frame_num}}':fontsize={h // 9}:fontcolor=white"
                 ":box=1:boxcolor=black@0.7:boxborderw=16:x=60:y=60")
     r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                        "-f", "lavfi", "-i", "testsrc2=size=3840x1080:rate=24000/1001:duration=20",
-                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=20",
+                        "-f", "lavfi", "-i", f"testsrc2=size={2 * w}x{h}:rate=24000/1001:duration={secs}",
+                        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={secs}",
                         "-map", "0:v", "-map", "1:a", "-vf", pan,
-                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", "48", "-pix_fmt", "yuv420p",
-                        *AAC, str(PACING)],
+                        "-c:v", "libx264", *enc, "-g", "48",
+                        *AAC, str(out)],
                        cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"ffmpeg exit {r.returncode}"
-    print("  完成  pacing  pan_23976")
+    print(f"  完成  pacing  {out.stem}")
     return None
 
 
@@ -629,7 +641,7 @@ def main() -> int:
     if args.tier == "pacing":
         err = generate_pacing(args.force)
         if err:
-            print(f"  失敗  pacing  pan_23976: {err}")
+            print(f"  失敗  pacing: {err}")
             return 2
         return 0
 

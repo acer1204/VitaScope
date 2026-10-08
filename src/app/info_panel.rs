@@ -52,6 +52,7 @@ impl VitascopeApp {
         // 螢幕更新率、電源、流暢播放的狀態（跟著每一幀更新，不用快取），加上 mpv 的顯示同步數字（每秒讀一次）
         let mut smooth = self.pacing_status().info_lines();
         smooth.extend(mediainfo::sync_lines(&cache.live));
+        smooth.extend(self.render_line());
         sections.push((crate::tr!("播放流暢度", "Smoothness"), smooth));
         sections
     }

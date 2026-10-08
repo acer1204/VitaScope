@@ -3,7 +3,9 @@
 //! 預設關閉；做法沒變就不送任何設定，所以沒打開的使用者 mpv 的選項完全不動。
 
 use super::VitascopeApp;
-use crate::pacing::{self as rules, Guard, Inputs, Overrides, Plan, Reason, SmoothMode, Verdict};
+use crate::pacing::{
+    self as rules, Guard, Inputs, Overrides, Plan, Presents, Reason, RenderStats, SmoothMode, Verdict,
+};
 use crate::player::AsyncKey;
 use crate::power::{self, PowerSource};
 use crate::screens::{self, Refresh};
@@ -26,6 +28,8 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 const HIDDEN_TICK: Duration = Duration::from_millis(40);
 /// 設定頁上的「每格幾次更新」多久讀一次
 const NUMBERS_EVERY: Duration = Duration::from_secs(1);
+/// VITASCOPE_DEBUG=pacing：畫面輸出的統計多久印一次
+const RENDER_LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// 查螢幕、電源的方法（自動測試換成假的）
 pub trait PlatformProbe {
@@ -336,6 +340,22 @@ pub(super) struct PacingCtl {
     monitor_size: Option<egui::Vec2>,
     /// 上一幀防呆有在量（依螢幕同步、播放中、看得到）
     sampling: bool,
+    render_log: RenderLog,
+}
+
+/// VITASCOPE_DEBUG=pacing：每 10 秒印一次畫面輸出的統計
+#[derive(Default)]
+struct RenderLog {
+    enabled: bool,
+    /// 第一格畫出來的時間
+    first: Option<Instant>,
+    /// 這一段從什麼時候開始（第一格畫出來 1 秒之後才開始算）
+    since: Option<Instant>,
+    /// 上一段結束時的累計數字
+    prev: RenderStats,
+    /// mpv 的 avsync（每秒讀一次，秒）
+    avsync: Vec<f64>,
+    avsync_read: Option<Instant>,
 }
 
 impl PacingCtl {
@@ -367,6 +387,10 @@ impl PacingCtl {
             fullscreen: None,
             monitor_size: None,
             sampling: false,
+            render_log: RenderLog {
+                enabled: rules::debug(),
+                ..Default::default()
+            },
         }
     }
 
@@ -779,6 +803,142 @@ impl VitascopeApp {
             ctx.request_repaint_after(after);
         }
     }
+}
+
+impl VitascopeApp {
+    /// 每一輪開始時：給影片畫面 egui 的 `predicted_dt` 與螢幕更新率（取影格時最多讓 mpv 等一次更新）；
+    /// VITASCOPE_DEBUG=pacing 時每 10 秒印一次畫面輸出的統計
+    pub(super) fn render_tick(&mut self, ctx: &egui::Context) {
+        let Some(video) = &self.video else { return };
+        video.begin_pass(ctx, self.pacing.refresh.map(|r| r.hz));
+        let log = &mut self.pacing.render_log;
+        if !log.enabled {
+            return;
+        }
+        let now = Instant::now();
+        let stats = video.stats();
+        let Some(since) = log.since else {
+            // 剛開始播放的一秒（載入、建立著色器）不算
+            if stats.frames > 0 && now - *log.first.get_or_insert(now) >= Duration::from_secs(1) {
+                log.since = Some(now);
+                log.prev = stats;
+                video.take_presents();
+                video.take_segment_max();
+            }
+            return;
+        };
+        if self.player.state.loaded && log.avsync_read.is_none_or(|t| now - t >= Duration::from_secs(1)) {
+            log.avsync_read = Some(now);
+            if let Ok(v) = self.player.mpv().get_property::<f64>("avsync") {
+                log.avsync.push(v);
+            }
+        }
+        if now - since < RENDER_LOG_EVERY {
+            return;
+        }
+        let presents = video.take_presents();
+        // 最久的 render、GPU 最多提早多少用這一段的最大值（環狀緩衝只有最近 128 次）
+        let seg = video.take_segment_max();
+        let stats = RenderStats {
+            max_us: seg.render_us,
+            blocking_max_us: seg.blocking_us,
+            gpu_lead_us: seg.gpu_lead_us,
+            ..stats
+        };
+        let line = render_summary(&log.prev, &stats, now - since, &presents, &log.avsync);
+        eprintln!("[vitascope] 畫面輸出統計：{line}");
+        log.since = Some(now);
+        log.prev = stats;
+        log.avsync.clear();
+    }
+
+    /// 媒體資訊面板「播放流暢度」裡畫面輸出的一行；還沒畫過影片（或沒有影片畫面）就沒有
+    pub(super) fn render_line(&self) -> Option<String> {
+        let s = self.video.as_ref()?.stats();
+        (s.frames > 0).then(|| render_line(&s))
+    }
+}
+
+/// 「畫面輸出 中位數 0.4 ms · 最久 3.2 ms · 每格 1.0 次重繪」
+fn render_line(s: &RenderStats) -> String {
+    let ms = |us: u32| f64::from(us) / 1000.0;
+    crate::tf!(
+        "畫面輸出 中位數 {:.1} ms · 最久 {:.1} ms · 每格 {:.1} 次重繪",
+        "Render p50 {:.1} ms · max {:.1} ms · {:.1} redraws per frame",
+        ms(s.p50_us),
+        ms(s.max_us),
+        s.passes_per_frame
+    )
+}
+
+/// VITASCOPE_DEBUG=pacing 的一行（`key=value` 用空白隔開，測試會解析）：這一段的次數（`blocking` = render 等到預定時間的次數，
+/// 後面是這一段平均等多久、最久等多久）、render 花的時間（最近 128 次的中位數、這一段最久）、
+/// 交出影格比預定時間晚多少（5／50／95／99 百分位）、相鄰兩格隔幾次螢幕更新的分布、估計的顯示時間比預定晚多少（中位數）、
+/// 取影格時離預定時間還有多久（5／50／95 百分位）、GPU 做完影格比預定時間晚多少（50／95 百分位）、
+/// 讓 render 等的範圍（一次螢幕更新）、計時器叫醒的那一輪平均晚多少、GPU 來不及時最多提早多少取影格、mpv 的 avsync（平均）。
+/// `now` 的 `max_us`、`blocking_max_us`、`gpu_lead_us` 是這一段的最大值（`render_tick` 換掉）
+fn render_summary(prev: &RenderStats, now: &RenderStats, elapsed: Duration, p: &Presents, avsync: &[f64]) -> String {
+    let secs = elapsed.as_secs_f64().max(1e-3);
+    let mut hist: Vec<(u32, usize)> = Vec::new();
+    for g in &p.gaps {
+        match hist.iter_mut().find(|(k, _)| k == g) {
+            Some((_, n)) => *n += 1,
+            None => hist.push((*g, 1)),
+        }
+    }
+    hist.sort_unstable();
+    let hist = hist
+        .iter()
+        .map(|(k, n)| format!("{k}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let ms = |v: &[i32], pct: u32| {
+        rules::percentile(v, pct).map_or("-".to_owned(), |us| format!("{:.2}", f64::from(us) / 1000.0))
+    };
+    let avsync = if avsync.is_empty() {
+        "-".to_owned()
+    } else {
+        format!("{:.2}", avsync.iter().sum::<f64>() / avsync.len() as f64 * 1000.0)
+    };
+    let passes = now.passes - prev.passes;
+    let blocking = now.blocking - prev.blocking;
+    let blocking_avg = if blocking == 0 {
+        "-".to_owned()
+    } else {
+        format!(
+            "{:.2}",
+            (now.blocking_us - prev.blocking_us) as f64 / blocking as f64 / 1000.0
+        )
+    };
+    format!(
+        "secs={secs:.1} renders={} deferred={} blocking={blocking} blocking_avg_ms={blocking_avg} blocking_max_ms={:.2} \
+         frames={} passes={passes} passes_per_s={:.1} \
+         passes_per_frame={:.2} p50_ms={:.2} max_ms={:.2} done_p5_ms={} done_p50_ms={} done_p95_ms={} done_p99_ms={} \
+         vsyncs={} late_p50_ms={} take_p5_ms={} take_p50_ms={} take_p95_ms={} gpu_p50_ms={} gpu_p95_ms={} \
+         window_ms={:.2} wake_late_ms={:.2} gpu_lead_ms={:.2} avsync_ms={avsync}",
+        now.renders - prev.renders,
+        now.deferred - prev.deferred,
+        f64::from(now.blocking_max_us) / 1000.0,
+        now.frames - prev.frames,
+        passes as f64 / secs,
+        now.passes_per_frame,
+        f64::from(now.p50_us) / 1000.0,
+        f64::from(now.max_us) / 1000.0,
+        ms(&p.done, 5),
+        ms(&p.done, 50),
+        ms(&p.done, 95),
+        ms(&p.done, 99),
+        if hist.is_empty() { "-" } else { &hist },
+        ms(&p.late, 50),
+        ms(&p.ahead, 5),
+        ms(&p.ahead, 50),
+        ms(&p.ahead, 95),
+        ms(&p.gpu, 50),
+        ms(&p.gpu, 95),
+        f64::from(now.window_us) / 1000.0,
+        f64::from(now.wake_late_us) / 1000.0,
+        f64::from(now.gpu_lead_us) / 1000.0,
+    )
 }
 
 /// 這一幀之後要怎麼叫醒介面
@@ -1838,5 +1998,88 @@ mod tests {
             wake(false, false, true, &hidden, true, Some(Duration::from_millis(10))).after,
             Some(Duration::from_millis(10))
         );
+    }
+
+    #[test]
+    fn render_line_in_both_languages() {
+        let s = RenderStats {
+            frames: 10,
+            passes_per_frame: 1.04,
+            p50_us: 420,
+            max_us: 3_180,
+            ..Default::default()
+        };
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(
+            render_line(&s),
+            "Render p50 0.4 ms · max 3.2 ms · 1.0 redraws per frame"
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(
+            render_line(&s),
+            "畫面輸出 中位數 0.4 ms · 最久 3.2 ms · 每格 1.0 次重繪"
+        );
+    }
+
+    #[test]
+    fn render_summary_line() {
+        let prev = RenderStats {
+            renders: 10,
+            deferred: 5,
+            blocking: 1,
+            blocking_us: 9_000,
+            frames: 10,
+            passes: 30,
+            ..Default::default()
+        };
+        let now = RenderStats {
+            renders: 250,
+            deferred: 485,
+            blocking: 3,
+            blocking_us: 18_000,
+            blocking_max_us: 5_120,
+            frames: 250,
+            passes: 750,
+            passes_per_frame: 1.876,
+            p50_us: 812,
+            max_us: 3_280,
+            window_us: 8_333,
+            wake_late_us: 1_420,
+            gpu_lead_us: 2_500,
+            ..Default::default()
+        };
+        let presents = Presents {
+            done: vec![-1_200, -900, 300, -2_600],
+            late: vec![3_100, 2_000, 4_000],
+            gaps: vec![5, 5, 6, 4, 5],
+            ahead: vec![4_100, 3_900, 6_000],
+            gpu: vec![300, -200, 2_400],
+        };
+        let line = render_summary(&prev, &now, Duration::from_secs(10), &presents, &[0.001, 0.002]);
+        assert_eq!(
+            line,
+            "secs=10.0 renders=240 deferred=480 blocking=2 blocking_avg_ms=4.50 blocking_max_ms=5.12 \
+             frames=240 passes=720 passes_per_s=72.0 passes_per_frame=1.88 \
+             p50_ms=0.81 max_ms=3.28 done_p5_ms=-2.60 done_p50_ms=-0.90 done_p95_ms=0.30 done_p99_ms=0.30 vsyncs=4:1,5:3,6:1 \
+             late_p50_ms=3.10 take_p5_ms=3.90 take_p50_ms=4.10 take_p95_ms=6.00 gpu_p50_ms=0.30 gpu_p95_ms=2.40 \
+             window_ms=8.33 wake_late_ms=1.42 gpu_lead_ms=2.50 avsync_ms=1.50"
+        );
+        // 量不到（不是 Windows、沒有預定時間）、這一段沒有等過的寫 -
+        let none = RenderStats {
+            blocking: prev.blocking,
+            blocking_us: prev.blocking_us,
+            ..now
+        };
+        let line = render_summary(&prev, &none, Duration::from_secs(10), &Presents::default(), &[]);
+        assert!(line.contains(" blocking=0 blocking_avg_ms=- "), "{line}");
+        assert!(
+            line.contains(
+                "done_p5_ms=- done_p50_ms=- done_p95_ms=- done_p99_ms=- vsyncs=- late_p50_ms=- take_p5_ms=- take_p50_ms=- \
+                 take_p95_ms=- \
+                 gpu_p50_ms=- gpu_p95_ms=- "
+            ),
+            "{line}"
+        );
+        assert!(line.ends_with(" avsync_ms=-"), "{line}");
     }
 }

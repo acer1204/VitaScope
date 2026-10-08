@@ -17,6 +17,8 @@ pub struct AutoShot {
     minimize: Vec<Duration>,
     /// 已經做了幾個
     minimize_done: usize,
+    /// 每一輪都要求重畫（模擬滑鼠移過按鈕的動畫，見 `busy_ui`）
+    busy: bool,
 }
 
 /// `VITASCOPE_TEST_MINIMIZE=3,6`：開始播放後第 3 秒縮到最小、第 6 秒還原（可以再接下去，輪流）。
@@ -41,7 +43,15 @@ impl AutoShot {
             requested: false,
             minimize: Vec::new(),
             minimize_done: 0,
+            busy: false,
         }
+    }
+
+    /// `VITASCOPE_TEST_BUSY_UI=1`（流暢播放的實機測試）：介面一直在重畫（每次螢幕更新一輪），
+    /// 像滑鼠在視窗上移動、按鈕的動畫；比真的移動滑鼠穩定
+    pub fn busy_ui(mut self, on: bool) -> Self {
+        self.busy = on;
+        self
     }
 
     /// 截圖前在這些時間（開始播放後）輪流縮到最小、還原
@@ -57,6 +67,9 @@ impl AutoShot {
 
     /// 每一幀呼叫：時間到就要求截圖，收到截圖就存檔並關閉視窗。要求截圖的那一幀回傳 true
     pub fn tick(&mut self, ctx: &egui::Context) -> bool {
+        if self.busy {
+            ctx.request_repaint();
+        }
         let Some(start) = self.start else { return false };
         if !self.requested {
             let elapsed = start.elapsed();
@@ -139,5 +152,27 @@ mod tests {
         assert_eq!(parse_minimize("3,6"), vec![s(3.0), s(6.0)]);
         assert_eq!(parse_minimize(" 6 , 3,x,-1,1.5"), vec![s(1.5), s(3.0), s(6.0)]);
         assert!(parse_minimize("").is_empty());
+    }
+
+    #[test]
+    fn busy_ui_repaints_every_pass() {
+        // 跑幾輪（egui 一開始會自己多畫幾輪），最後一輪之後還有沒有要求重畫
+        let repaints = |shot: AutoShot| {
+            let ctx = egui::Context::default();
+            let mut shot = shot;
+            for _ in 0..5 {
+                let mut out = ctx.run_ui(Default::default(), |ui| {
+                    shot.tick(ui.ctx());
+                });
+                // 沒有真的畫：字型貼圖的更新直接丟掉
+                out.textures_delta.clear();
+            }
+            ctx.has_requested_repaint_for(&egui::ViewportId::ROOT)
+        };
+        let shot = || AutoShot::new(PathBuf::from("x.png"), Duration::from_secs(5));
+        // 一般的自動截圖：還沒開始播放時不要求重畫
+        assert!(!repaints(shot()));
+        // VITASCOPE_TEST_BUSY_UI=1：每一輪都要求重畫
+        assert!(repaints(shot().busy_ui(true)));
     }
 }

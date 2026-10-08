@@ -4,7 +4,7 @@
 //! 流暢播放 = mpv 的 `video-sync=display-resample` + `display-fps-override=<螢幕的精確更新率>`：
 //! 依螢幕更新率微調播放速度，每格固定顯示相同次數的更新（24p 在 120 Hz 上每格 5 次），不會忽快忽慢。
 
-use crate::mpv::render::FrameInfo;
+use crate::mpv::render::{FrameInfo, RenderOpts};
 use crate::power::PowerSource;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -389,9 +389,6 @@ pub fn parse_overrides(env: Option<&str>) -> Overrides {
 
 // ───────────── 取影格的時機（畫面輸出不卡住介面） ─────────────
 
-/// 比影格該顯示的時間早這麼多取影格（留給繪製與 swap）
-pub const LEAD_NS: i64 = 2_000_000;
-
 /// `target_raw` 看起來是微秒（離目前的微秒時間比較近）。libmpv 0.37 起都是 `mp_time_ns` 的奈秒
 /// （render.h 的註解寫微秒，已經過時），呼叫 `mpv_get_time_ns` 就代表是 0.37 以上，照理不會發生
 pub fn target_is_us(raw: i64, now_ns: i64, now_us: i64) -> bool {
@@ -409,14 +406,455 @@ pub fn target_ns(raw: i64, now_ns: i64, now_us: i64) -> i64 {
     raw
 }
 
-/// 這一輪要不要先別取影格、等一下再來：回傳要等多久。
-/// 顯示同步中（block_vsync）、重繪、沒有指定時間、已經遲了、或等待時間不合理（超過 100 ms）都馬上畫
-pub fn defer(i: &FrameInfo, target_ns: i64, now_ns: i64) -> Option<Duration> {
+/// 新影格離預定時間還有多久（奈秒）。顯示同步中（block_vsync）、重繪、沒有指定時間、
+/// 已經到了或遲了、等待時間不合理（超過 100 ms）都是 None：馬上畫，不等
+pub fn frame_wait(i: &FrameInfo, target_ns: i64, now_ns: i64) -> Option<i64> {
     if !i.present || i.redraw || i.block_vsync || target_ns <= 0 {
         return None;
     }
-    let wait = target_ns - LEAD_NS - now_ns;
-    (wait > 0 && wait < 100_000_000).then(|| Duration::from_nanos(wait as u64))
+    let wait = target_ns - now_ns;
+    (wait > 0 && wait < 100_000_000).then_some(wait)
+}
+
+/// 不知道螢幕更新率時當成 60 Hz
+pub const DEFAULT_PERIOD_NS: i64 = 16_666_667;
+
+/// 讓 mpv 等的時間上限（螢幕更新一次的時間，奈秒；0 以下 = 不知道，當成 60 Hz）。
+/// 至少 4 ms：更新率很高（250 Hz 以上）時一次更新比計時器的誤差（約 1～2 ms）還短，
+/// 叫醒的那一輪常常會落在範圍外；最多 50 ms（偵測到奇怪的數字時也不會等太久）
+pub fn block_window(period_ns: i64) -> i64 {
+    let p = if period_ns > 0 { period_ns } else { DEFAULT_PERIOD_NS };
+    p.clamp(4_000_000, 50_000_000)
+}
+
+/// 範圍外再多容許這麼多：介面一直在重畫（滑鼠移動、動畫）時每輪隔一次更新，
+/// 前一輪剛好在範圍外的話這一輪離預定時間至少還有這麼多，夠 mpv 畫完（render 本身約 1 ms），
+/// 不會畫完已經過了預定時間；每輪開始到畫影片的時間差一點（約 1 ms）也還在範圍裡
+pub const BLOCK_MARGIN_NS: i64 = 2_000_000;
+
+/// 計時器叫醒的那一輪實際畫影片的時間比要求的晚多少：winit 的計時器晚 1～2 ms，
+/// 加上一輪開始到畫影片要先跑介面（除錯版要好幾毫秒）。量出來，下次提早這麼多叫醒。
+/// 介面一直在重畫（滑鼠移動、動畫）時每次垂直同步都有一輪，要求的時間之後的那一輪不是計時器叫醒的，
+/// 晚多少只是跟垂直同步差多少：不算
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WakeLate {
+    /// 平均晚多少（奈秒）
+    est: i64,
+    /// 要求這個時間畫影片（mpv 時鐘的奈秒），還沒等到
+    asked: Option<i64>,
+    /// 上一輪畫影片的時間
+    last: Option<i64>,
+}
+
+impl WakeLate {
+    /// 晚超過這麼多的是意外（視窗拖動之類），不算進平均
+    pub const OUTLIER: i64 = 10_000_000;
+
+    /// 要求在 `at` 畫影片
+    pub fn asked(&mut self, at: i64) {
+        self.asked = Some(at);
+    }
+
+    /// 等的影格在要求的時間之前就取了：之後那一輪不是為了它叫醒的，不算
+    pub fn cancel(&mut self) {
+        self.asked = None;
+    }
+
+    /// 這一輪在 `now` 畫影片（`window`：一次螢幕更新）。比要求的時間早的是別的原因（滑鼠、mpv 的事件）叫醒的，繼續等；
+    /// 上一輪在一次半更新之內的是介面一直在重畫
+    pub fn painted(&mut self, now: i64, window: i64) {
+        let prev = self.last.replace(now);
+        let Some(at) = self.asked else { return };
+        if now < at {
+            return;
+        }
+        self.asked = None;
+        if prev.is_some_and(|p| now - p < window + window / 2) {
+            return;
+        }
+        let late = now - at;
+        if late <= Self::OUTLIER {
+            // 指數平均（1/8）：抓得到趨勢，偶爾一次特別晚不會影響太多
+            self.est += (late - self.est) / 8;
+        }
+    }
+
+    /// 平均晚多少（奈秒）
+    pub fn estimate(&self) -> i64 {
+        self.est.clamp(0, Self::OUTLIER)
+    }
+}
+
+/// GPU 來不及在預定時間畫完影格時要提早多少取：mpv 在 render 裡先把影格交給 GPU（貼圖上傳、著色器）再等到預定時間，
+/// 以前（發現新影格就取）GPU 有 40 ms 可以畫，現在取的時候離預定時間只剩幾毫秒（介面一直重畫時最少 2 ms）。
+/// 實測介面一直重畫又播 4K 10-bit（軟體解碼）時，GPU 畫完的時間中位數、最晚的 5% 從預定時間後 0.7、1.8 ms
+/// 變成 2.9、8.8 ms，常常晚一次垂直同步顯示；最多提早 4 ms 時是 1.5、5.0 ms，最多 10 ms 時是 1.6、2.8 ms。
+/// 量法：render 回來之後的 GL timestamp（見 `video.rs` 的 `GpuTimer`），只看得到比預定時間晚多少（`over`；
+/// render 回來時已經到了預定時間，GPU 早就畫完的話量到的也是那時候）：晚了就照晚的量慢慢提早，準時了再慢慢退回來。
+/// GPU 一直滿載時提早也沒用（會一直提早到 `CAP`）：最多多等 `CAP`，還是比以前每格等 40 ms 短
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GpuLate {
+    /// 要提早多少取影格（奈秒）
+    lead: i64,
+}
+
+impl GpuLate {
+    /// 預定時間後這麼久之內畫完算準時（以前的做法實測中位數約 0～0.8 ms、最晚的 5% 約 1～1.9 ms）
+    pub const ON_TIME: i64 = 1_500_000;
+    /// 最多提早這麼多（每格最多再多等這麼久）
+    pub const CAP: i64 = 10_000_000;
+    /// 超過這麼多的是意外（卡住、拖動視窗），不算
+    const OUTLIER: i64 = 100_000_000;
+
+    /// 一格影格的 GPU 比預定時間晚 `over`（奈秒；負的 = 早）畫完
+    pub fn record(&mut self, over: i64) {
+        if over > Self::ON_TIME && over < Self::OUTLIER {
+            // 晚多少提早四分之一：幾格之內追上，偶爾一格特別晚不會一下子提早太多
+            self.lead = (self.lead + (over - Self::ON_TIME) / 4).min(Self::CAP);
+        } else if over <= Self::ON_TIME {
+            // 準時：慢慢退回來（44 格少一半，24 fps 約 2 秒）
+            self.lead -= self.lead / 64;
+        }
+    }
+
+    /// 要提早多少取影格（奈秒）
+    pub fn lead(&self) -> i64 {
+        self.lead
+    }
+}
+
+/// GPU 的時鐘（GL 的 timestamp）換成 mpv 時鐘（量 GPU 什麼時候畫完影格用，見 `video.rs` 的 `GpuTimer`）：
+/// 每次在 `before`、`after`（mpv 時鐘）之間問到 GPU 的時間 `gpu`，
+/// 時間差就在 `[before - gpu, after - gpu]` 之間。留最近幾次裡範圍最窄的一次（兩個時鐘的速度差很少，
+/// 幾秒內不用管）
+#[derive(Debug, Clone, Default)]
+pub struct ClockSync {
+    /// (範圍的寬度, 時間差)
+    samples: Ring<(i64, i64)>,
+}
+
+impl ClockSync {
+    pub fn sample(&mut self, before: i64, gpu: i64, after: i64) {
+        if after >= before {
+            self.samples.push((after - before, before + (after - before) / 2 - gpu));
+        }
+    }
+
+    /// GPU 的時間加上這個就是 mpv 時鐘；還沒量過是 None
+    pub fn offset(&self) -> Option<i64> {
+        self.samples
+            .values()
+            .iter()
+            .min_by_key(|(width, _)| *width)
+            .map(|(_, off)| *off)
+    }
+}
+
+/// 延後取影格時要跟 egui 要求多久之後重畫：egui 會從每個 `request_repaint_after` 扣掉 `predicted_dt`
+/// （預計一輪要花的時間，eframe 沒設定，固定是 1/60 秒），不加回去的話會早 17 ms 醒來，
+/// 接著一輪接一輪地空轉到時間（每輪還要等一次垂直同步）
+pub fn repaint_after(wait: Duration, predicted_dt: f32) -> Duration {
+    wait + Duration::try_from_secs_f32(predicted_dt).unwrap_or_default()
+}
+
+/// 看到新影格時這一輪怎麼做
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Take {
+    /// 現在取；`block` = render 等到影格的預定時間才回來
+    Now { block: bool },
+    /// 這一輪先不取，`wake` 之後再來一輪（還沒加回 egui 扣掉的 predicted_dt，見 `repaint_after`）
+    Later { wake: Duration },
+}
+
+/// 取影格的時機要用的量（奈秒）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Lead {
+    /// 讓 render 等的範圍：一次螢幕更新（見 `block_window`）
+    pub window: i64,
+    /// 計時器叫醒的那一輪平均晚多少（見 `WakeLate`）
+    pub late: i64,
+    /// GPU 來不及在預定時間畫完時要提早多少（見 `GpuLate`）
+    pub gpu: i64,
+}
+
+/// 看到新影格（預定時間 `due`，mpv 時鐘的奈秒）時要現在取還是等一下。
+/// 做法：等到離預定時間不到一次螢幕更新（`lead.window`）才取，取的時候讓 render 等到預定時間。
+/// 影格交出的時間跟以前（每格都讓 render 等，`VITASCOPE_PACING=block`）完全一樣，都是 mpv 到了預定時間才放行，
+/// 跟這一輪是計時器叫醒的還是滑鼠之類叫醒的無關；介面的執行緒每格最多等一次更新多一點
+/// （`BLOCK_MARGIN_NS`，GPU 來不及時再加上 `lead.gpu`）。
+/// - `pace` false（`VITASCOPE_PACING=block`）或問不到 `info`：照以前讓 render 等（不然影像會比聲音早）。
+/// - 視窗大小變了：馬上重畫（render 一定會取走新影格），不等。
+/// - 顯示同步、重繪、沒有預定時間、已經遲了、時間不合理：馬上畫，不等（見 `frame_wait`）。
+/// - 離預定時間超過範圍（加上 `BLOCK_MARGIN_NS`）：先不取，在大約 `due - window / 2` 再來一輪
+///   （扣掉計時器那一輪平均晚多少 `lead.late`），落在範圍中間，早一點晚一點都還在範圍裡。
+/// - GPU 來不及：整個範圍提早 `lead.gpu`，當成影格早這麼多到期
+pub fn take(pace: bool, resized: bool, info: Option<&FrameInfo>, due: i64, now: i64, lead: Lead) -> Take {
+    let Some(info) = info.filter(|_| pace) else {
+        return Take::Now { block: true };
+    };
+    if resized {
+        return Take::Now { block: false };
+    }
+    let Some(wait) = frame_wait(info, due, now) else {
+        return Take::Now { block: false };
+    };
+    let wait = wait - lead.gpu.clamp(0, GpuLate::CAP);
+    if wait <= lead.window + BLOCK_MARGIN_NS {
+        return Take::Now { block: true };
+    }
+    // 估計得太大時叫醒得太早，那一輪會再延後一次（多一輪而已）；估計得太小會在預定時間之後才醒，
+    // 影格晚一次垂直同步。更新率很高時半次更新比計時器晚的量還短，所以不用範圍限制
+    let aim = wait - lead.window / 2 - lead.late.clamp(0, WakeLate::OUTLIER);
+    Take::Later {
+        wake: Duration::from_nanos(aim.max(0) as u64),
+    }
+}
+
+// ───────────── 畫面輸出的統計 ─────────────
+
+/// VITASCOPE_DEBUG=pacing：一段時間內每格新影格交出、顯示的時間（微秒，跟預定時間比；負的 = 早）
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Presents {
+    /// render 回來（影格交出去、接著 swap）的時間
+    pub done: Vec<i32>,
+    /// 估計的顯示時間：swap 之後的下一次垂直同步（只有 Windows 量得到）
+    pub late: Vec<i32>,
+    /// 相鄰兩格隔了幾次螢幕更新（同上）
+    pub gaps: Vec<u32>,
+    /// 決定取影格時離預定時間還有多久（正的 = 還沒到；`VITASCOPE_PACING=block` 是發現新影格就取）
+    pub ahead: Vec<i32>,
+    /// GPU 做完影格（mpv 畫的部分）的時間（GL 的 timestamp query；不支援的話沒有）
+    pub gpu: Vec<i32>,
+}
+
+/// 累計每格新影格交出、顯示的時間（`video.rs` 的 VITASCOPE_DEBUG=pacing 紀錄用）
+#[derive(Debug, Clone, Default)]
+pub struct PresentLog {
+    /// 上一格在第幾次垂直同步顯示
+    last: Option<i64>,
+    p: Presents,
+}
+
+impl PresentLog {
+    /// 最多留這麼多筆（沒人拿的話不會一直長大）
+    pub const MAX: usize = 4096;
+
+    /// 剛畫好一格新影格：`now` 是 render 回來的時間，`due` 是預定時間（mpv 時鐘的奈秒；0 = 沒有指定），
+    /// `vsync` 是現在之後的第一次垂直同步：(第幾次, 離現在幾奈秒)，None = 量不到
+    pub fn record(&mut self, now: i64, due: i64, vsync: Option<(i64, i64)>) {
+        if due > 0 && self.p.done.len() < Self::MAX {
+            self.p.done.push(us(now - due));
+        }
+        let Some((n, until_ns)) = vsync else { return };
+        if let Some(prev) = self.last.replace(n) {
+            let gap = n - prev;
+            // 隔太久是暫停、拖動，不算
+            if (1..=30).contains(&gap) && self.p.gaps.len() < Self::MAX {
+                self.p.gaps.push(gap as u32);
+            }
+        }
+        if due > 0 && self.p.late.len() < Self::MAX {
+            self.p.late.push(us(now + until_ns - due));
+        }
+    }
+
+    /// 決定取一格新影格（有預定時間的）時，離預定時間還有 `ahead_ns`
+    pub fn taken(&mut self, ahead_ns: i64) {
+        if self.p.ahead.len() < Self::MAX {
+            self.p.ahead.push(us(ahead_ns));
+        }
+    }
+
+    /// 一格影格的 GPU 工作在預定時間之後 `over_ns` 做完（負的 = 之前）
+    pub fn gpu_done(&mut self, over_ns: i64) {
+        if self.p.gpu.len() < Self::MAX {
+            self.p.gpu.push(us(over_ns));
+        }
+    }
+
+    /// 拿走這一段的紀錄；下一段的第一格不跟這一段的最後一格比（垂直同步的時間表會重新要）
+    pub fn take(&mut self) -> Presents {
+        self.last = None;
+        std::mem::take(&mut self.p)
+    }
+}
+
+/// 奈秒換成微秒（存成 i32，超出範圍的截掉）
+fn us(ns: i64) -> i32 {
+    (ns / 1000).clamp(i32::MIN.into(), i32::MAX.into()) as i32
+}
+
+/// 第 `pct` 百分位（四捨五入到最近的一筆）；沒有資料就是 None
+pub fn percentile(values: &[i32], pct: u32) -> Option<i32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    let i = ((v.len() - 1) * pct.min(100) as usize + 50) / 100;
+    Some(*v.select_nth_unstable(i).1)
+}
+
+/// 垂直同步的時間表（`anchor` 是某一次的時間，每 `period` 一次）上，`now` 之後的第一次：
+/// (從 `anchor` 數第幾次, 時間)。剛好在垂直同步上算下一次（swap 趕不上這一次）
+pub fn next_vsync(anchor: i64, period: i64, now: i64) -> (i64, i64) {
+    let n = (now - anchor).div_euclid(period) + 1;
+    (n, anchor + n * period)
+}
+
+/// 統計最近幾次 render、幾格新影格
+pub const STATS_RING: usize = 128;
+
+/// 畫面輸出的統計（媒體資訊面板「播放流暢度」、VITASCOPE_DEBUG=pacing）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RenderStats {
+    /// mpv 畫了幾次（新影格、視窗大小改變的重畫都算）
+    pub renders: u64,
+    /// 新影格還沒到時間、這一輪先不取的次數
+    pub deferred: u64,
+    /// 只取走不畫的次數（SKIP_RENDERING；目前不用，一直是 0）
+    pub skipped: u64,
+    /// render 等到影格預定時間的次數（`RenderOpts.block`）：`VITASCOPE_PACING=block` 時每次都等（約 40 ms）；
+    /// 自己挑時間時離預定時間不到一次螢幕更新才取、讓 render 等剩下的時間，一般播放每格一次
+    pub blocking: u64,
+    /// 這些 render 總共花了多少時間（微秒，含畫的時間）：除以 `blocking` 是平均等多久
+    pub blocking_us: u64,
+    /// 最近 128 次等待的 render 最久花了多久（微秒）
+    pub blocking_max_us: u32,
+    /// 畫面重繪（影片的 paint callback）次數
+    pub passes: u64,
+    /// 新影格的數量
+    pub frames: u64,
+    /// 最近 128 格新影格：發現之後到畫出來（含畫的那一輪）平均每格重繪了幾次（見 `RenderCounter::rendered`）。
+    /// 只算延後的話是 1；mpv 的事件（播放位置）在發現之後才到的話多看一輪，一般播放 1.0～1.3。
+    /// egui 太早叫醒時會一輪接一輪地空轉到時間（每次垂直同步一輪），介面一直重畫時也是每次更新一輪：約 4
+    pub passes_per_frame: f64,
+    /// 最近 128 次 render 花的時間（微秒）：中位數、最大
+    pub p50_us: u32,
+    pub max_us: u32,
+    /// 目前讓 render 等的上限（微秒，螢幕更新一次的時間，見 `block_window`；`VideoView::stats` 填）
+    pub window_us: u32,
+    /// 計時器叫醒的那一輪平均晚多少畫影片（微秒，見 `WakeLate`；`VideoView::stats` 填）
+    pub wake_late_us: u32,
+    /// GPU 來不及時提早多少取影格（微秒，見 `GpuLate`；`VideoView::stats` 填）
+    pub gpu_lead_us: u32,
+}
+
+/// 固定大小的環狀緩衝：只留最後 `STATS_RING` 筆
+#[derive(Debug, Clone)]
+struct Ring<T: Copy + Default> {
+    items: [T; STATS_RING],
+    len: usize,
+    next: usize,
+}
+
+impl<T: Copy + Default> Default for Ring<T> {
+    fn default() -> Self {
+        Self {
+            items: [T::default(); STATS_RING],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl<T: Copy + Default> Ring<T> {
+    fn push(&mut self, v: T) {
+        self.items[self.next] = v;
+        self.next = (self.next + 1) % STATS_RING;
+        self.len = (self.len + 1).min(STATS_RING);
+    }
+
+    fn values(&self) -> &[T] {
+        &self.items[..self.len]
+    }
+}
+
+/// VITASCOPE_DEBUG=pacing 的一段時間裡最大的值（微秒）：環狀緩衝只留最近 128 次，一段（10 秒）不一定都在裡面
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SegmentMax {
+    /// render 最久花了多久
+    pub render_us: u32,
+    /// 等待的 render 最久花了多久
+    pub blocking_us: u32,
+    /// GPU 來不及時最多提早多少取影格
+    pub gpu_lead_us: u32,
+}
+
+/// 累計畫面輸出的統計（`VideoView` 在 paint callback 裡呼叫）
+#[derive(Debug, Clone, Default)]
+pub struct RenderCounter {
+    totals: RenderStats,
+    durations: Ring<u32>,
+    /// 等待的 render 花的時間
+    blocked: Ring<u32>,
+    per_frame: Ring<u16>,
+    /// 目前等著的新影格：已經延後幾次
+    deferrals: u16,
+    segment: SegmentMax,
+}
+
+impl RenderCounter {
+    /// 一輪畫面重繪（影片的 paint callback）
+    pub fn pass(&mut self) {
+        self.totals.passes += 1;
+    }
+
+    /// 新影格還沒到時間，這一輪先不取
+    pub fn defer(&mut self) {
+        self.totals.deferred += 1;
+        self.deferrals = self.deferrals.saturating_add(1);
+    }
+
+    /// 用 `o` 呼叫了一次 mpv 的 render，花了 `took`；`new_frame`：取走的是新影格（不是視窗大小改變的重畫）
+    pub fn rendered(&mut self, took: Duration, new_frame: bool, o: RenderOpts) {
+        self.totals.renders += 1;
+        if o.skip {
+            self.totals.skipped += 1;
+        }
+        let us = took.as_micros().min(u32::MAX as u128) as u32;
+        if o.block {
+            self.totals.blocking += 1;
+            self.totals.blocking_us += u64::from(us);
+            self.blocked.push(us);
+            self.segment.blocking_us = self.segment.blocking_us.max(us);
+        }
+        self.durations.push(us);
+        self.segment.render_us = self.segment.render_us.max(us);
+        if new_frame {
+            self.totals.frames += 1;
+            // 第一次看到新影格的那一輪（一般播放時一定是先延後）是發現它，不算；
+            // 之後每一輪（包括畫出來的那一輪）都是在等它。顯示同步時一看到就畫，算 1 次
+            self.per_frame.push(self.deferrals.max(1));
+            self.deferrals = 0;
+        }
+    }
+
+    /// 取影格時 GPU 來不及要提早 `ns`（奈秒）
+    pub fn gpu_lead(&mut self, ns: i64) {
+        let us = (ns / 1000).clamp(0, u32::MAX.into()) as u32;
+        self.segment.gpu_lead_us = self.segment.gpu_lead_us.max(us);
+    }
+
+    /// 上次拿了之後的最大值，拿了就重新算
+    pub fn take_segment(&mut self) -> SegmentMax {
+        std::mem::take(&mut self.segment)
+    }
+
+    pub fn stats(&self) -> RenderStats {
+        let mut s = self.totals;
+        let frames = self.per_frame.values();
+        if !frames.is_empty() {
+            s.passes_per_frame = frames.iter().map(|n| f64::from(*n)).sum::<f64>() / frames.len() as f64;
+        }
+        let mut d = self.durations.values().to_vec();
+        if !d.is_empty() {
+            let mid = d.len() / 2;
+            s.p50_us = *d.select_nth_unstable(mid).1;
+            s.max_us = d.iter().copied().max().unwrap_or(0);
+        }
+        s.blocking_max_us = self.blocked.values().iter().copied().max().unwrap_or(0);
+        s
+    }
 }
 
 #[cfg(test)]
@@ -1015,33 +1453,542 @@ mod tests {
     }
 
     #[test]
-    fn defer_waits_until_just_before_the_target() {
+    fn frame_wait_only_for_a_real_future_target() {
         let now = 1_000_000_000_000i64;
         let frame = FrameInfo {
             present: true,
             target_raw: 0,
             ..Default::default()
         };
-        let wait = defer(&frame, now + 40_000_000, now).unwrap();
-        assert_eq!(wait, Duration::from_millis(38));
+        assert_eq!(frame_wait(&frame, now + 40_000_000, now), Some(40_000_000));
+        assert_eq!(frame_wait(&frame, now + 1, now), Some(1));
         // 顯示同步、重繪、沒有影格、沒有時間：馬上畫
         let sync = FrameInfo {
             block_vsync: true,
             ..frame
         };
-        assert_eq!(defer(&sync, now + 40_000_000, now), None);
+        assert_eq!(frame_wait(&sync, now + 40_000_000, now), None);
         let redraw = FrameInfo { redraw: true, ..frame };
-        assert_eq!(defer(&redraw, now + 40_000_000, now), None);
+        assert_eq!(frame_wait(&redraw, now + 40_000_000, now), None);
         let nothing = FrameInfo {
             present: false,
             ..frame
         };
-        assert_eq!(defer(&nothing, now + 40_000_000, now), None);
-        assert_eq!(defer(&frame, 0, now), None);
-        // 已經遲了，或剩不到 2 ms
-        assert_eq!(defer(&frame, now - 1, now), None);
-        assert_eq!(defer(&frame, now + 1_500_000, now), None);
+        assert_eq!(frame_wait(&nothing, now + 40_000_000, now), None);
+        assert_eq!(frame_wait(&frame, 0, now), None);
+        // 已經到了或遲了
+        assert_eq!(frame_wait(&frame, now, now), None);
+        assert_eq!(frame_wait(&frame, now - 1, now), None);
         // 超過 100 ms：不合理，馬上畫
-        assert_eq!(defer(&frame, now + 150_000_000, now), None);
+        assert_eq!(frame_wait(&frame, now + 100_000_000, now), None);
+        assert_eq!(frame_wait(&frame, now + 99_999_999, now), Some(99_999_999));
+    }
+
+    #[test]
+    fn block_window_is_one_refresh() {
+        // 120 Hz、60 Hz、不知道（當 60 Hz）
+        assert_eq!(block_window(8_333_333), 8_333_333);
+        assert_eq!(block_window(16_683_350), 16_683_350);
+        assert_eq!(block_window(0), DEFAULT_PERIOD_NS);
+        assert_eq!(block_window(-5), DEFAULT_PERIOD_NS);
+        // 360 Hz：至少 4 ms；奇怪的數字最多 50 ms
+        assert_eq!(block_window(2_777_778), 4_000_000);
+        assert_eq!(block_window(1_000_000_000), 50_000_000);
+    }
+
+    #[test]
+    fn repaint_after_cancels_egui_predicted_dt() {
+        // egui 會從要求的延遲扣掉 predicted_dt（context.rs 的 request_repaint_after）：扣完要剛好是要等的時間
+        let egui = |d: Duration, pdt: f32| d.saturating_sub(Duration::from_secs_f32(pdt));
+        let wait = Duration::from_millis(38);
+        for pdt in [1.0 / 60.0, 1.0 / 120.0, 0.05] {
+            let asked = repaint_after(wait, pdt);
+            assert!(
+                egui(asked, pdt).abs_diff(wait) < Duration::from_micros(1),
+                "{pdt}: {asked:?}"
+            );
+        }
+        // 沒加回去的話會早 16.7 ms 醒來
+        assert!(egui(wait, 1.0 / 60.0) < Duration::from_millis(22));
+        // 奇怪的 predicted_dt：照原本的時間
+        assert_eq!(repaint_after(wait, 0.0), wait);
+        assert_eq!(repaint_after(wait, -1.0), wait);
+        assert_eq!(repaint_after(wait, f32::NAN), wait);
+    }
+
+    #[test]
+    fn take_decides_when_to_render_a_new_frame() {
+        let frame = FrameInfo {
+            present: true,
+            redraw: false,
+            repeat: false,
+            block_vsync: false,
+            target_raw: 0,
+        };
+        let ms = 1_000_000i64;
+        let us = 1_000i64;
+        let now = 10_000 * ms;
+        let p = block_window(8_333_333);
+        let lead = |late: i64| Lead {
+            window: p,
+            late,
+            gpu: 0,
+        };
+        let take_at = |due: i64, now: i64, late: i64| take(true, false, Some(&frame), due, now, lead(late));
+        let later = |ns: i64| Take::Later {
+            wake: Duration::from_nanos(ns as u64),
+        };
+        let block = Take::Now { block: true };
+        let now_free = Take::Now { block: false };
+        // 一般播放、發現新影格（約 40 ms 前）：先不取，在預定時間前半次更新再來
+        let due = now + 40 * ms;
+        assert_eq!(take_at(due, now, 0), later(40 * ms - p / 2));
+        // 計時器那一輪平均晚 1.5 ms：提早這麼多叫醒
+        assert_eq!(take_at(due, now, 1_500 * us), later(40 * ms - p / 2 - 1_500 * us));
+        // 晚很多（除錯版的介面很重、更新率很高時半次更新很短）：照樣提早這麼多，最多 10 ms
+        assert_eq!(take_at(due, now, 9 * ms), later(40 * ms - p / 2 - 9 * ms));
+        assert_eq!(take_at(due, now, 15 * ms), later(40 * ms - p / 2 - WakeLate::OUTLIER));
+        assert_eq!(take_at(due, now, -3 * ms), later(40 * ms - p / 2));
+        // 估計得太大、叫醒時還在範圍外：再延後一次（最少 0，馬上再來一輪）
+        assert_eq!(take_at(now + 12 * ms, now, 9 * ms), later(0));
+        // 離預定時間不到一次更新（加上容許的量）：不管是哪一輪（計時器、滑鼠、mpv 的事件）都現在取，
+        // 讓 render 等到預定時間（交出影格的時間跟 VITASCOPE_PACING=block 一樣）
+        for wait in [p + BLOCK_MARGIN_NS, p, p / 2, ms, 1] {
+            assert_eq!(take_at(now + wait, now, 0), block, "{wait}");
+            assert_eq!(take_at(now + wait, now, 4 * ms), block, "{wait}");
+        }
+        // 剛好超過：再等一下，叫醒時落在範圍中間
+        let wait = p + BLOCK_MARGIN_NS + 1;
+        assert_eq!(take_at(now + wait, now, 0), later(wait - p / 2));
+        // 已經到了、遲了：馬上畫，不等
+        assert_eq!(take_at(now, now, 0), now_free);
+        assert_eq!(take_at(now - 3 * ms, now, 0), now_free);
+        // 時間不合理（超過 100 ms）：馬上畫，不等
+        assert_eq!(take_at(now + 150 * ms, now, 0), now_free);
+        // VITASCOPE_PACING=block：一律讓 render 等（以前的做法）
+        assert_eq!(take(false, false, Some(&frame), due, now, lead(0)), block);
+        assert_eq!(take(false, true, Some(&frame), due, now, lead(0)), block);
+        // 問不到預定時間：照以前讓 mpv 等，不然影像會比聲音早
+        assert_eq!(take(true, false, None, due, now, lead(0)), block);
+        // 視窗大小變了：馬上畫，不等
+        assert_eq!(take(true, true, Some(&frame), due, now, lead(0)), now_free);
+        // 依螢幕同步：mpv 要我們馬上畫，swap 等垂直同步
+        let sync = FrameInfo {
+            block_vsync: true,
+            ..frame
+        };
+        assert_eq!(take(true, false, Some(&sync), 0, now, lead(0)), now_free);
+        // 重繪（暫停中改設定之類）：馬上畫
+        let redraw = FrameInfo { redraw: true, ..frame };
+        assert_eq!(take(true, false, Some(&redraw), due, now, lead(0)), now_free);
+        // 60 Hz：等的上限跟著變長
+        let p60 = block_window(16_666_667);
+        let lead60 = Lead { window: p60, ..lead(0) };
+        assert_eq!(take(true, false, Some(&frame), now + 15 * ms, now, lead60), block);
+        assert_eq!(take_at(now + 15 * ms, now, 0), later(15 * ms - p / 2));
+        // GPU 來不及：整個範圍提早，當成影格早 gpu 到期（離預定時間還有 12 ms 就取，等的時間也跟著變長）
+        let gpu = |g: i64| Lead { gpu: g, ..lead(0) };
+        assert_eq!(take(true, false, Some(&frame), now + 12 * ms, now, gpu(2 * ms)), block);
+        assert_eq!(
+            take(true, false, Some(&frame), due, now, gpu(2 * ms)),
+            later(38 * ms - p / 2)
+        );
+        // 最多提早 GpuLate::CAP；已經過了預定時間的照樣不等
+        assert_eq!(
+            take(true, false, Some(&frame), due, now, gpu(GpuLate::CAP + 10 * ms)),
+            later(40 * ms - GpuLate::CAP - p / 2)
+        );
+        assert_eq!(take(true, false, Some(&frame), now - ms, now, gpu(2 * ms)), now_free);
+    }
+
+    #[test]
+    fn deferred_wake_lands_inside_the_window() {
+        // 照 take 要求的時間叫醒（晚的量在估計附近）時，那一輪一定會取（不會再延後一次），
+        // 等的時間不超過一次更新加上容許的量（GPU 來不及時再加上提早的量）。
+        // 更新率很高時（4 ms）計時器晚的量可能超過半次更新，照樣要落在範圍裡
+        let frame = FrameInfo {
+            present: true,
+            ..Default::default()
+        };
+        let ms = 1_000_000i64;
+        for period in [4_000_000, 6_944_444, 8_333_333, 16_666_667, 33_366_700] {
+            let p = block_window(period);
+            for found in [3 * ms, 20 * ms, 41 * ms, 80 * ms] {
+                let (now, due) = (1_000 * ms, 1_000 * ms + found);
+                for (late, gpu) in [(0, 0), (ms, 0), (3 * ms, 0), (6 * ms, 0), (2 * ms, GpuLate::CAP)] {
+                    let lead = Lead { window: p, late, gpu };
+                    let Take::Later { wake } = take(true, false, Some(&frame), due, now, lead) else {
+                        assert!(found <= p + BLOCK_MARGIN_NS + gpu, "{period} {found}");
+                        continue;
+                    };
+                    let asked = now + wake.as_nanos() as i64;
+                    // 實際晚的量（就是估計的量）比估計少半次更新到多四分之一次更新都還在範圍裡
+                    for actual in [late - p / 2, late, late + p / 4] {
+                        let woke = asked + actual.max(0);
+                        assert_eq!(
+                            take(true, false, Some(&frame), due, woke, lead),
+                            Take::Now { block: true },
+                            "{period} {found} {late} {actual}"
+                        );
+                        assert!(due - woke <= p + BLOCK_MARGIN_NS + gpu && due - woke > 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn present_log_counts_vsyncs_between_frames() {
+        let ms = 1_000_000i64;
+        let mut log = PresentLog::default();
+        // 量不到垂直同步（不是 Windows）：只記交出的時間
+        log.record(1_000 * ms, 1_001 * ms, None);
+        let p = log.take();
+        assert_eq!((p.done, p.late, p.gaps), (vec![-1_000], vec![], vec![]));
+        // 每格隔 5 次更新；交出後 3 ms 的垂直同步顯示
+        let mut t = 2_000 * ms;
+        for n in [10, 15, 20, 26, 30] {
+            log.record(t, t + ms, Some((n, 3 * ms)));
+            t += 42 * ms;
+        }
+        // 暫停之後（隔 100 次）、往回的不算
+        log.record(t, t + ms, Some((130, 3 * ms)));
+        log.record(t, t + ms, Some((129, 3 * ms)));
+        // 沒有預定時間的不記交出、顯示的時間，但更新次數照算
+        log.record(t, 0, Some((134, 3 * ms)));
+        let p = log.take();
+        assert_eq!(p.gaps, vec![5, 5, 6, 4, 5]);
+        assert_eq!(p.done, vec![-1_000; 7]);
+        assert_eq!(p.late, vec![2_000; 7]);
+        assert_eq!(p.ahead, Vec::<i32>::new());
+        // 取影格時離預定時間多久（正的 = 還沒到）
+        log.taken(4_200_000);
+        log.taken(-300_000);
+        assert_eq!(log.take().ahead, vec![4_200, -300]);
+        // GPU 做完的時間
+        log.gpu_done(1_200_000);
+        log.gpu_done(-80_000);
+        assert_eq!(log.take().gpu, vec![1_200, -80]);
+        // 拿走之後重新開始：下一段的第一格不跟上一段的最後一格比
+        log.record(t, t + ms, Some((139, 0)));
+        assert_eq!(log.take().gaps, Vec::<u32>::new());
+        // 最多留 MAX 筆
+        for n in 0..PresentLog::MAX as i64 + 10 {
+            log.record(t, t + ms, Some((n, 0)));
+            log.taken(ms);
+            log.gpu_done(ms);
+        }
+        let p = log.take();
+        assert_eq!(
+            (p.done.len(), p.late.len(), p.gaps.len(), p.ahead.len(), p.gpu.len()),
+            (
+                PresentLog::MAX,
+                PresentLog::MAX,
+                PresentLog::MAX,
+                PresentLog::MAX,
+                PresentLog::MAX
+            )
+        );
+    }
+
+    #[test]
+    fn wake_late_learns_how_late_the_woken_pass_paints() {
+        let p = 8_333_333;
+        let mut o = WakeLate::default();
+        assert_eq!(o.estimate(), 0);
+        // 沒有要求過：不管
+        o.painted(1_000, p);
+        assert_eq!(o.estimate(), 0);
+        let mut at = 1_000_000_000i64;
+        for _ in 0..60 {
+            // 發現新影格的那一輪要求叫醒
+            o.painted(at - 36_000_000, p);
+            o.asked(at);
+            // 別的原因先畫的一輪（mpv 的事件）不算，繼續等
+            o.painted(at - 20_000_000, p);
+            o.painted(at + 2_600_000, p);
+            at += 41_708_000;
+        }
+        let est = o.estimate();
+        assert!((2_500_000..=2_600_000).contains(&est), "{est}");
+        // 同一個要求只算一次
+        o.painted(at + 9_000_000, p);
+        assert_eq!(o.estimate(), est);
+        // 新的要求取代舊的（延後之後又延後）
+        o.asked(at);
+        o.asked(at + 5_000_000);
+        o.painted(at + 1_000_000, p);
+        assert_eq!(o.estimate(), est, "比新的要求早");
+        // 晚超過 10 ms 的是意外，不算進平均
+        o.painted(at + 60_000_000, p);
+        assert_eq!(o.estimate(), est);
+        // 要求的時間之前就取了：之後的那一輪不算
+        o.asked(at + 100_000_000);
+        o.cancel();
+        o.painted(at + 105_000_000, p);
+        assert_eq!(o.estimate(), est);
+        // 一直很晚：估計跟著變大，最多 10 ms
+        at += 200_000_000;
+        for _ in 0..200 {
+            o.asked(at);
+            o.painted(at + 9_500_000, p);
+            at += 41_708_000;
+        }
+        assert!((9_000_000..=9_500_000).contains(&o.estimate()), "{}", o.estimate());
+    }
+
+    #[test]
+    fn wake_late_ignores_passes_of_a_busy_interface() {
+        // 介面一直在重畫：每次垂直同步一輪，要求的時間之後的那一輪晚多少只是跟垂直同步差多少（0～一次更新）
+        let p = 8_333_333;
+        let mut o = WakeLate::default();
+        let mut t = 1_000_000_000i64;
+        for n in 0..500i64 {
+            if n % 5 == 0 {
+                // 每 5 輪要求一次，要求的時間落在下一輪之前的不同位置
+                o.asked(t + (n * 1_234_567) % p);
+            }
+            o.painted(t, p);
+            t += p;
+        }
+        assert_eq!(o.estimate(), 0);
+        // 60 Hz 也一樣
+        let p60 = 16_666_667;
+        for n in 0..500i64 {
+            if n % 3 == 0 {
+                o.asked(t + (n * 1_234_567) % p60);
+            }
+            o.painted(t, p60);
+            t += p60;
+        }
+        assert_eq!(o.estimate(), 0);
+        // 介面停下來之後（上一輪是很久以前）照常量
+        t += 40_000_000;
+        o.asked(t - 2_000_000);
+        o.painted(t, p);
+        assert_eq!(o.estimate(), 2_000_000 / 8);
+    }
+
+    #[test]
+    fn gpu_late_takes_earlier_only_when_the_gpu_is_late() {
+        let ms = 1_000_000i64;
+        let mut g = GpuLate::default();
+        // 準時畫完（render 回來時 GPU 也差不多畫完了）：不提早
+        for _ in 0..100 {
+            g.record(300_000);
+            g.record(-200_000);
+            g.record(GpuLate::ON_TIME);
+        }
+        assert_eq!(g.lead(), 0);
+        // 晚 3.5 ms：提早晚的量（扣掉容許的 ON_TIME）的四分之一，晚幾格就追上
+        g.record(GpuLate::ON_TIME + 2 * ms);
+        assert_eq!(g.lead(), ms / 2);
+        for _ in 0..3 {
+            g.record(GpuLate::ON_TIME + 2 * ms);
+        }
+        assert_eq!(g.lead(), 2 * ms);
+        // 準時了：慢慢退回來（44 格少一半）
+        for _ in 0..44 {
+            g.record(0);
+        }
+        assert!((800_000..=1_200_000).contains(&g.lead()), "{}", g.lead());
+        // 偶爾一格晚一點（以前的做法也有）：只多一點，很快又退回來
+        let before = g.lead();
+        g.record(GpuLate::ON_TIME + 400_000);
+        assert_eq!(g.lead(), before + 100_000);
+        // 意外（卡住、拖動視窗）：不算，也不退
+        let before = g.lead();
+        g.record(150 * ms);
+        assert_eq!(g.lead(), before);
+        // 一直很晚（GPU 一直滿載，提早也沒用）：最多提早 CAP
+        for _ in 0..100 {
+            g.record(30 * ms);
+        }
+        assert_eq!(g.lead(), GpuLate::CAP);
+    }
+
+    #[test]
+    fn clock_sync_uses_the_tightest_sample() {
+        let mut c = ClockSync::default();
+        assert_eq!(c.offset(), None);
+        // GPU 時間 + 5000 = mpv 時鐘；問 GPU 的時間花了 400、40、1000
+        c.sample(10_000, 5_200 - 5_000 + 5_000, 10_400);
+        c.sample(20_000, 15_020, 20_040);
+        c.sample(30_000, 25_100, 31_000);
+        assert_eq!(c.offset(), Some(5_000));
+        // 時間倒退（不會發生）不算
+        c.sample(40_000, 1, 39_000);
+        assert_eq!(c.offset(), Some(5_000));
+        // 只看最近幾次（時鐘的速度差慢慢累積）
+        for i in 0..STATS_RING as i64 {
+            c.sample(
+                100_000 + i * 10_000,
+                100_000 + i * 10_000 - 7_000 + 50,
+                100_000 + i * 10_000 + 100,
+            );
+        }
+        assert_eq!(c.offset(), Some(7_000));
+    }
+
+    /// 不等、照常畫（自己挑時間取影格時的 render）
+    const NOW: RenderOpts = RenderOpts {
+        block: false,
+        skip: false,
+    };
+
+    #[test]
+    fn passes_per_frame_counts_the_passes_spent_waiting() {
+        let ms = Duration::from_millis(1);
+        // 依螢幕同步：一看到就畫
+        let mut c = RenderCounter::default();
+        for _ in 0..10 {
+            c.pass();
+            c.rendered(ms, true, NOW);
+        }
+        let s = c.stats();
+        assert_eq!((s.renders, s.frames, s.passes, s.deferred), (10, 10, 10, 0));
+        assert_eq!(s.passes_per_frame, 1.0);
+        // 一般播放：發現時延後一次，到時間畫（發現的那一輪不算）
+        let mut c = RenderCounter::default();
+        for _ in 0..10 {
+            c.pass();
+            c.defer();
+            c.pass();
+            c.rendered(ms, true, NOW);
+        }
+        assert_eq!(c.stats().passes_per_frame, 1.0);
+        // egui 太早叫醒：同一格延後 4 次
+        for _ in 0..10 {
+            for _ in 0..4 {
+                c.pass();
+                c.defer();
+            }
+            c.pass();
+            c.rendered(ms, true, NOW);
+        }
+        let s = c.stats();
+        assert_eq!(s.passes_per_frame, 2.5, "前 10 格 1 次、後 10 格 4 次");
+        assert_eq!((s.frames, s.deferred, s.passes), (20, 50, 70));
+        // 視窗大小改變的重畫不是新影格：不算一格，等著的那一格繼續累計
+        c.defer();
+        c.rendered(ms, false, NOW);
+        c.defer();
+        c.rendered(ms, true, NOW);
+        let s = c.stats();
+        assert_eq!((s.renders, s.frames), (22, 21));
+        assert!(
+            (s.passes_per_frame - 52.0 / 21.0).abs() < 1e-9,
+            "{}",
+            s.passes_per_frame
+        );
+        // 只看最近 128 格
+        for _ in 0..STATS_RING {
+            c.rendered(ms, true, NOW);
+        }
+        assert_eq!(c.stats().passes_per_frame, 1.0);
+    }
+
+    #[test]
+    fn segment_max_since_the_last_take() {
+        let mut c = RenderCounter::default();
+        assert_eq!(c.take_segment(), SegmentMax::default());
+        let block = RenderOpts {
+            block: true,
+            skip: false,
+        };
+        c.rendered(Duration::from_millis(40), true, block);
+        c.gpu_lead(3_000_000);
+        // 拿走之後重新算：之前的 40 ms 不算
+        assert_eq!(
+            c.take_segment(),
+            SegmentMax {
+                render_us: 40_000,
+                blocking_us: 40_000,
+                gpu_lead_us: 3_000
+            }
+        );
+        c.rendered(Duration::from_millis(9), true, block);
+        c.rendered(Duration::from_millis(12), false, NOW);
+        // 環狀緩衝已經沒有的也算（一段比 128 次長）
+        for _ in 0..STATS_RING {
+            c.rendered(Duration::from_millis(1), true, block);
+        }
+        c.gpu_lead(-5);
+        c.gpu_lead(1_500_000);
+        c.gpu_lead(500_000);
+        assert_eq!(c.stats().max_us, 1_000);
+        assert_eq!(
+            c.take_segment(),
+            SegmentMax {
+                render_us: 12_000,
+                blocking_us: 9_000,
+                gpu_lead_us: 1_500
+            }
+        );
+    }
+
+    #[test]
+    fn render_time_percentiles() {
+        let mut c = RenderCounter::default();
+        assert_eq!(c.stats(), RenderStats::default());
+        for us in 1..=100 {
+            let o = RenderOpts {
+                block: us % 4 == 0,
+                skip: us % 10 == 0,
+            };
+            c.rendered(Duration::from_micros(us), true, o);
+        }
+        let s = c.stats();
+        assert_eq!((s.p50_us, s.max_us, s.skipped, s.blocking), (51, 100, 10, 25));
+        // 等待的 render：4、8、…、100 微秒，總共 1300、最久 100
+        assert_eq!((s.blocking_us, s.blocking_max_us), (1_300, 100));
+        // 只看最近 128 次：之前很慢的那次掉出去之後 max 跟著變
+        c.rendered(Duration::from_millis(40), true, NOW);
+        assert_eq!(c.stats().max_us, 40_000);
+        for _ in 0..STATS_RING {
+            c.rendered(Duration::from_micros(400), true, NOW);
+        }
+        let s = c.stats();
+        assert_eq!((s.p50_us, s.max_us), (400, 400));
+        assert_eq!(s.renders, 100 + 1 + STATS_RING as u64);
+        // 不等的 render 不算進等待的時間
+        assert_eq!((s.blocking, s.blocking_us, s.blocking_max_us), (25, 1_300, 100));
+        // 等待的也只看最近 128 次的最大值；總共的時間一直累計
+        let wait = RenderOpts {
+            block: true,
+            skip: false,
+        };
+        c.rendered(Duration::from_micros(8_400), true, wait);
+        for _ in 0..STATS_RING {
+            c.rendered(Duration::from_micros(4_000), true, wait);
+        }
+        let s = c.stats();
+        assert_eq!(s.blocking, 25 + 1 + STATS_RING as u64);
+        assert_eq!(s.blocking_us, 1_300 + 8_400 + 4_000 * STATS_RING as u64);
+        assert_eq!(s.blocking_max_us, 4_000);
+    }
+
+    #[test]
+    fn percentiles_pick_the_nearest_sample() {
+        assert_eq!(percentile(&[], 50), None);
+        assert_eq!(percentile(&[5, 1, 3], 0), Some(1));
+        assert_eq!(percentile(&[5, 1, 3], 50), Some(3));
+        assert_eq!(percentile(&[5, 1, 3], 100), Some(5));
+        assert_eq!(percentile(&[5, 1, 3], 1000), Some(5));
+        let v: Vec<i32> = (1..=100).rev().collect();
+        assert_eq!(percentile(&v, 5), Some(6));
+        assert_eq!(percentile(&v, 95), Some(95));
+        assert_eq!(percentile(&[-3, 7], 50), Some(7));
+    }
+
+    #[test]
+    fn next_vsync_counts_from_the_anchor() {
+        assert_eq!(next_vsync(1000, 100, 1000), (1, 1100), "剛好在垂直同步上：趕不上這一次");
+        assert_eq!(next_vsync(1000, 100, 1001), (1, 1100));
+        assert_eq!(next_vsync(1000, 100, 1099), (1, 1100));
+        assert_eq!(next_vsync(1000, 100, 1100), (2, 1200));
+        // 時間表的基準在現在之後也可以
+        assert_eq!(next_vsync(1000, 100, 999), (0, 1000));
+        assert_eq!(next_vsync(1000, 100, 850), (-1, 900));
     }
 }

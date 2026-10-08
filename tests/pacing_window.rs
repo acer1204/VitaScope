@@ -2,7 +2,7 @@
 //! 會在螢幕上開視窗約 15 秒，所以預設不跑（#[ignore]），在有實體螢幕的開發機上手動跑：
 //!
 //! ```text
-//! python scripts/gen_samples.py --tier pacing
+//! python scripts/gen_samples.py --tier pacing      # 1080p 與 4K 10-bit 的平移影片
 //! cargo test --test pacing_window -- --ignored --nocapture --test-threads=1
 //! ```
 //!
@@ -20,7 +20,18 @@ static SCREEN: Mutex<()> = Mutex::new(());
 const SHOT_DELAY: f64 = 12.0;
 
 fn sample() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated/pacing/pan_23976.mkv");
+    pacing_sample("pan_23976.mkv")
+}
+
+/// 4K 10-bit H.264：顯示卡不能硬體解碼，render 要上傳大貼圖，GPU 畫一格比較久
+fn heavy_sample() -> PathBuf {
+    pacing_sample("pan_4k10.mkv")
+}
+
+fn pacing_sample(name: &str) -> PathBuf {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/pacing")
+        .join(name);
     assert!(
         p.exists(),
         "找不到樣本 {}，請先執行：python scripts/gen_samples.py --tier pacing",
@@ -40,6 +51,11 @@ struct Run {
 
 /// 用暫存的設定檔（`settings` 是 settings.json 的內容）開影戲播平移影片，等它截圖後自己關閉
 fn run(name: &str, settings: &str, env: &[(&str, &str)]) -> Run {
+    run_media(name, settings, env, &sample())
+}
+
+/// 同上，播 `media`
+fn run_media(name: &str, settings: &str, env: &[(&str, &str)], media: &Path) -> Run {
     let _screen = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("vitascope-pacing-window").join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -69,7 +85,7 @@ fn run(name: &str, settings: &str, env: &[(&str, &str)]) -> Run {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vitascope"));
     cmd.arg("--new-window")
         .arg("--fullscreen")
-        .arg(sample())
+        .arg(media)
         .arg("--shot")
         .arg(dir.join("shot.png"))
         .arg("--shot-delay")
@@ -82,6 +98,7 @@ fn run(name: &str, settings: &str, env: &[(&str, &str)]) -> Run {
         .env("VITASCOPE_DEBUG", "pacing")
         .env_remove("VITASCOPE_PACING")
         .env_remove("VITASCOPE_TEST_MINIMIZE")
+        .env_remove("VITASCOPE_TEST_BUSY_UI")
         .envs(env.iter().copied())
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(dir.join("stderr.txt")).unwrap());
@@ -196,6 +213,39 @@ fn shot_position(stderr: &str) -> Option<f64> {
         .ok()
 }
 
+/// VITASCOPE_DEBUG=pacing 每 10 秒印一次的「畫面輸出統計：key=value …」（第一段：第一格畫出來 1 秒之後的 10 秒）
+fn render_summary(stderr: &str) -> Option<Vec<(String, String)>> {
+    let rest = stderr.lines().find_map(|l| l.split_once("畫面輸出統計："))?.1;
+    Some(
+        rest.split_whitespace()
+            .filter_map(|kv| kv.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+    )
+}
+
+/// 統計裡的一個數字
+fn stat(summary: &[(String, String)], key: &str) -> f64 {
+    let v = &summary
+        .iter()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("統計裡沒有 {key}：{summary:?}"))
+        .1;
+    v.parse().unwrap_or_else(|_| panic!("{key}={v} 不是數字"))
+}
+
+/// 相鄰兩格隔幾次螢幕更新的分布（`vsyncs=5:230,6:2`；只有 Windows 量得到）：(更新次數, 格數)
+fn present_vsyncs(summary: &[(String, String)]) -> Vec<(u32, usize)> {
+    let raw = &summary.iter().find(|(k, _)| k == "vsyncs").expect("沒有 vsyncs").1;
+    raw.split(',')
+        .filter(|s| !s.is_empty() && *s != "-")
+        .map(|item| {
+            let (k, n) = item.split_once(':').expect("vsyncs 的格式");
+            (k.parse().unwrap(), n.parse().unwrap())
+        })
+        .collect()
+}
+
 const AUTO: &str = r#"{ "smooth": "auto" }"#;
 
 #[test]
@@ -246,6 +296,16 @@ fn display_sync_gives_an_exact_cadence() {
         "啟動時就決定依螢幕同步：\n{}",
         r.stderr
     );
+    // 依螢幕同步時 mpv 要我們馬上畫（不延後）：render 不等
+    let s = render_summary(&r.stderr).unwrap_or_else(|| panic!("沒有畫面輸出的統計\n{}", r.stderr));
+    eprintln!(
+        "render p50 {} ms、max {} ms、介面 {} 次/秒、延後 {} 次",
+        stat(&s, "p50_ms"),
+        stat(&s, "max_ms"),
+        stat(&s, "passes_per_s"),
+        stat(&s, "deferred")
+    );
+    assert!(stat(&s, "p50_ms") < 2.0, "{s:?}");
 }
 
 #[test]
@@ -298,6 +358,315 @@ fn minimize_and_restore() {
     assert!(total >= 50 && fives as f64 >= 0.995 * total as f64, "{hist:?}");
 }
 
+/// 一般播放一次量測的數字（VITASCOPE_DEBUG=pacing 的第一段統計）
+struct Audio {
+    s: Vec<(String, String)>,
+    /// 影戲的記錄（stderr）
+    stderr: String,
+    /// 相鄰兩格剛好隔 5 次更新的比例（只有 Windows 量得到；其他平台是 NaN）
+    fives: f64,
+    /// 量到幾格的更新次數
+    total: usize,
+}
+
+impl Audio {
+    fn get(&self, key: &str) -> f64 {
+        stat(&self.s, key)
+    }
+}
+
+/// 一般播放比較的情況
+#[derive(Clone, Copy, PartialEq)]
+enum Cond {
+    /// 介面閒著
+    Idle,
+    /// 介面一直重畫（VITASCOPE_TEST_BUSY_UI=1，像滑鼠在視窗上移動）
+    Busy,
+    /// 介面一直重畫，播 4K 10-bit（軟體解碼、上傳大貼圖，GPU 畫一格比較久：介面一直重畫時取影格到預定時間
+    /// 最少只剩 2 ms，GPU 來不來得及）
+    Heavy,
+}
+
+impl Cond {
+    fn name(self) -> &'static str {
+        match self {
+            Cond::Idle => "idle",
+            Cond::Busy => "busy",
+            Cond::Heavy => "heavy",
+        }
+    }
+
+    fn busy(self) -> bool {
+        self != Cond::Idle
+    }
+}
+
+/// 流暢播放關閉（一般播放、音訊同步）跑一次：`block` = VITASCOPE_PACING=block（以前的做法）
+fn audio_run(block: bool, cond: Cond, nth: usize) -> Audio {
+    let name = format!("audio-{}-{}-{nth}", cond.name(), if block { "block" } else { "pace" });
+    let mut env = Vec::new();
+    if block {
+        env.push(("VITASCOPE_PACING", "block"));
+    }
+    if cond.busy() {
+        env.push(("VITASCOPE_TEST_BUSY_UI", "1"));
+    }
+    let media = if cond == Cond::Heavy { heavy_sample() } else { sample() };
+    let r = run_media(&name, "{}", &env, &media);
+    assert_eq!(assumed_fps(&r.log), None, "{name}：不能依螢幕同步");
+    let s = render_summary(&r.stderr).unwrap_or_else(|| panic!("{name}：沒有畫面輸出的統計\n{}", r.stderr));
+    // avsync 是 mpv 排程影格時算的（player/video.c 的 update_av_diff），看不到我們什麼時候真的交出影格：
+    // 只抓得到整個卡住、掉格之類的大問題；交出影格的時間靠 done_* 比
+    assert!(stat(&s, "avsync_ms").abs() < 20.0, "{name}：影像跟聲音差太多 {s:?}");
+    // 播放中 mpv 一直等得到畫面（第一格顯示 1 秒後到截圖）。4K 10-bit 要先試完硬體解碼才軟體解碼，
+    // 第一格比「Starting playback」晚 1 秒多，等第一格時 mpv 也會記「not being called or stuck」
+    let pos = shot_position(&r.stderr).expect("沒有截圖時的播放位置");
+    let t0 = log_lines(&r.log)
+        .find(|(_, l)| l.contains("first video frame after restart shown"))
+        .or_else(|| log_lines(&r.log).find(|(_, l)| l.contains("Starting playback")))
+        .map_or(0.0, |(t, _)| t);
+    let stuck: Vec<f64> = stuck(&r.log)
+        .into_iter()
+        .filter(|t| (t0 + 1.0..t0 + pos + 0.05).contains(t))
+        .collect();
+    assert!(stuck.is_empty(), "{name}：播放中 mpv 等不到畫面：{stuck:?}");
+    let vs = present_vsyncs(&s);
+    let total: usize = vs.iter().map(|(_, n)| n).sum();
+    let fives = vs.iter().find(|(k, _)| *k == 5).map_or(0, |(_, n)| *n);
+    if cfg!(windows) {
+        assert!(total >= 200, "{name}：格數太少 {vs:?}");
+    }
+    let a = Audio {
+        fives: if total > 0 {
+            fives as f64 / total as f64
+        } else {
+            f64::NAN
+        },
+        total,
+        s,
+        stderr: r.stderr,
+    };
+    eprintln!(
+        "{name:<22} 5 次 {:>5.1}%（{fives}/{total}）交出 {:>6.2}/{:>6.2}/{:>6.2} ms  render {:>5.2}/{:>5.2} ms  \
+         等待 {} 次 平均 {} ms 最久 {:>5.2} ms  取 {:>5.2}/{:>5.2}/{:>5.2} ms 前  介面 {:>5.1} 次/秒  每格 {:.2} 輪  \
+         顯示 {} ms  GPU 畫完 {}/{} ms 提早 {:.2} ms  avsync {:>5.2} ms  {vs:?}",
+        a.fives * 100.0,
+        a.get("done_p5_ms"),
+        a.get("done_p50_ms"),
+        a.get("done_p95_ms"),
+        a.get("p50_ms"),
+        a.get("max_ms"),
+        a.get("blocking"),
+        stat_text(&a.s, "blocking_avg_ms"),
+        a.get("blocking_max_ms"),
+        a.get("take_p5_ms"),
+        a.get("take_p50_ms"),
+        a.get("take_p95_ms"),
+        a.get("passes_per_s"),
+        a.get("passes_per_frame"),
+        stat_text(&a.s, "late_p50_ms"),
+        stat_text(&a.s, "gpu_p50_ms"),
+        stat_text(&a.s, "gpu_p95_ms"),
+        a.get("gpu_lead_ms"),
+        a.get("avsync_ms"),
+    );
+    a
+}
+
+/// 螢幕更新一次的時間（ms），不從影戲問：Windows 問 DWM，其他平台用影戲啟動時印的更新率
+/// （量不到時當成 120 Hz，跟 `display_sync_gives_an_exact_cadence` 一樣假設開發機是 120 Hz 的螢幕）
+fn refresh_period_ms(stderr: &str) -> f64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Graphics::Dwm::{DWM_TIMING_INFO, DwmGetCompositionTimingInfo};
+        use windows_sys::Win32::System::Performance::QueryPerformanceFrequency;
+        // SAFETY: DWM_TIMING_INFO 是純資料，全 0 是合法的值；Windows 8.1 起 hwnd 要給 NULL
+        let mut info: DWM_TIMING_INFO = unsafe { std::mem::zeroed() };
+        info.cbSize = size_of::<DWM_TIMING_INFO>() as u32;
+        let mut freq = 0i64;
+        unsafe { QueryPerformanceFrequency(&mut freq) };
+        if unsafe { DwmGetCompositionTimingInfo(std::ptr::null_mut(), &mut info) } >= 0 && freq > 0 {
+            return info.qpcRefreshPeriod as f64 * 1000.0 / freq as f64;
+        }
+    }
+    let hz = stderr
+        .split("Refresh { hz: ")
+        .nth(1)
+        .and_then(|r| r.split([',', ' ']).next()?.parse::<f64>().ok())
+        .unwrap_or(120.0);
+    1000.0 / hz
+}
+
+/// 統計裡的一個值（原樣的文字，量不到是 -）
+fn stat_text<'a>(summary: &'a [(String, String)], key: &str) -> &'a str {
+    &summary
+        .iter()
+        .find(|(k, _)| k == key)
+        .unwrap_or_else(|| panic!("統計裡沒有 {key}：{summary:?}"))
+        .1
+}
+
+/// 幾次量測的平均
+fn mean(runs: &[Audio], f: impl Fn(&Audio) -> f64) -> f64 {
+    runs.iter().map(f).sum::<f64>() / runs.len() as f64
+}
+
+/// 一般播放（流暢播放關閉）時畫面輸出不卡住介面，影格交出、顯示的時間跟以前（`VITASCOPE_PACING=block`）一樣。
+/// 介面閒著、一直重畫（`VITASCOPE_TEST_BUSY_UI=1`，像滑鼠在視窗上移動）、一直重畫又播 4K 10-bit（GPU 畫一格比較久）三種情況都比。
+/// 10 秒的量測每次差幾個百分點（block 自己就在 83%～94% 之間），每種情況 block、pace 輪流各跑三次，比平均。
+/// 每格顯示幾次更新、估計的顯示時間要問 DWM 垂直同步的時間，只在 Windows 檢查
+#[test]
+#[ignore = "會在螢幕上開全螢幕視窗（約 15 秒，18 次）；在開發機上手動跑"]
+fn audio_mode_does_not_block_the_interface() {
+    const RUNS: usize = 3;
+    /// 取影格時多容許的量（`pacing::BLOCK_MARGIN_NS`）
+    const MARGIN_MS: f64 = 2.0;
+    let vsync_grid = cfg!(windows);
+    for cond in [Cond::Idle, Cond::Busy, Cond::Heavy] {
+        let (mut blocks, mut paces) = (Vec::new(), Vec::new());
+        for nth in 0..RUNS {
+            blocks.push(audio_run(true, cond, nth));
+            paces.push(audio_run(false, cond, nth));
+        }
+        let cond_name = match cond {
+            Cond::Idle => "介面閒著",
+            Cond::Busy => "介面一直重畫",
+            Cond::Heavy => "介面一直重畫、4K 10-bit",
+        };
+        let avg = |runs: &[Audio], key: &str| mean(runs, |a| a.get(key));
+        let (b_fives, p_fives) = (mean(&blocks, |a| a.fives), mean(&paces, |a| a.fives));
+        eprintln!(
+            "{cond_name}：每格 5 次更新 block {:.1}% / pace {:.1}%；交出 p5 {:.2}/{:.2}、p95 {:.2}/{:.2} ms；\
+             GPU 做完 p50 {:.2}/{:.2}、p95 {:.2}/{:.2} ms；avsync {:.2}/{:.2} ms；介面 {:.1}/{:.1} 次/秒",
+            b_fives * 100.0,
+            p_fives * 100.0,
+            avg(&blocks, "done_p5_ms"),
+            avg(&paces, "done_p5_ms"),
+            avg(&blocks, "done_p95_ms"),
+            avg(&paces, "done_p95_ms"),
+            avg(&blocks, "gpu_p50_ms"),
+            avg(&paces, "gpu_p50_ms"),
+            avg(&blocks, "gpu_p95_ms"),
+            avg(&paces, "gpu_p95_ms"),
+            avg(&blocks, "avsync_ms"),
+            avg(&paces, "avsync_ms"),
+            avg(&blocks, "passes_per_s"),
+            avg(&paces, "passes_per_s"),
+        );
+        for b in &blocks {
+            // 以前的做法：每格在介面的執行緒上等 40 ms 左右，每次 render 都等
+            assert!(b.get("p50_ms") > 20.0, "{cond_name}：基準（block）應該會等：{:?}", b.s);
+            assert_eq!(
+                b.get("blocking"),
+                b.get("renders"),
+                "{cond_name}：基準（block）每次都要等"
+            );
+            assert_eq!(b.get("deferred"), 0.0);
+            assert_eq!(b.get("gpu_lead_ms"), 0.0, "{cond_name}：基準（block）不提早");
+        }
+        // 讓 render 等的範圍是螢幕更新一次的時間（120 Hz 是 8.33 ms）：跟另外問到的更新率比
+        // （影戲沒把偵測到的更新率交給影片畫面的話會當成 60 Hz，等的時間變兩倍，其他數字看不出來）
+        let window = paces[0].get("window_ms");
+        let period = refresh_period_ms(&paces[0].stderr);
+        assert!(
+            (window - period).abs() < 0.05,
+            "{cond_name}：讓 render 等的範圍 {window} ms 不是螢幕更新一次的時間 {period:.3} ms"
+        );
+        let refresh = 1000.0 / period;
+        for p in &paces {
+            assert!(p.get("deferred") > 0.0, "{cond_name}：沒有延後取影格 {:?}", p.s);
+            // 取的時候照樣讓 render 等到預定時間，但最多等一次更新加上容許的 2 ms（GPU 來不及時再加上提早的量），
+            // 再留 3 ms 給 render 本身（除錯版）。max、gpu_lead_ms 是這一段（第一格之後 1 秒起的 10 秒）裡最大的
+            let bound = window + MARGIN_MS + p.get("gpu_lead_ms") + 3.0;
+            assert!(
+                p.get("max_ms") <= bound && p.get("blocking_max_ms") <= bound,
+                "{cond_name}：render 等太久（上限 {bound} ms）：{:?}",
+                p.s
+            );
+            assert!(p.get("blocking") > 0.0, "{cond_name}：{:?}", p.s);
+        }
+        // 交出影格的時間跟以前一樣：都是 mpv 到了預定時間才放行。最晚的 5% 不比以前晚超過 1 ms，
+        // 最早的 5% 不比以前早超過 2 ms（早取的影格會早一次垂直同步顯示，avsync 看不出來）
+        let (b95, p95) = (avg(&blocks, "done_p95_ms"), avg(&paces, "done_p95_ms"));
+        assert!(
+            p95 <= b95 + 1.0,
+            "{cond_name}：交出影格比以前晚：{p95} ms（以前 {b95} ms）"
+        );
+        let (b5, p5) = (avg(&blocks, "done_p5_ms"), avg(&paces, "done_p5_ms"));
+        assert!(p5 >= b5 - 2.0, "{cond_name}：交出影格比以前早：{p5} ms（以前 {b5} ms）");
+        // 偶爾晚交出的那幾格（取影格時已經過了預定時間、render 畫太久）：最晚的 1% 也不比以前晚超過 1 ms
+        let (b99, p99) = (avg(&blocks, "done_p99_ms"), avg(&paces, "done_p99_ms"));
+        assert!(
+            p99 <= b99 + 1.0,
+            "{cond_name}：有幾格交出得比以前晚：{p99} ms（以前 {b99} ms）"
+        );
+        let avsync = avg(&paces, "avsync_ms") - avg(&blocks, "avsync_ms");
+        assert!(avsync.abs() < 4.0, "{cond_name}：avsync 跟以前差 {avsync} ms");
+        // GPU 畫完影格的時間（量不到的平台沒有）：以前 GPU 有 40 ms 可以畫，現在取影格之後只剩幾毫秒；
+        // 晚畫完會晚一次垂直同步顯示（上面交出的時間看不出來）。1080p 跟以前差不到 0.1 ms。
+        // 4K 10-bit（軟體解碼）不提早的話中位數、最晚的 5% 比以前晚 2.2、7 ms（GpuLate 拿掉就會抓到），
+        // 最多提早 10 ms 時晚約 0.9、1.0 ms。留 1.5／2 ms（GPU 的時間每次跑差不少）
+        if stat_text(&paces[0].s, "gpu_p50_ms") != "-" {
+            for (key, slack) in [("gpu_p50_ms", 1.5), ("gpu_p95_ms", 2.0)] {
+                let (b, p) = (avg(&blocks, key), avg(&paces, key));
+                assert!(
+                    p <= b + slack,
+                    "{cond_name}：GPU 做完影格比以前晚：{key} {p} ms（以前 {b} ms）"
+                );
+            }
+        }
+        if vsync_grid {
+            // 每格顯示幾次更新：23.976 fps 的影格時間每 8.3 秒跨過一次垂直同步，跨過的地方前後有 10～17 格 4／6 次
+            // （交出時間差一點點就落在前後一次）；10 秒裡跨過一次或兩次要看開始的時間，所以一次 86% 一次 100%。
+            // 實測三次平均的差（pace − block）在 −3.4～+4.6 個百分點之間（7 組，平均 +0.6、標準差約 3），
+            // 留 3 個百分點會一成以上誤判：留 6 個（約 1%）。交出時間真的變晚的話上面的 done_*、下面的 late 會先抓到
+            assert!(
+                p_fives >= b_fives - 0.06,
+                "{cond_name}：每格 5 次更新的比例變差：{p_fives}（block {b_fives}）"
+            );
+            let late = avg(&paces, "late_p50_ms") - avg(&blocks, "late_p50_ms");
+            assert!(late.abs() < 2.0, "{cond_name}：顯示時間跟以前差 {late} ms");
+            assert!(paces.iter().chain(&blocks).all(|a| a.total >= 200));
+        }
+        let (b_passes, p_passes) = (avg(&blocks, "passes_per_s"), avg(&paces, "passes_per_s"));
+        if cond.busy() {
+            // 介面一直重畫：以前每格在 render 等 40 ms，介面只剩影片的格率；現在跟著螢幕更新率
+            assert!(
+                p_passes >= 0.85 * refresh,
+                "{cond_name}：介面每秒只畫 {p_passes} 次（螢幕 {refresh:.1} Hz）"
+            );
+            assert!(
+                b_passes < 0.5 * refresh,
+                "{cond_name}：基準（block）的介面應該只剩影片的格率：{b_passes} 次/秒"
+            );
+        } else {
+            // 介面閒著：等影格時沒有一輪接一輪地空轉到時間，發現新影格之後到畫出來大約只多一輪（critique A3）；
+            // egui 扣掉 predicted_dt 卻沒加回去的話是每次垂直同步都重畫（實測 119 次/秒、每格 3.9～4.0 輪）。
+            // 實測 1.00～1.32：mpv 的事件（播放位置）跟新影格的通知誰先到每次跑不一樣，
+            // 事件晚到的話同一格多看一輪；所以上限放到 1.5（還是遠低於空轉的 4）
+            for p in &paces {
+                assert!(
+                    p.get("passes_per_frame") <= 1.5,
+                    "{cond_name}：每格重繪太多次：{:?}",
+                    p.s
+                );
+                assert!(
+                    p.get("passes_per_s") < 0.85 * refresh,
+                    "{cond_name}：介面一直在重畫：{:?}",
+                    p.s
+                );
+                // 計時器叫醒的那一輪落在範圍中間（預定時間前約半次更新）：扣掉了計時器平均晚的量，
+                // 最早取的 5% 也還在預定時間前 2 ms 以上（沒扣的話只剩 1.2～1.6 ms，render 本身就要約 1 ms）
+                assert!(
+                    p.get("take_p5_ms") >= MARGIN_MS,
+                    "{cond_name}：計時器叫醒的那一輪太晚取影格：{:?}",
+                    p.s
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn log_parsing() {
     let log = "[   1.096][t][cplayer] s=1.001000 vsyncs=5 dur=0.041708 ratio=5.000000 err=0\n\
@@ -315,4 +684,14 @@ fn log_parsing() {
     ));
     assert_eq!(cadence(&vsyncs(log), 0.0, 2.0), (2, 1, vec![(5, 1), (6, 1)]));
     assert_eq!(shot_position("[vitascope] 截圖時的播放位置：11.982 秒\n"), Some(11.982));
+    let s = render_summary(
+        "[vitascope] 流暢播放：Audio(Setting)\n\
+         [vitascope] 影片畫面輸出：shader，視窗 MSAA 0x\n\
+         [vitascope] 畫面輸出統計：secs=10.0 renders=240 p50_ms=0.41 vsyncs=4:1,5:230,6:2 late_p50_ms=-1.20\n",
+    )
+    .unwrap();
+    assert_eq!(stat(&s, "renders"), 240.0);
+    assert_eq!(stat(&s, "late_p50_ms"), -1.2);
+    assert_eq!(present_vsyncs(&s), vec![(4, 1), (5, 230), (6, 2)]);
+    assert_eq!(render_summary("沒有統計\n"), None);
 }

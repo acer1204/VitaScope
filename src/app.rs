@@ -366,7 +366,12 @@ impl VitascopeApp {
             }
         }
         let (video, fatal) = match &cc.get_proc_address {
-            Some(gpa) => match VideoView::new(player.mpv().clone(), gpa.clone(), cc.egui_ctx.clone()) {
+            Some(gpa) => match VideoView::new(
+                player.mpv().clone(),
+                gpa.clone(),
+                cc.egui_ctx.clone(),
+                !launch.pacing.block,
+            ) {
                 Ok(v) => (Some(v), None),
                 Err(e) => (
                     None,
@@ -3218,6 +3223,7 @@ impl VitascopeApp {
 
 impl eframe::App for VitascopeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_tick(ctx);
         for ev in self.player.poll() {
             self.on_player_event(ev);
         }

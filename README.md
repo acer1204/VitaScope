@@ -26,7 +26,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   Windows 不允許程式自己設成預設播放器：到「設定 → 應用程式 → 預設應用程式」選影戲，或在影戲的「設定 → 系統」按「選擇預設播放器…」。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
-- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2 與 libxkbcommon-x11（一般桌面都有；AppImage 已內含）。
+- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2（mpv 0.37 以上）與 libxkbcommon-x11（一般桌面都有；AppImage 已內含）。
   AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）與 OpenSSL 3（libssl3，桌面系統都有）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
@@ -123,6 +123,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 - [x] **流暢播放**：依視窗所在螢幕的實際更新率（例如 119.88 Hz）微調播放速度，每格影像顯示的次數固定，
   平移畫面不會忽快忽慢；使用電池時自動暫停。在「設定 → 播放」或右鍵選單「畫質」打開（目前預設關閉）
+- [x] 一般播放時畫面輸出不再卡住介面（以前介面每秒只更新 24 次左右，跟著影片的格率）
 - [ ] 影像調整：亮度、對比、飽和度、色相、Gamma
 - [ ] 去交錯、去色帶
 - [ ] 縮放演算法選擇
@@ -267,11 +268,13 @@ vitascope 影片.mp4 --shot 截圖.png [--shot-delay 秒] [--fullscreen]
 
 | 環境變數 | 作用 |
 |---|---|
-| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v`。`VITASCOPE_DEBUG=pacing` 另外印出流暢播放的決定（螢幕更新率、電源、套用的設定） |
+| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v`。`VITASCOPE_DEBUG=pacing` 另外印出流暢播放的決定（螢幕更新率、電源、套用的設定），並每 10 秒印一次畫面輸出的統計（render 花的時間、等影格的時間、每格重繪幾次、交出影格比預定時間早或晚多少、顯示卡什麼時候畫完影格） |
 | `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"`；指定了 `video-sync` 或 `display-fps-override` 時流暢播放不會去改它們 |
 | `VITASCOPE_PACING=off` | 流暢播放完全不動作（跟沒有這個功能時一樣） |
+| `VITASCOPE_PACING=block` | 畫面輸出照以前的做法：每格在介面的執行緒上等到影格的預定時間（可以跟 `off` 一起用，以逗號隔開） |
 
-流暢播放的實機量測（全螢幕播 1080p 平移影片，從 mpv 的記錄算每格顯示幾次螢幕更新；會在螢幕上開視窗約 15 秒）：
+流暢播放的實機量測（全螢幕播 1080p、4K 10-bit 平移影片，從 mpv 的記錄算每格顯示幾次螢幕更新；每次會在螢幕上開視窗約 15 秒，
+一般播放的比較（介面閒著、一直重畫、一直重畫又播 4K，以前與現在的畫面輸出各三次）共 18 次）：
 
 ```bash
 python scripts/gen_samples.py --tier pacing

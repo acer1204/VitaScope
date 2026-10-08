@@ -468,8 +468,9 @@ jobs:
           macos_min=$(cat assets/macos-min-version.txt)
           glibc=$(cat assets/linux-glibc.txt)
           appimage_glibc=$(cat assets/appimage-glibc.txt)
-          # Debian 12 的 glibc 是 2.36、Debian 13 是 2.41
-          if printf '%s\n%s\n' "$glibc" 2.36 | sort -V -C; then debian=12; else debian=13; fi
+          # tar.gz 需要 libmpv 0.37 以上（client API 2.2）：Debian 12 只有 mpv 0.35，glibc（2.36）夠也不能用，
+          # 所以至少 Debian 13（glibc 2.41）
+          debian=13
 
           # CHANGELOG.md 裡這個版本的段落（「## v0.1.1 — 日期」到下一個「## 」之前）放在說明最前面
           awk -v tag="$GITHUB_REF_NAME" '/^## / { if (found) exit; found = ($2 == tag); next } found' \
@@ -491,7 +492,7 @@ jobs:
           | macOS @MACOS_MIN@ 以上（Apple Silicon） | `VitaScope-@TAG@-macos-arm64.dmg`（建議） | 打開後把 `VitaScope.app` 拖到「應用程式」 |
           | | `VitaScope-@TAG@-macos-arm64.zip` | 解壓縮後把資料夾裡的 `VitaScope.app` 拖到「應用程式」 |
           | Linux（x64） | `VitaScope-@TAG@-linux-x86_64.AppImage`（建議） | `chmod +x` 後直接執行，不用另外安裝 libmpv；需要 glibc @APPIMAGE_GLIBC@ 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）與 OpenSSL 3（桌面系統都有） |
-          | | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv（Ubuntu / Debian：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `./install.sh` 加入應用程式選單（`./install.sh --default` 設成預設播放器），或直接執行 `./vitascope` |
+          | | `VitaScope-@TAG@-linux-x64.tar.gz` | 先安裝 libmpv 0.37 以上（Ubuntu 24.04 / Debian 13 以後：`sudo apt install libmpv2`；Fedora：`sudo dnf install mpv-libs`），解壓縮後執行 `./install.sh` 加入應用程式選單（`./install.sh --default` 設成預設播放器），或直接執行 `./vitascope` |
 
           **Windows**：程式沒有數位簽章，第一次執行時可能出現「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」
           （開啟「智慧型應用程式控制」的 Windows 11 會直接擋下，沒有「仍要執行」可按）。
@@ -501,7 +502,7 @@ jobs:
           **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，
           在下方按「仍要打開」；也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
 
-          **Linux**：tar.gz 需要 glibc @GLIBC@ 以上與 libmpv.so.2（例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
+          **Linux**：tar.gz 需要 glibc @GLIBC@ 以上與 libmpv.so.2（mpv 0.37 以上；例如 Ubuntu 24.04 以後、Debian @DEBIAN@ 以後、目前的 Fedora）。
           AppImage 需要 FUSE（大多數桌面發行版都有；沒有的話加 `--appimage-extract-and-run` 執行）。
           tar.gz 另外需要 libxkbcommon-x11（一般桌面都有；AppImage 已內含）；中文介面需要中文字型（例如 `sudo apt install fonts-noto-cjk`），
           開檔對話框需要 xdg-desktop-portal 或 zenity。

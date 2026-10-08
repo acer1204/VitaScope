@@ -224,12 +224,13 @@ impl Mpv {
     /// 只能在初始化前設定的選項（例如 `vo`、`config`）要放這裡。
     pub fn new(options: &[(&str, &str)]) -> Result<Self> {
         let api = unsafe { sys::mpv_client_api_version() } as u64;
-        if api >> 16 != 2 {
+        // 2.2（mpv 0.37）起才有 mpv_get_time_ns（畫面輸出挑時間取影格要用）
+        if api >> 16 != 2 || api & 0xffff < 2 {
             return Err(Error::new(
                 sys::mpv_error_MPV_ERROR_UNSUPPORTED,
                 crate::tf!(
-                    "libmpv client API {}.{} 不相容（需要 2.x）",
-                    "libmpv client API {}.{} is not compatible (2.x required)",
+                    "libmpv client API {}.{} 不相容（需要 2.2 以上的 2.x，也就是 mpv 0.37 以上）",
+                    "libmpv client API {}.{} is not compatible (2.2 or a newer 2.x required, i.e. mpv 0.37 or newer)",
                     api >> 16,
                     api & 0xffff
                 ),
@@ -262,6 +263,17 @@ impl Mpv {
 
     pub(crate) fn raw(&self) -> *mut sys::mpv_handle {
         self.handle.as_ptr()
+    }
+
+    /// mpv 內部的時鐘（奈秒，跟 render API 的影格預定時間同一個基準）。
+    /// 任何時候、在畫面輸出的執行緒上都能呼叫（client.h：safe from render threads）；libmpv 0.37 起才有
+    pub fn time_ns(&self) -> i64 {
+        unsafe { sys::mpv_get_time_ns(self.raw()) }
+    }
+
+    /// 同 `time_ns`，單位是微秒
+    pub fn time_us(&self) -> i64 {
+        unsafe { sys::mpv_get_time_us(self.raw()) }
     }
 
     /// 執行指令，例如 `["loadfile", path]`、`["seek", "10", "relative"]`。

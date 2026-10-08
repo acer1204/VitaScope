@@ -12,7 +12,7 @@ use std::sync::Arc;
 pub type GetProcAddress = Arc<dyn Fn(&CStr) -> *const c_void + Send + Sync>;
 
 /// 下一個影格的資訊（`MPV_RENDER_PARAM_NEXT_FRAME_INFO`）：決定這一輪要不要先等一下再取影格
-/// （見 `pacing::defer`）
+/// （見 `pacing::take`）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameInfo {
     /// 有影格要顯示
@@ -25,6 +25,30 @@ pub struct FrameInfo {
     pub block_vsync: bool,
     /// 應該顯示的時間，mpv 原始的值（`mp_time_ns` 單位；0 = 沒有指定）
     pub target_raw: i64,
+}
+
+impl FrameInfo {
+    /// `mpv_render_frame_info` 的旗標（render.h：PRESENT=1、REDRAW=2、REPEAT=4、BLOCK_VSYNC=8）
+    pub fn from_raw(flags: u64, target_time: i64) -> Self {
+        let has = |bit: sys::mpv_render_frame_info_flag| flags & u64::from(bit) != 0;
+        Self {
+            present: has(sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_PRESENT),
+            redraw: has(sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_REDRAW),
+            repeat: has(sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_REPEAT),
+            block_vsync: has(sys::mpv_render_frame_info_flag_MPV_RENDER_FRAME_INFO_BLOCK_VSYNC),
+            target_raw: target_time,
+        }
+    }
+}
+
+/// 一次 `render` 的做法
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderOpts {
+    /// 等到影格的預定時間才回來（mpv 的預設，`MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME`）。
+    /// 不等的話要自己挑時間呼叫（見 `pacing::take`），否則影像會比聲音早
+    pub block: bool,
+    /// 只把影格取走、不畫（`MPV_RENDER_PARAM_SKIP_RENDERING`）
+    pub skip: bool,
 }
 
 pub struct RenderContext {
@@ -168,12 +192,26 @@ impl RenderContext {
         flags & u64::from(sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME) != 0
     }
 
+    /// 下一個影格的資訊（`update()` 說有新影格之後問）。mpv 不支援時回傳 None
+    pub fn next_frame_info(&self) -> Option<FrameInfo> {
+        let mut info = sys::mpv_render_frame_info {
+            flags: 0,
+            target_time: 0,
+        };
+        let param = sys::mpv_render_param {
+            type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_NEXT_FRAME_INFO,
+            data: &mut info as *mut _ as *mut c_void,
+        };
+        let code = unsafe { sys::mpv_render_context_get_info(self.ctx, param) };
+        (code >= 0).then(|| FrameInfo::from_raw(info.flags, info.target_time))
+    }
+
     /// 把目前影格畫到 `fbo`（0 = 預設 framebuffer）。
     /// `flip_y`：畫到 OpenGL 慣例（原點在左下）的 framebuffer 時要設 true。
     ///
     /// # Safety
     /// GL context 必須是 current，`fbo` 必須是完整、可繪製的 framebuffer。
-    pub unsafe fn render(&self, fbo: u32, width: i32, height: i32, flip_y: bool) -> Result<()> {
+    pub unsafe fn render(&self, fbo: u32, width: i32, height: i32, flip_y: bool, o: RenderOpts) -> Result<()> {
         let mut target = sys::mpv_opengl_fbo {
             fbo: fbo as c_int,
             w: width,
@@ -181,6 +219,9 @@ impl RenderContext {
             internal_format: 0,
         };
         let mut flip: c_int = flip_y.into();
+        let mut block: c_int = o.block.into();
+        // 0 = 照常畫（mpv 沒給這個參數時的預設）
+        let mut skip: c_int = o.skip.into();
         let mut params = [
             sys::mpv_render_param {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_OPENGL_FBO,
@@ -189,6 +230,14 @@ impl RenderContext {
             sys::mpv_render_param {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_FLIP_Y,
                 data: &mut flip as *mut c_int as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: &mut block as *mut c_int as *mut c_void,
+            },
+            sys::mpv_render_param {
+                type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_SKIP_RENDERING,
+                data: &mut skip as *mut c_int as *mut c_void,
             },
             sys::mpv_render_param {
                 type_: sys::mpv_render_param_type_MPV_RENDER_PARAM_INVALID,
@@ -200,6 +249,7 @@ impl RenderContext {
     }
 
     /// 畫面送出（swap buffers）後呼叫，幫助 mpv 掌握顯示時機。
+    /// 影戲不呼叫：呼叫過一次之後 mpv 每格都要等 swap，eframe 不畫（視窗縮小）時每格卡 200 ms
     pub fn report_swap(&self) {
         unsafe { sys::mpv_render_context_report_swap(self.ctx) };
     }
@@ -211,5 +261,25 @@ impl Drop for RenderContext {
             sys::mpv_render_context_set_update_callback(self.ctx, None, std::ptr::null_mut());
             sys::mpv_render_context_free(self.ctx);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_info_flags() {
+        // render.h：PRESENT=1、REDRAW=2、REPEAT=4、BLOCK_VSYNC=8
+        assert_eq!(FrameInfo::from_raw(0, 0), FrameInfo::default());
+        let present = FrameInfo::from_raw(1, 42);
+        assert!(present.present && !present.redraw && !present.repeat && !present.block_vsync);
+        assert_eq!(present.target_raw, 42);
+        assert!(FrameInfo::from_raw(1 | 2, 0).redraw);
+        assert!(FrameInfo::from_raw(1 | 4, 0).repeat);
+        let sync = FrameInfo::from_raw(1 | 4 | 8, 0);
+        assert!(sync.present && sync.repeat && sync.block_vsync && !sync.redraw);
+        // 不認得的位元不管
+        assert_eq!(FrameInfo::from_raw(1 | 1 << 20, 7), FrameInfo::from_raw(1, 7));
     }
 }

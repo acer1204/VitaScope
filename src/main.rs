@@ -68,10 +68,14 @@ fn parse_args() -> (Launch, bool) {
             _ => launch.files.push(PathBuf::from(arg)),
         }
     }
-    // VITASCOPE_TEST_MINIMIZE=3,6：截圖前縮到最小再還原（流暢播放的實機測試）
+    // 流暢播放的實機測試：VITASCOPE_TEST_MINIMIZE=3,6 截圖前縮到最小再還原；
+    // VITASCOPE_TEST_BUSY_UI=1 介面一直重畫（模擬滑鼠在視窗上移動）。只跟 --shot 一起用
     let minimize = std::env::var("VITASCOPE_TEST_MINIMIZE").unwrap_or_default();
+    let busy_ui = std::env::var_os("VITASCOPE_TEST_BUSY_UI").is_some_and(|v| v == "1");
     launch.autoshot = shot.map(|p| {
-        AutoShot::new(p, Duration::from_secs_f64(delay)).minimize_at(vitascope::autoshot::parse_minimize(&minimize))
+        AutoShot::new(p, Duration::from_secs_f64(delay))
+            .minimize_at(vitascope::autoshot::parse_minimize(&minimize))
+            .busy_ui(busy_ui)
     });
     // 流暢播放出問題時回到以前的做法：VITASCOPE_PACING=off（只在啟動時讀一次）
     launch.pacing = vitascope::pacing::Overrides::from_env();
@@ -136,10 +140,17 @@ fn main() -> eframe::Result {
         }
     }
     let wake = egui_ctx.clone();
+    let pace = !launch.pacing.block;
     let player = match Player::new(Options {
         wakeup: Some(Box::new(move || {
             if let Some(ctx) = wake.get() {
-                ctx.request_repaint();
+                if pace {
+                    // 只要一輪（`request_repaint()` 每次畫兩輪）：一般播放時 mpv 每格都有事件（播放位置），
+                    // 第二輪只是再看一次還沒到時間的影格。延遲不是 0 就只畫一輪，扣掉 predicted_dt 後還是馬上畫
+                    ctx.request_repaint_after_for(std::time::Duration::from_nanos(1), egui::ViewportId::ROOT);
+                } else {
+                    ctx.request_repaint();
+                }
             }
         })),
         hwdec: if settings.hwdec { "auto-safe" } else { "no" }.into(),
