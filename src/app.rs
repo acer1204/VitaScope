@@ -10,7 +10,8 @@ use crate::autoshot::AutoShot;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
-use crate::player::{MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
+use crate::picture::PictureDefaults;
+use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
 use crate::settings::{Settings, SubStyle, WindowGeometry};
 use crate::update::{self, UpdateStatus};
@@ -23,6 +24,7 @@ use eframe::glow;
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, WindowHandle,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -264,6 +266,12 @@ pub struct VitascopeApp {
     info_cache: Option<info_panel::InfoCache>,
     /// 音訊裝置的名稱（面板打開時查一次）
     audio_device: Option<String>,
+    /// 播放引擎有哪些 L3 功能（啟動時偵測）
+    caps: EngineCaps,
+    /// 這個引擎的縮放預設值（「標準」畫質）
+    picture_defaults: PictureDefaults,
+    /// 已送出、還沒回覆的非同步設定：指令編號 → 選項名稱（失敗時提示用）
+    async_pending: HashMap<u64, String>,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -340,7 +348,7 @@ impl VitascopeApp {
             eprintln!("[vitascope] OpenGL：{renderer}（{version}）");
             // Mesa 的軟體繪圖（llvmpipe 等，常見於虛擬機、沒有顯示卡驅動的電腦）上，
             // mpv 完整的繪圖流程畫出來是全黑的；改用簡化流程（少了高品質縮放等效果，但看得到畫面）
-            if is_mesa_software_renderer(&renderer) && !mpv_opts_override("gpu-dumb-mode") {
+            if is_mesa_software_renderer(&renderer) && !mpv_opts_override(&player, "gpu-dumb-mode") {
                 eprintln!("[vitascope] 偵測到軟體繪圖，mpv 改用簡化的繪圖流程");
                 let _ = player.mpv().set_property("gpu-dumb-mode", "yes");
             }
@@ -446,6 +454,9 @@ impl VitascopeApp {
             info_open: false,
             info_cache: None,
             audio_device: None,
+            caps: EngineCaps::default(),
+            picture_defaults: PictureDefaults::default(),
+            async_pending: HashMap::new(),
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -455,6 +466,8 @@ impl VitascopeApp {
             .player
             .get_string("mpv-configuration")
             .is_ok_and(|c| c.contains("gpl=false"));
+        // 軟體繪圖的判斷（gpu-dumb-mode）已經做完、還沒開任何檔案：這時才能同步設定 mpv
+        app.apply_startup();
         if launch.files.is_empty() {
             // 沒有要開檔：截的是起始畫面，現在就開始計時
             if let Some(shot) = &mut app.autoshot {
@@ -496,6 +509,83 @@ impl VitascopeApp {
     /// 目前的畫面調整（介面測試用）
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
+    }
+
+    /// 播放引擎偵測到的功能（介面測試用）
+    pub fn engine_caps(&self) -> &EngineCaps {
+        &self.caps
+    }
+
+    /// 這個播放引擎的縮放演算法預設值（介面測試用）
+    pub fn picture_defaults(&self) -> &PictureDefaults {
+        &self.picture_defaults
+    }
+
+    /// 目前畫面上的提示文字（介面測試用）
+    pub fn osd_text(&self) -> Option<&str> {
+        self.osd.as_ref().map(|(text, _)| text.as_str())
+    }
+
+    /// 啟動時（還沒開任何檔案）偵測播放引擎的功能。之後的批次在這裡同步套用畫質、音效設定；
+    /// 現在只偵測、記下來，不改任何 mpv 選項
+    fn apply_startup(&mut self) {
+        self.caps = self.player.probe_caps();
+        self.picture_defaults = self.player.picture_defaults();
+        if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+            eprintln!(
+                "[vitascope] 播放引擎功能：{:?}；縮放預設值：{:?}",
+                self.caps, self.picture_defaults
+            );
+        }
+    }
+
+    // ───────────── 非同步設定 mpv 選項 ─────────────
+
+    /// 非同步設定一個 mpv 選項（播放中改設定都用這個，不會卡住介面）；失敗時提示「無法套用」
+    pub fn set_option_async(&mut self, k: AsyncKey, name: &str, value: &str) {
+        let result = self.player.set_async(k, name, value);
+        self.track_async(k, name, result);
+    }
+
+    /// 非同步指令（change-list、af-command…），回覆依種類 `k` 分派
+    pub fn command_async_keyed(&mut self, k: AsyncKey, args: &[&str]) {
+        let result = self.player.command_async_keyed(k, args);
+        // 提示裡寫選項名稱（set、change-list 的第二個參數），其他指令寫指令名稱
+        let name = match args {
+            [cmd, name, ..] if matches!(*cmd, "set" | "change-list") => *name,
+            [cmd, ..] => *cmd,
+            [] => "",
+        };
+        self.track_async(k, name, result);
+    }
+
+    fn track_async(&mut self, k: AsyncKey, name: &str, result: crate::mpv::Result<u64>) {
+        match result {
+            Ok(id) => {
+                self.async_pending.insert(id, name.to_owned());
+            }
+            Err(e) => self.async_failed(k, name, &e.to_string()),
+        }
+    }
+
+    /// mpv 回覆了 `set_option_async` / `command_async_keyed` 送出的指令
+    fn on_async_reply(&mut self, id: u64, k: AsyncKey, error: Option<String>) {
+        let name = self.async_pending.remove(&id).unwrap_or_else(|| format!("{k:?}"));
+        if let Some(e) = error {
+            self.async_failed(k, &name, &e);
+        }
+    }
+
+    fn async_failed(&mut self, k: AsyncKey, name: &str, e: &str) {
+        // af-command 失敗不提示：沒開檔、濾鏡剛重建時本來就會失敗，之後會改寫整條 af
+        if k == AsyncKey::AfCommand {
+            if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+                eprintln!("[vitascope] af-command 失敗（{name}）：{e}");
+            }
+            return;
+        }
+        eprintln!("[vitascope] 無法套用 {name}：{e}");
+        self.osd(crate::tf!("無法套用 {name}：{e}", "Couldn't apply {name}: {e}"));
     }
 
     // ───────────── 操作 ─────────────
@@ -1310,7 +1400,11 @@ impl VitascopeApp {
                 self.file_gen += 1;
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
-            PlayerEvent::CommandReply { id, error } => self.on_command_reply(id, error),
+            PlayerEvent::CommandReply { id, error } => match crate::player::async_key(id) {
+                Some(k) => self.on_async_reply(id, k, error),
+                // 截圖
+                None => self.on_command_reply(id, error),
+            },
             // 新檔案的影像設定好了，尺寸才是新的
             PlayerEvent::VideoReconfig => {
                 // 記下檔案原本的形狀（解碼器的參數，不受任何調整影響），之後換長寬比、裁切都以它為準
@@ -3376,10 +3470,9 @@ fn is_mesa_software_renderer(renderer: &str) -> bool {
         .any(|name| r.contains(name))
 }
 
-/// 使用者用 VITASCOPE_MPV_OPTS 自己指定了這個 mpv 選項（就不自動調整）
-fn mpv_opts_override(name: &str) -> bool {
-    std::env::var("VITASCOPE_MPV_OPTS")
-        .is_ok_and(|opts| opts.split_whitespace().any(|kv| kv.split('=').next() == Some(name)))
+/// 使用者用 VITASCOPE_MPV_OPTS（或測試的 `Options.extra`）自己指定了這個 mpv 選項（就不自動調整）
+fn mpv_opts_override(player: &Player, name: &str) -> bool {
+    player.user_overrides().contains(name)
 }
 
 /// 秒數 → 「1:23:45」或「03:21」
@@ -3395,7 +3488,7 @@ pub fn fmt_time(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, short_versions};
+    use super::{fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, mpv_opts_override, short_versions};
 
     #[test]
     fn formats_time() {
@@ -3446,5 +3539,23 @@ mod tests {
         assert!(!is_mesa_software_renderer("NVIDIA GeForce RTX 3090/PCIe/SSE2"));
         assert!(!is_mesa_software_renderer("Mesa Intel(R) UHD Graphics 630 (CFL GT2)"));
         assert!(!is_mesa_software_renderer("Apple Software Renderer"));
+    }
+
+    #[test]
+    fn user_options_stop_the_automatic_dumb_mode() {
+        use crate::player::{Options, Player};
+        let player = |extra: Vec<(String, String)>| {
+            Player::new(Options {
+                extra,
+                ..Options::headless()
+            })
+            .unwrap()
+        };
+        let own = player(vec![("gpu-dumb-mode".into(), "no".into())]);
+        assert!(mpv_opts_override(&own, "gpu-dumb-mode"));
+        assert!(!mpv_opts_override(&own, "scale"));
+        if std::env::var_os("VITASCOPE_MPV_OPTS").is_none() {
+            assert!(!mpv_opts_override(&player(Vec::new()), "gpu-dumb-mode"));
+        }
     }
 }

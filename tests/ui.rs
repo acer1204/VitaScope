@@ -9,7 +9,7 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vitascope::app::{Launch, VitascopeApp};
-use vitascope::player::{Options, Player, State, TrackKind};
+use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
 use vitascope::settings::Settings;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -46,11 +46,19 @@ fn harness_with(file: Option<PathBuf>, settings: Settings) -> Harness<'static, V
 fn harness_launch(launch: Launch, settings: Settings) -> Harness<'static, VitascopeApp> {
     // 跟真正的播放器一樣播完停在最後一格，只是不出畫面、不出聲音。
     // 播放紀錄只放在記憶體（Launch 的預設），不會碰到使用者真正的紀錄
-    let player = Player::new(Options {
-        keep_open: true,
-        ..Options::headless()
-    })
-    .unwrap();
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            ..Options::headless()
+        },
+        launch,
+        settings,
+    )
+}
+
+/// 自己指定播放器的選項（例如用 `extra` 加 mpv 選項：vo-null-fps 之類的）
+fn harness_launch_with(opts: Options, launch: Launch, settings: Settings) -> Harness<'static, VitascopeApp> {
+    let player = Player::new(opts).unwrap();
     Harness::builder()
         .with_size([960.0, 600.0])
         .build_eframe(move |cc| VitascopeApp::new(cc, player, settings, launch))
@@ -2562,4 +2570,99 @@ fn rotated_mkv_crops_and_stretches_the_upright_picture() {
     // 裁成 16:9（第一下）：直的畫面裁掉上下
     h.key_press_modifiers(egui::Modifiers::CTRL, egui::Key::Q);
     step_until(&mut h, "裁成 16:9", |s| s.video_size == Some([240, 135]));
+}
+
+// ───────────── L3 基礎：非同步設定、啟動時不改 mpv 選項 ─────────────
+
+#[test]
+fn status_quo_options() {
+    // 預設設定啟動、開檔播放：使用者沒要求的 mpv 選項一個都不能變（之後的批次才開始套用畫質、音效）
+    let mut h = harness(Some(sample("common/mp4_h264_aac.mp4")));
+    step_until(&mut h, "開始播放", |s| s.loaded && s.time_pos > 0.0);
+    h.run_steps(3);
+    for name in [
+        "video-sync",
+        "display-fps-override",
+        "deinterlace",
+        "scale",
+        "dscale",
+        "cscale",
+        "af",
+        "glsl-shaders",
+        "volume-max",
+        "audio-device",
+    ] {
+        let default = prop(&h, &format!("option-info/{name}/default-value"));
+        assert_eq!(prop(&h, name), default, "{name} 不能被改掉");
+    }
+    // 啟動時有偵測引擎的功能，結果記下來了（沒偵測的話全是預設值 false；每個 FFmpeg 都有 aformat）
+    let caps = *h.state().engine_caps();
+    assert_eq!(caps.macos, cfg!(target_os = "macos"));
+    assert!(caps.af.aformat, "{caps:?}");
+    let mut fresh = Player::new(Options::headless()).unwrap();
+    let probed = fresh.probe_caps();
+    assert_eq!((caps.af, caps.deint_auto), (probed.af, probed.deint_auto));
+    // 縮放演算法的預設值是從引擎讀的
+    let d = h.state().picture_defaults();
+    for (name, value) in [
+        ("scale", &d.scale),
+        ("dscale", &d.dscale),
+        ("cscale", &d.cscale),
+        ("scale-antiring", &d.scale_antiring),
+    ] {
+        assert_eq!(*value, prop(&h, &format!("option-info/{name}/default-value")), "{name}");
+    }
+}
+
+#[test]
+fn async_option_failures_show_a_message_except_af_command() {
+    let mut h = harness(None);
+    h.step();
+    // af-command 失敗不提示（沒開檔時一定失敗；之後會改寫整條 af）。後面接一個會成功的設定，
+    // 非同步指令照順序執行：它生效時 af-command 的回覆也已經回來了
+    h.state_mut()
+        .command_async_keyed(AsyncKey::AfCommand, &["af-command", "vs-eq", "g", "3", "equalizer@b1"]);
+    h.state_mut().set_option_async(AsyncKey::Deband, "deband", "yes");
+    step_until_app(&mut h, "deband=yes 生效", |app| {
+        app.player().get_string("deband").is_ok_and(|v| v == "yes")
+    });
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), None, "af-command 失敗不能有提示");
+    // 其他設定失敗：提示選項名稱與原因
+    h.state_mut().set_option_async(AsyncKey::Deband, "deband", "bogus");
+    step_until_app(&mut h, "提示無法套用", |app| {
+        app.osd_text().is_some_and(|t| t.starts_with("無法套用 deband："))
+    });
+    h.state_mut().command_async_keyed(
+        AsyncKey::Shaders,
+        &["change-list", "glsl-shaders", "bogus-action", "x.glsl"],
+    );
+    step_until_app(&mut h, "提示無法套用 glsl-shaders", |app| {
+        app.osd_text().is_some_and(|t| t.starts_with("無法套用 glsl-shaders："))
+    });
+    // 英文介面
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.state_mut().set_option_async(AsyncKey::Sharpen, "sharpen", "bogus");
+    step_until_app(&mut h, "English message", |app| {
+        app.osd_text()
+            .is_some_and(|t| t.starts_with("Couldn't apply sharpen: "))
+    });
+}
+
+#[test]
+fn extra_options_count_as_user_overrides() {
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("deband".into(), "yes".into())],
+            ..Options::headless()
+        },
+        Launch::default(),
+        Settings::default(),
+    );
+    h.step();
+    assert!(h.state().player().user_overrides().contains("deband"));
+    assert_eq!(prop(&h, "deband"), "yes");
 }

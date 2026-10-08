@@ -9,6 +9,12 @@ use std::sync::mpsc;
 /// 截圖用的非同步指令編號從這裡開始（跟其他非同步指令分開）
 const SHOT_ID_BASE: u64 = 1 << 40;
 
+/// 第 n 張截圖的指令編號：流水號只用低 40 位元，編號一定在 [1<<40, 1<<41) 之間，
+/// 不會跑進設定選項用的那一段（`player::ASYNC_BASE` = 1<<44 起算）
+fn shot_id(n: u64) -> u64 {
+    SHOT_ID_BASE | (n & (SHOT_ID_BASE - 1))
+}
+
 /// 截圖相關的狀態
 pub(super) struct Capture {
     seq: u64,
@@ -119,7 +125,7 @@ impl VitascopeApp {
         let tmp = match &target {
             Target::File { tmp, .. } | Target::Clipboard { tmp } => tmp.to_string_lossy().into_owned(),
         };
-        let id = SHOT_ID_BASE + n;
+        let id = shot_id(n);
         let wanted = self.settings.screenshot_subtitles;
         let subtitles = fix.keeps_subtitles(wanted);
         match self.player.screenshot_to_file(id, &tmp, subtitles) {
@@ -279,3 +285,24 @@ impl VitascopeApp {
 /// 截圖的快捷鍵說明
 pub(super) const SHOT_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+E" } else { "Ctrl+E" };
 pub(super) const COPY_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+
+#[cfg(test)]
+mod tests {
+    use super::{SHOT_ID_BASE, shot_id};
+    use crate::player::{ASYNC_BASE, AsyncKey, async_key};
+
+    #[test]
+    fn screenshot_ids_never_look_like_option_replies() {
+        for n in [1, 2, 1000, (1 << 40) - 1, 1 << 40, (1 << 44) + 7, u64::MAX] {
+            let id = shot_id(n);
+            assert!((SHOT_ID_BASE..SHOT_ID_BASE << 1).contains(&id), "{n:#x} → {id:#x}");
+            assert!(id < ASYNC_BASE);
+            assert_eq!(async_key(id), None, "{n:#x} → {id:#x}");
+        }
+        // 平常的編號跟以前一樣
+        assert_eq!(shot_id(3), SHOT_ID_BASE + 3);
+        // 反過來：設定選項的編號（一定 ≥ ASYNC_BASE）也不在截圖那一段
+        const { assert!(ASYNC_BASE >= SHOT_ID_BASE << 1) };
+        assert!(AsyncKey::ALL.iter().all(|k| (*k as u64) < 1 << 20));
+    }
+}

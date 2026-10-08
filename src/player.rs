@@ -4,8 +4,10 @@
 use crate::mpv::{self, EndReason, Event, Format, Mpv, Value};
 use crate::subs::{self, ExternalSub, SubLang};
 use serde::Deserialize;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// 建立播放器的設定。
@@ -22,6 +24,9 @@ pub struct Options {
     pub external_subs: bool,
     /// 有新事件時呼叫（在 mpv 的執行緒上，只能用來喚醒 UI）
     pub wakeup: Option<Box<dyn Fn() + Send + Sync>>,
+    /// 額外的 mpv 選項，排在 VITASCOPE_MPV_OPTS 之後設定（測試用，例如 `("vo-null-fps", "120")`；
+    /// 環境變數是整個行程共用的，平行跑的測試會互相干擾）。跟環境變數一樣算是使用者指定的選項
+    pub extra: Vec<(String, String)>,
 }
 
 impl Default for Options {
@@ -33,6 +38,7 @@ impl Default for Options {
             auto_select_subs: true,
             external_subs: true,
             wakeup: None,
+            extra: Vec::new(),
         }
     }
 }
@@ -197,6 +203,13 @@ pub struct State {
     pub secondary_sid: Option<i64>,
     /// 標籤（歌名、演出者、專輯…），鍵是 mpv 整理過的名稱：Title、Artist、Album…
     pub metadata: std::collections::BTreeMap<String, String>,
+    /// mpv 正在依螢幕更新率同步影像（video-sync=display-*，而且 mpv 判斷這部影片適用；
+    /// 跟 mpv 的 display-sync-active 一樣，見 OBSERVED 的說明）
+    pub display_sync_active: bool,
+    /// 正在去交錯
+    pub deinterlace_active: bool,
+    /// 音訊直通中：直通的格式（"ac3"、"dts"…）；None = 一般 PCM 輸出或沒有聲音
+    pub audio_spdif: Option<String>,
 }
 
 impl State {
@@ -281,7 +294,165 @@ const OBSERVED: &[(&str, Format)] = &[
     ("sid", Format::String),
     ("secondary-sid", Format::String),
     ("filtered-metadata", Format::String),
+    // 以下是 L3 加的；只能加在最後面，前面的編號不能變
+    // 顯示同步：不觀察 display-sync-active，mpv 只在開檔、關檔時重新檢查它，播放中開始同步了也不會通知。
+    // mistimed-frame-count 每一輪都檢查，而且只在顯示同步時才有值（平常很少變，不會一直送通知）
+    ("mistimed-frame-count", Format::Int64),
+    ("deinterlace-active", Format::Flag),
+    // 節點：用字串讀拿到 JSON，只看 format（spdif-ac3 之類 = 音訊直通）
+    ("audio-out-params", Format::String),
 ];
+
+/// 非同步設定選項（`set_async`、`command_async_keyed`）的指令編號從這裡開始。
+/// 截圖用 1<<40 起算（app/capture.rs），兩段不會重疊：這一段一定有第 44 位元，截圖的一定沒有
+pub const ASYNC_BASE: u64 = 1 << 44;
+/// 指令編號的低 24 位元是流水號
+const ASYNC_SEQ_MASK: u64 = 0xFF_FFFF;
+
+/// 定義 `AsyncKey` 與 `AsyncKey::ALL`：兩者由同一份清單產生，新增種類只要加在清單最後面。
+/// 分開手寫的話，漏加進 `ALL` 的種類解不回來，它的回覆會被當成截圖的回覆、失敗也不會提示
+macro_rules! async_keys {
+    ($first:ident $(, $rest:ident)* $(,)?) => {
+        /// 非同步指令是為了哪一項設定送的：回覆（成功或失敗）依這個分派。
+        /// 編號從 1 開始連續（0 留給「不是設定送的」）
+        #[repr(u16)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum AsyncKey {
+            $first = 1,
+            $($rest,)*
+        }
+
+        impl AsyncKey {
+            /// 全部的種類，依編號排列
+            pub const ALL: [AsyncKey; [stringify!($first) $(, stringify!($rest))*].len()] =
+                [AsyncKey::$first $(, AsyncKey::$rest)*];
+        }
+    };
+}
+
+async_keys!(
+    VideoSync,
+    DisplayFps,
+    Adjust,
+    Deinterlace,
+    Deband,
+    Scaler,
+    Shaders,
+    Sharpen,
+    Tone,
+    AudioDevice,
+    Exclusive,
+    VolumeMax,
+    Downmix,
+    Spdif,
+    Af,
+    AfCommand,
+);
+
+impl AsyncKey {
+    fn from_raw(v: u64) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| *k as u64 == v)
+    }
+}
+
+/// 種類 + 流水號 → 非同步指令編號
+fn async_id(k: AsyncKey, seq: u64) -> u64 {
+    ASYNC_BASE | (k as u64) << 24 | (seq & ASYNC_SEQ_MASK)
+}
+
+/// 非同步指令編號 → 是哪一項設定送的；不是 `set_async` / `command_async_keyed` 送的（例如截圖）回傳 None
+pub fn async_key(id: u64) -> Option<AsyncKey> {
+    // 第 44 位元以上只能有第 44 位元
+    if id >> 44 != 1 {
+        return None;
+    }
+    AsyncKey::from_raw((id >> 24) & ((1 << 20) - 1))
+}
+
+/// 播放引擎有哪些 L3 功能（啟動時偵測一次；舊的引擎、系統的 libmpv 不一定有）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineCaps {
+    pub af: AfCaps,
+    /// deinterlace=auto（本專案建置的引擎有；Linux tar.gz 用的系統 libmpv 不一定有）
+    pub deint_auto: bool,
+    /// 軟體繪圖的簡化流程（gpu-dumb-mode）：不跑著色器、縮放演算法之類的效果
+    pub dumb: bool,
+    pub macos: bool,
+}
+
+/// 等化器、音量平衡用到的 FFmpeg 音訊濾鏡，各自有沒有
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AfCaps {
+    pub equalizer: bool,
+    pub acompressor: bool,
+    pub alimiter: bool,
+    pub dynaudnorm: bool,
+    pub speechnorm: bool,
+    pub aformat: bool,
+}
+
+impl AfCaps {
+    /// 偵測的濾鏡名稱
+    pub const NAMES: [&'static str; 6] = [
+        "equalizer",
+        "acompressor",
+        "alimiter",
+        "dynaudnorm",
+        "speechnorm",
+        "aformat",
+    ];
+
+    fn set(&mut self, name: &str, on: bool) {
+        match name {
+            "equalizer" => self.equalizer = on,
+            "acompressor" => self.acompressor = on,
+            "alimiter" => self.alimiter = on,
+            "dynaudnorm" => self.dynaudnorm = on,
+            "speechnorm" => self.speechnorm = on,
+            "aformat" => self.aformat = on,
+            _ => {}
+        }
+    }
+
+    /// 六個濾鏡都有
+    pub fn all(&self) -> bool {
+        self.equalizer && self.acompressor && self.alimiter && self.dynaudnorm && self.speechnorm && self.aformat
+    }
+}
+
+/// 偵測濾鏡時暫時加進 af 的標籤
+const PROBE_LABEL: &str = "@vs-probe";
+/// 畫面輸出的錯誤記錄最多留幾筆（給著色器失敗之類的偵測用）
+const RENDER_ERRORS_CAP: usize = 16;
+
+/// 沒有害處、不用讓使用者看到的錯誤記錄：nvdec 的 bwdif_cuda 建不起來時 mpv 會自己改用
+/// hwdownload + bwdif，播放不受影響
+fn is_harmless_error(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    (t.contains("bwdif_cuda") && t.contains("failed")) || t.contains("creating deinterlacer failed")
+}
+
+/// 畫面輸出（render API、vo）的記錄：著色器編譯失敗之類的錯誤從這裡來
+fn is_render_log(prefix: &str) -> bool {
+    prefix.starts_with("libmpv_render") || prefix.starts_with("vo")
+}
+
+/// `audio-out-params`（JSON）→ 直通的格式：format 是 spdif-ac3 之類的時候
+fn spdif_format(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    v["format"].as_str()?.strip_prefix("spdif-").map(str::to_owned)
+}
+
+/// VITASCOPE_MPV_OPTS 的內容 → (名稱, 值)；沒有「=」的項目略過（mpv 也不會收到）
+fn env_options(value: &str) -> impl Iterator<Item = (&str, &str)> {
+    value.split_whitespace().filter_map(|kv| kv.split_once('='))
+}
+
+/// VITASCOPE_MPV_OPTS 提到的選項名稱。沒有「=」的項目 mpv 收不到，但一樣算使用者自己處理的選項，
+/// 自動設定照舊略過它（例如只寫 gpu-dumb-mode 也不會自動開軟體繪圖的簡化流程）
+fn env_option_names(value: &str) -> impl Iterator<Item = &str> {
+    value.split_whitespace().filter_map(|kv| kv.split('=').next())
+}
 
 /// VITASCOPE_DEBUG 的值 → 要 mpv 送出的記錄等級。
 /// 沒設定只收錯誤；1 之類的值 = 警告與錯誤（印到 stderr，排查顯示卡、驅動之類的問題）；
@@ -372,6 +543,15 @@ pub struct Player {
     /// 最近一次開檔失敗的基本原因。mpv 的記錄訊息要等一般事件都取完才會送出，
     /// 常常比 EndFile 晚到，所以失敗後收到的錯誤記錄還要補進說明裡
     failure: Option<String>,
+    /// 非同步指令的流水號
+    async_seq: AtomicU64,
+    /// 使用者用 VITASCOPE_MPV_OPTS 或 `Options.extra` 指定的選項：自動設定都要略過它們
+    user_overrides: HashSet<String>,
+    /// 畫面輸出的錯誤記錄（收到的時間, 內容），最多 16 筆
+    render_errors: VecDeque<(Instant, String)>,
+    /// 偵測引擎功能失敗時 mpv 會記一筆錯誤；這些不是真的問題，不放進 recent_errors。
+    /// 每一項的兩個字串都出現在記錄裡才算（記錄訊息比較晚送達，可能開檔之後才收到）
+    probe_noise: Vec<[String; 2]>,
 }
 
 impl Player {
@@ -403,8 +583,13 @@ impl Player {
             options.push(("ao", "null"));
         }
         // 排查用：VITASCOPE_MPV_OPTS="名稱=值 名稱=值" 額外指定 mpv 選項（以空白分隔）
-        let extra = std::env::var("VITASCOPE_MPV_OPTS").unwrap_or_default();
-        options.extend(extra.split_whitespace().filter_map(|kv| kv.split_once('=')));
+        let env = std::env::var("VITASCOPE_MPV_OPTS").unwrap_or_default();
+        options.extend(env_options(&env));
+        options.extend(opts.extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let user_overrides = env_option_names(&env)
+            .map(str::to_owned)
+            .chain(opts.extra.iter().map(|(k, _)| k.clone()))
+            .collect();
         let mut mpv = Mpv::new(&options)?;
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
@@ -425,6 +610,10 @@ impl Player {
             auto_select_subs: opts.auto_select_subs,
             external_subs: opts.external_subs,
             failure: None,
+            async_seq: AtomicU64::new(0),
+            user_overrides,
+            render_errors: VecDeque::new(),
+            probe_noise: Vec::new(),
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -436,6 +625,113 @@ impl Player {
     /// 這次開檔以來 mpv 回報的錯誤訊息（最多 8 筆）
     pub fn recent_errors(&self) -> &[String] {
         &self.recent_errors
+    }
+
+    /// 使用者用 VITASCOPE_MPV_OPTS 或 `Options.extra` 指定的 mpv 選項名稱（這些不自動調整）
+    pub fn user_overrides(&self) -> &HashSet<String> {
+        &self.user_overrides
+    }
+
+    /// 取出畫面輸出的錯誤記錄（libmpv_render、vo；收到的時間, 內容）
+    pub fn take_render_errors(&mut self) -> Vec<(Instant, String)> {
+        self.render_errors.drain(..).collect()
+    }
+
+    // ───────────── 非同步設定 ─────────────
+
+    /// 非同步設定一個屬性（`set 名稱 值`）。結果以 `PlayerEvent::CommandReply { id }` 回報，
+    /// `async_key(id)` 就是 `k`。播放中改設定都要用非同步：很多畫面選項要等畫面輸出執行緒處理完才會回傳
+    pub fn set_async(&self, k: AsyncKey, name: &str, value: &str) -> mpv::Result<u64> {
+        self.command_async_keyed(k, &["set", name, value])
+    }
+
+    /// 非同步指令，回覆的編號帶著種類 `k`（見 `set_async`）。
+    /// 非同步指令之間照送出的順序執行；同步呼叫可能插隊到還沒執行的非同步指令前面
+    pub fn command_async_keyed(&self, k: AsyncKey, args: &[&str]) -> mpv::Result<u64> {
+        let id = async_id(k, self.async_seq.fetch_add(1, Ordering::Relaxed));
+        self.mpv.command_async(id, args)?;
+        Ok(id)
+    }
+
+    /// 同步設定一組選項，只在啟動時（還沒開任何檔案）用；使用者自己指定的選項略過。
+    /// 回傳設定失敗的（名稱, 錯誤）
+    pub fn apply_sync(&self, opts: &[(&str, String)]) -> Vec<(String, mpv::Error)> {
+        debug_assert!(!self.state.loaded && !self.state.loading, "apply_sync 只能在開檔之前用");
+        opts.iter()
+            .filter(|(name, _)| !self.user_overrides.contains(*name))
+            .filter_map(|(name, value)| {
+                self.mpv
+                    .set_property(name, value.as_str())
+                    .err()
+                    .map(|e| (name.to_string(), e))
+            })
+            .collect()
+    }
+
+    // ───────────── 引擎功能偵測 ─────────────
+
+    /// 偵測播放引擎的功能（同步；只在啟動時、還沒開檔之前呼叫）
+    pub fn probe_caps(&mut self) -> EngineCaps {
+        let mut af = AfCaps::default();
+        for name in AfCaps::NAMES {
+            af.set(name, self.probe_af(name));
+        }
+        EngineCaps {
+            af,
+            deint_auto: self.probe_deint_auto(),
+            dumb: self.mpv.get_string("gpu-dumb-mode").is_ok_and(|v| v == "yes"),
+            macos: cfg!(target_os = "macos"),
+        }
+    }
+
+    /// 這個引擎有沒有這個 FFmpeg 音訊濾鏡。mpv 加進 af 時就會檢查濾鏡名稱（不用開檔）；
+    /// 要用「@標籤:名稱」的寫法，「lavfi=[名稱]」要到建立濾鏡圖時才檢查。偵測完 af 恢復原狀
+    pub fn probe_af(&mut self, name: &str) -> bool {
+        // 播放中加濾鏡會重建整條音訊濾鏡鏈（聲音會斷一下）
+        debug_assert!(!self.state.loaded && !self.state.loading, "probe_af 只能在開檔之前用");
+        let before = self.mpv.get_string("af").unwrap_or_default();
+        let ok = self
+            .mpv
+            .command(&["af", "add", &format!("{PROBE_LABEL}:{name}")])
+            .is_ok();
+        let _ = self.mpv.command(&["af", "remove", PROBE_LABEL]);
+        if self.mpv.get_string("af").unwrap_or_default() != before {
+            let _ = self.mpv.set_property("af", before.as_str());
+        }
+        if !ok {
+            // 失敗時 mpv 記一筆「Option af-add: 'xxx' isn't supported.」
+            // （0.37 是「Option af-add: xxx doesn't exist.」）
+            self.probe_noise.push([name.to_owned(), "af-add".to_owned()]);
+        }
+        ok
+    }
+
+    /// deinterlace=auto 能不能用（試設一次，再設回原本的值）
+    fn probe_deint_auto(&mut self) -> bool {
+        let before = self.mpv.get_string("deinterlace").unwrap_or_else(|_| "no".to_owned());
+        let ok = self.mpv.set_property("deinterlace", "auto").is_ok();
+        let _ = self.mpv.set_property("deinterlace", before.as_str());
+        if !ok {
+            // 失敗時 mpv 記一筆「Invalid value for option deinterlace: auto」之類的
+            self.probe_noise.push(["deinterlace".to_owned(), "auto".to_owned()]);
+        }
+        ok
+    }
+
+    /// 縮放演算法的預設值（這個引擎的 option-info/…/default-value；讀不到的保留 mpv 文件寫的預設值）
+    pub fn picture_defaults(&self) -> crate::picture::PictureDefaults {
+        let mut d = crate::picture::PictureDefaults::default();
+        for (name, field) in [
+            ("scale", &mut d.scale),
+            ("dscale", &mut d.dscale),
+            ("cscale", &mut d.cscale),
+            ("scale-antiring", &mut d.scale_antiring),
+        ] {
+            if let Ok(v) = self.mpv.get_string(&format!("option-info/{name}/default-value")) {
+                *field = v;
+            }
+        }
+        d
     }
 
     // ───────────── 操作 ─────────────
@@ -942,7 +1238,19 @@ impl Player {
                 if std::env::var_os("VITASCOPE_DEBUG").is_some() {
                     eprint!("[mpv/{level}] [{prefix}] {text}");
                 }
-                if matches!(level.as_str(), "error" | "fatal") {
+                let noise = is_harmless_error(&text)
+                    || self
+                        .probe_noise
+                        .iter()
+                        .any(|parts| parts.iter().all(|p| text.contains(p.as_str())));
+                if matches!(level.as_str(), "error" | "fatal") && !noise {
+                    if is_render_log(&prefix) {
+                        if self.render_errors.len() >= RENDER_ERRORS_CAP {
+                            self.render_errors.pop_front();
+                        }
+                        self.render_errors
+                            .push_back((Instant::now(), format!("[{prefix}] {}", text.trim_end())));
+                    }
                     if self.recent_errors.len() >= 8 {
                         self.recent_errors.remove(0);
                     }
@@ -1053,6 +1361,11 @@ impl Player {
                     .and_then(|j| serde_json::from_str(j).ok())
                     .unwrap_or_default();
             }
+            // 關檔時 mpv 會送「不可用」（Value::None）過來，這三項就跟著歸零。
+            // 不在 EndFile 自己歸零：換檔時值可能前後一樣，mpv 就不會再通知，狀態會一直是錯的
+            "mistimed-frame-count" => s.display_sync_active = value.as_i64().is_some(),
+            "deinterlace-active" => s.deinterlace_active = value.as_bool().unwrap_or(false),
+            "audio-out-params" => s.audio_spdif = value.as_str().and_then(spdif_format),
             _ => {}
         }
     }
@@ -1173,7 +1486,141 @@ fn failure_reason(code: i32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{State, Track, TrackKind, debug_log_level, display_size};
+    use super::{
+        ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, debug_log_level, display_size,
+        env_option_names, env_options, is_harmless_error, is_render_log, spdif_format,
+    };
+
+    #[test]
+    fn async_ids_round_trip() {
+        for (i, k) in AsyncKey::ALL.into_iter().enumerate() {
+            // 編號從 1 開始連續（0 留給「不是設定送的」）
+            assert_eq!(k as usize, i + 1, "{k:?}");
+            for seq in [0, 1, 0x7F_FFFF, 0xFF_FFFF, 0x100_0000, u64::MAX] {
+                let id = async_id(k, seq);
+                assert_eq!(async_key(id), Some(k), "{k:?} {seq:#x}");
+                assert!((ASYNC_BASE..ASYNC_BASE << 1).contains(&id), "{id:#x}");
+            }
+        }
+        // 流水號溢位不會影響種類
+        assert_eq!(async_id(AsyncKey::Af, 0x100_0005), async_id(AsyncKey::Af, 5));
+    }
+
+    #[test]
+    fn unknown_and_out_of_range_ids_are_not_async_keys() {
+        let unknown_kind = ASYNC_BASE | (AsyncKey::ALL.len() as u64 + 1) << 24;
+        for id in [
+            0,
+            1,
+            ASYNC_BASE - 1,
+            // 種類 0
+            ASYNC_BASE,
+            ASYNC_BASE | 5,
+            unknown_kind,
+            // 種類的欄位超過 u16
+            ASYNC_BASE | 0x1_0001 << 24,
+            // 第 44 位元以上還有別的位元
+            ASYNC_BASE << 1 | (AsyncKey::Af as u64) << 24,
+            (1 << 45) | ASYNC_BASE | (AsyncKey::Af as u64) << 24,
+            u64::MAX,
+            // 截圖的編號（1<<40 起算）
+            (1 << 40) + 1,
+            (1 << 41) - 1,
+        ] {
+            assert_eq!(async_key(id), None, "{id:#x}");
+        }
+    }
+
+    #[test]
+    fn harmless_nvdec_fallbacks_are_recognised() {
+        assert!(is_harmless_error("filter bwdif_cuda: initialization failed\n"));
+        assert!(is_harmless_error(
+            "Disabling filter bwdif_cuda because it has FAILED.\n"
+        ));
+        assert!(is_harmless_error("creating deinterlacer failed\n"));
+        assert!(!is_harmless_error("bwdif_cuda: using CUDA 12\n"), "沒有失敗就不是");
+        assert!(!is_harmless_error("Failed to open file\n"));
+        assert!(!is_harmless_error("shader compile failed: hook.glsl\n"));
+        assert!(is_render_log("libmpv_render"));
+        assert!(is_render_log("vo/gpu"));
+        assert!(is_render_log("vo/libmpv/opengl"));
+        assert!(!is_render_log("ffmpeg"));
+        assert!(!is_render_log("cplayer"));
+    }
+
+    #[test]
+    fn spdif_format_from_audio_out_params() {
+        assert_eq!(
+            spdif_format(r#"{"samplerate":48000,"channel-count":2,"format":"spdif-ac3"}"#).as_deref(),
+            Some("ac3")
+        );
+        assert_eq!(spdif_format(r#"{"format":"spdif-dts-hd"}"#).as_deref(), Some("dts-hd"));
+        assert_eq!(spdif_format(r#"{"format":"floatp"}"#), None);
+        assert_eq!(spdif_format(r#"{"samplerate":48000}"#), None);
+        assert_eq!(spdif_format("not json"), None);
+    }
+
+    #[test]
+    fn env_options_skip_items_without_a_value() {
+        let opts: Vec<_> = env_options(" vo-null-fps=120  bogus scale=ewa_lanczossharp af= ").collect();
+        assert_eq!(
+            opts,
+            [("vo-null-fps", "120"), ("scale", "ewa_lanczossharp"), ("af", "")]
+        );
+        // 沒有值的項目 mpv 收不到，但還是算使用者自己處理的選項（跟加入 Options.extra 之前一樣）
+        let names: Vec<_> = env_option_names(" vo-null-fps=120  gpu-dumb-mode scale=ewa_lanczossharp af= ").collect();
+        assert_eq!(names, ["vo-null-fps", "gpu-dumb-mode", "scale", "af"]);
+    }
+
+    #[test]
+    fn error_logs_are_tapped_and_noise_is_dropped() {
+        use crate::mpv::Event;
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let log = |prefix: &str, level: &str, text: &str| Event::Log {
+            prefix: prefix.into(),
+            level: level.into(),
+            text: text.into(),
+        };
+        // 畫面輸出的錯誤：兩邊都收
+        p.handle(log("libmpv_render", "error", "shader compile failed: a.glsl\n"));
+        p.handle(log("vo/gpu", "fatal", "Could not create shader\n"));
+        // 不是錯誤、不是畫面輸出的：不進 render_errors
+        p.handle(log("vo/gpu", "warn", "just a warning\n"));
+        p.handle(log("ffmpeg", "error", "decoder broke\n"));
+        // nvdec 的去交錯退回軟體：沒有害處，兩邊都不收
+        p.handle(log("vf", "error", "filter bwdif_cuda failed\n"));
+        p.handle(log("autoconvert", "error", "creating deinterlacer failed\n"));
+        // 偵測引擎功能留下的記錄
+        p.probe_noise.push(["nope".into(), "af-add".into()]);
+        p.handle(log("cplayer", "error", "Option af-add: 'nope' isn't supported.\n"));
+        // mpv 0.37 的寫法
+        p.handle(log("cplayer", "error", "Option af-add: nope doesn't exist.\n"));
+        let render: Vec<String> = p.take_render_errors().into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            render,
+            [
+                "[libmpv_render] shader compile failed: a.glsl",
+                "[vo/gpu] Could not create shader"
+            ]
+        );
+        assert!(p.take_render_errors().is_empty(), "取出後就清空");
+        assert_eq!(
+            p.recent_errors(),
+            [
+                "[libmpv_render] shader compile failed: a.glsl",
+                "[vo/gpu] Could not create shader",
+                "[ffmpeg] decoder broke"
+            ]
+        );
+        // 最多留 16 筆（留最新的）
+        for i in 0..20 {
+            p.handle(log("libmpv_render", "error", &format!("e{i}\n")));
+        }
+        let render = p.take_render_errors();
+        assert_eq!(render.len(), 16);
+        assert_eq!(render[0].1, "[libmpv_render] e4");
+        assert_eq!(render[15].1, "[libmpv_render] e19");
+    }
 
     #[test]
     fn secondary_subtitle_id_does_not_hide_other_kinds() {
