@@ -155,6 +155,8 @@ jobs:
           sudo apt-get install -y ffmpeg xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1 appstream
       - run: python scripts/gen_samples.py
       - name: 測試
+        # 播放引擎卡住時（例如 DASH 分離器無限循環）測試程式會一直等，不要拖到整個工作逾時
+        timeout-minutes: 30
         run: cargo test --all-targets -- --nocapture
       - name: 版本
         run: |

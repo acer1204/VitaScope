@@ -1,0 +1,26 @@
+DASH 分離器被要求中斷時回傳 AVERROR_EXIT（原本回傳 0 卻沒有封包，會無限循環）
+
+FFmpeg 9.0.2 的 libavformat/dashdec.c：dash_read_packet() 的讀取迴圈以「沒有被要求中斷」為條件，中斷時迴圈結束，
+回傳 ret == 0（成功）卻沒有給封包。影片軌是 MP4 片段裡的 H.264 時需要解析器，read_frame_internal() 收到空封包會
+再呼叫一次，自己不檢查中斷，於是在這兩層之間無限循環，CPU 滿載。播放器換檔或關閉時，mpv 先請分離器執行緒結束，
+0.1 秒內沒結束就觸發中斷；這時分離器剛好在重新開啟下一個片段（片段邊界都會重開），就會卡死，mpv 也一直等它結束。
+macOS 的 CI（較慢的虛擬機）連續換檔約三成會卡住；其他平台的機器快，很少碰到，但程式碼相同。
+上游（2026-10 的 master）還是同樣的寫法。改成每圈先檢查中斷，被中斷就回傳 AVERROR_EXIT。
+
+--- a/libavformat/dashdec.c
++++ b/libavformat/dashdec.c
+@@ -2387,7 +2387,13 @@
+     if (!cur) {
+         return AVERROR_EOF;
+     }
+-    while (!ff_check_interrupt(c->interrupt_callback) && !ret) {
++    /* Modified for VitaScope (2026-10): return AVERROR_EXIT when interrupted. The loop used to end with
++     * ret == 0 and no packet; for a stream that needs parsing (H.264 from MP4 segments)
++     * read_frame_internal() then calls us again and again without checking the interrupt callback
++     * itself, so stopping a DASH stream at the wrong moment hung the player. */
++    while (!ret) {
++        if (ff_check_interrupt(c->interrupt_callback))
++            return AVERROR_EXIT;
+         ret = av_read_frame(cur->ctx, pkt);
+         if (ret >= 0) {
+             /* If we got a packet, return it */

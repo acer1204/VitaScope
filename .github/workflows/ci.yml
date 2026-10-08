@@ -81,6 +81,8 @@ jobs:
       # 格式矩陣、播放核心、介面測試都是 headless，不需要 GPU；
       # 硬體解碼測試（tests/hwdec.rs）需要 GPU，只在本機跑
       - name: 測試
+        # 播放引擎卡住時（例如 DASH 分離器無限循環）測試程式會一直等，不要拖到整個工作逾時
+        timeout-minutes: 30
         run: cargo test --all-targets -- --nocapture
 
       - name: 建置發佈版

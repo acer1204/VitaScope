@@ -419,16 +419,22 @@ fn dash_local_manifest() {
     assert_eq!(codec(&p, TrackKind::Video).as_deref(), Some("h264"));
     assert_eq!(codec(&p, TrackKind::Audio).as_deref(), Some("aac"));
     drop(p);
+    // 兩個播放器同時反覆重開：MPD 由 libxml2 解析（不能互相干擾）；換檔時 mpv 先請分離器執行緒結束，
+    // 來不及就觸發中斷，終止等待設成 0 讓中斷常常落在 DASH 分離器重開片段的時候（修正檔 ffmpeg-0002）
     let path = mpd.to_str().unwrap().to_owned();
     let threads: Vec<_> = (0..2)
         .map(|_| {
             let path = path.clone();
             std::thread::spawn(move || {
                 let mut p = engine();
-                for _ in 0..10 {
+                p.mpv().set_property("demuxer-termination-timeout", "0").unwrap();
+                for i in 0..20 {
                     p.open(&path).unwrap();
-                    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
-                        .unwrap_or_else(|e| panic!("DASH 打不開：{e}"));
+                    if let Err(e) = p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded) {
+                        // 卡住的 mpv 關不掉（結束時一直等分離器），直接結束測試程式，不要等到 CI 逾時
+                        eprintln!("DASH 第 {i} 次打不開：{e}");
+                        std::process::abort();
+                    }
                 }
             })
         })

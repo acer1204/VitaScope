@@ -153,6 +153,8 @@ jobs:
         run: brew install ffmpeg
       - run: python scripts/gen_samples.py
       - name: 測試
+        # 播放引擎卡住時（例如 DASH 分離器無限循環）測試程式會一直等，不要拖到整個工作逾時
+        timeout-minutes: 30
         run: cargo test --all-targets -- --nocapture
       - name: 版本
         run: |
