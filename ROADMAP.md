@@ -3,8 +3,9 @@
 目標：跨平台（Windows / macOS / Linux）、功能看齊 PotPlayer 的影片播放器。
 先做出能用的基本版，再依等級逐步補完；每完成一項就測一項。
 
-**目前進度（2026-10-07）**：L1、L2 完成（v0.2.0）。Windows 本機、macOS / Linux（GitHub Actions）自動測試通過；
-另用實際影片庫（約 1.4 萬部）抽樣 626 個檔案實測，全部能播放。下一步是 L3 進階調校。
+**目前進度（2026-10-09）**：L1、L2 完成（v0.2.0）。Windows 本機、macOS / Linux（GitHub Actions）自動測試通過；
+另用實際影片庫（約 1.4 萬部）抽樣 626 個檔案實測，全部能播放。L3 進階調校進行中：第一批（流暢播放、畫面輸出不卡住介面、
+影像與音訊的調校）已完成、尚未發佈，還需要人實際確認的項目列在各項底下的「手動確認」。
 
 ---
 
@@ -288,6 +289,8 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：拖曳、改大小視窗不會誤判「跟不上」「沒等垂直同步」
   - [ ] 手動確認：瀏覽器最大化蓋住播放器 30 秒不會誤判「沒等垂直同步」（Windows 不回報被蓋住）
   - [ ] 手動確認：多螢幕（不同更新率）之間拖曳、在系統設定改更新率
+  - [ ] 手動確認：縮到最小（含 Win+D）播 1 分鐘再還原，聲音照常、畫面接得上；筆電拔掉、插回電源時暫停與恢復
+  - [ ] 手動確認：macOS 的 ProMotion 螢幕與外接螢幕、X11 多螢幕、Wayland 上的狀態顯示（偵測不到更新率）
 - [x] 畫面輸出不再卡住介面：一般播放時離影格的預定時間大約一次螢幕更新（多 2 ms 的餘裕）才取影格（再讓 mpv 等到預定時間），
   介面的執行緒每格只等這麼久（自動；實機 120 Hz 電視上每格的等待從約 39 ms 降到平均約 3.5～6 ms、最久約 11 ms，
   介面一直重畫時每秒畫 120 次（以前 24 次）；交出影格的時間跟以前差不到 1 ms，
@@ -302,6 +305,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   （自動 kittest：按鍵、滑桿、選單、跨檔案沿用與存檔；截圖亮度檢查 `tests/picture_shot.rs`：亮度 +50 時畫面中央的平均亮度
   一般流程 125.0 → 197.0、軟體繪圖的簡化流程 125.9 → 198.2；Linux 的 llvmpipe（自動改用簡化流程）129.3 → 196.0，
   Linux 的 CI（系統的 libmpv 與本專案建置的）每次都跑）
+  - [ ] 手動確認：各項調整在實際影片上的效果（特別是色相、Gamma）、按住按鍵連續調整的反應
 - [x] 去交錯（自動 / 開啟 / 關閉，預設自動）、去色帶（deband）、銳化：右鍵選單「畫質」、控制面板、「設定 → 畫質」，整個程式共用、存檔；
   選單與提示顯示目前的狀態（mpv 的 deinterlace-active：已去交錯 / 逐行影片）；引擎沒有 deinterlace=auto 時（系統的 libmpv 0.37）
   不列「自動」、當成關閉
@@ -325,7 +329,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   畫不出來時還原到確定能用的組合（存檔、提示、設定頁標出來）、軟體繪圖停用、英文介面；截圖檢查 `tests/picture_shot.rs`（RTX 3090）：反相的著色器讓中央平均亮度 16.9 → 238.4，
   編譯不過的著色器記下錯誤（`error C1503: undefined variable`）後自動還原，截圖時 16.9 跟沒有著色器一樣；
   簡化流程（RTX 3090 指定 gpu-dumb-mode、Linux 的 llvmpipe）不送著色器，畫面不變、也不會誤判成壞掉）
-  - [ ] 手動確認：Anime4K、FSRCNNX 在 NVIDIA 顯示卡與 macOS 上實際的效果與速度
+  - [ ] 手動確認：Anime4K、FSRCNNX 在 NVIDIA（以及有機會的話 AMD、Intel）顯示卡與 macOS 上實際的效果與速度
 - [x] HDR → SDR 色調映射選項：曲線、目標亮度（自動或 100–1000 nits）、色域對應、動態峰值偵測（macOS 不顯示）。
   vo_gpu 的 gamma 曲線不列：它的著色器在 OpenGL 3.3 編譯不過，畫面變成一片藍。
   色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以這些選項在簡化流程照常可以用
@@ -465,10 +469,14 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 98 個樣本（常見 35、通用 37、罕見 26；CI 上 Linux、macOS 的 FFmpeg 少幾個編碼器，產生的樣本比較少） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 99 | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 163 | Windows、macOS、Linux |
 | 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
 | 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式、強制結束主視窗） | 6 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 97（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 241（其中 2 個預設略過：1 個需要網路、1 個只印出 Windows 偵測更新率的各種方法；單元測試有些只在特定平台編譯，數字是 Windows 的） | Windows、macOS、Linux |
+| 畫質 `tests/picture.rs`、音效 `tests/sound.rs`、非同步設定與引擎功能 `tests/async_opts.rs`、流暢播放 `tests/pacing.rs` | 10、13、8、2 | Windows、macOS、Linux |
+| 播放引擎的建置內容 `tests/engine_build.rs` | 7（舊的引擎、系統的 libmpv 略過 L3 元件的部分） | Windows、macOS、Linux |
+| 截圖檢查 `tests/picture_shot.rs`（會開視窗） | 6 + 2 個不開視窗的輔助測試 | Windows 本機（RTX 3090）、Linux 的 CI（虛擬螢幕）、macOS 的 libmpv 建置流程 |
+| 實機節奏 `tests/pacing_window.rs`（會開全螢幕視窗，手動跑） | 4 + 1 個不開視窗的輔助測試 | Windows 本機（RTX 3090 + 120 Hz 電視） |
 | 硬體解碼 `tests/hwdec.rs`（需要 GPU） | 8 種編碼 | RTX 3090 通過 |
 
 ### 4.5 真實影片庫普查（`examples/media_survey.rs`）
@@ -515,6 +523,13 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | R6 | 全螢幕時字幕上移只對文字字幕（SRT 等）有效，ASS 字幕有自己的版面 | 觀察實際使用情況再決定是否處理 |
 | R7 | macOS 的最低需求降到 macOS 11，但只在 GitHub 的 macOS 15 / 26 虛擬機測過，沒有在 11–14 的實機上跑過 | 建置時檢查每個目的檔的最低版本都是 11.0、記錄用到的較新 API（weak imports）；有使用者回報再處理 |
 | R8 | AppImage 的 PulseAudio、libva 用系統的，系統沒有時換成只有函式名稱的替身（音訊改走 ALSA、硬體解碼改用軟體解碼） | CI 在沒有這兩個函式庫的 Debian 13 容器實際播放，並強制走到替身的進入點 |
+| R9 | Wayland 不讓程式知道視窗在哪個螢幕、更新率多少；XWayland 的 RandR 更新率也只是合成器給的近似值 | 流暢播放在 Wayland 上維持一般播放（狀態顯示「偵測不到更新率」）；有可靠的介面（例如 wp_presentation）再加 |
+| R10 | macOS 的 ProMotion（可變更新率）螢幕：回報 120 Hz，OpenGL 的 swap 可能只跑到 60 Hz | 防呆偵測到只跑到一半更新率時改用一半；沒有實機測過，列入手動確認 |
+| R11 | 視窗縮到最小時 mpv 的影格沒人取（eframe 不畫隱藏的視窗），原本打算縮小時在背景把到時間的影格交給 mpv（排空影格） | 刻意不做：縮小再還原的實機測試（`pacing_window` 的 minimize_and_restore、`--shot` 縮小時的播放位置）位置都正確，聲音照常、畫面接得上。之後有問題再做；`VITASCOPE_PACING=no-drain` 目前只是保留的名稱 |
+| R12 | NVIDIA 硬體解碼的零複製（CUDA 與 OpenGL 共用貼圖）：mpv 重複用解碼的畫面時，可能跟還在畫的上一格撞在一起，大場景切換時偶爾閃一下方塊（使用者回報過一次，還不能穩定重現） | 能重現時先比較關掉硬體解碼、`hwdec=nvdec-copy`、`opengl-glfinish=yes`；要修的話在取新影格前等上一次 render 的 GL fence（`glClientWaitSync`，平常幾微秒），或在自建的 libmpv 改 `hwdec_cuda_gl.c` 每格 map / unmap |
+| R13 | 等化器預設、夜間模式、人聲平衡、音量平均的參數是照一般播放器的值和耳朵調的，沒有客觀標準 | ao=pcm 的量測只確認濾鏡有作用、不會破音；實際聽感列入手動確認，依回饋調整 |
+| R14 | mpv 的 `tone-mapping=gamma` 著色器在 OpenGL 上編譯不過（對純量做 swizzle），畫面變成整片藍 | HDR 曲線不列 Gamma；之後可以在自建的 libmpv 加修正檔再開放 |
+| R15 | 音訊直通在檔案一開始就被輸出拒絕時，這個引擎改回 PCM 之後會停住，跳轉一下才繼續播（第十批測試時發現，見第 7 節） | 測試用 `ao-null-format=float` 模擬並確認濾鏡鏈會設回；停住的部分要在引擎裡查，實機（擴大機、電視）確認時一起看 |
 
 ## 7. 開發中學到的事
 
@@ -612,6 +627,20 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   （`gapless-audio` 預設 weak），新檔案的聲音出來之前輸出還是上一個檔案的 PCM；要看 `audio-params/format`（解碼器送進濾鏡鏈的格式，
   直通時是 `spdif-ac3`）。另外這個引擎在檔案一開始就改回 PCM 時會停住（core-idle，沒有濾鏡鏈也一樣），跳轉一下才繼續播
   （測試用 `ao-null-format=float` 模擬，見 `passthrough_refused_restores_the_eq_chain`）。
+- **libmpv 預設的 BLOCK_FOR_TARGET_TIME 會卡住介面**：`mpv_render_context_render` 在介面的執行緒上等到影格的預定時間，
+  每格約 39 ms，介面每秒只能更新 24 次左右。改成影格快到時間（大約一次螢幕更新內）才取，再讓 mpv 精準等待。
+- **egui 的 `request_repaint_after` 會扣掉 `predicted_dt`**（eframe 沒有設定，固定 1/60 秒）：要等 38 ms 會提早約 17 ms 醒來，
+  接著幾輪都是馬上重畫，一格影像畫了好幾輪。排喚醒時間要把 `predicted_dt` 加回去。
+- **vo_libmpv 沒有回報螢幕更新率**（沒有 `VOCTRL_GET_DISPLAY_FPS`）：嵌在程式裡的 mpv 永遠不會依螢幕同步，
+  要自己偵測更新率，用 `display-fps-override` 告訴它，再設 `video-sync=display-resample`。
+- **`target_time` 的單位是奈秒**：render.h 的註解寫微秒，已經過時（libmpv 0.37 起都是 `mp_time_ns`）。
+  也不能在執行時猜單位：mpv 的時鐘從程式啟動算起，剛啟動時奈秒的數值很小，看起來像微秒。
+- **`display-sync-active` 播放中不會更新**：要知道有沒有在依螢幕同步，改看 `mistimed-frame-count` 有沒有值。
+- **同步的 `set_property` 會插隊到還沒執行的非同步指令前面**（同步呼叫直接鎖住核心，非同步的是排隊）；非同步指令彼此之間照順序。
+  同一個選項同時用兩種方式設定時，要想清楚最後是誰。
+- **字串清單選項設成 `""` 會變成有一個空項目的清單 `[""]`**，不是空清單；要清空用 `change-list <選項> clr ""`。
+- **Windows：觀察 `audio-device-list` 要讓程式一直有多執行緒 COM（MTA）**：mpv 在自己的執行緒初始化 MTA、關閉時拆掉，
+  那是程式裡唯一的 MTA 時，系統的裝置通知還在用，關閉播放器時存取違規。啟動時先 `CoIncrementMTAUsage`，不再減回去。
 - **產生的正弦波 WAV 可能被當成 MPEG-TS**：48 kHz 的 1 kHz 浮點正弦波每 192 位元組重複一次，剛好是 M2TS 的封包長度，
   FFmpeg 的偵測給 MPEG-TS 滿分、開不起來。測試指定 `demuxer-lavf-format=wav`。本專案建置的引擎也沒有 FFmpeg 的 `sine` 來源，
   測試用的聲音都在測試裡產生。
