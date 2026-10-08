@@ -997,3 +997,21 @@ fn wait_filters_running(p: &mut Player, probe: &[String; 5], what: &str) {
         let _ = p.wait_state(Duration::from_millis(20), |_| false);
     }
 }
+
+/// 觀察裝置清單（mpv 在自己的執行緒上開始偵測插拔）之後關閉播放器不能當掉：
+/// Windows 上 mpv 關閉時收掉 COM，以前在沒有其他 MTA 的程式裡會存取違規（GitHub 的 Windows 虛擬機每次都會）。
+/// 這個測試程式裡其他測試也會建立播放器，所以兩個播放器同時觀察、依序關閉
+#[test]
+fn closing_after_watching_the_device_list_does_not_crash() {
+    let mut p = player_with(&[]);
+    let mut q = player_with(&[]);
+    p.watch_audio_devices();
+    q.watch_audio_devices();
+    p.wait_state(TIMEOUT, |s| s.audio_devices.is_some()).unwrap();
+    q.wait_state(TIMEOUT, |s| s.audio_devices.is_some()).unwrap();
+    drop(p);
+    drop(q);
+    let mut r = player_with(&[]);
+    r.watch_audio_devices();
+    r.wait_state(TIMEOUT, |s| s.audio_devices.is_some()).unwrap();
+}

@@ -516,6 +516,23 @@ fn has_out_format(json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(json).is_ok_and(|v| v["format"].as_str().is_some_and(|f| !f.is_empty()))
 }
 
+/// Windows：整個程式一直保有多執行緒 COM（MTA）。mpv 偵測音訊裝置插拔（觀察 `audio-device-list`）時，
+/// 在自己的核心執行緒上 `CoInitializeEx(MTA)`，關閉時 `CoUninitialize`；那是程式裡唯一的 MTA 時，
+/// COM 整個被拆掉，系統的裝置通知卻還在用，關閉播放器時存取違規（GitHub 的 Windows 虛擬機上每次都會）。
+/// 先登記一份程式層級的 MTA 使用（不再減回去），mpv 收掉的就只是它自己那一份
+#[cfg(windows)]
+fn keep_com_mta_alive() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut cookie = std::ptr::null_mut();
+        // SAFETY: 只傳一個輸出用的指標；cookie 刻意不還（程式結束前都要保留）
+        let hr = unsafe { windows_sys::Win32::System::Com::CoIncrementMTAUsage(&mut cookie) };
+        if hr < 0 {
+            eprintln!("[vitascope] CoIncrementMTAUsage 失敗：{hr:#x}");
+        }
+    });
+}
+
 /// VITASCOPE_MPV_OPTS 的內容 → (名稱, 值)；沒有「=」的項目略過（mpv 也不會收到）
 fn env_options(value: &str) -> impl Iterator<Item = (&str, &str)> {
     value.split_whitespace().filter_map(|kv| kv.split_once('='))
@@ -646,6 +663,8 @@ pub struct Player {
 
 impl Player {
     pub fn new(opts: Options) -> mpv::Result<Self> {
+        #[cfg(windows)]
+        keep_com_mta_alive();
         let keep_open = if opts.keep_open { "yes" } else { "no" };
         let mut options: Vec<(&str, &str)> = vec![
             ("vo", if opts.headless { "null" } else { "libmpv" }),
