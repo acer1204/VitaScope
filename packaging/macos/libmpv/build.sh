@@ -183,7 +183,31 @@ d=$pkg/libmpv.2.dylib
 cp "$WORK/build/mpv/libmpv.2.dylib" "$d"   # 用建置資料夾裡的：meson install 會把 install name 改成絕對路徑
 cp "$PREFIX/include/mpv/"*.h "$pkg/include/mpv/"
 strip -S -x "$d"
-codesign --force --sign - "$d"; codesign --verify --strict "$d"   # strip 會讓連結時的 ad-hoc 簽章失效
+# 連結器的 LC_UUID 是對 strip 之前的內容算的（包括之後去掉的本地符號、除錯對照表），那部分偶爾不固定：
+# r4 第一次的兩次建置只差在 UUID。改用 strip 之後的內容（UUID 欄位先填 0、不含簽章）重新算，dylib 才會逐位元相同
+! codesign -d "$d" 2>/dev/null || codesign --remove-signature "$d"   # strip 後可能還留著（已失效的）連結器簽章
+python3 - "$d" <<'EOF'
+import hashlib, struct, sys
+path = sys.argv[1]
+b = bytearray(open(path, "rb").read())
+magic, _, _, _, ncmds, _, _, _ = struct.unpack_from("<IiiIIIII", b, 0)
+assert magic == 0xFEEDFACF, "不是 64 位元 Mach-O"
+off, at = 32, []
+for _ in range(ncmds):
+    cmd, size = struct.unpack_from("<II", b, off)
+    assert cmd != 0x1D, "還有 LC_CODE_SIGNATURE"
+    if cmd == 0x1B:
+        at.append(off + 8)
+    off += size
+assert len(at) == 1, "LC_UUID 應該剛好一個"
+b[at[0]:at[0] + 16] = bytes(16)
+u = bytearray(hashlib.sha256(b).digest()[:16])
+u[6] = (u[6] & 0x0F) | 0x30   # 跟連結器一樣標成第 3 版（名稱雜湊型）的 UUID
+u[8] = (u[8] & 0x3F) | 0x80
+b[at[0]:at[0] + 16] = u
+open(path, "wb").write(b)
+EOF
+codesign --force --sign - "$d"; codesign --verify --strict "$d"   # strip、改 UUID 之後重新簽章
 [[ $(otool -D "$d" | tail -1) == "@rpath/libmpv.2.dylib" ]] || die "install name 不是 @rpath/libmpv.2.dylib"
 [[ $(lipo -archs "$d") == arm64 ]] || die "不是 arm64"
 [[ $(vtool -show-build "$d" | awk '/minos/ {print $2}') == "$DT" ]] || die "dylib 的最低版本不是 $DT"
