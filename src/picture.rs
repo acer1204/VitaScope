@@ -1,5 +1,5 @@
 //! 畫質設定（亮度等影像調整、去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR 色調映射）：
-//! 設定的型別和純函式。套用到 mpv 的部分在之後的批次加上。
+//! 設定的型別和純函式。影像調整已經套用到 mpv（`Adjust::mpv_options`），其他項目在之後的批次加上。
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,103 @@ impl Adjust {
     /// 全部都是 0（沒有調整）
     pub fn is_neutral(&self) -> bool {
         *self == Self::default()
+    }
+
+    pub fn get(&self, kind: AdjustKind) -> i32 {
+        match kind {
+            AdjustKind::Brightness => self.brightness,
+            AdjustKind::Contrast => self.contrast,
+            AdjustKind::Saturation => self.saturation,
+            AdjustKind::Hue => self.hue,
+            AdjustKind::Gamma => self.gamma,
+        }
+    }
+
+    /// 設定一項（限制在 −100…100）
+    pub fn set(&mut self, kind: AdjustKind, value: i32) {
+        let v = value.clamp(Self::MIN, Self::MAX);
+        match kind {
+            AdjustKind::Brightness => self.brightness = v,
+            AdjustKind::Contrast => self.contrast = v,
+            AdjustKind::Saturation => self.saturation = v,
+            AdjustKind::Hue => self.hue = v,
+            AdjustKind::Gamma => self.gamma = v,
+        }
+    }
+
+    /// 對應的 mpv 選項，五項都列（啟動時同步套用）。mpv 的 brightness 等是畫面輸出的選項，
+    /// 不是 FFmpeg 的 eq 濾鏡（GPL）；軟體繪圖的簡化流程（gpu-dumb-mode）也有效
+    pub fn mpv_options(&self) -> Vec<(&'static str, String)> {
+        AdjustKind::ALL
+            .iter()
+            .map(|k| (k.mpv(), self.get(*k).to_string()))
+            .collect()
+    }
+
+    /// 不是 0 的項目：「亮度 +10、對比 -5」（`skip` 的項目不列）
+    pub fn summary(&self, skip: impl Fn(AdjustKind) -> bool) -> String {
+        AdjustKind::ALL
+            .into_iter()
+            .filter(|k| self.get(*k) != 0 && !skip(*k))
+            .map(|k| k.describe(self.get(k)))
+            .collect::<Vec<_>>()
+            .join(crate::tr!("、", ", "))
+    }
+}
+
+/// 影像調整的一項
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustKind {
+    Brightness,
+    Contrast,
+    Saturation,
+    Hue,
+    Gamma,
+}
+
+impl AdjustKind {
+    pub const ALL: [AdjustKind; 5] = [
+        AdjustKind::Brightness,
+        AdjustKind::Contrast,
+        AdjustKind::Saturation,
+        AdjustKind::Hue,
+        AdjustKind::Gamma,
+    ];
+
+    /// mpv 的選項名稱
+    pub fn mpv(self) -> &'static str {
+        match self {
+            AdjustKind::Brightness => "brightness",
+            AdjustKind::Contrast => "contrast",
+            AdjustKind::Saturation => "saturation",
+            AdjustKind::Hue => "hue",
+            AdjustKind::Gamma => "gamma",
+        }
+    }
+
+    /// 介面上的名稱
+    pub fn label(self) -> &'static str {
+        match self {
+            AdjustKind::Brightness => crate::tr!("亮度", "Brightness"),
+            AdjustKind::Contrast => crate::tr!("對比", "Contrast"),
+            AdjustKind::Saturation => crate::tr!("飽和度", "Saturation"),
+            AdjustKind::Hue => crate::tr!("色相", "Hue"),
+            AdjustKind::Gamma => "Gamma",
+        }
+    }
+
+    /// 「亮度 +3」「對比 -2」「飽和度 0」
+    pub fn describe(self, value: i32) -> String {
+        format!("{} {}", self.label(), fmt_signed(value))
+    }
+}
+
+/// 調整值：0 →「0」、3 →「+3」、-2 →「-2」（跟延遲之類的提示一樣用一般的減號）
+pub fn fmt_signed(value: i32) -> String {
+    if value == 0 {
+        "0".to_owned()
+    } else {
+        format!("{value:+}")
     }
 }
 
@@ -549,6 +646,58 @@ mod tests {
             [a.brightness, a.contrast, a.saturation, a.hue, a.gamma],
             [100, -100, 5, -100, 100]
         );
+    }
+
+    #[test]
+    fn adjust_get_set_and_options() {
+        let mut a = Adjust::default();
+        for (i, k) in AdjustKind::ALL.into_iter().enumerate() {
+            a.set(k, i as i32 * 10 - 20);
+        }
+        assert_eq!(
+            [a.brightness, a.contrast, a.saturation, a.hue, a.gamma],
+            [-20, -10, 0, 10, 20]
+        );
+        for k in AdjustKind::ALL {
+            assert_eq!(
+                a.get(k),
+                [a.brightness, a.contrast, a.saturation, a.hue, a.gamma][k as usize]
+            );
+        }
+        // 超出範圍時拉回
+        a.set(AdjustKind::Hue, 250);
+        a.set(AdjustKind::Gamma, -101);
+        assert_eq!((a.hue, a.gamma), (100, -100));
+        assert_eq!(
+            a.mpv_options(),
+            [
+                ("brightness", "-20".to_owned()),
+                ("contrast", "-10".to_owned()),
+                ("saturation", "0".to_owned()),
+                ("hue", "100".to_owned()),
+                ("gamma", "-100".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn adjust_text() {
+        assert_eq!([3, -2, 0].map(fmt_signed), ["+3", "-2", "0"]);
+        assert_eq!(AdjustKind::Contrast.describe(-2), "對比 -2");
+        assert_eq!(AdjustKind::Gamma.describe(5), "Gamma +5");
+        let a = Adjust {
+            brightness: 10,
+            contrast: -5,
+            hue: 1,
+            ..Adjust::default()
+        };
+        assert_eq!(a.summary(|_| false), "亮度 +10、對比 -5、色相 +1");
+        assert_eq!(a.summary(|k| k == AdjustKind::Contrast), "亮度 +10、色相 +1");
+        assert_eq!(Adjust::default().summary(|_| false), "");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(AdjustKind::Saturation.describe(0), "Saturation 0");
+        assert_eq!(a.summary(|_| false), "Brightness +10, Contrast -5, Hue +1");
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
     }
 
     #[test]

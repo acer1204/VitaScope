@@ -1,6 +1,7 @@
 //! 播放器視窗：影片畫面、控制列、快捷鍵、全螢幕。
 
 mod capture;
+mod control_panel;
 mod info_panel;
 mod pacing;
 mod playlist_panel;
@@ -12,7 +13,7 @@ use crate::autoshot::AutoShot;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
-use crate::picture::PictureDefaults;
+use crate::picture::{Adjust, AdjustKind, PictureDefaults};
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
 use crate::settings::{Settings, SubStyle, WindowGeometry};
@@ -133,6 +134,12 @@ enum Action {
     Settings,
     /// 流暢播放：開（使用電池時暫停）/ 關
     ToggleSmooth,
+    /// 影像調整：某一項加減（W/E、R/T、Y/U、I/O），限制在 −100…100
+    Adjust(AdjustKind, i32),
+    /// 影像調整全部還原（Q）
+    AdjustReset,
+    /// 控制面板（Alt+G）
+    ToggleControlPanel,
 }
 
 pub struct VitascopeApp {
@@ -143,6 +150,8 @@ pub struct VitascopeApp {
     fatal: Option<String>,
     last_activity: Instant,
     osd: Option<(String, Instant)>,
+    /// 最近一次開檔的時間：之後才出現的提示（下一個檔案、續播、字幕載入失敗）不被影像調整的提醒蓋掉
+    opened_at: Instant,
     /// 拖曳進度條時預覽的時間；放開後保留到 mpv 跳轉完成，進度條才不會跳回舊位置
     seek_drag: Option<f64>,
     seek_released: bool,
@@ -280,6 +289,12 @@ pub struct VitascopeApp {
     async_pending: HashMap<u64, String>,
     /// 流暢播放：螢幕更新率、電源、決定
     pacing: pacing::PacingCtl,
+    /// 影像調整（亮度、對比…）：這次執行跨檔案沿用（mpv 的這些選項換檔時不會還原）；
+    /// 勾了「下次開啟時沿用」才存進設定
+    adjust: Adjust,
+    /// 控制面板（Alt+G）
+    panel_open: bool,
+    panel_tab: control_panel::PanelTab,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -402,6 +417,12 @@ impl VitascopeApp {
             .or_else(|| owner.map(|o| Box::new(pacing::RealProbe::new(o.window)) as Box<dyn PlatformProbe>));
         let user_sync = mpv_opts_override(&player, "video-sync") || mpv_opts_override(&player, "display-fps-override");
         let pacing = pacing::PacingCtl::new(probe, user_sync, launch.pacing);
+        // 影像調整預設每次啟動從 0 開始；勾了「下次開啟時沿用」才用上次存的
+        let adjust = if settings.video.keep_adjust {
+            settings.video.adjust.clamped()
+        } else {
+            Adjust::default()
+        };
 
         let mut app = Self {
             player,
@@ -410,6 +431,7 @@ impl VitascopeApp {
             fatal,
             last_activity: Instant::now(),
             osd: None,
+            opened_at: Instant::now(),
             seek_drag: None,
             seek_released: false,
             fit_window_pending: false,
@@ -482,6 +504,9 @@ impl VitascopeApp {
             picture_defaults: PictureDefaults::default(),
             async_pending: HashMap::new(),
             pacing,
+            adjust,
+            panel_open: false,
+            panel_tab: control_panel::PanelTab::default(),
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -551,6 +576,11 @@ impl VitascopeApp {
         self.osd.as_ref().map(|(text, _)| text.as_str())
     }
 
+    /// 這次執行的影像調整（介面測試用）
+    pub fn adjust(&self) -> Adjust {
+        self.adjust
+    }
+
     /// 啟動時（還沒開任何檔案）偵測播放引擎的功能，同步套用要在第一個檔案就生效的設定
     /// （流暢播放打開而且已經查得到更新率時）。之後的批次在這裡同步套用畫質、音效設定
     fn apply_startup(&mut self) {
@@ -564,6 +594,7 @@ impl VitascopeApp {
         }
         // 要等軟體繪圖的判斷（caps.dumb）
         self.pacing_startup();
+        self.adjust_startup();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -677,6 +708,7 @@ impl VitascopeApp {
         self.video_click_time = None;
         self.pending_auto_next = false;
         self.switching_file = true;
+        self.opened_at = Instant::now();
         self.info_cache = None;
         // 開新檔一律從播放開始（mpv 會沿用上一個檔案的暫停狀態）；A-B 重播也會沿用，要清掉
         let _ = self.player.set_pause(false);
@@ -751,6 +783,7 @@ impl VitascopeApp {
     fn save_settings(&mut self) {
         self.settings.volume = self.player.state.volume;
         self.settings.muted = self.player.state.muted;
+        self.store_adjust();
         if let Err(e) = self.settings.save() {
             eprintln!("[vitascope] 無法儲存設定：{e}");
         }
@@ -918,6 +951,9 @@ impl VitascopeApp {
             Action::ChooseScreenshotDir => self.choose_screenshot_dir(),
             Action::Settings => self.settings_open = !self.settings_open,
             Action::ToggleSmooth => self.toggle_smooth(),
+            Action::Adjust(kind, delta) => self.step_adjust(kind, delta),
+            Action::AdjustReset => self.reset_adjust(),
+            Action::ToggleControlPanel => self.panel_open = !self.panel_open,
             Action::PlaylistRemove => {
                 if let Some(i) = self.playlist_selected {
                     self.remove_from_playlist(i);
@@ -1521,6 +1557,7 @@ impl VitascopeApp {
             }
         }
         if is_url(&path) {
+            self.adjust_reminder();
             return;
         }
         self.update_history(|h| h.add_recent(&path));
@@ -1543,6 +1580,7 @@ impl VitascopeApp {
                 self.update_history(|h| h.forget(&path));
             }
         }
+        self.adjust_reminder();
     }
 
     /// 播完時自動播放清單的下一個檔案。只算「播放中播到結尾」：
@@ -1631,6 +1669,14 @@ impl VitascopeApp {
             self.save_settings();
             return;
         }
+        // Esc 也先關控制面板
+        if self.panel_open
+            && !egui::Popup::is_any_open(ctx)
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            self.panel_open = false;
+            return;
+        }
         // Esc 也先關設定視窗
         if self.settings_open
             && !egui::Popup::is_any_open(ctx)
@@ -1673,6 +1719,7 @@ impl VitascopeApp {
             key(Modifiers::ALT, Key::ArrowDown, Action::Pan(0.0, PAN_STEP));
             key(Modifiers::ALT, Key::K, Action::RotateCw);
             key(Modifiers::ALT, Key::Backspace, Action::ResetView);
+            key(Modifiers::ALT, Key::G, Action::ToggleControlPanel);
             // 裁切用 Ctrl（macOS 也是 Control 鍵）：Cmd+Q 是結束程式
             key(Modifiers::CTRL, Key::Q, Action::CropCycle);
             key(Modifiers::COMMAND, Key::Z, Action::Flip(true));
@@ -1718,6 +1765,18 @@ impl VitascopeApp {
             key(Modifiers::NONE, Key::F1, Action::About);
             key(Modifiers::NONE, Key::F6, Action::TogglePlaylist);
             key(Modifiers::NONE, Key::F5, Action::Settings);
+            // 影像調整（PotPlayer 的按鍵）：排在所有 Ctrl / Cmd 組合鍵後面。egui 比對時會分辨 Ctrl / Cmd，
+            // 所以 Ctrl+E（截圖）、Ctrl+T（置頂）、Ctrl+I（媒體資訊）、Ctrl+Q（裁切）不會變成調整
+            key(Modifiers::NONE, Key::Q, Action::AdjustReset);
+            for (kind, minus, plus) in [
+                (AdjustKind::Brightness, Key::W, Key::E),
+                (AdjustKind::Contrast, Key::R, Key::T),
+                (AdjustKind::Saturation, Key::Y, Key::U),
+                (AdjustKind::Hue, Key::I, Key::O),
+            ] {
+                key(Modifiers::NONE, minus, Action::Adjust(kind, -1));
+                key(Modifiers::NONE, plus, Action::Adjust(kind, 1));
+            }
             if playlist_open {
                 key(Modifiers::NONE, Key::Delete, Action::PlaylistRemove);
                 // Mac 的鍵盤沒有 Delete 鍵（Alt+Backspace 已經在前面處理掉了）
@@ -2250,9 +2309,10 @@ impl VitascopeApp {
             || egui::DragAndDrop::has_any_payload(ctx)
             || self.seek_drag.is_some()
             || menu_open
-            // 設定、字幕外觀、關於這些視窗開著時，滑鼠游標不能消失
+            // 設定、字幕外觀、控制面板、關於這些視窗開著時，滑鼠游標不能消失
             || self.settings_open
             || self.sub_style_open
+            || self.panel_open
             || self.about_open;
         if visible && st.loaded && !st.paused {
             // 時間到要重繪一次，控制列才會消失
@@ -3345,6 +3405,7 @@ impl eframe::App for VitascopeApp {
         self.about_window(&ctx);
         self.subtitle_style_window(&ctx);
         self.settings_window(&ctx);
+        self.control_panel(&ctx);
         self.typing_last_frame = ctx.text_edit_focused();
     }
 

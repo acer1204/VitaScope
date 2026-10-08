@@ -174,6 +174,9 @@ jobs:
             p=$(grep -o '非黑色像素 [0-9.]*' s.log | awk '{print $2}'); echo "$v：${p:-沒有截圖}%"
             awk -v p="${p:-0}" 'BEGIN { exit !(p > 60) }'
           done
+      - name: 影像調整的截圖檢查（虛擬螢幕；llvmpipe 自動改用軟體繪圖的簡化流程，亮度 +50 要比較亮）
+        timeout-minutes: 10
+        run: xvfb-run -a -s "-screen 0 1280x800x24" cargo test --test picture_shot -- --ignored --nocapture --test-threads=1
       - name: AppImage（本機與乾淨的 Debian 13，包括兩個替身的進入點）
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"

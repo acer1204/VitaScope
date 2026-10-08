@@ -108,8 +108,13 @@ impl AutoShot {
                 Ok(()) => eprintln!("[vitascope] 截圖已存到 {}", self.path.display()),
                 Err(e) => eprintln!("[vitascope] 截圖存檔失敗：{e}"),
             }
-            // CI 用這行判斷畫面是否真的畫出來（全黑代表 OpenGL / 影片渲染失敗）
-            eprintln!("[vitascope] 截圖統計：非黑色像素 {:.1}%", non_black_percent(&image));
+            // CI 用這行判斷畫面是否真的畫出來（全黑代表 OpenGL / 影片渲染失敗）；
+            // 中央的平均亮度給影像調整的截圖檢查用（亮度 +50 要比 0 亮）
+            eprintln!(
+                "[vitascope] 截圖統計：非黑色像素 {:.1}%，中央平均亮度 {:.1}",
+                non_black_percent(&image),
+                center_luma(&image)
+            );
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
             ctx.request_repaint();
@@ -129,6 +134,22 @@ fn non_black_percent(image: &egui::ColorImage) -> f64 {
         .filter(|c| c.r() > 16 || c.g() > 16 || c.b() > 16)
         .count();
     lit as f64 * 100.0 / image.pixels.len() as f64
+}
+
+/// 畫面中央（寬、高各取中間一半）的平均亮度（Rec.709 的 Y，0–255）。
+/// 只看中央：上方的提示文字、下方的控制列不算進去
+fn center_luma(image: &egui::ColorImage) -> f64 {
+    let [w, h] = image.size;
+    let (xs, ys) = (w / 4..w - w / 4, h / 4..h - h / 4);
+    let (mut sum, mut n) = (0.0, 0usize);
+    for y in ys {
+        for x in xs.clone() {
+            let c = image.pixels[y * w + x];
+            sum += 0.2126 * f64::from(c.r()) + 0.7152 * f64::from(c.g()) + 0.0722 * f64::from(c.b());
+            n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { sum / n as f64 }
 }
 
 fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
@@ -152,6 +173,24 @@ mod tests {
         assert_eq!(parse_minimize("3,6"), vec![s(3.0), s(6.0)]);
         assert_eq!(parse_minimize(" 6 , 3,x,-1,1.5"), vec![s(1.5), s(3.0), s(6.0)]);
         assert!(parse_minimize("").is_empty());
+    }
+
+    #[test]
+    fn center_luma_ignores_the_edges() {
+        // 4×4：中央 2×2 是白色，外圈是黑色
+        let mut image = egui::ColorImage::filled([4, 4], egui::Color32::BLACK);
+        for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            image.pixels[y * 4 + x] = egui::Color32::WHITE;
+        }
+        assert!((center_luma(&image) - 255.0).abs() < 1e-6);
+        // 純綠色的亮度比純藍色高很多（人眼的感受）
+        let green = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 255, 0));
+        let blue = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 0, 255));
+        assert!(center_luma(&green) > 5.0 * center_luma(&blue));
+        assert_eq!(
+            center_luma(&egui::ColorImage::filled([0, 0], egui::Color32::BLACK)),
+            0.0
+        );
     }
 
     #[test]

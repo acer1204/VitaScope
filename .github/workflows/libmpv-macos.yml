@@ -171,6 +171,10 @@ jobs:
           wait $pid || true; kill $w 2>/dev/null || true; cat shot.log
           pct=$(grep -o '非黑色像素 [0-9.]*' shot.log | awk '{print $2}')
           awk -v p="${pct:-0}" 'BEGIN { exit !(p > 60) }'
+      - name: 影像調整的截圖檢查（macOS 虛擬機的 OpenGL 不一定完整，只記錄結果）
+        continue-on-error: true
+        timeout-minutes: 10
+        run: cargo test --test picture_shot -- --ignored --nocapture --test-threads=1
       - name: 硬體解碼（只記錄結果：GitHub 的 macOS 虛擬機不一定有 VideoToolbox）
         continue-on-error: true
         run: cargo test --test hwdec -- --ignored --nocapture

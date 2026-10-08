@@ -12,6 +12,8 @@ pub(super) enum Page {
     #[default]
     General,
     Playback,
+    /// 畫質（影像調整；之後加去交錯、縮放演算法、著色器、HDR）
+    Picture,
     Subtitles,
     Screenshot,
     System,
@@ -19,9 +21,10 @@ pub(super) enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 6] = [
+    const ALL: [Page; 7] = [
         Page::General,
         Page::Playback,
+        Page::Picture,
         Page::Subtitles,
         Page::Screenshot,
         Page::System,
@@ -32,6 +35,7 @@ impl Page {
         match self {
             Page::General => tr!("一般", "General"),
             Page::Playback => tr!("播放", "Playback"),
+            Page::Picture => tr!("畫質", "Video quality"),
             Page::Subtitles => tr!("字幕", "Subtitles"),
             Page::Screenshot => tr!("截圖", "Screenshots"),
             Page::System => tr!("系統", "System"),
@@ -73,6 +77,7 @@ impl VitascopeApp {
                             match self.settings_page {
                                 Page::General => changed |= self.general_page(ui, &mut action),
                                 Page::Playback => changed |= self.playback_page(ui),
+                                Page::Picture => self.picture_page(ui, &mut action),
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
                                 Page::System => changed |= self.system_page(ui),
@@ -315,6 +320,33 @@ impl VitascopeApp {
         }
     }
 
+    /// 畫質頁：影像調整（滑桿在控制面板裡）
+    fn picture_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        ui.strong(tr!("影像調整", "Image adjustments"));
+        ui.label(tf!(
+            "亮度、對比、飽和度、色相、Gamma：{}",
+            "Brightness, contrast, saturation, hue, gamma: {}",
+            self.adjust_summary()
+        ));
+        ui.add_space(4.0);
+        if ui.button(tr!("影像調整…", "Image adjustments…")).clicked() && !self.panel_open {
+            *action = Some(Action::ToggleControlPanel);
+        }
+        let mut keep = self.settings.video.keep_adjust;
+        if ui
+            .checkbox(&mut keep, super::control_panel::keep_adjust_label())
+            .on_hover_text(tr!(
+                "沒勾的話，調整只在這次執行有效（換檔案時會沿用），下次開啟影戲時從 0 開始",
+                "If unticked, adjustments last only until VitaScope closes (they carry over to the next file) \
+                 and start from 0 next time"
+            ))
+            .changed()
+        {
+            self.set_keep_adjust(keep);
+        }
+        // 之後的批次在這裡加去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR
+    }
+
     fn subtitles_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let style = &self.settings.subtitle;
         ui.label(tf!(
@@ -423,6 +455,15 @@ fn shortcuts_page(ui: &mut egui::Ui) {
             tr!("左右 / 上下翻轉", "Flip horizontally / vertically"),
         ),
         (format!("{alt} + Backspace"), tr!("畫面調整還原", "Reset the picture")),
+        ("W / E".to_owned(), tr!("亮度 - / +", "Brightness - / +")),
+        ("R / T".to_owned(), tr!("對比 - / +", "Contrast - / +")),
+        ("Y / U".to_owned(), tr!("飽和度 - / +", "Saturation - / +")),
+        ("I / O".to_owned(), tr!("色相 - / +", "Hue - / +")),
+        ("Q".to_owned(), tr!("影像調整還原", "Reset image adjustments")),
+        (
+            format!("{alt} + G"),
+            tr!("控制面板（影像調整）", "Control panel (image adjustments)"),
+        ),
         (format!("{cmd} + T"), tr!("視窗置頂", "Always on top")),
         ("F6".to_owned(), tr!("播放清單", "Playlist")),
         (

@@ -23,10 +23,25 @@ pub(super) fn smooth_locked_hover() -> &'static str {
 }
 
 impl VitascopeApp {
-    /// 右鍵選單的「畫質」。一直可以用（設定是整個程式共用的，不看有沒有開檔）
+    /// 右鍵選單的「畫質」：影像調整、流暢播放。一直可以用（設定是整個程式共用的，不看有沒有開檔）
     pub(super) fn picture_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let mut action = None;
         ui.menu_button(crate::tr!("畫質", "Video quality"), |ui| {
+            let panel = egui::Button::selectable(self.panel_open, crate::tr!("影像調整…", "Image adjustments…"))
+                .shortcut_text(format!("{}+G", super::ALT_KEY));
+            // 跟設定頁的按鈕一樣只負責打開（已經開著就不動；Alt+G 才是開關）
+            if ui.add(panel).clicked() && !self.panel_open {
+                action = Some(Action::ToggleControlPanel);
+            }
+            if super::menu_item(
+                ui,
+                !self.adjust_is_neutral(),
+                crate::tr!("還原影像調整", "Reset image adjustments"),
+                "Q",
+            ) {
+                action = Some(Action::AdjustReset);
+            }
+            ui.separator();
             let mode = self.settings.smooth;
             let mut on = mode != SmoothMode::Off;
             let label = match self.smooth_short(mode) {

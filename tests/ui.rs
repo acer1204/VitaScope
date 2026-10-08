@@ -1415,8 +1415,20 @@ fn viewport_commands(h: &Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand
 
 /// 在影片上按右鍵、點選單裡的項目。選單比視窗長時（小影片的視窗只有 421 高）先用滾輪捲到看得到
 fn click_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    hover_context_item(h, label);
+    h.get_by_label_contains(label).click();
+    h.step();
+}
+
+/// 在影片上按右鍵、捲到選單裡的項目、把滑鼠移到它上面（有子選單的話子選單會打開）
+fn hover_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     h.get_by_label("影片畫面").click_secondary();
     h.run_steps(2);
+    hover_menu_item(h, label);
+}
+
+/// 選單已經打開：捲到項目、把滑鼠移到它上面
+fn hover_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     let screen = h.ctx.content_rect();
     for _ in 0..10 {
         let item = h.get_by_label_contains(label).rect();
@@ -1436,8 +1448,6 @@ fn click_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     // 捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：先移到要點的項目上，等子選單關掉
     h.get_by_label_contains(label).hover();
     h.run_steps(3);
-    h.get_by_label_contains(label).click();
-    h.step();
 }
 
 #[test]
@@ -3343,4 +3353,630 @@ fn smooth_passthrough_drops_frames() {
     );
     assert!(status.applied);
     assert_eq!(status.describe(), "音訊直通中：以略過或重複影格對齊螢幕");
+}
+
+// ───────────── 影像調整、控制面板 ─────────────
+
+/// mpv 目前的影像調整值（brightness 之類的）
+fn adjust_prop(app: &VitascopeApp, name: &str) -> f64 {
+    app.player().get_f64(name).unwrap_or(f64::NAN)
+}
+
+/// 等 mpv 套用（影像調整是非同步設定的）
+fn wait_adjust(h: &mut Harness<'_, VitascopeApp>, name: &str, value: i32) {
+    step_until_app(h, &format!("mpv 的 {name} = {value}"), |app| {
+        adjust_prop(app, name) == f64::from(value)
+    });
+}
+
+const ADJUST_PROPS: [&str; 5] = ["brightness", "contrast", "saturation", "hue", "gamma"];
+
+fn key_event(key: egui::Key, modifiers: egui::Modifiers, repeat: bool) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat,
+        modifiers,
+    }
+}
+
+#[test]
+fn picture_keys_adjust_and_reset() {
+    use egui::Key;
+    let dir = TempDir::new("adjust-keys");
+    for lang in vitascope::i18n::Lang::ALL {
+        let en = lang == vitascope::i18n::Lang::En;
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        settings.screenshot_dir = Some(dir.0.clone());
+        let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+        settle(&mut h, "mkv_multitrack.mkv");
+        for (key, name, value, zh_text, en_text) in [
+            (Key::E, "brightness", 1, "亮度 +1", "Brightness +1"),
+            (Key::W, "brightness", 0, "亮度 0", "Brightness 0"),
+            (Key::W, "brightness", -1, "亮度 -1", "Brightness -1"),
+            (Key::T, "contrast", 1, "對比 +1", "Contrast +1"),
+            (Key::R, "contrast", 0, "對比 0", "Contrast 0"),
+            (Key::R, "contrast", -1, "對比 -1", "Contrast -1"),
+            (Key::U, "saturation", 1, "飽和度 +1", "Saturation +1"),
+            (Key::Y, "saturation", 0, "飽和度 0", "Saturation 0"),
+            (Key::Y, "saturation", -1, "飽和度 -1", "Saturation -1"),
+            (Key::O, "hue", 1, "色相 +1", "Hue +1"),
+            (Key::I, "hue", 0, "色相 0", "Hue 0"),
+            (Key::I, "hue", -1, "色相 -1", "Hue -1"),
+        ] {
+            h.key_press(key);
+            h.step();
+            assert_eq!(
+                h.state().osd_text(),
+                Some(if en { en_text } else { zh_text }),
+                "{key:?}"
+            );
+            wait_adjust(&mut h, name, value);
+        }
+        let a = h.state().adjust();
+        assert_eq!(
+            [a.brightness, a.contrast, a.saturation, a.hue, a.gamma],
+            [-1, -1, -1, -1, 0]
+        );
+        // 按住不放（鍵盤自動重複）：每一下都算
+        for repeat in [false, true, true] {
+            h.event(key_event(Key::E, egui::Modifiers::NONE, repeat));
+            h.step();
+        }
+        wait_adjust(&mut h, "brightness", 2);
+        // Shift 不影響（egui 比對時忽略多按的 Shift）
+        h.key_press_modifiers(egui::Modifiers::SHIFT, Key::E);
+        h.step();
+        wait_adjust(&mut h, "brightness", 3);
+        // Q：全部還原
+        h.key_press(Key::Q);
+        h.step();
+        assert_eq!(
+            h.state().osd_text(),
+            Some(if en {
+                "Image adjustments reset"
+            } else {
+                "影像調整已還原"
+            })
+        );
+        for name in ADJUST_PROPS {
+            wait_adjust(&mut h, name, 0);
+        }
+        assert!(h.state().adjust().is_neutral());
+        if en {
+            continue;
+        }
+        // Ctrl（macOS：Cmd）+ E / T / I、Ctrl + Q 還是原本的功能，不會變成影像調整
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::E);
+        wait_for_png(&mut h, &dir.0, 1);
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::T);
+        h.run_steps(2);
+        assert!(h.state().settings().always_on_top, "Ctrl+T 視窗置頂");
+        h.key_press_modifiers(egui::Modifiers::COMMAND, Key::I);
+        h.run_steps(2);
+        h.get_by_label_contains("640×360（16:9）");
+        h.key_press_modifiers(egui::Modifiers::CTRL, Key::Q);
+        h.run_steps(2);
+        assert!(h.state().geometry().crop.is_some(), "Ctrl+Q 裁切");
+        assert!(h.state().adjust().is_neutral(), "{:?}", h.state().adjust());
+        h.run_steps(5);
+        for name in ADJUST_PROPS {
+            assert_eq!(adjust_prop(h.state(), name), 0.0, "{name}");
+        }
+    }
+}
+
+#[test]
+fn adjust_session_carry_and_keep() {
+    let dir = TempDir::new("adjust-keep");
+    let (a, b) = (dir.clip("a.mp4"), dir.clip("b.mp4"));
+    let path = dir.0.join("settings.json");
+    let saved = |key: &str| -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["video"][key].clone()
+    };
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(Some(a), settings);
+    settle(&mut h, "a.mp4");
+    for _ in 0..3 {
+        h.key_press(egui::Key::E);
+        h.step();
+    }
+    h.key_press(egui::Key::R);
+    h.step();
+    wait_adjust(&mut h, "brightness", 3);
+    wait_adjust(&mut h, "contrast", -1);
+    // 開另一個檔案：mpv 的影像調整不會還原（不在 reset-on-next-file 裡），開檔時提醒一下
+    drop_file(&mut h, b.clone());
+    step_until(&mut h, "開始播放 b.mp4", |s| playing(s, "b.mp4"));
+    step_until_app(&mut h, "提醒影像調整", |app| {
+        app.osd_text() == Some("影像調整中：亮度 +3、對比 -1（Q 還原）")
+    });
+    h.run_steps(3);
+    assert_eq!(adjust_prop(h.state(), "brightness"), 3.0);
+    assert_eq!(adjust_prop(h.state(), "contrast"), -1.0);
+    // 沒勾「下次開啟時沿用」：存檔時（例如切換視窗置頂）不寫影像調整
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    h.run_steps(2);
+    assert_eq!(saved("keep_adjust"), false);
+    assert_eq!(saved("adjust")["brightness"], 0);
+    assert_eq!(saved("adjust")["contrast"], 0);
+    // 在控制面板勾選：馬上存下這次的調整
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("下次開啟時沿用這些調整").click();
+    h.run_steps(2);
+    assert!(h.state().settings().video.keep_adjust);
+    assert_eq!(saved("keep_adjust"), true);
+    assert_eq!(saved("adjust")["brightness"], 3);
+    assert_eq!(saved("adjust")["contrast"], -1);
+    // 再調一下，存檔時跟著寫
+    h.key_press(egui::Key::U);
+    h.step();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    h.run_steps(2);
+    assert_eq!(saved("adjust")["saturation"], 1);
+    drop(h);
+
+    // 下次開啟：用存下來的調整，啟動時（開檔前）就套用，開檔時提醒
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(Some(b.clone()), settings);
+    h.step();
+    assert_eq!(adjust_prop(h.state(), "brightness"), 3.0, "啟動時同步套用");
+    assert_eq!(adjust_prop(h.state(), "saturation"), 1.0);
+    step_until_app(&mut h, "提醒影像調整", |app| {
+        app.osd_text() == Some("影像調整中：亮度 +3、對比 -1、飽和度 +1（Q 還原）")
+    });
+    // 取消勾選：存的值清成 0，下次從 0 開始（這次執行照樣沿用）
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("下次開啟時沿用這些調整").click();
+    h.run_steps(2);
+    assert_eq!(saved("keep_adjust"), false);
+    assert_eq!(saved("adjust")["brightness"], 0);
+    assert_eq!(h.state().adjust().brightness, 3);
+    assert_eq!(adjust_prop(h.state(), "brightness"), 3.0);
+    drop(h);
+
+    // 設定檔裡有值、但沒勾沿用（例如手動改的）：從 0 開始
+    std::fs::write(
+        &path,
+        r#"{"auto_next": false, "video": {"keep_adjust": false, "adjust": {"brightness": 7}}}"#,
+    )
+    .unwrap();
+    let mut h = harness_with(Some(b), Settings::load_from(path.clone()));
+    settle(&mut h, "b.mp4");
+    assert!(h.state().adjust().is_neutral());
+    assert_eq!(adjust_prop(h.state(), "brightness"), 0.0);
+    assert_ne!(
+        h.state().osd_text().map(|t| t.starts_with("影像調整中")),
+        Some(true),
+        "沒有調整時不提醒"
+    );
+}
+
+/// 用無障礙動作設定滑桿的值（像螢幕閱讀器那樣）
+fn set_slider(h: &mut Harness<'_, VitascopeApp>, label: &str, value: f64) {
+    let (target_node, target_tree) = h.get_by_label(label).accesskit_node().locate();
+    h.event(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+        action: egui::accesskit::Action::SetValue,
+        target_tree,
+        target_node,
+        data: Some(egui::accesskit::ActionData::NumericValue(value)),
+    }));
+    h.run_steps(2);
+}
+
+/// 用滑鼠把滑桿從中間拖到最右邊。`holding`：拖到最右邊、還沒放開滑鼠時要檢查的事
+fn drag_slider_to_max(
+    h: &mut Harness<'_, VitascopeApp>,
+    label: &str,
+    holding: impl FnOnce(&mut Harness<'_, VitascopeApp>),
+) {
+    let rect = h.get_by_label(label).rect();
+    let (from, to) = (rect.center(), egui::pos2(rect.right() + 20.0, rect.center().y));
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    for e in [
+        egui::Event::PointerMoved(from),
+        button(from, true),
+        egui::Event::PointerMoved(egui::pos2(from.x + 10.0, from.y)),
+        egui::Event::PointerMoved(to),
+    ] {
+        h.event(e);
+        h.step();
+    }
+    holding(h);
+    h.event(button(to, false));
+    h.step();
+    h.run_steps(2);
+}
+
+/// 開右鍵選單、把滑鼠移到「畫質」上（子選單打開）
+fn open_picture_menu(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "畫質 ⏵");
+}
+
+/// 同上，但在影片畫面的左下角按右鍵（控制面板開著時，畫面中間會被面板蓋住）
+fn open_picture_menu_from_corner(h: &mut Harness<'_, VitascopeApp>) {
+    let video = h.get_by_label("影片畫面").rect();
+    let pos = video.left_bottom() + egui::vec2(30.0, -30.0);
+    h.event(egui::Event::PointerMoved(pos));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+    hover_menu_item(h, "畫質 ⏵");
+}
+
+/// 設定檔裡存的值（`video.adjust.名稱`）
+fn saved_adjust(path: &std::path::Path, name: &str) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["video"]["adjust"][name].clone()
+}
+
+#[test]
+fn control_panel_alt_g_and_esc() {
+    let dir = TempDir::new("control-panel");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.video.keep_adjust = true;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    h.get_by_label("W/E 亮度・R/T 對比・Y/U 飽和度・I/O 色相");
+    for name in ["亮度", "對比", "飽和度", "色相", "Gamma"] {
+        assert_eq!(
+            h.get_by_label(name).accesskit_node().role(),
+            egui::accesskit::Role::Slider,
+            "{name}"
+        );
+    }
+    // 設定滑桿的值：馬上套用，存檔（勾了沿用）
+    set_slider(&mut h, "亮度", 25.0);
+    wait_adjust(&mut h, "brightness", 25);
+    assert_eq!(h.state().settings().video.adjust.brightness, 25);
+    assert_eq!(saved_adjust(&path, "brightness"), 25);
+    // 用滑鼠拖：拖曳中就套用，放開才存檔
+    drag_slider_to_max(&mut h, "Gamma", |h| {
+        wait_adjust(h, "gamma", 100);
+        assert_eq!(saved_adjust(&path, "gamma"), 0, "還沒放開滑鼠，不存檔");
+    });
+    assert_eq!(h.state().settings().video.adjust.gamma, 100);
+    assert_eq!(saved_adjust(&path, "gamma"), 100, "放開滑鼠時存檔");
+    // 每一列的 ↺：只還原那一項（值是 0 的那幾列不能按），也存檔
+    let resets: Vec<bool> = h
+        .query_all_by_label("↺")
+        .map(|n| n.accesskit_node().is_disabled())
+        .collect();
+    assert_eq!(resets, [false, true, true, true, false], "亮度、Gamma 有調整");
+    h.query_all_by_label("↺").last().unwrap().click();
+    h.run_steps(2);
+    wait_adjust(&mut h, "gamma", 0);
+    assert_eq!(h.state().adjust().brightness, 25, "亮度不受影響");
+    assert_eq!(adjust_prop(h.state(), "brightness"), 25.0);
+    assert_eq!(saved_adjust(&path, "gamma"), 0, "按 ↺ 時存檔");
+    // 按鍵改的值，滑桿跟著變
+    h.key_press(egui::Key::E);
+    h.run_steps(2);
+    assert_eq!(h.get_by_label("亮度").accesskit_node().numeric_value(), Some(26.0));
+    // 全部還原
+    h.get_by_label("全部還原（Q）").click();
+    h.run_steps(2);
+    for name in ADJUST_PROPS {
+        wait_adjust(&mut h, name, 0);
+    }
+    assert!(h.get_by_label("全部還原（Q）").accesskit_node().is_disabled());
+    // 全螢幕時 Esc 先關面板，再按一次才離開全螢幕
+    set_fullscreen(&mut h, true);
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Fullscreen(false)),
+        "面板開著時 Esc 只關面板：{cmds:?}"
+    );
+    h.run_steps(2);
+    assert!(h.query_by_label("控制面板").is_none(), "Esc 關閉控制面板");
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(
+        cmds.contains(&egui::ViewportCommand::Fullscreen(false)),
+        "面板關了，Esc 離開全螢幕：{cmds:?}"
+    );
+    set_fullscreen(&mut h, false);
+    // Alt+G 開、再按一次關
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    assert!(h.query_by_label("控制面板").is_none());
+    // 右鍵選單「畫質」：沒有調整時「還原影像調整」不能按；「影像調整…」打開面板
+    open_picture_menu(&mut h);
+    assert!(h.get_by_label_contains("還原影像調整").accesskit_node().is_disabled());
+    h.get_by_label_contains("影像調整…").click();
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    h.get_by_label("亮度");
+    // 面板開著時再選一次「影像調整…」：還是開著（選單只負責打開，Alt+G 才是開關）
+    open_picture_menu_from_corner(&mut h);
+    h.get_by_label_contains("影像調整…").click();
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    // 有調整時可以從選單還原
+    h.key_press(egui::Key::T);
+    h.run_steps(2);
+    wait_adjust(&mut h, "contrast", 1);
+    // 小影片的視窗裡，面板會蓋到畫面中間（右鍵會按在面板上）：先關掉
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_picture_menu(&mut h);
+    let reset = h.get_by_label_contains("還原影像調整");
+    assert!(!reset.accesskit_node().is_disabled());
+    reset.click();
+    h.run_steps(2);
+    wait_adjust(&mut h, "contrast", 0);
+    assert_eq!(h.state().osd_text(), Some("影像調整已還原"));
+}
+
+/// 勾了「下次開啟時沿用」、存著亮度 `brightness` 的設定（只在記憶體裡）
+fn kept_brightness(brightness: i32) -> Settings {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.keep_adjust = true;
+    settings.video.adjust.brightness = brightness;
+    settings
+}
+
+fn shows_adjust_reminder(app: &VitascopeApp) -> bool {
+    app.osd_text().is_some_and(|t| t.starts_with("影像調整中"))
+}
+
+/// 一直跑介面幀直到條件成立；期間都不能出現影像調整的提醒
+fn step_without_reminder(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&State) -> bool) {
+    let start = Instant::now();
+    loop {
+        h.step();
+        assert!(
+            !shows_adjust_reminder(h.state()),
+            "{what}：不該提醒影像調整（{:?}）",
+            h.state().osd_text()
+        );
+        if cond(&h.state().player().state) {
+            return;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// 開檔時的影像調整提醒不能蓋掉開檔後才出現、比較要緊的提示
+#[test]
+fn adjust_reminder_gives_way_to_next_file_and_resume() {
+    // 播放清單的下一個：「下一個（2/3）：第2集.mp4」
+    let dir = three_episodes("adjust-next");
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), kept_brightness(3));
+    step_until_app(&mut h, "開檔時提醒影像調整", |app| {
+        app.osd_text() == Some("影像調整中：亮度 +3（Q 還原）")
+    });
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（2/3）：第2集.mp4"));
+    step_without_reminder(&mut h, "換到第2集", |s| playing(s, "第2集.mp4"));
+    for _ in 0..10 {
+        step_without_reminder(&mut h, "第2集載入後", |_| true);
+    }
+    drop(h);
+
+    // 續播：「從 00:30 繼續播放（Home 從頭播放）」
+    let long = sample("common/mp4_long.mp4");
+    let mut h = harness_with(Some(long.clone()), kept_brightness(3));
+    step_until(&mut h, "開始播放", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until_app(&mut h, "沒有續播時照樣提醒", |app| {
+        playing(&app.player().state, "mp4_h264_aac.mp4") && shows_adjust_reminder(app)
+    });
+    // 等這個提醒消失，下面才分得出是不是又提醒了
+    step_until_app(&mut h, "提醒消失", |app| app.osd_text().is_none());
+    drop_file(&mut h, long);
+    step_without_reminder(&mut h, "從上次的位置繼續", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos >= 28.0
+    });
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(osd.contains("繼續播放（Home 從頭播放）"), "{osd}");
+}
+
+#[test]
+fn adjust_reminder_skips_audio_only_files() {
+    let mut h = harness_with(Some(sample("general/audio_flac.flac")), kept_brightness(3));
+    step_without_reminder(&mut h, "播放純音訊檔", |s| {
+        playing(s, "audio_flac.flac") && s.time_pos > 0.3
+    });
+    for _ in 0..10 {
+        step_without_reminder(&mut h, "播放中", |_| true);
+    }
+    assert_eq!(h.state().adjust().brightness, 3, "調整照樣沿用，只是不提醒");
+}
+
+// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定的影像調整：以 mpv 的值為準，影戲不去改它，也不存檔
+#[test]
+fn adjust_set_by_mpv_opts_is_left_alone() {
+    let dir = TempDir::new("adjust-locked");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.video.keep_adjust = true;
+    settings.video.adjust.brightness = 5;
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("brightness".into(), "20".into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mkv_multitrack.mkv");
+    assert_eq!(h.state().adjust().brightness, 20, "面板的數字跟 mpv 一致");
+    assert_eq!(adjust_prop(h.state(), "brightness"), 20.0);
+    assert!(!shows_adjust_reminder(h.state()), "{:?}", h.state().osd_text());
+    // 按鍵：說明原因，不改
+    h.key_press(egui::Key::E);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("亮度：已由 VITASCOPE_MPV_OPTS 指定"));
+    // 其他項目照常
+    h.key_press(egui::Key::T);
+    h.step();
+    wait_adjust(&mut h, "contrast", 1);
+    assert_eq!(adjust_prop(h.state(), "brightness"), 20.0);
+    // Q 只還原其他項目
+    h.key_press(egui::Key::Q);
+    h.step();
+    wait_adjust(&mut h, "contrast", 0);
+    h.run_steps(3);
+    assert_eq!(adjust_prop(h.state(), "brightness"), 20.0);
+    assert_eq!(h.state().adjust().brightness, 20);
+    // 控制面板：亮度的滑桿停用，其他可以調；只剩被指定的項目時「全部還原」不能按
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    assert!(h.get_by_label("亮度").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("對比").accesskit_node().is_disabled());
+    assert!(h.get_by_label("全部還原（Q）").accesskit_node().is_disabled());
+    // 存檔（切換視窗置頂）：設定檔裡的亮度還是使用者自己存的 5
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    h.run_steps(2);
+    assert_eq!(saved_adjust(&path, "brightness"), 5);
+}
+
+// 「設定 → 畫質」：目前調整的摘要、「下次開啟時沿用這些調整」勾選與取消都馬上存檔
+#[test]
+fn picture_page_keep_checkbox_saves() {
+    let dir = TempDir::new("adjust-page");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    h.step();
+    for _ in 0..2 {
+        h.key_press(egui::Key::E);
+        h.step();
+    }
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    h.get_by_label("亮度、對比、飽和度、色相、Gamma：亮度 +2");
+    h.get_by_label("下次開啟時沿用這些調整").click();
+    h.run_steps(2);
+    assert!(h.state().settings().video.keep_adjust);
+    let saved = |key: &str| -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["video"][key].clone()
+    };
+    assert_eq!(saved("keep_adjust"), true);
+    assert_eq!(saved("adjust")["brightness"], 2);
+    h.get_by_label("下次開啟時沿用這些調整").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().video.keep_adjust);
+    assert_eq!(saved("keep_adjust"), false);
+    assert_eq!(saved("adjust")["brightness"], 0);
+    assert_eq!(h.state().adjust().brightness, 2, "這次執行照樣沿用");
+}
+
+#[test]
+fn picture_page_renders_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.key_press(egui::Key::E);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("Brightness +1"));
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Video quality").click();
+    h.run_steps(2);
+    h.get_by_label("Image adjustments");
+    h.get_by_label("Brightness, contrast, saturation, hue, gamma: Brightness +1");
+    h.get_by_label("Keep these adjustments next time");
+    h.get_by_label("Image adjustments…").click();
+    h.run_steps(2);
+    h.get_by_label("Control Panel");
+    assert_eq!(
+        h.get_by_label("Brightness").accesskit_node().role(),
+        egui::accesskit::Role::Slider
+    );
+    h.get_by_label("Reset all (Q)");
+    h.get_by_label("W/E brightness · R/T contrast · Y/U saturation · I/O hue");
+    assert!(h.query_by_label_contains("亮度").is_none(), "沒有中文");
+}
+
+#[test]
+fn shortcuts_page_lists_the_picture_keys() {
+    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+    for (lang, page, rows) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            "快捷鍵",
+            [
+                "亮度 - / +",
+                "對比 - / +",
+                "飽和度 - / +",
+                "色相 - / +",
+                "影像調整還原",
+                "控制面板（影像調整）",
+            ],
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            "Shortcuts",
+            [
+                "Brightness - / +",
+                "Contrast - / +",
+                "Saturation - / +",
+                "Hue - / +",
+                "Reset image adjustments",
+                "Control panel (image adjustments)",
+            ],
+        ),
+    ] {
+        let mut settings = Settings::default();
+        settings.language = lang;
+        let mut h = harness_with(None, settings);
+        h.step();
+        h.key_press(egui::Key::F5);
+        h.run_steps(2);
+        h.get_by_label(page).click();
+        h.run_steps(2);
+        for key in ["W / E", "R / T", "Y / U", "I / O", "Q", &format!("{alt} + G")] {
+            h.get_by_label(key);
+        }
+        for row in rows {
+            h.get_by_label(row);
+        }
+    }
 }
