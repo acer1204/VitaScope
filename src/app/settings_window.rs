@@ -579,8 +579,7 @@ impl VitascopeApp {
         }
     }
 
-    /// 音效頁：輸出裝置、獨佔模式、轉成立體聲、音訊直通（選了馬上套用、存檔）。
-    /// 等化器、音量平衡、音量上限之後加在「轉成立體聲」上面
+    /// 音效頁：輸出裝置、獨佔模式、等化器、音量平衡、音量上限、轉成立體聲、音訊直通（選了馬上套用、存檔）
     fn sound_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let a = self.settings.audio.clone();
         ui.strong(tr!("輸出裝置", "Output device"));
@@ -649,6 +648,32 @@ impl VitascopeApp {
                 *action = Some(Action::ToggleExclusive);
             }
         }
+
+        ui.add_space(12.0);
+        ui.strong(tr!("等化器", "Equalizer"));
+        ui.horizontal(|ui| {
+            ui.label(self.eq_summary());
+            // 十段滑桿在控制面板（不擋住畫面，邊聽邊調）
+            if ui.button(tr!("等化器…", "Equalizer…")).clicked() {
+                *action = Some(Action::ShowEqualizer);
+            }
+        });
+        if let Some(why) = self.eq_disabled() {
+            ui.weak(why);
+        }
+
+        ui.add_space(12.0);
+        ui.strong(tr!("音量", "Volume"));
+        ui.horizontal(|ui| {
+            if let Some(m) = self.leveling_combo(ui, "settings_leveling") {
+                *action = Some(Action::SetLeveling(m));
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(v) = self.volume_max_combo(ui, "settings_volume_max") {
+                *action = Some(Action::SetVolumeMax(v));
+            }
+        });
 
         ui.add_space(12.0);
         ui.strong(tr!("聲道", "Channels"));
@@ -856,7 +881,10 @@ fn shortcuts_page(ui: &mut egui::Ui) {
         ("Q".to_owned(), tr!("影像調整還原", "Reset image adjustments")),
         (
             format!("{alt} + G"),
-            tr!("控制面板（影像調整）", "Control panel (image adjustments)"),
+            tr!(
+                "控制面板（影像調整、等化器）",
+                "Control panel (image adjustments, equalizer)"
+            ),
         ),
         (format!("{cmd} + T"), tr!("視窗置頂", "Always on top")),
         ("F6".to_owned(), tr!("播放清單", "Playlist")),

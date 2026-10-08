@@ -210,6 +210,8 @@ pub struct State {
     pub deinterlace_active: bool,
     /// 音訊直通中：直通的格式（"ac3"、"dts"…）；None = 一般 PCM 輸出或沒有聲音
     pub audio_spdif: Option<String>,
+    /// 音訊輸出開著、是一般的 PCM（不是直通）
+    pub audio_out_pcm: bool,
     /// 目前的影片是 HDR（video-params 的 gamma 是 pq 或 hlg）
     pub video_hdr: bool,
     /// 音訊輸出裝置清單（第一項是 auto）；None = 還沒讀過（見 `Player::read_audio_devices`、`watch_audio_devices`）
@@ -426,7 +428,7 @@ impl AfCaps {
         "aformat",
     ];
 
-    fn set(&mut self, name: &str, on: bool) {
+    pub(crate) fn set(&mut self, name: &str, on: bool) {
         match name {
             "equalizer" => self.equalizer = on,
             "acompressor" => self.acompressor = on,
@@ -435,6 +437,19 @@ impl AfCaps {
             "speechnorm" => self.speechnorm = on,
             "aformat" => self.aformat = on,
             _ => {}
+        }
+    }
+
+    /// 有沒有這個濾鏡（`NAMES` 的名稱；其他名稱都是沒有）
+    pub fn has(&self, name: &str) -> bool {
+        match name {
+            "equalizer" => self.equalizer,
+            "acompressor" => self.acompressor,
+            "alimiter" => self.alimiter,
+            "dynaudnorm" => self.dynaudnorm,
+            "speechnorm" => self.speechnorm,
+            "aformat" => self.aformat,
+            _ => false,
         }
     }
 
@@ -494,6 +509,11 @@ fn picture_key(name: &str) -> AsyncKey {
 fn spdif_format(json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     v["format"].as_str()?.strip_prefix("spdif-").map(str::to_owned)
+}
+
+/// `audio-out-params`（JSON）有輸出格式（音訊輸出開著）
+fn has_out_format(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json).is_ok_and(|v| v["format"].as_str().is_some_and(|f| !f.is_empty()))
 }
 
 /// VITASCOPE_MPV_OPTS 的內容 → (名稱, 值)；沒有「=」的項目略過（mpv 也不會收到）
@@ -620,6 +640,8 @@ pub struct Player {
     shaders_applied: Option<Vec<String>>,
     /// 還沒回覆的非同步 glsl-shaders 指令
     shaders_inflight: HashSet<u64>,
+    /// 音量超過 100% 時，經過限幅器放大的部分（%）：總音量 = mpv 的 volume + 這個（見 `set_volume_total`）
+    boost_pct: f64,
 }
 
 impl Player {
@@ -661,7 +683,12 @@ impl Player {
         let mut mpv = Mpv::new(&options)?;
         // profile=high-quality、include=… 之類間接改到的畫質、音效選項也算使用者指定的：
         // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是這些選項）
-        for name in crate::picture::MANAGED.into_iter().chain(crate::sound::MANAGED) {
+        // af（等化器、音量平衡的濾鏡鏈）也一樣：預設是空的
+        for name in crate::picture::MANAGED
+            .into_iter()
+            .chain(crate::sound::MANAGED)
+            .chain(["af"])
+        {
             if let (Ok(now), Ok(default)) = (
                 mpv.get_string(name),
                 mpv.get_string(&format!("option-info/{name}/default-value")),
@@ -711,6 +738,7 @@ impl Player {
             shader_user: shader_base,
             shader_flip: [None, None],
             shaders_inflight: HashSet::new(),
+            boost_pct: 0.0,
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -792,6 +820,15 @@ impl Player {
         sync: bool,
     ) -> Vec<(&'static str, AsyncKey, mpv::Result<Option<u64>>)> {
         self.apply_cached(opts, sync, sound_key)
+    }
+
+    /// `apply_sound` 會送出哪些選項（跟上次送的不一樣、使用者沒有自己指定的）
+    pub fn pending_sound<'a>(&'a self, opts: &'a [(&'static str, String)]) -> impl Iterator<Item = &'static str> + 'a {
+        opts.iter()
+            .filter(|(name, value)| {
+                !self.user_overrides.contains(*name) && self.options_applied.get(name) != Some(value)
+            })
+            .map(|(name, _)| *name)
     }
 
     fn apply_cached(
@@ -1066,6 +1103,42 @@ impl Player {
 
     pub fn set_volume(&self, volume: f64) -> mpv::Result<()> {
         self.mpv.set_property("volume", volume.clamp(0.0, 100.0))
+    }
+
+    /// 總音量（%）：mpv 的音量 + 經過限幅器放大的部分（見 `set_volume_total`）。
+    /// 有放大時 mpv 的音量一定是 100（直接用 100：剛設定完，屬性變化的通知可能還沒到）
+    pub fn volume_total(&self) -> f64 {
+        if self.boost_pct > 0.0 {
+            100.0 + self.boost_pct
+        } else {
+            self.state.volume
+        }
+    }
+
+    /// 經過限幅器放大的部分（%；沒有放大或用 mpv 自己的音量放大時是 0）
+    pub fn boost_pct(&self) -> f64 {
+        self.boost_pct
+    }
+
+    /// 設定總音量（0…`cap`，`cap` 是音量上限）。100% 以下就是 mpv 的音量。
+    /// 超過 100%：`limiter`（濾鏡鏈裡有限幅器）時 mpv 的音量停在 100、超過的部分記在 `boost_pct`，
+    /// 由呼叫的人改限幅器的輸入增益（`sound::limit_command`、改寫 af）；沒有限幅器時用 mpv 自己的音量放大
+    ///（把 volume-max 提高到 `cap`；mpv 的音量在濾鏡鏈後面，可能破音）
+    pub fn set_volume_total(&mut self, volume: f64, cap: f64, limiter: bool) -> mpv::Result<()> {
+        let v = volume.clamp(0.0, cap.max(100.0));
+        if v <= 100.0 {
+            self.boost_pct = 0.0;
+            return self.mpv.set_property("volume", v);
+        }
+        if limiter {
+            self.boost_pct = v - 100.0;
+            return self.mpv.set_property("volume", 100.0);
+        }
+        self.boost_pct = 0.0;
+        if self.mpv.get_property::<f64>("volume-max").is_ok_and(|max| max < v) {
+            self.mpv.set_property("volume-max", cap)?;
+        }
+        self.mpv.set_property("volume", v)
     }
 
     pub fn set_mute(&self, muted: bool) -> mpv::Result<()> {
@@ -1668,7 +1741,10 @@ impl Player {
             // 不在 EndFile 自己歸零：換檔時值可能前後一樣，mpv 就不會再通知，狀態會一直是錯的
             "mistimed-frame-count" => s.display_sync_active = value.as_i64().is_some(),
             "deinterlace-active" => s.deinterlace_active = value.as_bool().unwrap_or(false),
-            "audio-out-params" => s.audio_spdif = value.as_str().and_then(spdif_format),
+            "audio-out-params" => {
+                s.audio_spdif = value.as_str().and_then(spdif_format);
+                s.audio_out_pcm = s.audio_spdif.is_none() && value.as_str().is_some_and(has_out_format);
+            }
             "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
             // 讀不到（Value::None）時保留上一次的清單
             "audio-device-list" if !self.fake_devices => {
@@ -1798,8 +1874,8 @@ fn failure_reason(code: i32) -> &'static str {
 mod tests {
     use super::{
         ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, debug_log_level, display_size,
-        env_option_names, env_options, is_harmless_error, is_hdr_gamma, is_render_log, mpv_version, picture_key,
-        sound_key, spdif_format, spdif_live,
+        env_option_names, env_options, has_out_format, is_harmless_error, is_hdr_gamma, is_render_log, mpv_version,
+        picture_key, sound_key, spdif_format, spdif_live,
     };
 
     #[test]
@@ -1870,6 +1946,12 @@ mod tests {
         assert_eq!(spdif_format(r#"{"format":"floatp"}"#), None);
         assert_eq!(spdif_format(r#"{"samplerate":48000}"#), None);
         assert_eq!(spdif_format("not json"), None);
+        // 一般的 PCM 輸出（直通沒發生時，app 依這個把濾鏡鏈設回來）
+        assert!(has_out_format(r#"{"samplerate":48000,"format":"floatp"}"#));
+        assert!(has_out_format(r#"{"format":"spdif-ac3"}"#));
+        assert!(!has_out_format(r#"{"samplerate":48000}"#));
+        assert!(!has_out_format(r#"{"format":""}"#));
+        assert!(!has_out_format("not json"));
     }
 
     #[test]

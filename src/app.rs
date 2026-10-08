@@ -23,6 +23,7 @@ use crate::picture::{
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
 use crate::settings::{Settings, SubStyle, WindowGeometry};
+use crate::sound::{EqPreset, Leveling};
 use crate::update::{self, UpdateStatus};
 use crate::video::VideoView;
 use eframe::egui::{
@@ -167,6 +168,14 @@ enum Action {
     ToggleExclusive,
     ToggleDownmix,
     TogglePassthrough,
+    /// 等化器（開 / 關）、預設（選了順便打開）；「等化器…」打開控制面板的音效分頁
+    ToggleEq,
+    SetEqPreset(EqPreset),
+    ShowEqualizer,
+    /// 音量平衡：關閉、夜間模式、人聲平衡、音量平均
+    SetLeveling(Leveling),
+    /// 音量上限（%）：100 / 130 / 150 / 200
+    SetVolumeMax(u32),
 }
 
 pub struct VitascopeApp {
@@ -347,6 +356,23 @@ pub struct VitascopeApp {
     /// 換輸出裝置之後要選回來的音軌：這個檔案最後選的音軌（使用者自己關掉音軌時是 None）。
     /// 播放中拔掉裝置時 mpv 會先自己重開音訊輸出、開不起來就把音軌關掉，之後改裝置也不會再開
     audio_restore: Option<i64>,
+    /// 上次送給 mpv 的 af（等化器、音量平衡、限幅器的濾鏡鏈）；None = 不確定（mpv 不接受、或還沒管）
+    af_applied: Option<String>,
+    /// mpv 不接受的 af：同一條不再送（設定改了才再試）
+    af_failed: Option<String>,
+    /// 還沒回覆的非同步 af：指令編號 → 送出的值
+    af_inflight: HashMap<u64, String>,
+    /// 即時調整（af-command）之後什麼時候改寫整條 af
+    af_debounce: crate::sound::AfDebounce,
+    /// 預測接下來的音訊會直通（濾鏡鏈先清空）；真的開始直通、或一直是 PCM 時取消
+    spdif_expect: bool,
+    spdif_expect_at: Instant,
+    /// 上次問 mpv 解碼格式的時間（等直通時，見 `spdif_refused`）
+    spdif_polled_at: Instant,
+    /// 送出的 af-command 數（介面測試確認即時調整走 af-command、不是整條改寫）
+    af_commands_sent: u64,
+    /// 上一幀濾鏡鏈是不是當成直通中（實際的或預測的）：變了才換濾鏡鏈
+    af_spdif_seen: bool,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -411,6 +437,7 @@ impl VitascopeApp {
         crate::fonts::install_cjk(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        // 啟動時音量最多 100%：上次放大到 150% 也從 100% 開始，開啟時不會突然很大聲（set_volume 限制在 0–100）
         let _ = player.set_volume(settings.volume);
         let _ = player.set_mute(settings.muted);
         player.apply_sub_style(&settings.subtitle);
@@ -571,6 +598,15 @@ impl VitascopeApp {
             spdif_seen: None,
             audio_seen: None,
             audio_restore: None,
+            af_applied: None,
+            af_failed: None,
+            af_inflight: HashMap::new(),
+            af_debounce: Default::default(),
+            spdif_expect: false,
+            spdif_expect_at: Instant::now(),
+            spdif_polled_at: Instant::now(),
+            af_commands_sent: 0,
+            af_spdif_seen: false,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -640,6 +676,21 @@ impl VitascopeApp {
         self.osd.as_ref().map(|(text, _)| text.as_str())
     }
 
+    /// 送出的 af-command 數（介面測試用：拖滑桿、調音量時先用 af-command 即時調整）
+    pub fn af_commands_sent(&self) -> u64 {
+        self.af_commands_sent
+    }
+
+    /// 還沒回覆的非同步 af 設定數（介面測試用：啟動時是同步設定的，一個都沒有）
+    pub fn af_sets_in_flight(&self) -> usize {
+        self.af_inflight.len()
+    }
+
+    /// 即時調整之後還在等著改寫整條 af（介面測試用）
+    pub fn af_rewrite_pending(&self) -> bool {
+        self.af_debounce.due().is_some()
+    }
+
     /// 這次執行的影像調整（介面測試用）
     pub fn adjust(&self) -> Adjust {
         self.adjust
@@ -676,6 +727,9 @@ impl VitascopeApp {
     /// 非同步指令（change-list、af-command…），回覆依種類 `k` 分派
     pub fn command_async_keyed(&mut self, k: AsyncKey, args: &[&str]) {
         let result = self.player.command_async_keyed(k, args);
+        if k == AsyncKey::AfCommand && result.is_ok() {
+            self.af_commands_sent += 1;
+        }
         // 提示裡寫選項名稱（set、change-list 的第二個參數），其他指令寫指令名稱
         let name = match args {
             [cmd, name, ..] if matches!(*cmd, "set" | "change-list") => *name,
@@ -701,6 +755,9 @@ impl VitascopeApp {
             AsyncKey::Shaders => "glsl-shaders".to_owned(),
             _ => format!("{k:?}"),
         });
+        if k == AsyncKey::Af {
+            self.af_reply(id, error.is_some());
+        }
         if let Some(e) = error {
             // 流暢播放的設定 mpv 不接受：這次執行改回一般播放（改設定時再試）
             if matches!(k, AsyncKey::VideoSync | AsyncKey::DisplayFps) {
@@ -802,10 +859,13 @@ impl VitascopeApp {
         //（音訊延遲通常是藍牙耳機之類的裝置延遲，保留）
         let _ = self.player.set_secondary_sub(None);
         let _ = self.player.set_sub_delay(0.0);
+        // 開了音訊直通：新檔案可能會直通，濾鏡鏈先清空（同步，排在開檔之前）
+        self.sound_before_open();
         if let Err(e) = self.player.open(&path.to_string_lossy()) {
             self.player.state.last_error = Some(crate::tf!("無法開啟：{e}", "Cannot open: {e}"));
-            // 不會有 StartFile 了：舊檔案照樣在播，畫面調整要繼續同步
+            // 不會有 StartFile 了：舊檔案照樣在播，畫面調整要繼續同步；濾鏡鏈照舊檔案的音軌
             self.switching_file = false;
+            self.sound_file_loaded();
         }
     }
 
@@ -866,7 +926,8 @@ impl VitascopeApp {
     }
 
     fn save_settings(&mut self) {
-        self.settings.volume = self.player.state.volume;
+        // 存總音量（超過 100% 的放大也算）；下次啟動時最多從 100% 開始
+        self.settings.volume = self.player.volume_total();
         self.settings.muted = self.player.state.muted;
         self.store_adjust();
         if let Err(e) = self.settings.save() {
@@ -995,14 +1056,19 @@ impl VitascopeApp {
             // 音訊直通中：音量交給擴大機
             Action::Volume(_) if st.audio_spdif.is_some() => self.osd(sound::spdif_volume_hover()),
             Action::Volume(delta) => {
-                // 直接問 mpv 目前的音量：連續捲動滾輪時，屬性變化的通知可能還沒送到
-                let current = self.player.get_f64("volume").unwrap_or(st.volume);
-                let v = (current + delta).clamp(0.0, 100.0);
-                let _ = self.player.set_volume(v);
-                if st.muted {
+                // 直接問 mpv 目前的音量：連續捲動滾輪時，屬性變化的通知可能還沒送到。
+                // 總音量 = mpv 的音量 + 限幅器放大的部分，上限是設定的音量上限（預設 100%）
+                let muted = st.muted;
+                let current = match self.player.get_f64("volume") {
+                    Ok(v) => v + self.player.boost_pct(),
+                    Err(_) => self.player.volume_total(),
+                };
+                let v = (current + delta).clamp(0.0, self.volume_cap());
+                self.set_volume_total(v, false);
+                if muted {
                     let _ = self.player.set_mute(false);
                 }
-                self.osd(crate::tf!("音量 {v:.0}%", "Volume {v:.0}%"));
+                self.osd(sound::volume_osd(v));
             }
             Action::ToggleMute => {
                 let muted = !st.muted;
@@ -1056,6 +1122,11 @@ impl VitascopeApp {
             Action::ToggleExclusive => self.set_exclusive(!self.settings.audio.exclusive),
             Action::ToggleDownmix => self.set_downmix(!self.settings.audio.downmix),
             Action::TogglePassthrough => self.set_passthrough(!self.settings.audio.passthrough.enabled),
+            Action::ToggleEq => self.set_eq_enabled(!self.settings.audio.eq.enabled),
+            Action::SetEqPreset(p) => self.set_eq_preset(p),
+            Action::ShowEqualizer => self.show_equalizer(),
+            Action::SetLeveling(l) => self.set_leveling(l),
+            Action::SetVolumeMax(v) => self.set_volume_max(v),
             Action::PlaylistRemove => {
                 if let Some(i) = self.playlist_selected {
                     self.remove_from_playlist(i);
@@ -1545,8 +1616,16 @@ impl VitascopeApp {
         } else {
             crate::tr!("音軌", "Audio")
         };
+        // 換成會直通的音軌：濾鏡鏈先清空（同步，排在選音軌之前）
+        if kind == TrackKind::Audio {
+            self.sound_before_track(id);
+        }
         if let Err(e) = self.player.select_track(kind, id) {
             self.osd(crate::tf!("無法切換{name}：{e}", "Cannot switch {name}: {e}"));
+            if kind == TrackKind::Audio {
+                let current = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
+                self.sound_before_track(current);
+            }
             return;
         }
         // 使用者自己選的音軌（包括關掉）：換裝置之後照這個
@@ -1648,6 +1727,8 @@ impl VitascopeApp {
                 self.seek_released = false;
                 if let Some(e) = error {
                     eprintln!("[vitascope] {e}");
+                    // 開檔失敗：不會直通，濾鏡鏈設回來
+                    self.sound_open_failed();
                     // 開檔失敗也要截圖（截的是錯誤畫面）
                     if let Some(shot) = &mut self.autoshot {
                         shot.arm();
@@ -1660,6 +1741,8 @@ impl VitascopeApp {
 
     /// 檔案載入完成：加進最近開啟，有上次的位置就從那裡繼續
     fn on_file_loaded(&mut self) {
+        // 選上的音軌會不會直通（開了直通時，開檔前先清空了濾鏡鏈）
+        self.sound_file_loaded();
         self.preview_file_loaded();
         let Ok(path) = self.player.get_string("path") else {
             return;
@@ -2949,21 +3032,25 @@ impl VitascopeApp {
     fn volume_controls(&mut self, ui: &mut egui::Ui) {
         // 音量條短一點，窄視窗時左邊的時間、速度才放得下（Slider 的寬度看 spacing，不看 add_sized）
         ui.spacing_mut().slider_width = 70.0;
-        let st = &self.player.state;
-        let mut volume = st.volume;
-        let slider = egui::Slider::new(&mut volume, 0.0..=100.0)
+        let total = self.player.volume_total();
+        let mut volume = total;
+        // 範圍到音量上限（預設 100%；調高之後超過 100% 的部分經過限幅器放大）
+        let slider = egui::Slider::new(&mut volume, 0.0..=self.volume_cap())
             .show_value(false)
             .trailing_fill(true);
         // 音訊直通中：音量交給擴大機，滑桿停用
+        let st = &self.player.state;
         let spdif = st.audio_spdif.is_some();
+        let muted = st.muted;
         let response = ui
             .add_enabled_ui(!spdif, |ui| ui.add_sized([70.0, 20.0], slider))
             .inner
-            .on_hover_text(crate::tf!("音量 {:.0}%（↑ ↓）", "Volume {:.0}% (↑ ↓)", st.volume))
+            .on_hover_text(crate::tf!("音量 {:.0}%（↑ ↓）", "Volume {:.0}% (↑ ↓)", total))
             .on_disabled_hover_text(sound::spdif_volume_hover());
-        if response.changed() {
-            let _ = self.player.set_volume(volume);
-            if st.muted {
+        if response.changed() || response.drag_stopped() {
+            // 拖曳中先即時調整，放開（或點一下）時改寫濾鏡鏈（超過 100% 時）
+            self.set_volume_total(volume, response.drag_stopped() || !response.dragged());
+            if muted && response.changed() {
                 let _ = self.player.set_mute(false);
             }
         }

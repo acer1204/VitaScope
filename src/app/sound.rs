@@ -1,11 +1,24 @@
-//! 音效設定（輸出裝置、獨佔模式、轉成立體聲、音訊直通）的邏輯：右鍵選單「音效」、設定頁都走這裡。
+//! 音效設定（輸出裝置、獨佔模式、轉成立體聲、等化器、音量平衡、音量上限、音訊直通）的邏輯：
+//! 右鍵選單「音效」、控制面板、設定頁都走這裡。
 //! 設定整個程式共用、改了馬上存檔；對應到哪些 mpv 選項由 `sound::mpv_options` 決定，套用時只送有變的
 //!（改裝置、獨佔、聲道都會重新開啟音訊輸出，聲音中斷一下）。
+//! 等化器、音量平衡、音量超過 100% 的放大在影戲自己的 af 濾鏡鏈（`sound::af_chain`）：字串是唯一的依據，
+//! 拖滑桿、調音量時先送 af-command 馬上聽得到，停下來再改寫字串（見 `af_live`）。
+//! 音訊直通的資料不能過濾鏡，預測會直通時先把 af 清空（開檔前、選音軌前、播放中打開直通時），直通結束再設回來
 
 use super::VitascopeApp;
 use crate::player::{AsyncKey, TrackKind};
-use crate::sound::{self, AUTO_DEVICE, AudioDevice, AudioSettings, Passthrough};
+use crate::sound::{self, AUTO_DEVICE, AudioDevice, AudioSettings, EqPreset, Leveling, Passthrough};
 use crate::{tf, tr};
+use eframe::egui;
+use std::time::{Duration, Instant};
+
+/// 預測會直通、音訊輸出卻一直是一般的 PCM（擴大機、輸出方式不支援，mpv 改回 PCM）：等這麼久就不再當成直通，
+/// 濾鏡鏈設回來
+const SPDIF_GRACE: Duration = Duration::from_millis(1500);
+
+/// 等直通時多久問一次 mpv 解碼的格式（見 `spdif_refused`）
+const SPDIF_POLL: Duration = Duration::from_millis(100);
 
 /// 音訊直通中：音量交給擴大機（音量鍵、滑桿不動作時的提示、停用的說明）
 pub(super) fn spdif_volume_hover() -> &'static str {
@@ -23,6 +36,63 @@ pub(super) fn auto_device_label() -> &'static str {
 /// 開 / 關
 fn on_off(on: bool) -> &'static str {
     if on { tr!("開", "on") } else { tr!("關", "off") }
+}
+
+/// 引擎沒有等化器用的濾鏡（舊的引擎）：停用時的說明
+pub(super) fn eq_missing_hover() -> &'static str {
+    tr!(
+        "播放引擎缺少等化器濾鏡，請更新影戲",
+        "The playback engine lacks the equalizer filters; please update VitaScope"
+    )
+}
+
+/// 音量上限的說明：有限幅器時不會破音；沒有時（舊的引擎、VITASCOPE_MPV_OPTS 指定了 af）可能破音
+pub(super) fn volume_max_hover(limiter: bool) -> &'static str {
+    if limiter {
+        tr!(
+            "超過 100% 會經過限幅器，不會爆音",
+            "Above 100% the sound goes through a limiter, so it won't clip"
+        )
+    } else {
+        tr!(
+            "沒有限幅器（播放引擎太舊，或 VITASCOPE_MPV_OPTS 指定了 af）：超過 100% 可能會破音",
+            "No limiter (old playback engine, or af set by VITASCOPE_MPV_OPTS): above 100% the sound may clip"
+        )
+    }
+}
+
+/// 「音量平衡」的說明（右鍵選單、控制面板、設定頁共用）
+pub(super) fn leveling_hover() -> &'static str {
+    tr!(
+        "夜間模式：小聲變大、大聲變小，晚上不吵到別人；人聲平衡：讓說話的音量一致；音量平均：整部片的音量差不多大",
+        "Night mode: quiet parts louder and loud parts quieter, for late-night viewing. Voice leveling: keeps speech \
+         at an even volume. Normalize: evens out the volume across the whole video."
+    )
+}
+
+/// 音量的提示：超過 100% 註明「放大」
+pub(super) fn volume_osd(v: f64) -> String {
+    if v > 100.0 {
+        tf!("音量 {v:.0}%（放大）", "Volume {v:.0}% (boosted)")
+    } else {
+        tf!("音量 {v:.0}%", "Volume {v:.0}%")
+    }
+}
+
+/// 等化器某一段的增益（「+5」「-2.5」「0」）
+pub(super) fn fmt_gain(db: f32) -> String {
+    let n = sound::fmt_num(f64::from(db));
+    if db > 0.0 { format!("+{n}") } else { n }
+}
+
+/// 音量上限的選項（「150%」）
+pub(super) fn volume_max_label(v: u32) -> &'static str {
+    match v {
+        130 => "130%",
+        150 => "150%",
+        200 => "200%",
+        _ => "100%",
+    }
 }
 
 impl VitascopeApp {
@@ -43,6 +113,21 @@ impl VitascopeApp {
         for (name, _, result) in self.player.apply_sound(&opts, true) {
             if let Err(e) = result {
                 eprintln!("[vitascope] 無法套用 {name}：{e}");
+            }
+        }
+        // 等化器、音量平衡、音量上限超過 100% 的濾鏡鏈：接在其他音效選項後面同步設定，第一個檔案就生效
+        //（什麼都沒開時是空的，跟 mpv 原本一樣，不用送）
+        if let Some(chain) = self.wanted_af() {
+            if chain.is_empty() {
+                self.af_applied = self.player.get_string("af").ok().filter(String::is_empty);
+            } else {
+                match self.player.mpv().set_property("af", chain.as_str()) {
+                    Ok(()) => self.af_applied = Some(chain),
+                    Err(e) => {
+                        eprintln!("[vitascope] 無法套用 af：{e}");
+                        self.af_failed = Some(chain);
+                    }
+                }
             }
         }
     }
@@ -67,6 +152,7 @@ impl VitascopeApp {
                 self.check_saved_device(&list, true);
             }
         }
+        self.af_tick();
         let spdif = self.player.state.audio_spdif.clone();
         if spdif != self.spdif_seen {
             if let Some(format) = &spdif {
@@ -127,6 +213,8 @@ impl VitascopeApp {
         let Some(id) = self.audio_restore.filter(|_| self.player.state.loaded) else {
             return;
         };
+        // 重新選音軌會重新建立音訊（照設定試直通）：會直通的話濾鏡鏈先清空
+        self.sound_before_reopen(Some(id));
         self.set_option_async(AsyncKey::AudioDevice, "aid", &id.to_string());
     }
 
@@ -150,9 +238,21 @@ impl VitascopeApp {
         )
     }
 
-    /// 設定改了之後：非同步送出有變的選項
+    /// 設定改了之後：非同步送出有變的選項。濾鏡鏈先送：播放中打開直通時，af 要在 audio-spdif 之前清空
+    ///（非同步指令照順序執行）；關掉直通時 af 要等直通真的結束才設回來（`af_tick`）
     pub(super) fn apply_sound(&mut self) {
+        self.sync_af();
         let opts = self.sound_options();
+        // 換裝置、獨佔模式、聲道會重新開啟音訊輸出，mpv 會再試一次直通（之前不支援、改回 PCM 的也會）：
+        // 目前的音軌會直通的話濾鏡鏈先清空（同步，排在這些非同步的設定之前）
+        if self
+            .player
+            .pending_sound(&opts)
+            .any(|n| sound::REOPENS_OUTPUT.contains(&n))
+        {
+            let id = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
+            self.sound_before_reopen(id);
+        }
         for (name, key, result) in self.player.apply_sound(&opts, false) {
             match result {
                 Ok(Some(id)) => {
@@ -169,6 +269,9 @@ impl VitascopeApp {
         let before = self.settings.audio.clone();
         change(&mut self.settings.audio);
         if self.settings.audio != before {
+            if self.settings.audio.passthrough != before.passthrough {
+                self.passthrough_changed();
+            }
             self.apply_sound();
             self.save_settings();
         }
@@ -303,5 +406,489 @@ impl VitascopeApp {
         ) {
             self.player.forget_sound(name);
         }
+    }
+}
+
+// ───────────── 等化器、音量平衡、音量放大：af 濾鏡鏈 ─────────────
+
+impl VitascopeApp {
+    /// 使用者用 VITASCOPE_MPV_OPTS（或 profile=、include=）指定了 af：影戲不改它
+    pub(super) fn af_locked(&self) -> bool {
+        self.sound_locked("af")
+    }
+
+    /// 現在該有的 af；使用者自己指定了 af 時 None（不管）
+    fn wanted_af(&self) -> Option<String> {
+        if self.af_locked() {
+            return None;
+        }
+        let spdif = self.spdif_active().is_some() || self.spdif_expect;
+        Some(sound::af_chain(
+            &self.settings.audio,
+            &self.caps.af,
+            spdif,
+            sound::boost_level(self.player.volume_total()),
+        ))
+    }
+
+    /// 送出一條 af（非同步）。送出的就當成 mpv 現在的值（之後的非同步指令照順序執行）；mpv 不接受時見 `af_reply`
+    fn send_af(&mut self, value: &str) {
+        match self.player.set_async(AsyncKey::Af, "af", value) {
+            Ok(id) => {
+                self.async_pending.insert(id, "af".to_owned());
+                self.af_inflight.insert(id, value.to_owned());
+                self.af_applied = Some(value.to_owned());
+            }
+            Err(e) => {
+                self.af_applied = None;
+                self.async_failed(AsyncKey::Af, "af", &e.to_string());
+            }
+        }
+    }
+
+    /// 結構改變（等化器開關、預設、音量平衡、音量上限、進出直通…）或即時調整停下來：整條 af 改成現在該有的。
+    /// 跟上次送的一樣、或是 mpv 拒絕過的就不送
+    pub(super) fn sync_af(&mut self) {
+        self.af_debounce.cancel();
+        let Some(want) = self.wanted_af() else { return };
+        if self.af_applied.as_deref() == Some(want.as_str()) || self.af_failed.as_deref() == Some(want.as_str()) {
+            return;
+        }
+        self.send_af(&want);
+    }
+
+    /// 直通結束（或預測的直通沒發生）：先送「af ""」再送整條，濾鏡一定重新建立。
+    /// 直通時濾鏡碰到直通的資料會失敗、被 mpv 停用；mpv 重設 af 時會留下參數沒變的濾鏡，
+    /// 先清空就不會留下失敗的那一個。兩個非同步指令照順序執行
+    fn revive_af(&mut self) {
+        let Some(want) = self.wanted_af() else { return };
+        self.af_debounce.cancel();
+        if want.is_empty() || self.af_failed.as_deref() == Some(want.as_str()) {
+            self.sync_af();
+            return;
+        }
+        if self.af_applied.as_deref() != Some("") {
+            self.send_af("");
+        }
+        self.send_af(&want);
+    }
+
+    /// 即時調整（拖等化器的滑桿、調超過 100% 的音量、改前級）：播放中而且濾鏡鏈的結構沒變（只有參數不一樣）時，
+    /// 先送 af-command 馬上聽得到，停下來之後再改寫整條 af（`flush` = 放開滑桿，下一幀就改寫；不然等 300 毫秒）。
+    /// af-command 的值在跳轉、換音軌時會被 mpv 用字串重建濾鏡蓋掉，所以一定要改寫字串。
+    /// 沒開檔、或濾鏡鏈裡還沒有 `label` 那一段（結構改變）時直接改寫
+    fn af_live(&mut self, label: &str, commands: &[[String; 5]], flush: bool) {
+        let Some(want) = self.wanted_af() else { return };
+        let applied = self.af_applied.clone().unwrap_or_default();
+        let same_shape = [sound::EQ_LABEL, sound::LEVEL_LABEL, sound::LIMIT_LABEL]
+            .into_iter()
+            .all(|l| sound::has_stage(&applied, l) == sound::has_stage(&want, l));
+        if !(self.player.state.loaded && same_shape && sound::has_stage(&want, label)) {
+            self.sync_af();
+            return;
+        }
+        for c in commands {
+            let args: Vec<&str> = c.iter().map(String::as_str).collect();
+            self.command_async_keyed(AsyncKey::AfCommand, &args);
+        }
+        let now = Instant::now();
+        if flush {
+            self.af_debounce.flush(now);
+            self.egui_ctx.request_repaint();
+        } else {
+            self.af_debounce.touch(now);
+            self.egui_ctx.request_repaint_after(sound::AF_DEBOUNCE);
+        }
+    }
+
+    /// 限幅器的輸入增益（音量放大 × 前級）即時改
+    fn limiter_live(&mut self, flush: bool) {
+        let level = sound::limiter_level(
+            &self.settings.audio,
+            &self.caps.af,
+            sound::boost_level(self.player.volume_total()),
+        );
+        self.af_live(sound::LIMIT_LABEL, &[sound::limit_command(level)], flush);
+    }
+
+    /// mpv 回覆了 af 的設定：失敗的話記下來（同一條不再送；mpv 留著原本的值，不確定是哪一條）
+    pub(super) fn af_reply(&mut self, id: u64, failed: bool) {
+        let Some(value) = self.af_inflight.remove(&id) else {
+            return;
+        };
+        if failed {
+            self.af_failed = Some(value);
+            self.af_applied = None;
+        }
+    }
+
+    /// 每一幀：調整停下來 300 毫秒了就改寫 af；直通開始、結束（實際的或預測的）時換濾鏡鏈
+    fn af_tick(&mut self) {
+        let now = Instant::now();
+        if self.af_debounce.take(now) {
+            self.sync_af();
+        } else if let Some(due) = self.af_debounce.due() {
+            self.egui_ctx.request_repaint_after(due.saturating_duration_since(now));
+        }
+        if self.spdif_expect {
+            let waited = self.spdif_expect_at.elapsed();
+            if self.player.state.audio_spdif.is_some() {
+                // 真的開始直通了：之後看實際的狀態
+                self.spdif_expect = false;
+            } else if waited >= SPDIF_GRACE && self.spdif_refused() {
+                // 預測會直通，卻是用一般的 PCM 播放（不支援直通，mpv 改回 PCM）：濾鏡鏈設回來
+                self.spdif_expect = false;
+            } else {
+                self.egui_ctx
+                    .request_repaint_after(SPDIF_GRACE.saturating_sub(waited).max(SPDIF_POLL));
+            }
+        }
+        let spdif = self.player.state.audio_spdif.is_some() || self.spdif_expect;
+        if spdif != self.af_spdif_seen {
+            self.af_spdif_seen = spdif;
+            if spdif {
+                self.sync_af();
+            } else {
+                self.revive_af();
+            }
+        }
+    }
+
+    /// 預測的直通沒有發生（mpv 用 PCM 播放這個檔案的聲音）。輸出的格式是觀察的，解碼的格式直接問 mpv
+    ///（只在等直通、輸出是 PCM 時才問，最多每 `SPDIF_POLL` 一次）
+    fn spdif_refused(&mut self) -> bool {
+        let (loaded, out_pcm) = (self.player.state.loaded, self.player.state.audio_out_pcm);
+        if !loaded || !out_pcm || self.spdif_polled_at.elapsed() < SPDIF_POLL {
+            return false;
+        }
+        self.spdif_polled_at = Instant::now();
+        let decoded = self.player.get_string("audio-params/format").ok();
+        sound::spdif_refused(out_pcm, decoded.as_deref())
+    }
+
+    /// 重新開啟音訊輸出、重新選音軌之前（mpv 會照設定再試一次直通）：這條音軌（`id`）會直通的話先清空濾鏡鏈。
+    /// 不會直通的話不動（預測中的直通照舊等）
+    fn sound_before_reopen(&mut self, id: Option<i64>) {
+        if self.player.state.loaded && self.track_predicts_spdif(id) {
+            self.expect_spdif_now();
+        }
+    }
+
+    /// 這條音軌（編號）照目前的設定會不會直通
+    fn track_predicts_spdif(&self, id: Option<i64>) -> bool {
+        id.and_then(|id| self.player.state.tracks_of(TrackKind::Audio).find(|t| t.id == id))
+            .and_then(|t| t.codec.as_deref())
+            .is_some_and(|codec| sound::predict_spdif(codec, &self.settings.audio.passthrough))
+    }
+
+    /// 預測接下來的音訊會直通：記下來；濾鏡鏈還有東西的話馬上（同步）清空，
+    /// 直通的資料才不會碰到濾鏡（同步設定排在接下來的開檔、選音軌之前）
+    fn expect_spdif_now(&mut self) {
+        self.spdif_expect = true;
+        self.spdif_expect_at = Instant::now();
+        self.af_spdif_seen = true;
+        self.af_debounce.cancel();
+        if self.af_locked() || self.af_applied.as_deref().is_none_or(str::is_empty) {
+            return;
+        }
+        match self.player.mpv().set_property("af", "") {
+            Ok(()) => {
+                self.af_applied = Some(String::new());
+                // 還沒執行的非同步 af（例如剛改寫的整條）可能排在這個同步設定之後：再排一個空的在它們後面
+                if !self.af_inflight.is_empty() {
+                    self.send_af("");
+                }
+            }
+            Err(e) => eprintln!("[vitascope] 無法清空 af：{e}"),
+        }
+    }
+
+    /// 照目前的設定預測選上的音軌（`id`）會不會直通
+    fn predict_track(&mut self, id: Option<i64>) {
+        if self.track_predicts_spdif(id) {
+            self.expect_spdif_now();
+        } else {
+            self.spdif_expect = false;
+        }
+    }
+
+    /// 開新檔之前：開了音訊直通的話，還不知道新檔案的音軌會不會直通，先當成會（清空濾鏡鏈）；
+    /// 載入完成看了音軌再決定（`sound_file_loaded`）。沒開直通時什麼都不做
+    pub(super) fn sound_before_open(&mut self) {
+        if !sound::spdif_value(&self.settings.audio.passthrough).is_empty() && !self.af_locked() {
+            self.expect_spdif_now();
+        }
+    }
+
+    /// 檔案載入完成：看選上的音軌會不會直通
+    pub(super) fn sound_file_loaded(&mut self) {
+        let id = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
+        self.predict_track(id);
+    }
+
+    /// 開檔失敗：不會有音訊，不再當成會直通
+    pub(super) fn sound_open_failed(&mut self) {
+        self.spdif_expect = false;
+    }
+
+    /// 選音軌之前：新的音軌會直通的話先清空濾鏡鏈；不會的話之後（`af_tick`）設回來
+    pub(super) fn sound_before_track(&mut self, id: Option<i64>) {
+        self.predict_track(id);
+    }
+
+    /// 播放中改了直通的設定：新的引擎（mpv 0.41 起）馬上重新開音訊，照新的設定預測目前的音軌；
+    /// 舊的引擎要到下一個檔案才生效，目前的檔案不變
+    fn passthrough_changed(&mut self) {
+        if !self.player.state.loaded || !self.caps.spdif_live {
+            return;
+        }
+        let id = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
+        self.predict_track(id);
+    }
+
+    // ───────────── 等化器 ─────────────
+
+    /// 等化器不能用的原因：VITASCOPE_MPV_OPTS 指定了 af、引擎沒有濾鏡、音訊直通中
+    pub(super) fn eq_disabled(&self) -> Option<&'static str> {
+        self.sound_disabled("af")
+            .or_else(|| (!sound::eq_available(&self.caps.af)).then(eq_missing_hover))
+            .or_else(|| self.spdif_active().is_some().then(spdif_volume_hover))
+    }
+
+    /// 「等化器：搖滾」「等化器：關」
+    fn eq_osd(&mut self) {
+        let eq = self.settings.audio.eq;
+        if eq.enabled {
+            self.osd(tf!("等化器：{}", "Equalizer: {}", eq.preset.label()));
+        } else {
+            self.osd(tr!("等化器：關", "Equalizer: off"));
+        }
+    }
+
+    pub(super) fn set_eq_enabled(&mut self, on: bool) {
+        if self.eq_disabled().is_some() {
+            return;
+        }
+        self.change_sound(|a| a.eq.enabled = on);
+        self.eq_osd();
+    }
+
+    /// 選預設（順便打開等化器：選了預設就是要用）
+    pub(super) fn set_eq_preset(&mut self, preset: EqPreset) {
+        if self.eq_disabled().is_some() {
+            return;
+        }
+        self.change_sound(|a| {
+            a.eq.enabled = true;
+            a.eq.preset = preset;
+        });
+        self.eq_osd();
+    }
+
+    /// 拖某一段（`band` 從 0 開始）：預設變成「自訂」（從目前的值開始改），馬上聽得到；`commit` = 放開滑桿，存檔
+    pub(super) fn set_eq_band(&mut self, band: usize, db: f32, commit: bool) {
+        if self.eq_disabled().is_some() || band >= sound::EQ_BANDS.len() {
+            return;
+        }
+        let db = db.clamp(-sound::EQ_MAX_GAIN, sound::EQ_MAX_GAIN);
+        let eq = &mut self.settings.audio.eq;
+        let before = eq.effective_gains();
+        let mut gains = before;
+        gains[band] = db;
+        let changed = gains != before;
+        eq.gains = gains;
+        eq.preset = EqPreset::Custom;
+        if changed && eq.enabled {
+            let mut commands = vec![sound::band_command(band, db)];
+            // 自動防止破音：最高的那一段變了，前級（限幅器的輸入增益）也跟著變
+            let a = &self.settings.audio;
+            if sound::preamp(&before, a.eq.auto_preamp) != sound::preamp(&gains, a.eq.auto_preamp) {
+                let level = sound::limiter_level(a, &self.caps.af, sound::boost_level(self.player.volume_total()));
+                commands.push(sound::limit_command(level));
+            }
+            self.af_live(sound::EQ_LABEL, &commands, commit);
+        } else if commit {
+            self.sync_af();
+        }
+        if commit {
+            self.save_settings();
+        }
+    }
+
+    /// 「還原」：全部回到 0（平坦）
+    pub(super) fn reset_eq(&mut self) {
+        if self.eq_disabled().is_some() {
+            return;
+        }
+        self.change_sound(|a| {
+            a.eq.preset = EqPreset::Flat;
+            a.eq.gains = [0.0; 10];
+        });
+        self.eq_osd();
+    }
+
+    /// 自動防止破音（前級）：只改限幅器的輸入增益
+    pub(super) fn set_auto_preamp(&mut self, on: bool) {
+        if self.eq_disabled().is_some() || self.settings.audio.eq.auto_preamp == on {
+            return;
+        }
+        self.settings.audio.eq.auto_preamp = on;
+        self.limiter_live(true);
+        self.save_settings();
+        self.osd(tf!("自動防止破音：{}", "Prevent clipping: {}", on_off(on)));
+    }
+
+    /// 前級（dB，負數）：等化器開著、自動防止破音、有段落調高時才有
+    pub(super) fn eq_preamp_db(&self) -> Option<f64> {
+        let eq = &self.settings.audio.eq;
+        let pre = sound::preamp(&eq.effective_gains(), eq.auto_preamp);
+        (eq.enabled && pre < 1.0).then(|| 20.0 * pre.log10())
+    }
+
+    /// 等化器目前的狀態（設定頁）：「搖滾（開啟）」「平坦（關閉）」
+    pub(super) fn eq_summary(&self) -> String {
+        let eq = &self.settings.audio.eq;
+        if eq.enabled {
+            tf!("{}（開啟）", "{} (on)", eq.preset.label())
+        } else {
+            tf!("{}（關閉）", "{} (off)", eq.preset.label())
+        }
+    }
+
+    /// 打開控制面板的「音效」分頁（右鍵選單、設定頁的「等化器…」）
+    pub(super) fn show_equalizer(&mut self) {
+        self.panel_open = true;
+        self.panel_tab = super::control_panel::PanelTab::Sound;
+    }
+
+    // ───────────── 音量平衡 ─────────────
+
+    /// 音量平衡整個不能改的原因：VITASCOPE_MPV_OPTS 指定了 af、音訊直通中
+    pub(super) fn leveling_disabled(&self) -> Option<&'static str> {
+        self.sound_disabled("af")
+            .or_else(|| self.spdif_active().is_some().then(spdif_volume_hover))
+    }
+
+    /// 某一種音量平衡不能選的原因：引擎沒有它的濾鏡
+    pub(super) fn leveling_missing(&self, mode: Leveling) -> Option<String> {
+        (!mode.available(&self.caps.af)).then(|| {
+            let filter = mode.filter().unwrap_or_default();
+            tf!(
+                "播放引擎缺少 {filter} 濾鏡，請更新影戲",
+                "The playback engine lacks the {filter} filter; please update VitaScope"
+            )
+        })
+    }
+
+    /// 左邊名稱「音量平衡」+ 下拉選單（控制面板、設定頁）；引擎沒有濾鏡的那一種停用並說明。選了不一樣的回傳它
+    pub(super) fn leveling_combo(&self, ui: &mut egui::Ui, id: &str) -> Option<Leveling> {
+        let label = ui.label(tr!("音量平衡", "Volume leveling"));
+        let current = self.settings.audio.leveling;
+        let disabled = self.leveling_disabled();
+        let mut chosen = None;
+        let r = ui
+            .add_enabled_ui(disabled.is_none(), |ui| {
+                egui::ComboBox::from_id_salt(id)
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for mode in Leveling::ALL {
+                            let missing = self.leveling_missing(mode);
+                            let r = ui.add_enabled(
+                                missing.is_none(),
+                                egui::Button::selectable(current == mode, mode.menu_label()),
+                            );
+                            let r = match &missing {
+                                Some(why) => r.on_disabled_hover_text(why),
+                                None => r,
+                            };
+                            if r.clicked() && current != mode {
+                                chosen = Some(mode);
+                            }
+                        }
+                    })
+                    .response
+            })
+            .inner
+            .labelled_by(label.id)
+            .on_hover_text(leveling_hover());
+        if let Some(why) = disabled {
+            r.on_disabled_hover_text(why);
+        }
+        chosen
+    }
+
+    /// 左邊名稱「音量上限」+ 下拉選單（控制面板、設定頁）。選了不一樣的回傳它
+    pub(super) fn volume_max_combo(&self, ui: &mut egui::Ui, id: &str) -> Option<u32> {
+        let limiter = !self.af_locked() && self.caps.af.alimiter;
+        let label = ui.label(tr!("音量上限", "Volume limit"));
+        let current = self.settings.audio.volume_max;
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(volume_max_label(current))
+            .show_ui(ui, |ui| {
+                for v in sound::VOLUME_MAX_CHOICES {
+                    if ui.selectable_label(current == v, volume_max_label(v)).clicked() && current != v {
+                        chosen = Some(v);
+                    }
+                }
+            })
+            .response
+            .labelled_by(label.id)
+            .on_hover_text(volume_max_hover(limiter));
+        chosen
+    }
+
+    pub(super) fn set_leveling(&mut self, mode: Leveling) {
+        if self.leveling_disabled().is_some() || self.leveling_missing(mode).is_some() {
+            return;
+        }
+        self.change_sound(|a| a.leveling = mode);
+        self.osd(tf!("音量平衡：{}", "Volume leveling: {}", mode.label()));
+    }
+
+    // ───────────── 音量（可以超過 100%） ─────────────
+
+    /// 濾鏡鏈有限幅器：超過 100% 的音量在限幅器放大（不然用 mpv 自己的音量，可能破音）
+    pub(super) fn limiter_on(&self) -> bool {
+        !self.af_locked() && sound::has_limiter(&self.settings.audio, &self.caps.af)
+    }
+
+    /// 音量上限（%）
+    pub(super) fn volume_cap(&self) -> f64 {
+        f64::from(self.settings.audio.volume_max)
+    }
+
+    /// 設定總音量（0…音量上限）。超過 100% 而且有限幅器時改限幅器的輸入增益：先送 af-command，
+    /// `flush`（放開滑桿）時下一幀就改寫 af，不然停下來 300 毫秒之後
+    pub(super) fn set_volume_total(&mut self, v: f64, flush: bool) {
+        let limiter = self.limiter_on();
+        let before = self.player.boost_pct();
+        let cap = self.volume_cap();
+        if let Err(e) = self.player.set_volume_total(v, cap, limiter) {
+            eprintln!("[vitascope] 無法設定音量：{e}");
+        }
+        if limiter && (self.player.boost_pct() != before || (flush && self.af_debounce.due().is_some())) {
+            self.limiter_live(flush);
+        }
+    }
+
+    /// 音量上限：100 / 130 / 150 / 200%。調低時總音量也拉下來
+    pub(super) fn set_volume_max(&mut self, max: u32) {
+        let max = sound::snap_volume_max(max);
+        if max == self.settings.audio.volume_max {
+            return;
+        }
+        let total = self.player.volume_total();
+        self.settings.audio.volume_max = max;
+        if total > f64::from(max) {
+            // 先把音量拉下來（放大變小或歸零），濾鏡鏈再跟著新的上限改
+            let limiter = self.limiter_on();
+            if let Err(e) = self.player.set_volume_total(f64::from(max), f64::from(max), limiter) {
+                eprintln!("[vitascope] 無法設定音量：{e}");
+            }
+        }
+        self.apply_sound();
+        self.save_settings();
+        self.osd(tf!("音量上限：{max}%", "Volume limit: {max}%"));
     }
 }

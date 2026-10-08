@@ -3961,7 +3961,7 @@ fn shortcuts_page_lists_the_picture_keys() {
                 "飽和度 - / +",
                 "色相 - / +",
                 "影像調整還原",
-                "控制面板（影像調整）",
+                "控制面板（影像調整、等化器）",
             ],
         ),
         (
@@ -3973,7 +3973,7 @@ fn shortcuts_page_lists_the_picture_keys() {
                 "Saturation - / +",
                 "Hue - / +",
                 "Reset image adjustments",
-                "Control panel (image adjustments)",
+                "Control panel (image adjustments, equalizer)",
             ],
         ),
     ] {
@@ -5008,6 +5008,20 @@ fn sound_harness(
     devices: Option<&[(&str, &str)]>,
     change: impl FnOnce(&mut Settings),
 ) -> (TempDir, PathBuf, Harness<'static, VitascopeApp>) {
+    sound_harness_with(name, file, devices, &[], change)
+}
+
+/// 重播同一個檔案（樣本只有 3 秒；步驟多的測試在 CI 上可能比樣本還久，播完就停在最後）
+const LOOP_FILE: (&str, &str) = ("loop-file", "inf");
+
+/// 同 `sound_harness`，另外指定 mpv 選項（`extra`，當成 VITASCOPE_MPV_OPTS）
+fn sound_harness_with(
+    name: &str,
+    file: Option<&str>,
+    devices: Option<&[(&str, &str)]>,
+    extra: &[(&str, &str)],
+    change: impl FnOnce(&mut Settings),
+) -> (TempDir, PathBuf, Harness<'static, VitascopeApp>) {
     let dir = TempDir::new(name);
     let path = dir.0.join("settings.json");
     let mut settings = Settings::load_from(path.clone());
@@ -5015,6 +5029,7 @@ fn sound_harness(
     change(&mut settings);
     let mut player = Player::new(Options {
         keep_open: true,
+        extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         ..Options::headless()
     })
     .unwrap();
@@ -5536,4 +5551,762 @@ fn passthrough_codecs_set_by_mpv_opts_say_why() {
         h.run_steps(3);
         h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
     }
+}
+
+// ───────────── 音效：等化器、音量平衡、音量上限（影戲自己的 af 濾鏡鏈） ─────────────
+
+/// 引擎有沒有等化器、音量平衡、限幅器的濾鏡（本專案建置的引擎、CI 的系統 libmpv 都有；舊的引擎略過）
+fn has_af_filters(h: &Harness<'_, VitascopeApp>, test: &str) -> bool {
+    let caps = h.state().engine_caps().af;
+    if !caps.all() {
+        eprintln!("{test}：播放引擎缺少音訊濾鏡（{caps:?}），略過");
+    }
+    caps.all()
+}
+
+/// 等到 mpv 的 af 符合條件（af 是非同步設定的；讀回來的寫法是 lavfi=graph=%長度%…，比對裡面的濾鏡）
+fn wait_af(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&str) -> bool) {
+    let start = Instant::now();
+    loop {
+        h.step();
+        let af = prop(h, "af");
+        if cond(&af) {
+            return;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}\naf = {af}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 有濾鏡被 mpv 停用（濾鏡失敗時 mpv 記一筆錯誤，播放照樣繼續）
+fn disabled_filters(h: &Harness<'_, VitascopeApp>) -> Vec<String> {
+    h.state()
+        .player()
+        .recent_errors()
+        .iter()
+        .filter(|e| e.contains("Disabling filter"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn sound_menu_items() {
+    let (_dir, path, mut h) = sound_harness_with(
+        "sound-eq-menu",
+        Some("common/mp4_h264_aac.mp4"),
+        None,
+        &[LOOP_FILE],
+        |_| {},
+    );
+    if !has_af_filters(&h, "sound_menu_items") {
+        return;
+    }
+    assert_eq!(prop(&h, "af"), "", "預設什麼都沒開");
+    // 等化器預設 → 搖滾：順便打開等化器；最高 +6 dB，自動防止破音的前級 −6 dB 在限幅器
+    pick_sound_item(&mut h, &["等化器預設"], "搖滾");
+    assert_eq!(h.state().osd_text(), Some("等化器：搖滾"));
+    wait_af(&mut h, "搖滾", |af| {
+        af.contains("equalizer@b1=f=31:t=o:w=1:g=5")
+            && af.contains("equalizer@b10=f=16000:t=o:w=1:g=6")
+            && af.contains("alimiter@lim=level_in=0.501187")
+    });
+    let saved = saved_audio(&path);
+    assert_eq!(saved["eq"]["enabled"], true);
+    assert_eq!(saved["eq"]["preset"], "rock");
+    // 音量平衡 → 夜間模式
+    pick_sound_item(&mut h, &["音量平衡"], "夜間模式（小聲變大、大聲變小）");
+    assert_eq!(h.state().osd_text(), Some("音量平衡：夜間模式"));
+    wait_af(&mut h, "夜間模式", |af| {
+        af.contains("acompressor@c=threshold=0.125:ratio=4") && af.contains("equalizer@b1=")
+    });
+    assert_eq!(saved_audio(&path)["leveling"], "night");
+    // 取消勾選等化器：只剩音量平衡和限幅器
+    pick_sound_item(&mut h, &[], "等化器");
+    assert_eq!(h.state().osd_text(), Some("等化器：關"));
+    wait_af(&mut h, "等化器關掉", |af| {
+        !af.contains("equalizer") && af.contains("acompressor") && af.contains("level_in=1:")
+    });
+    // 人聲平衡、音量平均
+    pick_sound_item(&mut h, &["音量平衡"], "人聲平衡");
+    assert_eq!(h.state().osd_text(), Some("音量平衡：人聲平衡"));
+    wait_af(&mut h, "人聲平衡", |af| {
+        af.contains("speechnorm@s=") && !af.contains("acompressor")
+    });
+    pick_sound_item(&mut h, &["音量平衡"], "音量平均");
+    wait_af(&mut h, "音量平均", |af| af.contains("dynaudnorm@d="));
+    assert_eq!(saved_audio(&path)["leveling"], "normalize");
+    // 轉成立體聲
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert_eq!(h.state().osd_text(), Some("轉成立體聲：開"));
+    wait_prop(&mut h, "audio-channels", "stereo");
+    // 音量上限 150%；音量平衡關掉之後濾鏡鏈只剩限幅器，再改回 100% 就清空
+    pick_sound_item(&mut h, &["音量上限"], "150%");
+    assert_eq!(h.state().osd_text(), Some("音量上限：150%"));
+    assert_eq!(saved_audio(&path)["volume_max"], 150);
+    pick_sound_item(&mut h, &["音量平衡"], "關閉");
+    assert_eq!(h.state().osd_text(), Some("音量平衡：關閉"));
+    wait_af(&mut h, "只剩限幅器", |af| {
+        af.contains("alimiter@lim") && !af.contains("dynaudnorm")
+    });
+    pick_sound_item(&mut h, &["音量上限"], "100%");
+    wait_af(&mut h, "全部關掉", str::is_empty);
+    // 「等化器…」打開控制面板的音效分頁
+    pick_sound_item(&mut h, &[], "等化器…");
+    h.get_by_label("控制面板");
+    h.get_by_label("自動防止破音");
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+}
+
+#[test]
+fn volume_up_past_100_when_max_raised() {
+    let (_dir, path, mut h) = sound_harness_with(
+        "sound-boost-keys",
+        Some("common/mp4_h264_aac.mp4"),
+        None,
+        &[LOOP_FILE],
+        |s| s.audio.volume_max = 150,
+    );
+    if !h.state().engine_caps().af.alimiter {
+        eprintln!("volume_up_past_100_when_max_raised：播放引擎沒有 alimiter，略過");
+        return;
+    }
+    step_until(&mut h, "音量 100", |s| s.volume == 100.0);
+    // 音量上限超過 100%：一開始就有限幅器（放大 1 倍），之後調音量只改它的輸入增益
+    wait_af(&mut h, "限幅器", |af| af.contains("alimiter@lim=level_in=1:"));
+    let sent = h.state().af_commands_sent();
+    for _ in 0..10 {
+        h.key_press(egui::Key::ArrowUp);
+        h.step();
+    }
+    // 按著音量鍵：先送 af-command 馬上聽得到，整條 af 等停下來 300 毫秒才改寫（不會每按一下就重建濾鏡）
+    assert!(h.state().af_commands_sent() > sent, "按音量鍵先送 af-command");
+    assert!(h.state().af_rewrite_pending(), "停下來才改寫");
+    assert!(prop(&h, "af").contains("level_in=1:"), "還沒改寫：{}", prop(&h, "af"));
+    h.run_steps(2);
+    let player = h.state().player();
+    assert_eq!(player.volume_total(), 150.0, "到音量上限");
+    assert_eq!(player.get_f64("volume").unwrap(), 100.0, "mpv 的音量停在 100");
+    assert_eq!(h.state().osd_text(), Some("音量 150%（放大）"));
+    // 停下來之後改寫 af：放大 1.5³ = 3.375 倍
+    wait_af(&mut h, "放大寫進字串", |af| af.contains("level_in=3.375:"));
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    assert_eq!(h.state().player().volume_total(), 150.0, "不超過音量上限");
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("音量 145%（放大）"));
+    wait_af(&mut h, "145%", |af| af.contains("level_in=3.048625:"));
+    // 存檔存總音量
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(v["volume"], 145.0);
+    // 回到 100% 以下：mpv 自己的音量，放大歸零
+    for _ in 0..10 {
+        h.key_press(egui::Key::ArrowDown);
+        h.step();
+    }
+    step_until(&mut h, "音量 95", |s| s.volume == 95.0);
+    assert_eq!(h.state().player().volume_total(), 95.0);
+    assert_eq!(h.state().osd_text(), Some("音量 95%"));
+    wait_af(&mut h, "放大歸零", |af| af.contains("level_in=1:"));
+    // 滾輪也可以超過 100%
+    h.get_by_label("影片畫面").hover();
+    h.run_steps(1);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, 3.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(3);
+    assert_eq!(h.state().player().volume_total(), 110.0);
+    assert_eq!(h.state().osd_text(), Some("音量 110%（放大）"));
+    // 控制列的音量滑桿：範圍到音量上限；放開（或用無障礙操作設定）時下一幀就改寫 af，不用等 300 毫秒
+    set_volume_slider(&mut h, 150.0);
+    assert_eq!(h.state().player().volume_total(), 150.0);
+    assert_eq!(h.state().player().get_f64("volume").unwrap(), 100.0);
+    assert!(!h.state().af_rewrite_pending(), "放開滑桿就改寫");
+    wait_af(&mut h, "滑桿 150%", |af| af.contains("level_in=3.375:"));
+    // 調低音量上限：總音量也拉下來
+    pick_sound_item(&mut h, &["音量上限"], "100%");
+    assert_eq!(h.state().player().volume_total(), 100.0);
+    wait_af(&mut h, "沒有限幅器", str::is_empty);
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+}
+
+#[test]
+fn af_rewritten_directly_without_a_file() {
+    // 沒開檔時濾鏡鏈還沒建立，af-command 沒有對象：不送，直接改寫整條 af（不用等 300 毫秒）
+    let (_dir, _path, mut h) = sound_harness("sound-af-no-file", None, None, |s| {
+        s.audio.volume_max = 150;
+        s.audio.eq.enabled = true;
+    });
+    if !has_af_filters(&h, "af_rewritten_directly_without_a_file") {
+        return;
+    }
+    assert!(!h.state().player().state.loaded);
+    wait_af(&mut h, "平坦 + 限幅器", |af| {
+        af.contains("equalizer@b6=f=1000:t=o:w=1:g=0,") && af.contains("alimiter@lim=level_in=1:")
+    });
+    let sent = h.state().af_commands_sent();
+    // 音量鍵超過 100%：放大 1.1³ = 1.331 倍
+    for _ in 0..2 {
+        h.key_press(egui::Key::ArrowUp);
+        h.step();
+    }
+    assert_eq!(h.state().player().volume_total(), 110.0);
+    assert_eq!(h.state().af_commands_sent(), sent, "沒開檔不送 af-command");
+    assert!(!h.state().af_rewrite_pending(), "直接改寫，不用等");
+    wait_af(&mut h, "放大寫進字串", |af| af.contains("level_in=1.331:"));
+    // 控制面板的等化器滑桿也一樣
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("音效").click();
+    h.run_steps(2);
+    set_slider(&mut h, "1k", 6.0);
+    assert_eq!(h.state().af_commands_sent(), sent, "沒開檔不送 af-command");
+    assert!(!h.state().af_rewrite_pending());
+    wait_af(&mut h, "1 kHz +6", |af| af.contains("equalizer@b6=f=1000:t=o:w=1:g=6,"));
+}
+
+#[test]
+fn startup_volume_capped_at_100() {
+    // 上次放大到 150%：啟動時從 100% 開始（開啟時不會突然很大聲）
+    let (_dir, path, h) = sound_harness("sound-startup-volume", None, None, |s| {
+        s.audio.volume_max = 150;
+        s.volume = 150.0;
+    });
+    assert_eq!(h.state().player().get_f64("volume").unwrap(), 100.0);
+    assert_eq!(h.state().player().volume_total(), 100.0);
+    assert_eq!(h.state().player().boost_pct(), 0.0);
+    assert_eq!(h.state().settings().audio.volume_max, 150, "音量上限照樣記得");
+    drop(h);
+    // 120% 也一樣（mpv 自己的 volume-max 預設 130，擋不住 120）
+    let (_dir3, _path3, h) = sound_harness("sound-startup-volume-120", None, None, |s| {
+        s.audio.volume_max = 150;
+        s.volume = 120.0;
+    });
+    assert_eq!(h.state().player().get_f64("volume").unwrap(), 100.0);
+    assert_eq!(h.state().player().volume_total(), 100.0);
+    drop(h);
+    // 100% 以下照存下的值
+    let (_dir2, _path2, h) = sound_harness("sound-startup-volume-low", None, None, |s| s.volume = 40.0);
+    assert_eq!(h.state().player().get_f64("volume").unwrap(), 40.0);
+    let _ = path;
+}
+
+#[test]
+fn startup_sets_the_af_chain_before_the_first_frame() {
+    // 啟動時同步設定濾鏡鏈（排在開第一個檔案之前，第一個檔案從第一個聲音就有效）：
+    // app 一建好、還沒跑任何一幀，af 就已經是整條
+    let dir = TempDir::new("sound-startup-af");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.audio.eq.enabled = true;
+    settings.audio.eq.preset = vitascope::sound::EqPreset::Rock;
+    settings.audio.volume_max = 150;
+    let player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new((String::new(), 0)));
+    let seen_in_app = seen.clone();
+    let h = Harness::builder().with_size([960.0, 600.0]).build_eframe(move |cc| {
+        let app = VitascopeApp::new(cc, player, settings, Launch::default());
+        *seen_in_app.lock().unwrap() = (
+            app.player().get_string("af").unwrap_or_default(),
+            app.af_sets_in_flight(),
+        );
+        app
+    });
+    if !has_af_filters(&h, "startup_sets_the_af_chain_before_the_first_frame") {
+        return;
+    }
+    let (af, in_flight) = seen.lock().unwrap().clone();
+    assert!(
+        af.contains(ROCK_B1) && af.contains("alimiter@lim=level_in=0.501187:"),
+        "建好 app 時：{af}"
+    );
+    assert_eq!(in_flight, 0, "同步設定，不是排在後面的非同步指令");
+}
+
+/// 把垂直的滑桿從中間拖到最上面（還沒放開時先跑 `holding`）
+fn drag_vertical_slider_to_top(
+    h: &mut Harness<'_, VitascopeApp>,
+    label: &str,
+    holding: impl FnOnce(&mut Harness<'_, VitascopeApp>),
+) {
+    let rect = h.get_by_label(label).rect();
+    let (from, to) = (rect.center(), egui::pos2(rect.center().x, rect.top() - 20.0));
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    for e in [
+        egui::Event::PointerMoved(from),
+        button(from, true),
+        egui::Event::PointerMoved(egui::pos2(from.x, from.y - 10.0)),
+        egui::Event::PointerMoved(to),
+    ] {
+        h.event(e);
+        h.step();
+    }
+    holding(h);
+    h.event(button(to, false));
+    h.step();
+    h.run_steps(2);
+}
+
+#[test]
+fn control_panel_sound_tab() {
+    let (_dir, path, mut h) = sound_harness_with(
+        "sound-panel",
+        Some("common/mp4_h264_aac.mp4"),
+        None,
+        &[LOOP_FILE],
+        |_| {},
+    );
+    if !has_af_filters(&h, "control_panel_sound_tab") {
+        return;
+    }
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("音效").click();
+    h.run_steps(2);
+    // 十段滑桿，各有無障礙標籤；等化器沒開時停用
+    for band in ["31", "62", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"] {
+        let node = h.get_by_label(band);
+        assert_eq!(node.accesskit_node().role(), egui::accesskit::Role::Slider, "{band}");
+        assert!(node.accesskit_node().is_disabled(), "{band}");
+    }
+    h.get_by_label("等化器").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("等化器：平坦"));
+    wait_af(&mut h, "平坦", |af| af.contains("equalizer@b6=f=1000:t=o:w=1:g=0,"));
+    assert!(!h.get_by_label("1k").accesskit_node().is_disabled());
+    // 用滑鼠拖 1 kHz 那一段到最上面：拖曳中馬上變成「自訂」、先送 af-command，放開才存檔、改寫 af
+    let sent = h.state().af_commands_sent();
+    drag_vertical_slider_to_top(&mut h, "1k", |h| {
+        let eq = h.state().settings().audio.eq;
+        assert_eq!(eq.preset, vitascope::sound::EqPreset::Custom);
+        assert_eq!(eq.gains[5], 12.0);
+        assert_eq!(saved_audio(&path)["eq"]["preset"], "flat", "放開才存檔");
+        assert!(h.state().af_commands_sent() > sent, "拖曳中先送 af-command");
+        assert!(h.state().af_rewrite_pending(), "放開才改寫");
+        let af = prop(h, "af");
+        assert!(af.contains("equalizer@b6=f=1000:t=o:w=1:g=0,"), "放開才改寫：{af}");
+    });
+    wait_af(&mut h, "1 kHz +12", |af| {
+        af.contains("equalizer@b6=f=1000:t=o:w=1:g=12,") && af.contains("level_in=0.251189:")
+    });
+    let saved = saved_audio(&path);
+    assert_eq!(saved["eq"]["preset"], "custom");
+    assert_eq!(saved["eq"]["gains"][5], 12.0);
+    h.get_by_label("（前級 -12.0 dB）");
+    assert_eq!(combo_box(&h, "預設").accesskit_node().value().as_deref(), Some("自訂"));
+    // 用無障礙操作（鍵盤、螢幕閱讀器）改 31 Hz
+    set_slider(&mut h, "31", -6.0);
+    wait_af(&mut h, "31 Hz -6", |af| af.contains("equalizer@b1=f=31:t=o:w=1:g=-6,"));
+    assert_eq!(saved_audio(&path)["eq"]["gains"][0], -6.0);
+    // 不自動防止破音：前級回到 1
+    h.get_by_label("自動防止破音").click();
+    h.run_steps(2);
+    wait_af(&mut h, "沒有前級", |af| af.contains("level_in=1:"));
+    assert_eq!(saved_audio(&path)["eq"]["auto_preamp"], false);
+    // 還原：全部 0
+    h.get_by_label("還原").click();
+    h.run_steps(2);
+    wait_af(&mut h, "還原", |af| {
+        af.contains("equalizer@b1=f=31:t=o:w=1:g=0,") && af.contains("equalizer@b6=f=1000:t=o:w=1:g=0,")
+    });
+    assert_eq!(saved_audio(&path)["eq"]["preset"], "flat");
+    // 音量平衡、音量上限的下拉選單
+    combo_box(&h, "音量平衡").click();
+    h.run_steps(2);
+    h.get_by_label("夜間模式（小聲變大、大聲變小）").click();
+    h.run_steps(2);
+    wait_af(&mut h, "夜間模式", |af| af.contains("acompressor@c="));
+    combo_box(&h, "音量上限").click();
+    h.run_steps(2);
+    h.get_by_label("200%").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().audio.volume_max, 200);
+    // 轉成立體聲
+    h.get_by_label("轉成立體聲").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "audio-channels", "stereo");
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+}
+
+#[test]
+fn sound_settings_page_eq_and_volume() {
+    let (_dir, path, mut h) = sound_harness("sound-page-eq", None, None, |_| {});
+    if !has_af_filters(&h, "sound_settings_page_eq_and_volume") {
+        return;
+    }
+    open_settings_page(&mut h, "音效");
+    h.get_by_label("平坦（關閉）");
+    // 音量上限：說明經過限幅器
+    let max = combo_box(&h, "音量上限");
+    max.hover();
+    h.run_steps(3);
+    h.get_by_label("超過 100% 會經過限幅器，不會爆音");
+    combo_in_view(&mut h, "音量上限");
+    h.get_by_label("130%").click();
+    h.run_steps(2);
+    assert_eq!(saved_audio(&path)["volume_max"], 130);
+    wait_af(&mut h, "限幅器", |af| af.contains("alimiter@lim=level_in=1:"));
+    combo_in_view(&mut h, "音量平衡");
+    h.get_by_label("人聲平衡").click();
+    h.run_steps(2);
+    assert_eq!(saved_audio(&path)["leveling"], "dialogue");
+    wait_af(&mut h, "人聲平衡", |af| af.contains("speechnorm@s="));
+    // 「等化器…」打開控制面板的音效分頁
+    click_in_view(&mut h, "等化器…");
+    h.get_by_label("控制面板");
+    h.get_by_label("自動防止破音");
+}
+
+/// 開了音訊直通，等化器用「搖滾」
+fn spdif_with_rock(s: &mut Settings) {
+    s.audio.passthrough.enabled = true;
+    s.audio.eq.enabled = true;
+    s.audio.eq.preset = vitascope::sound::EqPreset::Rock;
+}
+
+/// 「搖滾」的 31 Hz 那一段（af 裡有等化器）
+const ROCK_B1: &str = "equalizer@b1=f=31:t=o:w=1:g=5";
+
+/// 用無障礙操作設定控制列的音量滑桿（控制列上另一個滑桿是進度條）
+fn set_volume_slider(h: &mut Harness<'_, VitascopeApp>, value: f64) {
+    let (target_node, target_tree) = h
+        .query_all_by_role(egui::accesskit::Role::Slider)
+        .find(|s| s.accesskit_node().label().as_deref() != Some("進度"))
+        .expect("控制列的音量滑桿")
+        .accesskit_node()
+        .locate();
+    h.event(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+        action: egui::accesskit::Action::SetValue,
+        target_tree,
+        target_node,
+        data: Some(egui::accesskit::ActionData::NumericValue(value)),
+    }));
+    h.run_steps(2);
+}
+
+#[test]
+fn passthrough_track_switch_clears_the_eq_chain() {
+    // 換音軌：換成會直通的（AC-3）之前先清空 af（同步，排在選音軌之前），濾鏡不會碰到直通的資料；
+    // 換成不會直通的（外掛的 FLAC）之後等化器回來
+    let dir = TempDir::new("sound-spdif-track");
+    let video = dir.0.join("雙音軌.mkv");
+    std::fs::copy(sample("common/mkv_hevc_ac3.mkv"), &video).unwrap();
+    // 同名的外掛音軌（FLAC）會自動載入
+    std::fs::copy(sample("common/mkv_extaudio.mka"), dir.0.join("雙音軌.mka")).unwrap();
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    spdif_with_rock(&mut settings);
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![(LOOP_FILE.0.into(), LOOP_FILE.1.into())],
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![video],
+            ..Default::default()
+        },
+        settings,
+    );
+    if !has_af_filters(&h, "passthrough_track_switch_clears_the_eq_chain") {
+        return;
+    }
+    settle(&mut h, "雙音軌.mkv");
+    step_until(&mut h, "直通中、載入外掛音軌", |s| {
+        s.audio_spdif.as_deref() == Some("ac3") && s.tracks_of(TrackKind::Audio).count() == 2
+    });
+    assert_eq!(prop(&h, "af"), "", "直通中沒有濾鏡");
+    let ac3 = h
+        .state()
+        .player()
+        .state
+        .tracks_of(TrackKind::Audio)
+        .find(|t| !t.external)
+        .unwrap()
+        .label();
+    // 換成外掛的 FLAC：不會直通，直通結束之後等化器回來
+    h.get_by_label("音軌").click();
+    h.run_steps(2);
+    h.get_by_label_contains("雙音軌.mka").click();
+    step_until(&mut h, "換成 FLAC、不再直通", |s| {
+        s.selected(TrackKind::Audio).is_some_and(|t| t.external) && s.audio_spdif.is_none()
+    });
+    wait_af(&mut h, "FLAC 有等化器", |af| af.contains(ROCK_B1));
+    // 換回 AC-3：選音軌的那一幀 af 就已經清空（還沒開始直通）
+    h.get_by_label("音軌").click();
+    h.run_steps(2);
+    h.get_by_label_contains(&ac3).click();
+    h.step();
+    assert_eq!(prop(&h, "af"), "", "選會直通的音軌之前先清空");
+    step_until(&mut h, "又開始直通", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    wait_real(&mut h, 0.5);
+    assert_eq!(prop(&h, "af"), "");
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+}
+
+/// 直通開不起來、mpv 改回 PCM 之後：沒在播的話往回跳一下（見 `passthrough_refused_restores_the_eq_chain`）
+fn kick_after_spdif_fallback(h: &mut Harness<'_, VitascopeApp>) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        h.step();
+        if prop(h, "core-idle") == "no" && !prop(h, "audio-out-params").is_empty() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.key_press(egui::Key::ArrowLeft);
+    h.run_steps(2);
+}
+
+#[test]
+fn passthrough_refused_restores_the_eq_chain() {
+    // 輸出（擴大機、輸出方式）不支援直通時 mpv 改回 PCM 播放：預測會直通而清空的濾鏡鏈，確定沒有直通之後設回來。
+    // 之後重新開啟音訊輸出（轉成立體聲、換裝置）時 mpv 會再試一次直通：濾鏡鏈要先清空，不然濾鏡碰到直通的資料會失敗。
+    // ao=null 的 format 選項模擬只接受 float 的輸出（直通的格式開不起來）
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-spdif-refused",
+        Some("common/mkv_hevc_ac3.mkv"),
+        None,
+        &[LOOP_FILE, ("ao-null-format", "float")],
+        spdif_with_rock,
+    );
+    if !has_af_filters(&h, "passthrough_refused_restores_the_eq_chain") {
+        return;
+    }
+    if prop(&h, "ao-null-format") != "float" {
+        eprintln!("passthrough_refused_restores_the_eq_chain：這個引擎的 ao=null 沒有 format 選項，略過");
+        return;
+    }
+    // 這個引擎在檔案一開始就改回 PCM 時會停住（core-idle，沒有濾鏡鏈也一樣），跳轉一下才繼續播
+    kick_after_spdif_fallback(&mut h);
+    wait_af(&mut h, "沒有直通，等化器回來", |af| af.contains(ROCK_B1));
+    assert_eq!(h.state().player().state.audio_spdif, None);
+    wait_real(&mut h, 0.3);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+    // 轉成立體聲：mpv 重新開啟音訊輸出、再試一次直通。送出之前濾鏡鏈已經清空
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert_eq!(prop(&h, "af"), "", "重新開啟音訊輸出之前先清空");
+    wait_prop(&mut h, "audio-channels", "stereo");
+    kick_after_spdif_fallback(&mut h);
+    wait_af(&mut h, "又沒有直通，等化器回來", |af| af.contains(ROCK_B1));
+    wait_real(&mut h, 0.3);
+    assert_eq!(h.state().player().state.audio_spdif, None);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+}
+
+#[test]
+fn passthrough_clears_and_restores_the_eq_chain() {
+    // 直通的資料不能過濾鏡：開了直通又開了等化器，AC-3 檔案直通之前 af 已經清空（沒有濾鏡失敗），
+    // 關掉直通之後等化器回來、照樣有作用
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-spdif-eq",
+        Some("common/mkv_hevc_ac3.mkv"),
+        None,
+        &[LOOP_FILE],
+        spdif_with_rock,
+    );
+    if !has_af_filters(&h, "passthrough_clears_and_restores_the_eq_chain") {
+        return;
+    }
+    step_until(&mut h, "直通中", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    h.run_steps(5);
+    assert_eq!(prop(&h, "af"), "", "直通中沒有濾鏡");
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+    // 等化器、音量平衡在直通中停用，說明原因
+    open_sound_menu(&mut h);
+    let eq = h.get_by_label("等化器");
+    assert!(eq.accesskit_node().is_disabled());
+    eq.hover();
+    h.run_steps(3);
+    h.get_by_label("音訊直通中：聲音由擴大機處理");
+    assert!(h.get_by_label_contains("音量平衡").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 關掉直通：等化器回來（舊的引擎要重新開檔）
+    pick_sound_item(&mut h, &[], "音訊直通（使用中：AC-3）");
+    let live = h.state().engine_caps().spdif_live;
+    if !live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    step_until(&mut h, "改回一般輸出", |s| s.loaded && s.audio_spdif.is_none());
+    wait_af(&mut h, "等化器回來", |af| {
+        af.contains("equalizer@b1=f=31:t=o:w=1:g=5")
+    });
+    wait_real(&mut h, 0.5);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+    open_sound_menu(&mut h);
+    assert!(
+        !h.get_by_label("等化器").accesskit_node().is_disabled(),
+        "直通結束：等化器又可以用"
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 再打開直通：af 先清空才開始直通，濾鏡不會失敗
+    pick_sound_item(&mut h, &[], "音訊直通");
+    if !live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    step_until(&mut h, "又開始直通", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    assert_eq!(prop(&h, "af"), "");
+    wait_real(&mut h, 0.5);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+    // 換成不會直通的檔案：開檔前先清空，載入後看了音軌（AAC）再把等化器放回去
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    wait_af(&mut h, "AAC 檔案有等化器", |af| {
+        af.contains("equalizer@b1=f=31:t=o:w=1:g=5")
+    });
+    assert_eq!(h.state().player().state.audio_spdif, None);
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+}
+
+#[test]
+fn unpredicted_spdif_clears_and_revives_the_eq_chain() {
+    // 預測不到的直通（VITASCOPE_MPV_OPTS 指定了 audio-spdif，影戲的直通設定是關的）：真的開始直通之後清空 af，
+    // 直通結束再把等化器設回來（先清空再設，濾鏡重新建立）
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-spdif-unpredicted",
+        Some("common/mkv_hevc_ac3.mkv"),
+        None,
+        &[LOOP_FILE, ("audio-spdif", "ac3")],
+        |s| {
+            s.audio.eq.enabled = true;
+            s.audio.eq.preset = vitascope::sound::EqPreset::Rock;
+        },
+    );
+    if !has_af_filters(&h, "unpredicted_spdif_clears_and_revives_the_eq_chain") {
+        return;
+    }
+    assert!(h.state().player().user_overrides().contains("audio-spdif"));
+    assert!(!h.state().settings().audio.passthrough.enabled);
+    step_until(&mut h, "直通中", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    wait_af(&mut h, "直通開始之後清空", str::is_empty);
+    wait_real(&mut h, 0.3);
+    assert_eq!(prop(&h, "af"), "", "直通中沒有濾鏡");
+    // 濾鏡在清空之前可能已經碰到直通的資料、失敗了（預測不到，沒辦法事先清空）：記下來，之後比對內容
+    let mut failed = disabled_filters(&h);
+    // 關掉直通（舊的引擎要重新開檔）：等化器回來，不再失敗
+    h.state().player().mpv().set_property("audio-spdif", "").unwrap();
+    if !h.state().engine_caps().spdif_live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+        // 重新開檔時錯誤紀錄清空了
+        failed.clear();
+    }
+    step_until(&mut h, "改回一般輸出", |s| s.loaded && s.audio_spdif.is_none());
+    wait_af(&mut h, "等化器回來", |af| af.contains(ROCK_B1));
+    wait_real(&mut h, 0.5);
+    assert_eq!(disabled_filters(&h), failed, "等化器重新建立，沒有再失敗");
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+}
+
+#[test]
+fn af_set_by_mpv_opts_is_left_alone() {
+    // 使用者用 VITASCOPE_MPV_OPTS 指定了 af：影戲不改它；等化器、音量平衡停用並說明；
+    // 音量超過 100% 改用 mpv 自己的音量（沒有限幅器）
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.audio.volume_max = 150;
+    settings.audio.eq.enabled = true;
+    let user_af = "lavfi=[anull]";
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("af".into(), user_af.into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mp4_h264_aac.mp4")],
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mp4_h264_aac.mp4");
+    let before = prop(&h, "af");
+    assert!(before.contains("anull"), "{before}");
+    assert!(h.state().player().user_overrides().contains("af"));
+    open_sound_menu(&mut h);
+    let eq = h.get_by_label("等化器");
+    assert!(eq.accesskit_node().is_disabled());
+    eq.hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    assert!(h.get_by_label_contains("等化器預設").accesskit_node().is_disabled());
+    assert!(h.get_by_label_contains("音量平衡").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    for _ in 0..10 {
+        h.key_press(egui::Key::ArrowUp);
+        h.step();
+    }
+    step_until(&mut h, "mpv 自己的音量 150", |s| s.volume == 150.0);
+    assert_eq!(h.state().player().boost_pct(), 0.0);
+    assert_eq!(h.state().osd_text(), Some("音量 150%（放大）"));
+    h.run_steps(30);
+    assert_eq!(prop(&h, "af"), before, "使用者的 af 不能被改掉");
+}
+
+#[test]
+fn sound_eq_ui_in_english() {
+    let (_dir, _path, mut h) = sound_harness("sound-eq-en", Some("common/mp4_h264_aac.mp4"), None, |s| {
+        s.language = vitascope::i18n::Lang::En;
+        s.audio.volume_max = 130;
+    });
+    if !has_af_filters(&h, "sound_eq_ui_in_english") {
+        return;
+    }
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Volume 105% (boosted)"));
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Sound ⏵");
+    for label in ["Equalizer…", "Equalizer"] {
+        h.get_by_label(label);
+    }
+    h.get_by_label("Volume leveling ⏵");
+    h.get_by_label("Volume limit ⏵");
+    hover_menu_item(&mut h, "Equalizer preset");
+    h.get_by_label("Rock").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Equalizer: Rock"));
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Sound ⏵");
+    hover_menu_item(&mut h, "Volume leveling");
+    h.get_by_label("Night mode (quiet parts louder, loud parts quieter)")
+        .click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Volume leveling: Night mode"));
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("Sound").click();
+    h.run_steps(2);
+    for label in ["Prevent clipping", "Reset", "Downmix to stereo", "1k", "16k"] {
+        h.get_by_label(label);
+    }
+    combo_box(&h, "Preset");
+    combo_box(&h, "Volume limit");
+    // 關掉控制面板（它的「Sound」分頁跟設定的「Sound」頁同名）
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    open_settings_page(&mut h, "Sound");
+    h.get_by_label("Rock (on)");
+    assert!(h.query_by_label_contains("等化器").is_none(), "沒有中文");
+    assert!(h.query_by_label_contains("音量").is_none(), "沒有中文");
 }

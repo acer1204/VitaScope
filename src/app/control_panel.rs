@@ -1,29 +1,38 @@
-//! 控制面板（Alt+G、右鍵選單「畫質 → 影像調整…」）：不擋住操作的小視窗，滑桿一動畫面馬上跟著變。
+//! 控制面板（Alt+G、右鍵選單「畫質 → 影像調整…」「音效 → 等化器…」）：不擋住操作的小視窗，
+//! 滑桿一動畫面、聲音馬上跟著變。
 //! 也放影像調整（亮度、對比、飽和度、色相、Gamma）本身的邏輯：快捷鍵、右鍵選單、設定頁都走這裡。
 
 use super::quality::combo;
 use super::{Action, VitascopeApp, mpv_opts_override};
 use crate::picture::{Adjust, AdjustKind, Deinterlace, Strength, fmt_signed};
 use crate::player::AsyncKey;
+use crate::sound::{EQ_BAND_LABELS, EQ_MAX_GAIN, EqPreset};
 use crate::{tf, tr};
-use eframe::egui::{self, Align2, Id, vec2};
+use eframe::egui::{self, Align, Align2, Id, Layout, vec2};
 
 /// 控制面板的分頁
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum PanelTab {
     #[default]
     Picture,
+    /// 等化器、音量平衡、轉成立體聲、音量上限
+    Sound,
 }
 
 impl PanelTab {
-    /// 「音效」分頁（等化器…）跟著音效的批次加進來；還沒有內容的分頁先不顯示
-    const ALL: [PanelTab; 1] = [PanelTab::Picture];
+    const ALL: [PanelTab; 2] = [PanelTab::Picture, PanelTab::Sound];
 
     fn title(self) -> &'static str {
         match self {
             PanelTab::Picture => tr!("畫質", "Video quality"),
+            PanelTab::Sound => tr!("音效", "Sound"),
         }
     }
+}
+
+/// 等化器沒開：滑桿停用時的說明
+fn eq_off_hover() -> &'static str {
+    tr!("先勾選「等化器」", "Tick \"Equalizer\" first")
 }
 
 /// 使用者用 VITASCOPE_MPV_OPTS 指定了這一項：停用時的說明
@@ -57,6 +66,7 @@ impl VitascopeApp {
                 ui.separator();
                 match self.panel_tab {
                     PanelTab::Picture => self.picture_tab(ui),
+                    PanelTab::Sound => self.sound_tab(ui),
                 }
             });
         if !open {
@@ -170,6 +180,118 @@ impl VitascopeApp {
         // 沒勾「下次開啟時沿用」時不用存（存檔也不會寫影像調整）
         if save && self.settings.video.keep_adjust {
             self.save_settings();
+        }
+    }
+
+    /// 「音效」分頁：等化器（開關、預設、還原、自動防止破音、十段滑桿）、音量平衡、轉成立體聲、音量上限。
+    /// 拖滑桿時馬上聽得到（af-command），放開才改寫濾鏡鏈、存檔
+    fn sound_tab(&mut self, ui: &mut egui::Ui) {
+        let commit = |r: &egui::Response| r.drag_stopped() || (r.changed() && !r.dragged());
+        let a = self.settings.audio.clone();
+        let eq_off = self.eq_disabled();
+        let mut action = None;
+        ui.horizontal_wrapped(|ui| {
+            let mut on = a.eq.enabled;
+            let r = ui
+                .add_enabled(
+                    eq_off.is_none(),
+                    egui::Checkbox::new(&mut on, tr!("等化器", "Equalizer")),
+                )
+                .on_disabled_hover_text(eq_off.unwrap_or_default());
+            if r.changed() {
+                action = Some(Action::ToggleEq);
+            }
+            ui.add_space(8.0);
+            if let Some(p) = combo(
+                ui,
+                tr!("預設", "Preset"),
+                "panel_eq_preset",
+                a.eq.preset,
+                &EqPreset::ALL,
+                EqPreset::label,
+                eq_off,
+            ) {
+                action = Some(Action::SetEqPreset(p));
+            }
+            let flat = a.eq.effective_gains().iter().all(|g| *g == 0.0);
+            let reset = ui
+                .add_enabled(eq_off.is_none() && !flat, egui::Button::new(tr!("還原", "Reset")))
+                .on_hover_text(tr!("十段都回到 0（平坦）", "Sets all ten bands back to 0 (flat)"));
+            if reset.clicked() {
+                self.reset_eq();
+            }
+        });
+        ui.horizontal(|ui| {
+            let mut auto = a.eq.auto_preamp;
+            let r = ui
+                .add_enabled(
+                    eq_off.is_none(),
+                    egui::Checkbox::new(&mut auto, tr!("自動防止破音", "Prevent clipping")),
+                )
+                .on_hover_text(tr!(
+                    "有段落調高時，整體先降低同樣的量，大聲的地方不會破音",
+                    "When bands are raised, the overall level is lowered by the same amount so loud parts don't clip"
+                ))
+                .on_disabled_hover_text(eq_off.unwrap_or_default());
+            if r.changed() {
+                self.set_auto_preamp(auto);
+            }
+            if let Some(db) = self.eq_preamp_db() {
+                ui.weak(tf!("（前級 {db:.1} dB）", "(preamp {db:.1} dB)"));
+            }
+        });
+        // 十段：由下往上排（頻率、滑桿、增益），頻率的標籤先建立，當滑桿的無障礙標籤
+        let gains = a.eq.effective_gains();
+        let bands_off = eq_off.or_else(|| (!a.eq.enabled).then(eq_off_hover));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = 120.0;
+            for (band, name) in EQ_BAND_LABELS.into_iter().enumerate() {
+                ui.allocate_ui_with_layout(vec2(30.0, 170.0), Layout::bottom_up(Align::Center), |ui| {
+                    let label = ui.label(name);
+                    let mut g = gains[band];
+                    let slider = egui::Slider::new(&mut g, -EQ_MAX_GAIN..=EQ_MAX_GAIN)
+                        .vertical()
+                        .step_by(0.5)
+                        .show_value(false);
+                    let r = ui
+                        .add_enabled(bands_off.is_none(), slider)
+                        .labelled_by(label.id)
+                        .on_hover_text(tf!("{name} Hz：{} dB", "{name} Hz: {} dB", super::sound::fmt_gain(g)))
+                        .on_disabled_hover_text(bands_off.unwrap_or_default());
+                    ui.weak(super::sound::fmt_gain(g));
+                    if r.changed() || r.drag_stopped() {
+                        self.set_eq_band(band, g, commit(&r));
+                    }
+                });
+            }
+        });
+        ui.weak(tr!("頻率（Hz）；增益 −12…+12 dB", "Frequency (Hz); gain −12…+12 dB"));
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            if let Some(m) = self.leveling_combo(ui, "panel_leveling") {
+                action = Some(Action::SetLeveling(m));
+            }
+            ui.add_space(8.0);
+            let mut downmix = a.downmix;
+            let disabled = self.downmix_disabled();
+            let r = ui
+                .add_enabled(
+                    disabled.is_none(),
+                    egui::Checkbox::new(&mut downmix, tr!("轉成立體聲", "Downmix to stereo")),
+                )
+                .on_hover_text(super::tuning_menu::downmix_hover())
+                .on_disabled_hover_text(disabled.unwrap_or_default());
+            if r.changed() {
+                action = Some(Action::ToggleDownmix);
+            }
+            ui.add_space(8.0);
+            if let Some(v) = self.volume_max_combo(ui, "panel_volume_max") {
+                action = Some(Action::SetVolumeMax(v));
+            }
+        });
+        if let Some(a) = action {
+            let ctx = ui.ctx().clone();
+            self.run(&ctx, a);
         }
     }
 

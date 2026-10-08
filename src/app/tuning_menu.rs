@@ -2,10 +2,11 @@
 //! 跟每個檔案各自的「畫面」（長寬比、裁切、旋轉…）、「音軌」分開。
 
 use super::quality::{dumb_hover, follow_quality, scaler_choice};
-use super::sound::auto_device_label;
+use super::sound::{auto_device_label, leveling_hover, volume_max_hover, volume_max_label};
 use super::{Action, VitascopeApp};
 use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{ChromaScaler, Downscaler, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_label};
+use crate::sound::{EqPreset, Leveling, VOLUME_MAX_CHOICES};
 use crate::{tf, tr};
 use eframe::egui;
 
@@ -210,12 +211,58 @@ impl VitascopeApp {
         action
     }
 
-    /// 右鍵選單的「音效」（緊接在「畫質」後面）：多聲道轉成立體聲、輸出裝置（＋獨佔模式）、音訊直通。
-    /// 一直可以用（設定是整個程式共用的）。等化器、音量平衡、音量上限之後加在分隔線上面
+    /// 右鍵選單的「音效」（緊接在「畫質」後面）：等化器、音量平衡、多聲道轉成立體聲、音量上限、
+    /// 輸出裝置（＋獨佔模式）、音訊直通。一直可以用（設定是整個程式共用的）
     pub(super) fn sound_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let mut action = None;
         let a = self.settings.audio.clone();
         ui.menu_button(tr!("音效", "Sound"), |ui| {
+            // 跟「畫質 ▸ 影像調整…」一樣只負責打開（控制面板的音效分頁有十段滑桿）
+            if ui.button(tr!("等化器…", "Equalizer…")).clicked() {
+                action = Some(Action::ShowEqualizer);
+            }
+            let eq_off = self.eq_disabled();
+            let mut eq_on = a.eq.enabled;
+            let r = ui
+                .add_enabled(
+                    eq_off.is_none(),
+                    egui::Checkbox::new(&mut eq_on, tr!("等化器", "Equalizer")),
+                )
+                .on_disabled_hover_text(eq_off.unwrap_or_default());
+            if r.changed() {
+                action = Some(Action::ToggleEq);
+            }
+            submenu(ui, tr!("等化器預設", "Equalizer preset"), eq_off, |ui| {
+                for p in EqPreset::ALL {
+                    if ui.selectable_label(a.eq.preset == p, p.label()).clicked() {
+                        action = Some(Action::SetEqPreset(p));
+                    }
+                }
+            });
+            // 目前選的在子選單裡標出來（跟「等化器預設」一樣）
+            submenu(
+                ui,
+                tr!("音量平衡", "Volume leveling"),
+                self.leveling_disabled(),
+                |ui| {
+                    for mode in Leveling::ALL {
+                        let missing = self.leveling_missing(mode);
+                        let r = ui
+                            .add_enabled(
+                                missing.is_none(),
+                                egui::Button::selectable(a.leveling == mode, mode.menu_label()),
+                            )
+                            .on_hover_text(leveling_hover());
+                        let r = match &missing {
+                            Some(why) => r.on_disabled_hover_text(why),
+                            None => r,
+                        };
+                        if r.clicked() {
+                            action = Some(Action::SetLeveling(mode));
+                        }
+                    }
+                },
+            );
             let mut downmix = a.downmix;
             let disabled = self.downmix_disabled();
             let r = ui
@@ -234,6 +281,19 @@ impl VitascopeApp {
             if r.changed() {
                 action = Some(Action::ToggleDownmix);
             }
+            // 音量上限：超過 100% 經過限幅器（沒有限幅器時用 mpv 自己的音量，可能破音）
+            let limiter = !self.af_locked() && self.caps.af.alimiter;
+            submenu(ui, tr!("音量上限", "Volume limit"), None, |ui| {
+                for v in VOLUME_MAX_CHOICES {
+                    if ui
+                        .selectable_label(a.volume_max == v, volume_max_label(v))
+                        .on_hover_text(volume_max_hover(limiter))
+                        .clicked()
+                    {
+                        action = Some(Action::SetVolumeMax(v));
+                    }
+                }
+            });
             ui.separator();
             if let Some(a) = self.device_menu(ui) {
                 action = Some(a);
