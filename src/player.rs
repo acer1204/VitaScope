@@ -527,9 +527,10 @@ fn round_ms(seconds: f64) -> f64 {
     (seconds * 1000.0).round() / 1000.0
 }
 
-/// 換檔時還原的畫面選項（翻轉用的是 vf 與 glsl-shaders）
+/// 換檔時還原的畫面選項（軟體繪圖翻轉用的 vf 也是）。不含 glsl-shaders：它由影戲管理
+///（使用者的著色器組合換檔照舊，翻轉的著色器在開新檔之前拿掉，見 `Player::open`）
 const GEOMETRY_OPTIONS: &str =
-    "video-aspect-override,video-crop,video-rotate,video-zoom,video-pan-x,video-pan-y,panscan,vf,glsl-shaders";
+    "video-aspect-override,video-crop,video-rotate,video-zoom,video-pan-x,video-pan-y,panscan,vf";
 
 /// 畫面輸出收到的影格參數（`video-out-params`）
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -576,6 +577,14 @@ pub struct Player {
     probe_noise: Vec<[String; 2]>,
     /// 上次由 `apply_picture` 送出的畫質選項值（只送有變的）
     picture_applied: HashMap<&'static str, String>,
+    /// 像素著色器：使用者的組合（app 給的；VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時是使用者原本的清單，不改）
+    shader_user: Vec<String>,
+    /// 翻轉用的著色器（左右、上下）；每個檔案各自的，開新檔時拿掉
+    shader_flip: [Option<PathBuf>; 2],
+    /// 上次送出的 glsl-shaders；None = 不確定 mpv 現在的值（送出失敗、或可能被晚到的非同步指令蓋掉），下次一定送
+    shaders_applied: Option<Vec<String>>,
+    /// 還沒回覆的非同步 glsl-shaders 指令
+    shaders_inflight: HashSet<u64>,
 }
 
 impl Player {
@@ -626,6 +635,17 @@ impl Player {
                 user_overrides.insert(name.to_owned());
             }
         }
+        // 像素著色器也一樣：glsl-shaders 預設是空的，建立後有內容（include=、profile= 的設定檔改的也算），
+        // 或 VITASCOPE_MPV_OPTS 寫了 glsl-shaders（即使是空的；glsl-shaders-append 之類、別名 glsl-shader 也算），
+        // 就是使用者自己指定的。影戲不改它，翻轉的著色器接在它後面。glsl-shader-opts 是著色器的參數、不是清單，不算
+        // 指定成空的（glsl-shaders=）時 mpv 的清單是一個空字串：不當成檔案（翻轉接在後面時不能多一個空的路徑）
+        let mut shader_base = mpv.get_string_list("glsl-shaders").unwrap_or_default();
+        shader_base.retain(|s| !s.is_empty());
+        let names_shader_list =
+            |n: &String| n == "glsl-shader" || n == "glsl-shaders" || n.starts_with("glsl-shaders-");
+        if !shader_base.is_empty() || user_overrides.iter().any(names_shader_list) {
+            user_overrides.insert("glsl-shaders".to_owned());
+        }
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
@@ -650,6 +670,10 @@ impl Player {
             render_errors: VecDeque::new(),
             probe_noise: Vec::new(),
             picture_applied: HashMap::new(),
+            shaders_applied: Some(shader_base.clone()),
+            shader_user: shader_base,
+            shader_flip: [None, None],
+            shaders_inflight: HashSet::new(),
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -671,6 +695,12 @@ impl Player {
     /// 取出畫面輸出的錯誤記錄（libmpv_render、vo；收到的時間, 內容）
     pub fn take_render_errors(&mut self) -> Vec<(Instant, String)> {
         self.render_errors.drain(..).collect()
+    }
+
+    /// 測試用：當成畫面輸出記錄了這行錯誤（例如著色器編譯失敗；介面測試沒有真的畫面）
+    #[doc(hidden)]
+    pub fn push_render_error(&mut self, text: &str) {
+        self.render_errors.push_back((Instant::now(), text.to_owned()));
     }
 
     // ───────────── 非同步設定 ─────────────
@@ -740,6 +770,85 @@ impl Player {
     /// 非同步設定的畫質選項 mpv 不接受：忘掉記下的值，下次套用時再送
     pub fn forget_picture(&mut self, name: &str) {
         self.picture_applied.remove(name);
+    }
+
+    // ───────────── 像素著色器（glsl-shaders） ─────────────
+
+    /// mpv 目前的 glsl-shaders（每一項；直接問 mpv）
+    pub fn shader_list(&self) -> mpv::Result<Vec<String>> {
+        self.mpv.get_string_list("glsl-shaders")
+    }
+
+    /// 使用者的著色器組合（目前的；不含翻轉）
+    pub fn user_shaders(&self) -> &[String] {
+        &self.shader_user
+    }
+
+    /// 送出的 glsl-shaders 都已經生效（沒有還沒回覆的非同步指令，也確定 mpv 的值；自動測試用）
+    pub fn shaders_settled(&self) -> bool {
+        self.shaders_inflight.is_empty() && self.shaders_applied.is_some()
+    }
+
+    /// 換使用者的著色器組合（app 依使用中的組合算好，缺的檔案已經拿掉）：重新組出清單，有變才送。
+    /// `sync`：啟動時（還沒開檔）同步設定；不然非同步（`AsyncKey::Shaders`，回傳指令編號）。
+    /// VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時不換（留著使用者自己的清單）
+    pub fn set_user_shaders(&mut self, user: Vec<String>, sync: bool) -> mpv::Result<Option<u64>> {
+        if self.user_overrides.contains("glsl-shaders") {
+            return Ok(None);
+        }
+        self.shader_user = user;
+        self.push_shaders(sync)
+    }
+
+    /// 目前該有的清單：使用者的組合 + 翻轉
+    fn wanted_shaders(&self) -> Vec<String> {
+        let [h, v] = &self.shader_flip;
+        crate::picture::shader::compose(&self.shader_user, h.as_deref(), v.as_deref())
+    }
+
+    /// 把該有的清單送給 mpv（跟上次送的一樣就不送）。一次換掉整個清單（change-list set），
+    /// mpv 只重新載入一次著色器；空的清單用 clr（set 空字串會變成一個空的項目）
+    fn push_shaders(&mut self, sync: bool) -> mpv::Result<Option<u64>> {
+        let wanted = self.wanted_shaders();
+        if self.shaders_applied.as_ref() == Some(&wanted) {
+            return Ok(None);
+        }
+        let value = crate::picture::shader::list_value(&wanted).map_err(|e| mpv::Error {
+            code: libmpv2_sys::mpv_error_MPV_ERROR_INVALID_PARAMETER,
+            context: e.message(),
+        })?;
+        let args: [&str; 4] = if wanted.is_empty() {
+            ["change-list", "glsl-shaders", "clr", ""]
+        } else {
+            ["change-list", "glsl-shaders", "set", &value]
+        };
+        let result = if sync {
+            self.mpv.command(&args).map(|()| None)
+        } else {
+            self.command_async_keyed(AsyncKey::Shaders, &args).map(Some)
+        };
+        match &result {
+            Ok(Some(id)) => {
+                self.shaders_inflight.insert(*id);
+                self.shaders_applied = Some(wanted);
+            }
+            // 同步設定可能插隊到還沒執行的非同步指令前面（之後才執行的舊清單會蓋掉它）：
+            // 還有沒回覆的話不確定最後的值，開始播新檔時（StartFile）再送一次非同步的
+            Ok(None) => {
+                self.shaders_applied = self.shaders_inflight.is_empty().then_some(wanted);
+            }
+            Err(_) => self.shaders_applied = None,
+        }
+        result
+    }
+
+    /// 開新檔之前：拿掉翻轉的著色器（每個檔案各自的）。同步設定，新檔案的第一格就不會翻轉
+    ///（非同步的可能排在 loadfile 之後才生效）；換檔時頓一下看不出來
+    fn reset_shaders_for_next_file(&mut self) {
+        self.shader_flip = [None, None];
+        if let Err(e) = self.push_shaders(true) {
+            eprintln!("[vitascope] 無法設定 glsl-shaders：{e}");
+        }
     }
 
     // ───────────── 引擎功能偵測 ─────────────
@@ -816,7 +925,15 @@ impl Player {
 
     pub fn open(&mut self, path: &str) -> mpv::Result<()> {
         self.state.last_error = None;
-        self.mpv.command(&["loadfile", path, "replace"])
+        let flips = self.shader_flip.clone();
+        self.reset_shaders_for_next_file();
+        let result = self.mpv.command(&["loadfile", path, "replace"]);
+        if result.is_err() && flips.iter().any(Option::is_some) {
+            // 沒有換檔：舊檔案照樣在播，翻轉放回去
+            self.shader_flip = flips;
+            let _ = self.push_shaders(false);
+        }
+        result
     }
 
     pub fn stop(&self) -> mpv::Result<()> {
@@ -961,9 +1078,15 @@ impl Player {
         Ok(true)
     }
 
-    /// 翻轉。`use_filter` = 用 vf 濾鏡（軟體繪圖的簡化流程不跑著色器）；
+    /// 翻轉。`use_filter` = 用 vf 濾鏡（軟體繪圖的簡化流程不跑著色器；同步設定，回傳 None）；
     /// 濾鏡在旋轉之前翻，轉了 90° / 270° 時左右、上下要對調
-    pub fn set_flip(&self, horizontal: bool, on: bool, use_filter: bool, quarter_turn: bool) -> mpv::Result<()> {
+    pub fn set_flip(
+        &mut self,
+        horizontal: bool,
+        on: bool,
+        use_filter: bool,
+        quarter_turn: bool,
+    ) -> mpv::Result<Option<u64>> {
         let label = if horizontal { "@vs-hflip" } else { "@vs-vflip" };
         if use_filter {
             let _ = self.mpv.command(&["vf", "remove", label]);
@@ -971,22 +1094,19 @@ impl Player {
                 let filter = if horizontal != quarter_turn { "hflip" } else { "vflip" };
                 self.mpv.command(&["vf", "add", &format!("{label}:{filter}")])?;
             }
-            return Ok(());
+            return Ok(None);
         }
-        let path = crate::geometry::flip_shader_path(horizontal).map_err(|e| mpv::Error {
-            code: libmpv2_sys::mpv_error_MPV_ERROR_GENERIC,
-            context: crate::tf!("無法寫出翻轉用的著色器：{e}", "Cannot write the flip shader: {e}"),
-        })?;
-        let path = path.to_string_lossy();
-        let listed = self
-            .mpv
-            .get_string("glsl-shaders")
-            .is_ok_and(|list| list.contains(path.as_ref()));
-        match (on, listed) {
-            (true, false) => self.mpv.command(&["change-list", "glsl-shaders", "append", &path]),
-            (false, true) => self.mpv.command(&["change-list", "glsl-shaders", "remove", &path]),
-            _ => Ok(()),
-        }
+        // 著色器：接在使用者的組合後面，整個清單重新送（非同步，回傳指令編號；沒有變就是 None）
+        let path = if on {
+            Some(crate::geometry::flip_shader_path(horizontal).map_err(|e| mpv::Error {
+                code: libmpv2_sys::mpv_error_MPV_ERROR_GENERIC,
+                context: crate::tf!("無法寫出翻轉用的著色器：{e}", "Cannot write the flip shader: {e}"),
+            })?)
+        } else {
+            None
+        };
+        self.shader_flip[usize::from(!horizontal)] = path;
+        self.push_shaders(false)
     }
 
     /// 目前的章節，直接問 mpv（剛跳完章節時也是新的值，連按才會累加）；-1 = 第一章之前
@@ -1346,6 +1466,12 @@ impl Player {
                 self.failure = None;
                 self.recent_errors.clear();
                 self.loaded_subs.clear();
+                // 翻轉是每個檔案各自的（通常 `open` 已經拿掉了）；清單跟該有的不一樣、或不確定
+                //（開檔前的同步設定可能被晚到的非同步指令蓋掉）就再送一次。非同步指令照順序執行，這次的一定最後生效
+                self.shader_flip = [None, None];
+                if let Err(e) = self.push_shaders(false) {
+                    eprintln!("[vitascope] 無法設定 glsl-shaders：{e}");
+                }
                 Some(PlayerEvent::StartFile)
             }
             Event::FileLoaded => {
@@ -1390,10 +1516,16 @@ impl Player {
             }
             Event::Seek => Some(PlayerEvent::Seek),
             Event::Shutdown => Some(PlayerEvent::Shutdown),
-            Event::CommandReply { id, result } => Some(PlayerEvent::CommandReply {
-                id,
-                error: result.err().map(|e| e.to_string()),
-            }),
+            Event::CommandReply { id, result } => {
+                // glsl-shaders 沒設成功：不知道 mpv 現在的值，下次一定再送
+                if self.shaders_inflight.remove(&id) && result.is_err() {
+                    self.shaders_applied = None;
+                }
+                Some(PlayerEvent::CommandReply {
+                    id,
+                    error: result.err().map(|e| e.to_string()),
+                })
+            }
             _ => None,
         }
     }

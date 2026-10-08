@@ -15,7 +15,7 @@ pub(super) enum Page {
     #[default]
     General,
     Playback,
-    /// 畫質（影像調整、去交錯、去色帶、銳化、縮放演算法、HDR；之後加著色器）
+    /// 畫質（影像調整、去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR）
     Picture,
     Subtitles,
     Screenshot,
@@ -50,6 +50,8 @@ impl Page {
 impl VitascopeApp {
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
+            // 下次打開時重新檢查著色器檔案（可能換過內容）
+            self.shader_info.clear();
             return;
         }
         let mut open = true;
@@ -323,7 +325,7 @@ impl VitascopeApp {
         }
     }
 
-    /// 畫質頁：影像調整（滑桿在控制面板裡），去交錯、去色帶、銳化、縮放演算法、HDR
+    /// 畫質頁：影像調整（滑桿在控制面板裡），去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR
     fn picture_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         ui.strong(tr!("影像調整", "Image adjustments"));
         ui.label(tf!(
@@ -350,7 +352,7 @@ impl VitascopeApp {
         self.processing_sections(ui, action);
     }
 
-    /// 畫質頁的去交錯、去色帶／銳化、縮放演算法、HDR → SDR（選了馬上套用、存檔）
+    /// 畫質頁的去交錯、去色帶／銳化、縮放演算法、像素著色器、HDR → SDR（選了馬上套用、存檔）
     fn processing_sections(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         let v = self.settings.video.clone();
         let dumb = self.caps.dumb;
@@ -476,6 +478,8 @@ impl VitascopeApp {
         if dumb {
             ui.weak(dumb_hover());
         }
+
+        self.shader_section(ui, action);
 
         // HDR：色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以不看 dumb
         ui.add_space(12.0);

@@ -359,3 +359,179 @@ fn video_hdr_follows_the_file() {
     p.wait_state(TIMEOUT, |s| !s.loaded && !s.video_hdr)
         .unwrap_or_else(|e| panic!("關檔後歸零：{e}"));
 }
+
+// ───────────── 像素著色器（glsl-shaders） ─────────────
+
+/// 檔名有中文、空白、逗號的著色器路徑（只放在清單裡，檔案不用存在：vo=null 不載入著色器）
+fn shader_paths(tag: &str, n: usize) -> Vec<String> {
+    let dir = std::env::temp_dir().join("影戲 著色器 測試");
+    (0..n)
+        .map(|i| {
+            dir.join(format!("{tag} 第 {i} 個, 放大.glsl"))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// 處理事件，直到送出的 glsl-shaders 都生效
+fn wait_shaders(p: &mut Player) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while !p.shaders_settled() {
+        assert!(std::time::Instant::now() < deadline, "glsl-shaders 的指令一直沒有回覆");
+        let _ = p.wait(Duration::from_millis(50));
+    }
+}
+
+/// 開檔，等到這個檔案載入
+fn open_and_wait(p: &mut Player, rel: &str) {
+    p.open(&sample(rel)).unwrap();
+    // 先等這個檔案的 StartFile：上一個檔案的事件可能還在佇列裡
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::StartFile).unwrap();
+    let name = PathBuf::from(rel).file_name().unwrap().to_string_lossy().into_owned();
+    p.wait_state(TIMEOUT, |s| {
+        s.loaded && s.path.as_deref().is_some_and(|path| path.ends_with(&name))
+    })
+    .unwrap_or_else(|e| panic!("{rel}：{e}"));
+}
+
+#[test]
+fn shader_list_value_is_split_the_way_mpv_splits_it() {
+    // `list_value` 用的分隔字元就是 mpv 的路徑清單用的（各平台、各版本的引擎）：一次設定，讀回來每一項都一樣。
+    // 讀的時候用 Node（讀成字串的話 0.37 用逗號分隔，跟路徑裡的逗號分不開）
+    let p = player_with(&[]);
+    assert!(p.shader_list().unwrap().is_empty(), "預設是空的");
+    let paths = shader_paths("設定", 3);
+    let value = picture::shader::list_value(&paths).unwrap();
+    p.mpv()
+        .command(&["change-list", "glsl-shaders", "set", &value])
+        .unwrap();
+    assert_eq!(p.shader_list().unwrap(), paths);
+    p.mpv().command(&["change-list", "glsl-shaders", "clr", ""]).unwrap();
+    assert!(p.shader_list().unwrap().is_empty(), "clr 清空（不是一個空的項目）");
+}
+
+#[test]
+fn shader_list_survives_next_file() {
+    let mut p = player_with(&[]);
+    let user = shader_paths("組合", 2);
+    let id = p
+        .set_user_shaders(user.clone(), false)
+        .unwrap()
+        .expect("非同步送出要有指令編號");
+    assert_eq!(async_key(id), Some(AsyncKey::Shaders));
+    assert_eq!(p.set_user_shaders(user.clone(), false).unwrap(), None, "沒有變就不送");
+    wait_shaders(&mut p);
+    assert_eq!(p.shader_list().unwrap(), user);
+    // 換兩次檔：組合照舊（glsl-shaders 不在 reset-on-next-file 裡）
+    for rel in ["common/mp4_h264_aac.mp4", "common/mkv_multitrack.mkv"] {
+        open_and_wait(&mut p, rel);
+        wait_shaders(&mut p);
+        assert_eq!(p.shader_list().unwrap(), user, "{rel}");
+    }
+    // 翻轉接在組合後面
+    p.set_flip(true, true, false, false).unwrap().expect("非同步送出");
+    p.set_flip(false, true, false, false).unwrap().expect("非同步送出");
+    wait_shaders(&mut p);
+    let list = p.shader_list().unwrap();
+    assert_eq!(list[..2], user[..]);
+    assert!(
+        list[2].ends_with("hflip.glsl") && list[3].ends_with("vflip.glsl"),
+        "{list:?}"
+    );
+    // 換檔：翻轉拿掉、組合照舊。loadfile 之前就同步改好了，新檔案的第一格就不會翻轉
+    p.open(&sample("common/mp4_h264_aac.mp4")).unwrap();
+    assert_eq!(p.shader_list().unwrap(), user, "開檔之前就拿掉翻轉");
+    // 是同步設定的：沒有排隊中的非同步指令（非同步的可能排在 loadfile 之後，新檔案的第一格還是翻轉的）
+    assert!(p.shaders_settled(), "開檔前的重設要同步完成");
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::StartFile).unwrap();
+    wait_shaders(&mut p);
+    assert_eq!(p.shader_list().unwrap(), user);
+    // 只有翻轉：換檔之後是空的
+    p.set_user_shaders(Vec::new(), false).unwrap();
+    p.set_flip(false, true, false, false).unwrap();
+    wait_shaders(&mut p);
+    let list = p.shader_list().unwrap();
+    assert!(list.len() == 1 && list[0].ends_with("vflip.glsl"), "{list:?}");
+    p.open(&sample("common/mkv_multitrack.mkv")).unwrap();
+    assert!(p.shader_list().unwrap().is_empty(), "開檔之前就清空");
+    assert!(p.shaders_settled(), "開檔前的重設要同步完成");
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::StartFile).unwrap();
+    wait_shaders(&mut p);
+    assert!(p.shader_list().unwrap().is_empty());
+}
+
+#[test]
+fn flip_sent_right_before_a_file_switch_does_not_leak_into_the_next_file() {
+    // 翻轉（非同步）還沒執行就開新檔：開檔前的同步設定可能插隊到它前面，之後才執行的翻轉會把它蓋掉。
+    // 這時開始播新檔（StartFile）會再送一次非同步的，照順序一定最後生效：新檔案不會帶著翻轉
+    let mut p = player_with(&[]);
+    let user = shader_paths("插隊", 2);
+    p.set_user_shaders(user.clone(), false).unwrap();
+    wait_shaders(&mut p);
+    let files = ["common/mp4_h264_aac.mp4", "common/mkv_multitrack.mkv"];
+    for i in 0..10 {
+        p.set_flip(true, true, false, false).unwrap().expect("非同步送出");
+        p.set_flip(false, true, false, false).unwrap().expect("非同步送出");
+        // 兩個翻轉都還沒回覆就開檔
+        open_and_wait(&mut p, files[i % 2]);
+        wait_shaders(&mut p);
+        assert_eq!(p.shader_list().unwrap(), user, "第 {i} 次");
+    }
+}
+
+#[test]
+fn glsl_shaders_set_by_the_user_are_kept() {
+    // VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定了 glsl-shaders：影戲不換它，翻轉接在它後面
+    let mine = shader_paths("使用者", 2);
+    let mut p = player_with(&[("glsl-shaders", &picture::shader::list_value(&mine).unwrap())]);
+    assert!(p.user_overrides().contains("glsl-shaders"));
+    assert_eq!(p.user_shaders(), mine);
+    assert_eq!(p.shader_list().unwrap(), mine);
+    assert_eq!(
+        p.set_user_shaders(shader_paths("組合", 1), false).unwrap(),
+        None,
+        "使用者指定的不換"
+    );
+    p.set_flip(true, true, false, false).unwrap().expect("非同步送出");
+    wait_shaders(&mut p);
+    let list = p.shader_list().unwrap();
+    assert_eq!(list[..2], mine[..]);
+    assert!(list[2].ends_with("hflip.glsl"), "{list:?}");
+    open_and_wait(&mut p, "common/mp4_h264_aac.mp4");
+    wait_shaders(&mut p);
+    assert_eq!(p.shader_list().unwrap(), mine, "換檔後還是使用者的");
+    // 設定檔（include=…、profile=…）間接指定的也算：建立後清單不是空的
+    let dir = std::env::temp_dir().join(format!("vitascope-shader-include-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("shaders.conf");
+    std::fs::write(&conf, format!("glsl-shaders={}\n", mine[0])).unwrap();
+    let p = player_with(&[("include", &conf.to_string_lossy())]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(p.user_shaders(), &mine[..1]);
+    assert!(p.user_overrides().contains("glsl-shaders"));
+    // 指定成空的（要不使用著色器）：也是使用者的，組合不能加進去
+    let mut p = player_with(&[("glsl-shaders", "")]);
+    assert!(p.user_overrides().contains("glsl-shaders"));
+    assert_eq!(p.set_user_shaders(shader_paths("組合", 1), false).unwrap(), None);
+    wait_shaders(&mut p);
+    assert!(
+        p.shader_list().unwrap().iter().all(String::is_empty),
+        "{:?}",
+        p.shader_list()
+    );
+    // 翻轉：只有翻轉的著色器（不能多一個空的路徑）
+    p.set_flip(true, true, false, false).unwrap().expect("非同步送出");
+    wait_shaders(&mut p);
+    let list = p.shader_list().unwrap();
+    assert!(list.len() == 1 && list[0].ends_with("hflip.glsl"), "{list:?}");
+    // glsl-shaders-append、別名 glsl-shader（mpv 從 API 設定不了，清單是空的）：寫了就算使用者自己處理
+    for name in ["glsl-shaders-append", "glsl-shader"] {
+        let p = player_with(&[(name, &mine[0])]);
+        assert!(p.user_overrides().contains("glsl-shaders"), "{name}");
+    }
+    // 沒指定的：影戲管理。glsl-shader-opts 是著色器的參數，不是清單
+    assert!(!player_with(&[]).user_overrides().contains("glsl-shaders"));
+    let p = player_with(&[("glsl-shader-opts", "strength=0.5")]);
+    assert!(!p.user_overrides().contains("glsl-shaders"));
+}

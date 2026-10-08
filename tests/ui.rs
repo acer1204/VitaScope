@@ -1583,20 +1583,19 @@ fn zoom_and_pan_keys() {
 
 #[test]
 fn flip_keys_toggle_the_flip_shader() {
+    // 翻轉的著色器跟使用者的著色器同一個清單，非同步送出：等它生效
+    let flips = |app: &VitascopeApp| {
+        let list = app.player().shader_list().unwrap();
+        let has = |name: &str| list.iter().any(|f| f.ends_with(name));
+        (has("hflip.glsl"), has("vflip.glsl"))
+    };
     let mut h = playing_multitrack();
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
-    h.run_steps(2);
-    assert!(
-        prop(&h, "glsl-shaders").contains("hflip.glsl"),
-        "{}",
-        prop(&h, "glsl-shaders")
-    );
+    step_until_app(&mut h, "左右翻轉", |app| flips(app) == (true, false));
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::P);
-    h.run_steps(2);
-    assert!(prop(&h, "glsl-shaders").contains("vflip.glsl"));
+    step_until_app(&mut h, "上下翻轉", |app| flips(app) == (true, true));
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
-    h.run_steps(2);
-    assert!(!prop(&h, "glsl-shaders").contains("hflip.glsl"), "再按一次取消");
+    step_until_app(&mut h, "再按一次取消", |app| flips(app) == (false, true));
 }
 
 #[test]
@@ -4204,6 +4203,15 @@ fn dumb_mode_greys_out_gpu_only_items() {
     settings.auto_next = false;
     settings.video.quality = vitascope::picture::Quality::High;
     settings.video.deband = vitascope::picture::Strength::Strong;
+    // 使用中的像素著色器組合（別的電腦存的設定）：簡化流程不跑著色器，不送給 mpv
+    let dir = TempDir::new("dumb-shaders");
+    let (invert, _, _) = write_shaders(&dir);
+    settings.video.shaders.presets = vec![vitascope::picture::ShaderPreset {
+        id: 3,
+        name: "A".into(),
+        files: vec![path_str(&invert)],
+    }];
+    settings.video.shaders.active = Some(3);
     let mut h = harness_launch_with(
         Options {
             extra: vec![("gpu-dumb-mode".into(), "yes".into())],
@@ -4218,11 +4226,17 @@ fn dumb_mode_greys_out_gpu_only_items() {
     );
     settle(&mut h, "mkv_multitrack.mkv");
     assert!(h.state().engine_caps().dumb);
+    assert!(
+        h.state().player().shader_list().unwrap().is_empty(),
+        "簡化流程不送著色器"
+    );
+    assert_eq!(h.state().settings().video.shaders.active, Some(3), "設定照舊");
     // 選項照樣對應（簡化流程的畫面輸出會忽略它們；設定跟 mpv 的值一致）
     assert_eq!(prop(&h, "scale"), "ewa_lanczossharp");
     assert_eq!(prop(&h, "deband"), "yes");
     open_picture_menu(&mut h);
-    for label in ["去色帶", "銳化", "縮放演算法"] {
+    // 使用者的像素著色器也不跑（翻轉改用濾鏡）
+    for label in ["去色帶", "銳化", "縮放演算法", "像素著色器"] {
         assert!(h.get_by_label_contains(label).accesskit_node().is_disabled(), "{label}");
     }
     // 去交錯是解碼後的濾鏡、影像調整與 HDR 色調映射在輸出到螢幕時做，簡化流程也有：照常
@@ -4258,7 +4272,13 @@ fn dumb_mode_greys_out_gpu_only_items() {
         let combo = combo_box(&h, label);
         assert_eq!(combo.accesskit_node().is_disabled(), disabled, "{label}");
     }
-    for (label, disabled) in [("高品質", true), ("快速", true), ("開啟", false), ("自動", false)] {
+    for (label, disabled) in [
+        ("高品質", true),
+        ("快速", true),
+        ("不使用", true),
+        ("開啟", false),
+        ("自動", false),
+    ] {
         assert_eq!(
             h.get_by_label(label).accesskit_node().is_disabled(),
             disabled,
@@ -4266,6 +4286,7 @@ fn dumb_mode_greys_out_gpu_only_items() {
         );
     }
     h.get_by_label("軟體繪圖模式不支援");
+    h.get_by_label("軟體繪圖模式不支援像素著色器");
 }
 
 /// 捲到看得到再點（設定頁比視窗長）。捲動有動畫，多跑幾幀等它停下來
@@ -4523,4 +4544,381 @@ fn picture_page_processing_in_english() {
     h.run_steps(2);
     assert_eq!(h.state().osd_text(), Some("Debanding: Strong"));
     assert!(h.query_by_label_contains("去色帶").is_none(), "沒有中文");
+}
+
+// ───────────── 像素著色器 ─────────────
+
+/// 測試用的著色器檔案：反相（mpv 格式，有 DESC）、原樣輸出（mpv 格式）、PotPlayer / MPC 的 HLSL
+fn write_shaders(dir: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+    let invert = dir.0.join("反相 測試.glsl");
+    std::fs::write(
+        &invert,
+        "//!HOOK MAIN\n//!BIND HOOKED\n//!DESC 反相\n\
+         vec4 hook() { vec4 c = HOOKED_tex(HOOKED_pos); return vec4(1.0 - c.rgb, c.a); }\n",
+    )
+    .unwrap();
+    let keep = dir.0.join("keep.glsl");
+    std::fs::write(
+        &keep,
+        "//!HOOK MAIN\n//!BIND HOOKED\n//!DESC 原樣\nvec4 hook() { return HOOKED_tex(HOOKED_pos); }\n",
+    )
+    .unwrap();
+    let hlsl = dir.0.join("bad.hlsl");
+    std::fs::write(
+        &hlsl,
+        "sampler s0 : register(s0);\nfloat4 main(float2 tex : TEXCOORD0) : COLOR {\n  return 1 - tex2D(s0, tex);\n}\n",
+    )
+    .unwrap();
+    (invert, keep, hlsl)
+}
+
+fn path_str(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// 等到送出的 glsl-shaders 都生效、mpv 的清單符合條件（著色器是非同步設定的）
+fn wait_shader_list(h: &mut Harness<'_, VitascopeApp>, what: &str, want: impl Fn(&[String]) -> bool) {
+    step_until_app(h, what, |app| {
+        app.player().shaders_settled() && app.player().shader_list().is_ok_and(|l| want(&l))
+    });
+}
+
+/// 打開設定視窗的 `page` 頁
+fn open_settings_page(h: &mut Harness<'_, VitascopeApp>, page: &str) {
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label(page).click();
+    h.run_steps(2);
+}
+
+#[test]
+fn shader_preset_and_flip() {
+    let (dir, path, mut h) = video_settings_harness("shader-preset", "common/mkv_multitrack.mkv");
+    let (invert, keep, hlsl) = write_shaders(&dir);
+    // 設定 → 畫質 → 新增組合
+    open_settings_page(&mut h, "畫質");
+    h.get_by_label("像素著色器");
+    h.get_by_label("著色器檔案由你自己提供（例如 Anime4K、FSRCNNX 的 .glsl）");
+    click_in_view(&mut h, "新增組合");
+    let id = h.state().settings().video.shaders.presets[0].id;
+    assert_ne!(id, 0);
+    assert_eq!(saved_video(&path)["shaders"]["presets"][0]["name"], "組合 1");
+    // 加入檔案（檔案對話框選好的）；.hlsl 被拒絕，設定頁上說明原因
+    let rejected = h.state_mut().add_shader_files(id, &[invert.clone(), keep.clone()]);
+    assert!(rejected.is_empty(), "{rejected:?}");
+    let rejected = h.state_mut().add_shader_files(id, std::slice::from_ref(&hlsl));
+    assert_eq!(rejected.len(), 1);
+    h.run_steps(2);
+    h.get_by_label("bad.hlsl：這不是 mpv 格式的 GLSL 著色器（需要 //!HOOK）");
+    h.get_by_label("1. 反相 測試.glsl");
+    h.get_by_label("2. keep.glsl");
+    h.get_by_label("反相");
+    let user = vec![path_str(&invert), path_str(&keep)];
+    assert_eq!(h.state().settings().video.shaders.presets[0].files, user);
+    assert_eq!(
+        saved_video(&path)["shaders"]["presets"][0]["files"],
+        serde_json::json!(user)
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 右鍵選單「畫質 ▸ 像素著色器」選這個組合
+    pick_picture_item(&mut h, &["像素著色器"], "組合 1");
+    assert_eq!(h.state().osd_text(), Some("像素著色器：組合 1（2 個檔案）"));
+    wait_shader_list(&mut h, "使用組合", |l| l == user);
+    assert_eq!(saved_video(&path)["shaders"]["active"], id);
+    // Ctrl+Z：使用者的檔案之後接翻轉的著色器
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    wait_shader_list(&mut h, "組合 + 左右翻轉", |l| {
+        l.len() == 3 && l[..2] == user[..] && l[2].ends_with("hflip.glsl")
+    });
+    // 下一個檔案：組合照舊，翻轉拿掉
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    assert!(h.state().geometry().is_default());
+    wait_shader_list(&mut h, "換檔後只剩組合", |l| l == user);
+    assert_eq!(h.state().settings().video.shaders.active, Some(id));
+    // 不使用：清單是空的
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "像素著色器");
+    assert_eq!(
+        h.get_by_label("組合 1").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "選單上標出使用中的組合"
+    );
+    h.get_by_label("不使用").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("像素著色器：不使用"));
+    wait_shader_list(&mut h, "不使用", |l| l.is_empty());
+    assert_eq!(saved_video(&path)["shaders"]["active"], serde_json::Value::Null);
+    // 「管理著色器…」打開設定的畫質頁（先在設定視窗換到別頁再關掉：不是剛好停在畫質頁）
+    open_settings_page(&mut h, "一般");
+    assert!(h.query_by_label("新增組合").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    pick_picture_item(&mut h, &["像素著色器"], "管理著色器…");
+    h.get_by_label("新增組合");
+}
+
+#[test]
+fn shader_editor_reorders_renames_and_deletes() {
+    let dir = TempDir::new("shader-editor");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    h.step();
+    let (invert, keep, _) = write_shaders(&dir);
+    let (invert, keep) = (path_str(&invert), path_str(&keep));
+    open_settings_page(&mut h, "畫質");
+    click_in_view(&mut h, "新增組合");
+    let id = h.state().settings().video.shaders.presets[0].id;
+    h.state_mut()
+        .add_shader_files(id, &[PathBuf::from(&invert), PathBuf::from(&keep)]);
+    h.run_steps(2);
+    // 設定頁上選這個組合
+    click_in_view(&mut h, "組合 1");
+    wait_shader_list(&mut h, "使用組合", |l| l == [invert.clone(), keep.clone()]);
+    // ↓：第一個移到後面；使用中的組合馬上重新套用
+    h.query_all_by_label("↓").next().unwrap().click();
+    h.run_steps(2);
+    wait_shader_list(&mut h, "換了順序", |l| l == [keep.clone(), invert.clone()]);
+    assert_eq!(
+        saved_video(&path)["shaders"]["presets"][0]["files"],
+        serde_json::json!([keep, invert])
+    );
+    // ✕：移除第二個
+    h.query_all_by_label("✕").nth(1).unwrap().click();
+    h.run_steps(2);
+    wait_shader_list(&mut h, "移除", |l| l == [keep.clone()]);
+    h.get_by_label("組合 1（1 個檔案）");
+    // 改名：打字時標題跟著變，按 Enter 才存檔
+    h.query_all_by_label("名稱")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::TextInput)
+        .unwrap()
+        .focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("Anime4K A".into()));
+    h.run_steps(2);
+    h.get_by_label("Anime4K A（1 個檔案）");
+    assert_eq!(
+        saved_video(&path)["shaders"]["presets"][0]["name"],
+        "組合 1",
+        "還在打字"
+    );
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(saved_video(&path)["shaders"]["presets"][0]["name"], "Anime4K A");
+    // 刪除使用中的組合：改成不使用
+    click_in_view(&mut h, "刪除組合");
+    wait_shader_list(&mut h, "刪除後不使用", |l| l.is_empty());
+    assert!(h.state().settings().video.shaders.presets.is_empty());
+    assert_eq!(h.state().settings().video.shaders.active, None);
+    assert_eq!(saved_video(&path)["shaders"]["presets"], serde_json::json!([]));
+}
+
+#[test]
+fn missing_shader_files_are_skipped_and_the_preset_kept() {
+    let dir = TempDir::new("shader-missing");
+    let (invert, _, _) = write_shaders(&dir);
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.shaders.presets = vec![vitascope::picture::ShaderPreset {
+        id: 42,
+        name: "A".into(),
+        files: vec![path_str(&dir.0.join("不見了.glsl")), path_str(&invert)],
+    }];
+    settings.video.shaders.active = Some(42);
+    let mut h = harness_with(None, settings);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("找不到著色器檔案，先略過：不見了.glsl"));
+    wait_shader_list(&mut h, "略過找不到的", |l| l == [path_str(&invert)]);
+    assert_eq!(h.state().settings().video.shaders.active, Some(42), "組合照舊");
+    assert_eq!(h.state().settings().video.shaders.presets[0].files.len(), 2);
+    // 啟動時使用中的組合也要看能不能用（自動測試沒有畫面，一直等著）
+    assert!(h.state().shader_watch_pending());
+    // 設定頁上標出找不到的檔案
+    open_settings_page(&mut h, "畫質");
+    click_in_view(&mut h, "A（2 個檔案）");
+    h.get_by_label("⚠ 找不到檔案");
+}
+
+/// 編譯失敗的記錄（mpv 不會寫是哪個檔案，算組合的第一個）
+const COMPILE_ERRORS: [&str; 2] = [
+    "[libmpv_render] fragment shader compile log (status=0):",
+    "[libmpv_render] 0(37) : error C1503: undefined variable \"no_such_variable\"",
+];
+
+// 換了組合之後畫不出來：還原到最後一個確定能用的組合、重新套用、存檔、提示、設定頁標出來
+#[test]
+fn shader_failure_reverts_to_the_last_working_preset() {
+    let (dir, path, mut h) = video_settings_harness("shader-revert", "common/mkv_multitrack.mkv");
+    let (invert, keep, _) = write_shaders(&dir);
+    let third = dir.0.join("third.glsl");
+    std::fs::copy(&keep, &third).unwrap();
+    let (a, b, c) = (
+        h.state_mut().add_shader_preset(),
+        h.state_mut().add_shader_preset(),
+        h.state_mut().add_shader_preset(),
+    );
+    h.state_mut().add_shader_files(a, std::slice::from_ref(&keep));
+    h.state_mut().add_shader_files(b, std::slice::from_ref(&invert));
+    h.state_mut().add_shader_files(c, std::slice::from_ref(&third));
+    h.run_steps(2);
+    // A：從畫出第一格開始算，30 格沒有錯誤就確定能用
+    h.state_mut().simulate_video_frames(5);
+    pick_picture_item(&mut h, &["像素著色器"], "組合 1");
+    wait_shader_list(&mut h, "使用 A", |l| l == [path_str(&keep)]);
+    assert!(h.state().shader_watch_pending(), "還沒畫");
+    h.state_mut().simulate_video_frames(6);
+    h.run_steps(2);
+    assert!(h.state().shader_watch_pending(), "第一格才開始算");
+    h.state_mut().simulate_video_frames(40);
+    h.run_steps(2);
+    assert!(!h.state().shader_watch_pending(), "30 格沒有錯誤");
+    // B 編譯失敗：還原成 A
+    pick_picture_item(&mut h, &["像素著色器"], "組合 2");
+    assert!(h.state().shader_watch_pending());
+    for e in COMPILE_ERRORS {
+        h.state_mut().push_render_error(e);
+    }
+    h.run_steps(2);
+    assert!(!h.state().shader_watch_pending());
+    assert_eq!(h.state().settings().video.shaders.active, Some(a));
+    assert_eq!(saved_video(&path)["shaders"]["active"], a);
+    assert_eq!(
+        h.state().osd_text(),
+        Some(
+            "像素著色器無法使用，已還原：反相 測試.glsl（0(37) : error C1503: undefined variable \"no_such_variable\"）"
+        )
+    );
+    wait_shader_list(&mut h, "還原成 A", |l| l == [path_str(&keep)]);
+    // 還沒看完 B 就換成 C、C 也失敗：還原成確定能用的 A，不是還沒確認的 B
+    pick_picture_item(&mut h, &["像素著色器"], "組合 2");
+    pick_picture_item(&mut h, &["像素著色器"], "組合 3");
+    h.state_mut()
+        .push_render_error("[libmpv_render] third.glsl: Unrecognized command 'HOKO'!");
+    h.run_steps(2);
+    assert_eq!(h.state().settings().video.shaders.active, Some(a));
+    assert!(!h.state().shader_watch_pending());
+    wait_shader_list(&mut h, "又還原成 A", |l| l == [path_str(&keep)]);
+    // 設定頁上標出 B 的檔案畫不出來
+    pick_picture_item(&mut h, &["像素著色器"], "組合 3");
+    assert!(h.state().shader_watch_pending());
+    open_settings_page(&mut h, "畫質");
+    click_in_view(&mut h, "組合 2（1 個檔案）");
+    h.get_by_label("⚠ 無法使用：0(37) : error C1503: undefined variable \"no_such_variable\"");
+    // 刪除使用中、還在看的 C（最後新增的組合，設定頁上已展開，排在最後）：不再看，之後才到的錯誤不會把 A 換回來
+    h.query_all_by_label("刪除組合").last().unwrap().scroll_to_me();
+    h.run_steps(15);
+    h.query_all_by_label("刪除組合").last().unwrap().click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().video.shaders.presets.len(), 2);
+    assert_eq!(h.state().settings().video.shaders.active, None);
+    assert!(!h.state().shader_watch_pending());
+    h.state_mut()
+        .push_render_error("[libmpv_render] third.glsl: Unrecognized command 'HOKO'!");
+    h.run_steps(2);
+    assert_eq!(h.state().settings().video.shaders.active, None);
+    wait_shader_list(&mut h, "刪除後不使用", |l| l.is_empty());
+}
+
+// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定了 glsl-shaders：影戲不換它，選單停用並說明；翻轉照樣接在後面
+#[test]
+fn shaders_set_by_mpv_opts_are_left_alone() {
+    let dir = TempDir::new("shader-opts");
+    let (invert, keep, _) = write_shaders(&dir);
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.shaders.presets = vec![vitascope::picture::ShaderPreset {
+        id: 7,
+        name: "A".into(),
+        files: vec![path_str(&invert), path_str(&dir.0.join("不見了.glsl"))],
+    }];
+    settings.video.shaders.active = Some(7);
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("glsl-shaders".into(), path_str(&keep))],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    // 組合根本不用：不提示找不到檔案
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(!osd.contains("找不到著色器檔案"), "{osd}");
+    settle(&mut h, "mkv_multitrack.mkv");
+    assert_eq!(
+        h.state().player().shader_list().unwrap(),
+        [path_str(&keep)],
+        "啟動時不能蓋掉"
+    );
+    assert!(!h.state().shader_watch_pending());
+    open_picture_menu(&mut h);
+    assert!(h.get_by_label_contains("像素著色器").accesskit_node().is_disabled());
+    h.get_by_label_contains("像素著色器").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    wait_shader_list(&mut h, "使用者的 + 左右翻轉", |l| {
+        l.len() == 2 && l[0] == path_str(&keep) && l[1].ends_with("hflip.glsl")
+    });
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    wait_shader_list(&mut h, "換檔後還是使用者的", |l| l == [path_str(&keep)]);
+    open_settings_page(&mut h, "畫質");
+    h.get_by_label("glsl-shaders 已由 VITASCOPE_MPV_OPTS 指定");
+}
+
+#[test]
+fn shader_section_in_english() {
+    let dir = TempDir::new("shader-en");
+    let (_, _, hlsl) = write_shaders(&dir);
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    open_settings_page(&mut h, "Video quality");
+    h.get_by_label("Pixel shaders");
+    click_in_view(&mut h, "New preset");
+    let id = h.state().settings().video.shaders.presets[0].id;
+    h.state_mut().add_shader_files(id, &[hlsl]);
+    h.run_steps(2);
+    for label in [
+        "Preset 1 (0 files)",
+        "No files yet",
+        "Add files…",
+        "Delete preset",
+        "bad.hlsl: This isn't an mpv GLSL shader (it needs //!HOOK)",
+        "Bring your own shader files (for example the .glsl files of Anime4K or FSRCNNX)",
+    ] {
+        h.get_by_label(label);
+    }
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 沒開檔時畫面中間是起始畫面的按鈕：在左下角按右鍵
+    let pos = h.get_by_label("Video").rect().left_bottom() + egui::vec2(30.0, -30.0);
+    h.event(egui::Event::PointerMoved(pos));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Video quality ⏵");
+    hover_menu_item(&mut h, "Pixel shaders");
+    h.get_by_label("Preset 1").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Pixel shaders: Preset 1 (0 files)"));
+    assert!(h.query_by_label_contains("著色器").is_none(), "沒有中文");
 }

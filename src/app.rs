@@ -8,6 +8,7 @@ mod playlist_panel;
 mod preview;
 mod quality;
 mod settings_window;
+mod shaders;
 mod tuning_menu;
 
 use crate::autoshot::AutoShot;
@@ -158,6 +159,8 @@ enum Action {
     SetTargetPeak(Option<u32>),
     SetGamut(Gamut),
     SetComputePeak(bool),
+    /// 像素著色器：使用的組合（編號）；None = 不使用
+    SetShaderPreset(Option<u32>),
 }
 
 pub struct VitascopeApp {
@@ -315,6 +318,18 @@ pub struct VitascopeApp {
     panel_tab: control_panel::PanelTab,
     /// 改去交錯時的提示（顯示的時間）：「目前」的狀態要等 mpv 換好濾鏡，提示還在時跟著更新
     deint_osd: Option<Instant>,
+    /// 換了像素著色器之後，看它能不能用（畫不出來就還原）
+    shader_watch: crate::picture::shader::ShaderApply,
+    /// 著色器檔案的檢查結果（設定頁顯示說明或問題）；設定視窗關掉時清掉，下次打開重新檢查
+    shader_info: HashMap<String, Result<crate::picture::shader::ShaderInfo, crate::picture::shader::ShaderProblem>>,
+    /// 這次執行畫不出來的著色器檔案 → 原因（設定頁標出來）
+    shader_failures: HashMap<String, String>,
+    /// 最近一次加入檔案時被拒絕的（檔名, 原因）
+    shader_rejected: Option<(String, String)>,
+    /// 剛新增的組合：設定頁展開它一次
+    shader_new: Option<u32>,
+    /// 自動測試沒有畫面時當成畫了幾格（見 `simulate_video_frames`）
+    simulated_frames: Option<u64>,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -528,6 +543,12 @@ impl VitascopeApp {
             panel_open: false,
             panel_tab: control_panel::PanelTab::default(),
             deint_osd: None,
+            shader_watch: Default::default(),
+            shader_info: HashMap::new(),
+            shader_failures: HashMap::new(),
+            shader_rejected: None,
+            shader_new: None,
+            simulated_frames: None,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -651,7 +672,11 @@ impl VitascopeApp {
 
     /// mpv 回覆了 `set_option_async` / `command_async_keyed` 送出的指令
     fn on_async_reply(&mut self, id: u64, k: AsyncKey, error: Option<String>) {
-        let name = self.async_pending.remove(&id).unwrap_or_else(|| format!("{k:?}"));
+        // 不是這裡送的（Player 開始播新檔時自己重送的 glsl-shaders）：用選項名稱
+        let name = self.async_pending.remove(&id).unwrap_or_else(|| match k {
+            AsyncKey::Shaders => "glsl-shaders".to_owned(),
+            _ => format!("{k:?}"),
+        });
         if let Some(e) = error {
             // 流暢播放的設定 mpv 不接受：這次執行改回一般播放（改設定時再試）
             if matches!(k, AsyncKey::VideoSync | AsyncKey::DisplayFps) {
@@ -665,6 +690,10 @@ impl VitascopeApp {
                 self.player.forget_picture(&name);
             }
             self.async_failed(k, &name, &e);
+            // 像素著色器 mpv 不接受：剛換的組合就還原（提示換成「已還原」）
+            if k == AsyncKey::Shaders {
+                self.shader_reply_failed(&e);
+            }
         }
     }
 
@@ -995,6 +1024,7 @@ impl VitascopeApp {
             Action::SetTargetPeak(p) => self.set_target_peak(p),
             Action::SetGamut(g) => self.set_gamut(g),
             Action::SetComputePeak(on) => self.set_compute_peak(on),
+            Action::SetShaderPreset(id) => self.set_shader_preset(id),
             Action::PlaylistRemove => {
                 if let Some(i) = self.playlist_selected {
                     self.remove_from_playlist(i);
@@ -1273,8 +1303,14 @@ impl VitascopeApp {
         // 濾鏡在畫面輸出旋轉之前翻：看的是檔案本身的旋轉加上使用者的旋轉
         let file_rotate = self.natural.map_or(0, |(_, r)| r);
         let quarter = (file_rotate + i64::from(self.geometry.rotate)).rem_euclid(180) == 90;
-        if let Err(e) = self.player.set_flip(horizontal, on, self.flip_with_filter(), quarter) {
-            self.osd(crate::tf!("無法翻轉畫面：{e}", "Cannot flip the picture: {e}"));
+        let use_filter = self.flip_with_filter();
+        match self.player.set_flip(horizontal, on, use_filter, quarter) {
+            // 著色器的翻轉是非同步送的（跟使用者的著色器組合同一個清單）
+            Ok(Some(id)) => {
+                self.async_pending.insert(id, "glsl-shaders".to_owned());
+            }
+            Ok(None) => {}
+            Err(e) => self.osd(crate::tf!("無法翻轉畫面：{e}", "Cannot flip the picture: {e}")),
         }
     }
 
@@ -3328,6 +3364,7 @@ impl eframe::App for VitascopeApp {
         for ev in self.player.poll() {
             self.on_player_event(ev);
         }
+        self.shader_tick();
         // 視窗出現之後才有螢幕可查
         if self.frames >= 2 {
             self.pacing_tick(ctx);

@@ -1,4 +1,5 @@
-//! 畫質設定（去交錯、去色帶、銳化、縮放演算法、HDR 色調映射）的邏輯：右鍵選單、控制面板、設定頁都走這裡。
+//! 畫質設定（去交錯、去色帶、銳化、縮放演算法、HDR 色調映射）的邏輯：右鍵選單、控制面板、設定頁都走這裡
+//!（像素著色器在 `shaders`）。
 //! 設定整個程式共用、改了馬上存檔；對應到哪些 mpv 選項由 `picture::mpv_options` 決定，套用時只送有變的。
 
 use super::{VitascopeApp, mpv_opts_override};
@@ -71,6 +72,8 @@ impl VitascopeApp {
                 eprintln!("[vitascope] 無法套用 {name}：{e}");
             }
         }
+        // 使用中的像素著色器組合：也看它能不能用（顯示卡、驅動換了之後可能畫不出來），畫不出來就改成不使用
+        self.apply_shaders(true, Some(None));
     }
 
     /// 目前的設定對應的 mpv 選項（VITASCOPE_MPV_OPTS 指定的不列）

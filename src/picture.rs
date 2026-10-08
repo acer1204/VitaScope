@@ -1,6 +1,8 @@
 //! 畫質設定（亮度等影像調整、去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR 色調映射）：
 //! 設定的型別和純函式。影像調整由 `Adjust::mpv_options` 對應到 mpv；去交錯、去色帶、銳化、
-//! 縮放演算法、HDR 由 `mpv_options` 對應；像素著色器在之後的批次加上。
+//! 縮放演算法、HDR 由 `mpv_options` 對應；像素著色器（glsl-shaders）見 `shader`。
+
+pub mod shader;
 
 use crate::player::EngineCaps;
 use serde::{Deserialize, Serialize};
@@ -534,6 +536,25 @@ impl ShaderSettings {
     pub fn active_preset(&self) -> Option<&ShaderPreset> {
         let id = self.active?;
         self.presets.iter().find(|p| p.id == id)
+    }
+
+    pub fn preset(&self, id: u32) -> Option<&ShaderPreset> {
+        self.presets.iter().find(|p| p.id == id)
+    }
+
+    pub fn preset_mut(&mut self, id: u32) -> Option<&mut ShaderPreset> {
+        self.presets.iter_mut().find(|p| p.id == id)
+    }
+}
+
+impl ShaderPreset {
+    /// 介面上的名稱（沒有名稱時「（未命名）」）
+    pub fn label(&self) -> &str {
+        if self.name.trim().is_empty() {
+            crate::tr!("（未命名）", "(unnamed)")
+        } else {
+            &self.name
+        }
     }
 }
 

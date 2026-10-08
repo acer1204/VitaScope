@@ -68,7 +68,7 @@ impl VitascopeApp {
         action
     }
 
-    /// 「畫質」選單的去交錯、去色帶、銳化、縮放演算法、HDR 色調映射（設定頁、控制面板也有同樣的選項）
+    /// 「畫質」選單的去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR 色調映射（設定頁、控制面板也有同樣的選項）
     fn processing_items(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let v = self.settings.video.clone();
         let mut action = None;
@@ -142,6 +142,32 @@ impl VitascopeApp {
                 });
             });
         });
+        // 像素著色器：使用中的組合；「管理著色器…」打開設定的畫質頁（編輯組合）
+        let mut manage = false;
+        submenu(
+            ui,
+            tr!("像素著色器", "Pixel shaders"),
+            self.shaders_disabled(),
+            |ui| {
+                let active = v.shaders.active;
+                if ui.selectable_label(active.is_none(), tr!("不使用", "None")).clicked() {
+                    action = Some(Action::SetShaderPreset(None));
+                }
+                for p in &v.shaders.presets {
+                    if ui.selectable_label(active == Some(p.id), p.label()).clicked() {
+                        action = Some(Action::SetShaderPreset(Some(p.id)));
+                    }
+                }
+                ui.separator();
+                if ui.button(tr!("管理著色器…", "Manage shaders…")).clicked() {
+                    manage = true;
+                }
+            },
+        );
+        if manage {
+            self.settings_open = true;
+            self.settings_page = super::settings_window::Page::Picture;
+        }
         // HDR：色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有（只略過縮放、去色帶之類的處理）
         let tone = v.tone;
         submenu(ui, tr!("HDR 色調映射", "HDR tone mapping"), None, |ui| {

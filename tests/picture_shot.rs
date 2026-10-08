@@ -204,6 +204,108 @@ fn hdr_target_peak_applies_in_dumb_mode() {
     );
 }
 
+/// 單色的測試畫面：testsrc2 左上角深色的一小塊放大成整個畫面（這個 FFmpeg 只有 testsrc2，沒有 color）。
+/// 反相之後很亮，一看就知道著色器有沒有作用
+const DARK: &str = "av://lavfi:testsrc2=size=640x360:rate=30:duration=20,crop=w=8:h=8:x=0:y=0,scale=640:360";
+
+/// 設定檔：一個像素著色器組合，使用中
+fn shader_settings(files: &[&Path]) -> String {
+    let files: Vec<String> = files.iter().map(|f| f.to_string_lossy().into_owned()).collect();
+    serde_json::json!({"video": {"shaders": {"presets": [{"id": 1, "name": "測試", "files": files}], "active": 1}}})
+        .to_string()
+}
+
+/// 測試用的著色器：反相、編譯不過的（放在暫存資料夾）
+fn test_shaders(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = std::env::temp_dir()
+        .join("vitascope-picture-shot")
+        .join(format!("shader-files-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let invert = dir.join("反相 測試.glsl");
+    std::fs::write(
+        &invert,
+        "//!HOOK MAIN\n//!BIND HOOKED\n//!DESC 反相\n\
+         vec4 hook() { vec4 c = HOOKED_tex(HOOKED_pos); return vec4(1.0 - c.rgb, c.a); }\n",
+    )
+    .unwrap();
+    let broken = dir.join("broken.glsl");
+    std::fs::write(
+        &broken,
+        "//!HOOK MAIN\n//!BIND HOOKED\n//!DESC 壞掉的\n\
+         vec4 hook() { return HOOKED_tex(HOOKED_pos) * no_such_variable; }\n",
+    )
+    .unwrap();
+    (invert, broken)
+}
+
+/// 記錄裡有「偵測到軟體繪圖」：自動改用簡化流程（Linux CI 的 llvmpipe），使用者的著色器不跑
+fn auto_dumb(log: &str) -> bool {
+    log.contains("偵測到軟體繪圖")
+}
+
+/// 使用者的像素著色器真的畫在畫面上（反相的著色器讓深色變成淺色）；壞掉的著色器（編譯不過）
+/// 記下錯誤後自動還原成不使用，截圖時畫面是正常的。
+/// 軟體繪圖（Linux CI 的 llvmpipe 自動改用簡化流程）不跑著色器：畫面跟沒有著色器一樣
+#[test]
+#[ignore = "會在螢幕上開視窗（約 15 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn invert_shader_applies_and_a_broken_one_is_reverted() {
+    let (invert, broken) = test_shaders("gpu");
+    let (plain, log) = shot("shader-none", "{}", "", DARK);
+    // 實測 RTX 3090：沒有著色器 16.9、反相 238.4
+    assert!(plain < 80.0, "沒有著色器的畫面應該是深色的（{plain:.1}）");
+    let (inverted, log2) = shot("shader-invert", &shader_settings(&[&invert]), "", DARK);
+    let errors = render_errors(&log2);
+    assert!(errors.is_empty(), "反相的著色器不能有錯誤\n{}", errors.join("\n"));
+    assert!(!log2.contains("像素著色器無法使用"), "{log2}");
+    if auto_dumb(&log) {
+        eprintln!("軟體繪圖（簡化流程）：使用者的著色器不跑");
+        assert!(
+            (inverted - plain).abs() < 10.0,
+            "簡化流程不送著色器，畫面不變（{plain:.1} → {inverted:.1}）"
+        );
+        return;
+    }
+    assert!(
+        inverted > 170.0,
+        "反相的著色器應該讓畫面變亮（{plain:.1} → {inverted:.1}）"
+    );
+    let (after, log) = shot("shader-broken", &shader_settings(&[&broken]), "", DARK);
+    let errors = render_errors(&log);
+    assert!(!errors.is_empty(), "壞掉的著色器要有畫面輸出的錯誤記錄\n{log}");
+    let reverted = log
+        .lines()
+        .find(|l| l.contains("像素著色器無法使用，已還原：broken.glsl"))
+        .unwrap_or_else(|| panic!("要自動還原\n{log}"));
+    eprintln!("{reverted}");
+    assert!(
+        (after - plain).abs() < 10.0,
+        "還原之後的截圖是正常的畫面（{plain:.1}、{after:.1}）"
+    );
+}
+
+/// 軟體繪圖的簡化流程不跑使用者的著色器：使用中的組合不送給 mpv，畫面跟沒有著色器一樣、也不會誤判成壞掉而還原
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn shaders_are_not_used_in_dumb_mode() {
+    let (invert, broken) = test_shaders("dumb");
+    let (plain, _) = shot("shader-dumb-none", "{}", "gpu-dumb-mode=yes", DARK);
+    for (name, file) in [("invert", &invert), ("broken", &broken)] {
+        let (luma, log) = shot(
+            &format!("shader-dumb-{name}"),
+            &shader_settings(&[file]),
+            "gpu-dumb-mode=yes",
+            DARK,
+        );
+        assert!(
+            (luma - plain).abs() < 10.0,
+            "{name}：簡化流程不送著色器，畫面不變（{plain:.1} → {luma:.1}）"
+        );
+        assert!(!log.contains("像素著色器無法使用"), "{name}：\n{log}");
+        let errors = render_errors(&log);
+        assert!(errors.is_empty(), "{name}：畫面輸出出錯\n{}", errors.join("\n"));
+    }
+}
+
 #[test]
 fn reads_the_luma_from_the_log() {
     let log = "[vitascope] 截圖已存到 x.png\n[vitascope] 截圖統計：非黑色像素 99.1%，中央平均亮度 87.2\n";

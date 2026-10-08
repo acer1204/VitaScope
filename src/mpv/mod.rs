@@ -312,6 +312,48 @@ impl Mpv {
         self.get_property::<String>(name)
     }
 
+    /// 讀字串清單（`glsl-shaders` 之類）的每一項。用 Node 讀：讀成字串時分隔字元各版本不同
+    /// （0.37 是逗號、新版的路徑清單是平台的路徑分隔字元），路徑裡也可能有逗號
+    pub fn get_string_list(&self, name: &str) -> Result<Vec<String>> {
+        let n = cstring(name);
+        // SAFETY: mpv_node 是純資料（全 0 = MPV_FORMAT_NONE）；成功時 mpv 填好內容，讀完用 mpv_free_node_contents 釋放
+        let mut node: sys::mpv_node = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            sys::mpv_get_property(
+                self.raw(),
+                n.as_ptr(),
+                sys::mpv_format_MPV_FORMAT_NODE,
+                &mut node as *mut sys::mpv_node as *mut c_void,
+            )
+        };
+        check(code, || crate::tf!("讀取屬性 {name}", "reading property {name}"))?;
+        // SAFETY: format 決定 union 裡哪一個欄位有效；陣列的 values 有 num 個
+        let list = unsafe {
+            match node.format {
+                sys::mpv_format_MPV_FORMAT_NODE_ARRAY if !node.u.list.is_null() => {
+                    let l = &*node.u.list;
+                    let values: &[sys::mpv_node] = if l.num > 0 && !l.values.is_null() {
+                        std::slice::from_raw_parts(l.values, l.num as usize)
+                    } else {
+                        &[]
+                    };
+                    Ok(values
+                        .iter()
+                        .filter(|v| v.format == sys::mpv_format_MPV_FORMAT_STRING && !v.u.string.is_null())
+                        .map(|v| CStr::from_ptr(v.u.string).to_string_lossy().into_owned())
+                        .collect())
+                }
+                sys::mpv_format_MPV_FORMAT_NONE => Ok(Vec::new()),
+                _ => Err(Error::new(
+                    sys::mpv_error_MPV_ERROR_PROPERTY_FORMAT,
+                    crate::tf!("{name} 不是字串清單", "{name} is not a string list"),
+                )),
+            }
+        };
+        unsafe { sys::mpv_free_node_contents(&mut node) };
+        list
+    }
+
     pub fn observe(&self, id: u64, name: &str, format: Format) -> Result<()> {
         let n = cstring(name);
         let code = unsafe { sys::mpv_observe_property(self.raw(), id, n.as_ptr(), format.raw()) };

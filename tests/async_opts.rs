@@ -34,25 +34,17 @@ fn next_reply(p: &mut Player) -> (u64, Option<String>) {
     }
 }
 
-/// mpv 的路徑清單（glsl-shaders）讀成字串時的分隔字元。0.37 的 glsl-shaders 還是一般的字串清單，
-/// 用逗號分隔（測試的路徑裡沒有逗號）
-const LIST_SEP: [char; 2] = [if cfg!(windows) { ';' } else { ':' }, ','];
-
+/// mpv 的 glsl-shaders 的每一項（用 Node 讀：讀成字串的話分隔字元各版本不同，0.37 是逗號）
 fn shader_list(p: &Player) -> Vec<String> {
-    let s = p.get_string("glsl-shaders").unwrap();
-    if s.is_empty() {
-        Vec::new()
-    } else {
-        s.split(LIST_SEP).map(str::to_owned).collect()
-    }
+    p.shader_list().unwrap()
 }
 
-/// 檔名有中文和空白的著色器路徑（只用在清單裡，檔案不用存在）
+/// 檔名有中文、空白和逗號的著色器路徑（只用在清單裡，檔案不用存在）
 fn shader_paths(tag: &str) -> Vec<String> {
     let dir = std::env::temp_dir().join("影戲 著色器 測試");
     (0..3)
         .map(|i| {
-            dir.join(format!("{tag} 第 {i} 個 放大.glsl"))
+            dir.join(format!("{tag} 第 {i} 個, 放大.glsl"))
                 .to_string_lossy()
                 .into_owned()
         })
