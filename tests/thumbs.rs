@@ -42,7 +42,7 @@ fn thumbnails_of_different_times_differ() {
     t.open(1, &sample("common/mp4_long.mp4")); // 90 秒、160x90
     let a = get(&t, 1, 10.0, 90.0);
     assert_eq!((a.w, a.h), (240, 135));
-    assert!(a.rgba.chunks_exact(4).all(|p| p[3] == 255), "不透明");
+    assert!(a.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255), "不透明");
     let b = get(&t, 1, 60.0, 90.0);
     assert_ne!(a.rgba, b.rgba, "不同時間的畫面不一樣");
 }

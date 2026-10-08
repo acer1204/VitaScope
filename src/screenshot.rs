@@ -185,7 +185,7 @@ impl Image {
         };
         if fix.hflip {
             for row in img.rgba.chunks_exact_mut(img.w * 4) {
-                let px: Vec<[u8; 4]> = row.chunks_exact(4).rev().map(|p| [p[0], p[1], p[2], p[3]]).collect();
+                let px: Vec<[u8; 4]> = row.as_chunks::<4>().0.iter().rev().copied().collect();
                 row.copy_from_slice(px.concat().as_slice());
             }
         }
@@ -233,9 +233,14 @@ pub fn decode_png(path: &Path) -> std::io::Result<Image> {
     buf.truncate(info.buffer_size());
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf,
-        png::ColorType::Rgb => buf.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::Rgb => buf
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 255])
+            .collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-        png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::GrayscaleAlpha => buf.as_chunks::<2>().0.iter().flat_map(|&[g, a]| [g, g, g, a]).collect(),
         other => {
             return Err(std::io::Error::other(crate::tf!(
                 "不支援的 PNG 格式 {other:?}",
@@ -258,7 +263,13 @@ pub fn encode_png(img: &Image, path: &Path) -> std::io::Result<()> {
     encoder.set_depth(png::BitDepth::Eight);
     encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
-    let rgb: Vec<u8> = img.rgba.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb: Vec<u8> = img
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, _]| [r, g, b])
+        .collect();
     writer.write_image_data(&rgb).map_err(std::io::Error::other)?;
     writer.finish().map_err(std::io::Error::other)
 }
@@ -308,7 +319,7 @@ pub fn finish(target: Target, fix: Fixup) -> Done {
                 // 剪貼簿不吃透明度（egui 交給系統的是預乘過的顏色），一律不透明
                 Ok(img) => {
                     let mut img = img.fixed(fix);
-                    for p in img.rgba.chunks_exact_mut(4) {
+                    for p in img.rgba.as_chunks_mut::<4>().0 {
                         p[3] = 255;
                     }
                     Done::Copied(img)
