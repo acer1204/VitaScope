@@ -4,7 +4,7 @@
 use crate::mpv::{self, EndReason, Event, Format, Mpv, Value};
 use crate::subs::{self, ExternalSub, SubLang};
 use serde::Deserialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -210,6 +210,8 @@ pub struct State {
     pub deinterlace_active: bool,
     /// 音訊直通中：直通的格式（"ac3"、"dts"…）；None = 一般 PCM 輸出或沒有聲音
     pub audio_spdif: Option<String>,
+    /// 目前的影片是 HDR（video-params 的 gamma 是 pq 或 hlg）
+    pub video_hdr: bool,
 }
 
 impl State {
@@ -301,6 +303,8 @@ const OBSERVED: &[(&str, Format)] = &[
     ("deinterlace-active", Format::Flag),
     // 節點：用字串讀拿到 JSON，只看 format（spdif-ac3 之類 = 音訊直通）
     ("audio-out-params", Format::String),
+    // 影片的轉換函數（pq、hlg = HDR）；只在換影片設定時變
+    ("video-params/gamma", Format::String),
 ];
 
 /// 非同步設定選項（`set_async`、`command_async_keyed`）的指令編號從這裡開始。
@@ -375,6 +379,8 @@ pub struct EngineCaps {
     pub af: AfCaps,
     /// deinterlace=auto（本專案建置的引擎有；Linux tar.gz 用的系統 libmpv 不一定有）
     pub deint_auto: bool,
+    /// 有 deinterlace-active 屬性（看得到目前有沒有在去交錯；系統的 libmpv 0.37 沒有）
+    pub deint_status: bool,
     /// 軟體繪圖的簡化流程（gpu-dumb-mode）：不跑著色器、縮放演算法之類的效果
     pub dumb: bool,
     pub macos: bool,
@@ -435,6 +441,22 @@ fn is_harmless_error(text: &str) -> bool {
 /// 畫面輸出（render API、vo）的記錄：著色器編譯失敗之類的錯誤從這裡來
 fn is_render_log(prefix: &str) -> bool {
     prefix.starts_with("libmpv_render") || prefix.starts_with("vo")
+}
+
+/// video-params 的 gamma（轉換函數）是 HDR 的：PQ（HDR10、杜比視界）或 HLG
+fn is_hdr_gamma(gamma: &str) -> bool {
+    matches!(gamma, "pq" | "hlg")
+}
+
+/// 畫質選項 → 非同步設定時的種類（回覆依種類分派）
+fn picture_key(name: &str) -> AsyncKey {
+    match name {
+        "deinterlace" => AsyncKey::Deinterlace,
+        "sharpen" => AsyncKey::Sharpen,
+        "scale" | "dscale" | "cscale" | "scale-antiring" => AsyncKey::Scaler,
+        n if n.starts_with("deband") => AsyncKey::Deband,
+        _ => AsyncKey::Tone,
+    }
 }
 
 /// `audio-out-params`（JSON）→ 直通的格式：format 是 spdif-ac3 之類的時候
@@ -552,6 +574,8 @@ pub struct Player {
     /// 偵測引擎功能失敗時 mpv 會記一筆錯誤；這些不是真的問題，不放進 recent_errors。
     /// 每一項的兩個字串都出現在記錄裡才算（記錄訊息比較晚送達，可能開檔之後才收到）
     probe_noise: Vec<[String; 2]>,
+    /// 上次由 `apply_picture` 送出的畫質選項值（只送有變的）
+    picture_applied: HashMap<&'static str, String>,
 }
 
 impl Player {
@@ -586,11 +610,22 @@ impl Player {
         let env = std::env::var("VITASCOPE_MPV_OPTS").unwrap_or_default();
         options.extend(env_options(&env));
         options.extend(opts.extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let user_overrides = env_option_names(&env)
+        let mut user_overrides: HashSet<String> = env_option_names(&env)
             .map(str::to_owned)
             .chain(opts.extra.iter().map(|(k, _)| k.clone()))
             .collect();
         let mut mpv = Mpv::new(&options)?;
+        // profile=high-quality、include=… 之類間接改到的畫質選項也算使用者指定的：
+        // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是畫質選項）
+        for name in crate::picture::MANAGED {
+            if let (Ok(now), Ok(default)) = (
+                mpv.get_string(name),
+                mpv.get_string(&format!("option-info/{name}/default-value")),
+            ) && now != default
+            {
+                user_overrides.insert(name.to_owned());
+            }
+        }
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
@@ -614,6 +649,7 @@ impl Player {
             user_overrides,
             render_errors: VecDeque::new(),
             probe_noise: Vec::new(),
+            picture_applied: HashMap::new(),
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -668,6 +704,44 @@ impl Player {
             .collect()
     }
 
+    /// 套用畫質選項（`picture::mpv_options` 的結果），只送跟上次送出的不一樣的。
+    /// `sync`：啟動時（還沒開檔）同步設定；不然非同步，依選項分成去交錯、去色帶、銳化、縮放、HDR 幾種回覆。
+    /// 回傳送出的每一項：同步設定成功是 `Ok(None)`，非同步送出是 `Ok(Some(指令編號))`，失敗是 `Err`。
+    /// 失敗的不記下來（下次再送）；非同步的回覆說失敗時呼叫 `forget_picture`
+    pub fn apply_picture(
+        &mut self,
+        opts: &[(&'static str, String)],
+        sync: bool,
+    ) -> Vec<(&'static str, AsyncKey, mpv::Result<Option<u64>>)> {
+        debug_assert!(
+            !sync || (!self.state.loaded && !self.state.loading),
+            "同步設定只能在開檔之前用"
+        );
+        let mut sent = Vec::new();
+        for (name, value) in opts {
+            if self.user_overrides.contains(*name) || self.picture_applied.get(name) == Some(value) {
+                continue;
+            }
+            let key = picture_key(name);
+            let result = if sync {
+                self.mpv.set_property(name, value.as_str()).map(|()| None)
+            } else {
+                self.set_async(key, name, value).map(Some)
+            };
+            match &result {
+                Ok(_) => self.picture_applied.insert(name, value.clone()),
+                Err(_) => self.picture_applied.remove(name),
+            };
+            sent.push((*name, key, result));
+        }
+        sent
+    }
+
+    /// 非同步設定的畫質選項 mpv 不接受：忘掉記下的值，下次套用時再送
+    pub fn forget_picture(&mut self, name: &str) {
+        self.picture_applied.remove(name);
+    }
+
     // ───────────── 引擎功能偵測 ─────────────
 
     /// 偵測播放引擎的功能（同步；只在啟動時、還沒開檔之前呼叫）
@@ -679,6 +753,10 @@ impl Player {
         EngineCaps {
             af,
             deint_auto: self.probe_deint_auto(),
+            deint_status: self
+                .mpv
+                .get_string("property-list")
+                .is_ok_and(|list| list.split(',').any(|name| name == "deinterlace-active")),
             dumb: self.mpv.get_string("gpu-dumb-mode").is_ok_and(|v| v == "yes"),
             macos: cfg!(target_os = "macos"),
         }
@@ -1366,6 +1444,7 @@ impl Player {
             "mistimed-frame-count" => s.display_sync_active = value.as_i64().is_some(),
             "deinterlace-active" => s.deinterlace_active = value.as_bool().unwrap_or(false),
             "audio-out-params" => s.audio_spdif = value.as_str().and_then(spdif_format),
+            "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
             _ => {}
         }
     }
@@ -1488,7 +1567,7 @@ fn failure_reason(code: i32) -> &'static str {
 mod tests {
     use super::{
         ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, debug_log_level, display_size,
-        env_option_names, env_options, is_harmless_error, is_render_log, spdif_format,
+        env_option_names, env_options, is_harmless_error, is_hdr_gamma, is_render_log, picture_key, spdif_format,
     };
 
     #[test]
@@ -1558,6 +1637,35 @@ mod tests {
         assert_eq!(spdif_format(r#"{"format":"floatp"}"#), None);
         assert_eq!(spdif_format(r#"{"samplerate":48000}"#), None);
         assert_eq!(spdif_format("not json"), None);
+    }
+
+    #[test]
+    fn hdr_gamma_and_picture_keys() {
+        assert!(is_hdr_gamma("pq") && is_hdr_gamma("hlg"));
+        assert!(!is_hdr_gamma("bt.1886") && !is_hdr_gamma("srgb") && !is_hdr_gamma(""));
+        // 畫質選項的回覆依種類分派：每個選項都要歸到它那一組
+        let keys: Vec<AsyncKey> = crate::picture::MANAGED.into_iter().map(picture_key).collect();
+        use AsyncKey::*;
+        assert_eq!(
+            keys,
+            [
+                Deinterlace,
+                Deband,
+                Deband,
+                Deband,
+                Deband,
+                Deband,
+                Sharpen,
+                Scaler,
+                Scaler,
+                Scaler,
+                Scaler,
+                Tone,
+                Tone,
+                Tone,
+                Tone
+            ]
+        );
     }
 
     #[test]

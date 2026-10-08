@@ -6,6 +6,7 @@ mod info_panel;
 mod pacing;
 mod playlist_panel;
 mod preview;
+mod quality;
 mod settings_window;
 mod tuning_menu;
 
@@ -13,7 +14,10 @@ use crate::autoshot::AutoShot;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
-use crate::picture::{Adjust, AdjustKind, PictureDefaults};
+use crate::picture::{
+    Adjust, AdjustKind, ChromaScaler, Deinterlace, Downscaler, Gamut, PictureDefaults, Quality, Strength, ToneCurve,
+    Upscaler,
+};
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
 use crate::settings::{Settings, SubStyle, WindowGeometry};
@@ -140,6 +144,20 @@ enum Action {
     AdjustReset,
     /// 控制面板（Alt+G）
     ToggleControlPanel,
+    /// 畫質（整個程式共用、存檔）：去交錯、去色帶、銳化、縮放演算法
+    SetDeinterlace(Deinterlace),
+    SetDeband(Strength),
+    SetSharpen(Strength),
+    SetQuality(Quality),
+    /// 個別指定放大 / 縮小 / 色度的演算法；None = 跟隨畫質
+    SetUpscaler(Option<Upscaler>),
+    SetDownscaler(Option<Downscaler>),
+    SetChromaScaler(Option<ChromaScaler>),
+    /// HDR 轉 SDR：曲線、目標亮度（None = 自動）、色域對應、依畫面動態調整亮度
+    SetTone(ToneCurve),
+    SetTargetPeak(Option<u32>),
+    SetGamut(Gamut),
+    SetComputePeak(bool),
 }
 
 pub struct VitascopeApp {
@@ -295,6 +313,8 @@ pub struct VitascopeApp {
     /// 控制面板（Alt+G）
     panel_open: bool,
     panel_tab: control_panel::PanelTab,
+    /// 改去交錯時的提示（顯示的時間）：「目前」的狀態要等 mpv 換好濾鏡，提示還在時跟著更新
+    deint_osd: Option<Instant>,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -507,6 +527,7 @@ impl VitascopeApp {
             adjust,
             panel_open: false,
             panel_tab: control_panel::PanelTab::default(),
+            deint_osd: None,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -595,6 +616,8 @@ impl VitascopeApp {
         // 要等軟體繪圖的判斷（caps.dumb）
         self.pacing_startup();
         self.adjust_startup();
+        // 去交錯（預設自動）、去色帶、銳化、縮放演算法、HDR：第一個檔案就要生效
+        self.video_startup();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -633,6 +656,13 @@ impl VitascopeApp {
             // 流暢播放的設定 mpv 不接受：這次執行改回一般播放（改設定時再試）
             if matches!(k, AsyncKey::VideoSync | AsyncKey::DisplayFps) {
                 self.pacing.apply_failed();
+            }
+            // 畫質選項沒設成功：忘掉記下的值，下次改設定時整組再送一次
+            if matches!(
+                k,
+                AsyncKey::Deinterlace | AsyncKey::Deband | AsyncKey::Sharpen | AsyncKey::Scaler | AsyncKey::Tone
+            ) {
+                self.player.forget_picture(&name);
             }
             self.async_failed(k, &name, &e);
         }
@@ -954,6 +984,17 @@ impl VitascopeApp {
             Action::Adjust(kind, delta) => self.step_adjust(kind, delta),
             Action::AdjustReset => self.reset_adjust(),
             Action::ToggleControlPanel => self.panel_open = !self.panel_open,
+            Action::SetDeinterlace(d) => self.set_deinterlace(d),
+            Action::SetDeband(s) => self.set_deband(s),
+            Action::SetSharpen(s) => self.set_sharpen(s),
+            Action::SetQuality(q) => self.set_quality(q),
+            Action::SetUpscaler(s) => self.set_upscaler(s),
+            Action::SetDownscaler(s) => self.set_downscaler(s),
+            Action::SetChromaScaler(s) => self.set_chroma_scaler(s),
+            Action::SetTone(c) => self.set_tone(c),
+            Action::SetTargetPeak(p) => self.set_target_peak(p),
+            Action::SetGamut(g) => self.set_gamut(g),
+            Action::SetComputePeak(on) => self.set_compute_peak(on),
             Action::PlaylistRemove => {
                 if let Some(i) = self.playlist_selected {
                     self.remove_from_playlist(i);
@@ -3307,6 +3348,7 @@ impl eframe::App for VitascopeApp {
         }
         self.auto_next();
         self.autosave();
+        self.refresh_deint_osd();
         if ctx.input(|i| i.pointer.delta() != Vec2::ZERO || i.pointer.any_down()) {
             self.last_activity = Instant::now();
         }

@@ -1,8 +1,9 @@
 //! 控制面板（Alt+G、右鍵選單「畫質 → 影像調整…」）：不擋住操作的小視窗，滑桿一動畫面馬上跟著變。
 //! 也放影像調整（亮度、對比、飽和度、色相、Gamma）本身的邏輯：快捷鍵、右鍵選單、設定頁都走這裡。
 
-use super::{VitascopeApp, mpv_opts_override};
-use crate::picture::{Adjust, AdjustKind, fmt_signed};
+use super::quality::combo;
+use super::{Action, VitascopeApp, mpv_opts_override};
+use crate::picture::{Adjust, AdjustKind, Deinterlace, Strength, fmt_signed};
 use crate::player::AsyncKey;
 use crate::{tf, tr};
 use eframe::egui::{self, Align2, Id, vec2};
@@ -63,7 +64,7 @@ impl VitascopeApp {
         }
     }
 
-    /// 「畫質」分頁：五個滑桿（拖曳時馬上套用，放開才存檔）
+    /// 「畫質」分頁：五個滑桿（拖曳時馬上套用，放開才存檔），銳化、去色帶、去交錯
     fn picture_tab(&mut self, ui: &mut egui::Ui) {
         // 跟設定頁一樣：拖曳、打字時馬上生效，放開滑鼠或離開欄位時才存檔
         let commit =
@@ -99,7 +100,54 @@ impl VitascopeApp {
                     ui.end_row();
                 }
             });
-        // 之後的批次在這裡加去交錯、去色帶、銳化
+        ui.add_space(6.0);
+        // 銳化、去色帶、去交錯（整個程式共用的設定，選了馬上存檔）
+        let mut action = None;
+        let v = self.settings.video.clone();
+        ui.horizontal_wrapped(|ui| {
+            if let Some(s) = combo(
+                ui,
+                tr!("銳化", "Sharpening"),
+                "panel_sharpen",
+                v.sharpen,
+                &Strength::ALL,
+                Strength::label,
+                self.video_disabled(true, "sharpen"),
+            ) {
+                action = Some(Action::SetSharpen(s));
+            }
+            ui.add_space(8.0);
+            if let Some(s) = combo(
+                ui,
+                tr!("去色帶", "Debanding"),
+                "panel_deband",
+                v.deband,
+                &Strength::ALL,
+                Strength::label,
+                self.video_disabled(true, "deband"),
+            ) {
+                action = Some(Action::SetDeband(s));
+            }
+            ui.add_space(8.0);
+            if let Some(d) = combo(
+                ui,
+                tr!("去交錯", "Deinterlacing"),
+                "panel_deinterlace",
+                self.deint_effective(),
+                &self.deint_choices(),
+                Deinterlace::label,
+                self.video_disabled(false, "deinterlace"),
+            ) {
+                action = Some(Action::SetDeinterlace(d));
+            }
+            if let Some(now) = self.deint_status() {
+                ui.weak(tf!("（目前：{now}）", "(now: {now})"));
+            }
+        });
+        if let Some(a) = action {
+            let ctx = ui.ctx().clone();
+            self.run(&ctx, a);
+        }
         ui.add_space(6.0);
         if ui
             .add_enabled(

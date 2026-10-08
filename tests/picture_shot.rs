@@ -1,6 +1,6 @@
 //! 影像調整的截圖檢查：真的開一個視窗播測試畫面，用 `--shot` 截下 egui 實際畫出來的畫面，
 //! 比較亮度 +50 跟沒有調整時畫面中央的平均亮度。一般的繪圖流程、軟體繪圖的簡化流程（gpu-dumb-mode，
-//! Linux CI 的 llvmpipe 用的）各比一次。
+//! Linux CI 的 llvmpipe 用的）各比一次。HDR10 影片在每一種色調映射曲線下都要畫得出來（不是黑的、沒有著色器錯誤）。
 //!
 //! 會在螢幕上開視窗（每次約 5 秒），所以預設不跑（#[ignore]）：
 //!
@@ -20,9 +20,9 @@ static SCREEN: Mutex<()> = Mutex::new(());
 /// 跟 CI 的介面測試同一個測試畫面（彩色條紋、漸層、會動的數字）
 const MEDIA: &str = "av://lavfi:testsrc2=size=640x360:rate=30:duration=20";
 
-/// 用暫存的設定檔（`settings` 是 settings.json 的內容）開影戲，等它截圖後自己關閉。
+/// 用暫存的設定檔（`settings` 是 settings.json 的內容）開影戲播 `media`，等它截圖後自己關閉。
 /// 回傳（畫面中央的平均亮度, 影戲的記錄）
-fn shot(name: &str, settings: &str, mpv_opts: &str) -> (f64, String) {
+fn shot(name: &str, settings: &str, mpv_opts: &str, media: &str) -> (f64, String) {
     let _screen = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("vitascope-picture-shot").join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -40,7 +40,7 @@ fn shot(name: &str, settings: &str, mpv_opts: &str) -> (f64, String) {
     let stderr_path = dir.join("stderr.txt");
     let mut child = Command::new(env!("CARGO_BIN_EXE_vitascope"))
         .arg("--new-window")
-        .arg(MEDIA)
+        .arg(media)
         .arg("--shot")
         .arg(dir.join("shot.png"))
         .arg("--shot-delay")
@@ -50,6 +50,8 @@ fn shot(name: &str, settings: &str, mpv_opts: &str) -> (f64, String) {
         .env("XDG_CONFIG_HOME", dir.join("xdg"))
         .env("HOME", &home)
         .env("VITASCOPE_MPV_OPTS", mpv_opts)
+        // mpv 的記錄印到 stderr：著色器編譯失敗之類的錯誤、設定了哪些選項（Set property）
+        .env("VITASCOPE_DEBUG", "v")
         .env_remove("VITASCOPE_PACING")
         .env_remove("VITASCOPE_TEST_MINIMIZE")
         .env_remove("VITASCOPE_TEST_BUSY_UI")
@@ -91,8 +93,8 @@ fn brightness_settings(brightness: i32) -> String {
 }
 
 fn compare(label: &str, mpv_opts: &str) {
-    let (plain, _) = shot(&format!("{label}-0"), &brightness_settings(0), mpv_opts);
-    let (bright, log) = shot(&format!("{label}-50"), &brightness_settings(50), mpv_opts);
+    let (plain, _) = shot(&format!("{label}-0"), &brightness_settings(0), mpv_opts, MEDIA);
+    let (bright, log) = shot(&format!("{label}-50"), &brightness_settings(50), mpv_opts, MEDIA);
     assert!(!log.contains("無法套用"), "{log}");
     // 測試畫面中央平均大約 125；亮度 +50 實測（RTX 3090）一般流程 125.0 → 197.0、簡化流程 125.9 → 198.2
     assert!(
@@ -118,9 +120,111 @@ fn brightness_raises_the_picture_in_dumb_mode() {
     compare("dumb", "gpu-dumb-mode=yes");
 }
 
+/// 記錄裡畫面輸出（libmpv_render、vo）的錯誤
+fn render_errors(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|l| l.starts_with("[mpv/error]") || l.starts_with("[mpv/fatal]"))
+        .filter(|l| l.contains("] [libmpv_render]") || l.contains("] [vo/"))
+        .collect()
+}
+
+/// 記錄裡有沒有「Set property: tone-mapping="hable" -> 1」（mpv 接受了這個值）
+fn property_set(log: &str, name: &str, value: &str) -> bool {
+    let prefix = format!("Set property: {name}=");
+    log.lines().any(|l| {
+        l.split_once(&prefix).is_some_and(|(_, rest)| {
+            let (v, result) = rest.trim_end().rsplit_once(" -> ").unwrap_or((rest, ""));
+            v.trim_matches('"') == value && result == "1"
+        })
+    })
+}
+
+/// HDR10 樣本在每一條曲線下都要畫得出來。色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程
+/// （Linux CI 的 llvmpipe）也一樣會做，所以 CI 上也測得到曲線。
+/// 測的是「畫得出來、沒有著色器錯誤、曲線有送到 mpv」，不是各曲線的觀感（這個樣本的亮度大多在曲線的轉折點以下，
+/// 各曲線中央亮度只差幾個單位）
+#[test]
+#[ignore = "會在螢幕上開視窗（約 40 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn hdr_is_not_black_under_any_tone_curve() {
+    let media =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated/general/mkv_hevc10_hdr10.mkv");
+    assert!(
+        media.exists(),
+        "找不到樣本 {}，請先執行：python scripts/gen_samples.py",
+        media.display()
+    );
+    let media = media.to_string_lossy();
+    for curve in vitascope::picture::ToneCurve::ALL {
+        let name = serde_json::to_value(curve).unwrap();
+        let name = name.as_str().unwrap();
+        let settings = format!(r#"{{"video": {{"tone": {{"curve": "{name}"}}}}}}"#);
+        let (luma, log) = shot(&format!("hdr-{name}"), &settings, "", &media);
+        assert!(!log.contains("無法套用"), "{name}：{log}");
+        // 設定檔的曲線真的送到了 mpv（讀設定檔出錯的話每次都會是「自動」）
+        assert!(
+            property_set(&log, "tone-mapping", curve.mpv()),
+            "{name}：mpv 沒有收到 tone-mapping={}\n{log}",
+            curve.mpv()
+        );
+        // 著色器編譯失敗時 mpv 在 libmpv_render 記錯誤，畫面變成一片藍（gamma 曲線在 OpenGL 3.3 實測中央 18.5）
+        let errors = render_errors(&log);
+        assert!(errors.is_empty(), "{name}：畫面輸出出錯\n{}", errors.join("\n"));
+        // 實測各曲線中央平均：RTX 3090 137–142；Linux 的 llvmpipe（簡化流程、沒有動態峰值偵測）72.6–100.1。
+        // 著色器壞掉時的一片藍是 18.5
+        assert!(luma > 40.0, "{name}：HDR 畫面太暗（中央平均亮度 {luma:.1}）");
+    }
+}
+
+/// 軟體繪圖的簡化流程也做色調映射（所以選單上 HDR 的選項不停用）：目標亮度 100 跟 1000 nits 的畫面要不一樣
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn hdr_target_peak_applies_in_dumb_mode() {
+    let media =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated/general/mkv_hevc10_hdr10.mkv");
+    assert!(
+        media.exists(),
+        "找不到樣本 {}，請先執行：python scripts/gen_samples.py",
+        media.display()
+    );
+    let media = media.to_string_lossy();
+    let shot_peak = |peak: u32| {
+        let settings = format!(r#"{{"video": {{"tone": {{"target_peak": {peak}}}}}}}"#);
+        let (luma, log) = shot(&format!("hdr-dumb-{peak}"), &settings, "gpu-dumb-mode=yes", &media);
+        assert!(property_set(&log, "target-peak", &peak.to_string()), "{peak}：\n{log}");
+        let errors = render_errors(&log);
+        assert!(errors.is_empty(), "{peak}：畫面輸出出錯\n{}", errors.join("\n"));
+        luma
+    };
+    let (low, high) = (shot_peak(100), shot_peak(1000));
+    // 實測簡化流程：RTX 3090 141.3 → 161.6（一般流程 142.2 → 162.1）；Linux 的 llvmpipe 94.0 → 162.2，
+    // 系統的 libmpv 0.37 94.0 → 117.1
+    assert!(
+        (high - low).abs() > 8.0,
+        "簡化流程的目標亮度沒有作用（100 nits {low:.1}、1000 nits {high:.1}）"
+    );
+}
+
 #[test]
 fn reads_the_luma_from_the_log() {
     let log = "[vitascope] 截圖已存到 x.png\n[vitascope] 截圖統計：非黑色像素 99.1%，中央平均亮度 87.2\n";
     assert_eq!(center_luma(log), Some(87.2));
     assert_eq!(center_luma("[vitascope] 截圖存檔失敗"), None);
+}
+
+#[test]
+fn reads_render_errors_and_set_properties_from_the_log() {
+    let log = "[mpv/v] [cplayer] Set property: tone-mapping=\"hable\" -> 1\n\
+               [mpv/v] [cplayer] Set property: target-peak=\"auto\" -> 1\n\
+               [mpv/v] [cplayer] Set property: tone-mapping=gamma -> -2\n\
+               [mpv/error] [libmpv_render] fragment shader source:\n\
+               [mpv/error] [cplayer] Option af-add: 'x' isn't supported.\n\
+               [mpv/v] [libmpv_render] shader compile log (status=1): ok\n";
+    assert!(property_set(log, "tone-mapping", "hable"));
+    assert!(property_set(log, "target-peak", "auto"));
+    assert!(!property_set(log, "tone-mapping", "gamma"), "-> -2 是失敗");
+    assert!(!property_set(log, "tone-mapping", "clip"));
+    assert_eq!(
+        render_errors(log),
+        ["[mpv/error] [libmpv_render] fragment shader source:"]
+    );
 }

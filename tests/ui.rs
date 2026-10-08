@@ -2589,10 +2589,12 @@ fn rotated_mkv_crops_and_stretches_the_upright_picture() {
 
 #[test]
 fn status_quo_options() {
-    // 預設設定啟動、開檔播放：使用者沒要求的 mpv 選項一個都不能變（之後的批次才開始套用畫質、音效）
+    // 預設設定啟動、開檔播放：使用者沒要求的 mpv 選項一個都不能變（之後的批次才開始套用畫質、音效）。
+    // 例外是去交錯：擁有者決定預設「自動」（批次 7），引擎支援 auto 時從啟動就是 auto
     let mut h = harness(Some(sample("common/mp4_h264_aac.mp4")));
     step_until(&mut h, "開始播放", |s| s.loaded && s.time_pos > 0.0);
     h.run_steps(3);
+    let caps = *h.state().engine_caps();
     for name in [
         "video-sync",
         "display-fps-override",
@@ -2606,10 +2608,14 @@ fn status_quo_options() {
         "audio-device",
     ] {
         let default = prop(&h, &format!("option-info/{name}/default-value"));
-        assert_eq!(prop(&h, name), default, "{name} 不能被改掉");
+        let expected = if name == "deinterlace" && caps.deint_auto {
+            "auto".to_owned()
+        } else {
+            default
+        };
+        assert_eq!(prop(&h, name), expected, "{name} 不能被改掉");
     }
     // 啟動時有偵測引擎的功能，結果記下來了（沒偵測的話全是預設值 false；每個 FFmpeg 都有 aformat）
-    let caps = *h.state().engine_caps();
     assert_eq!(caps.macos, cfg!(target_os = "macos"));
     assert!(caps.af.aformat, "{caps:?}");
     let mut fresh = Player::new(Options::headless()).unwrap();
@@ -3979,4 +3985,542 @@ fn shortcuts_page_lists_the_picture_keys() {
             h.get_by_label(row);
         }
     }
+}
+
+// ───────────── 畫質：去交錯、去色帶、銳化、縮放演算法、HDR ─────────────
+
+/// 右鍵選單「畫質」→ 一層層的子選單（`path`，標籤的一部分）→ 點 `item`（完整標籤）
+fn pick_picture_item(h: &mut Harness<'_, VitascopeApp>, path: &[&str], item: &str) {
+    open_picture_menu(h);
+    for sub in path {
+        hover_menu_item(h, sub);
+    }
+    h.get_by_label(item).click();
+    h.run_steps(2);
+}
+
+/// 等 mpv 的選項變成 `value`（畫質選項是非同步設定的）
+fn wait_prop(h: &mut Harness<'_, VitascopeApp>, name: &str, value: &str) {
+    step_until_app(h, &format!("mpv 的 {name} = {value}"), |app| {
+        app.player().get_string(name).is_ok_and(|v| v == value)
+    });
+}
+
+/// 設定檔裡存的 `video`
+fn saved_video(path: &std::path::Path) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["video"].clone()
+}
+
+/// 用暫存資料夾的設定檔、播放 `file`（播完不接下一個）
+fn video_settings_harness(name: &str, file: &str) -> (TempDir, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample(file)), settings);
+    let file_name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+    settle(&mut h, &file_name);
+    (dir, path, h)
+}
+
+#[test]
+fn video_menu_items() {
+    let (_dir, path, mut h) = video_settings_harness("video-menu", "common/mkv_multitrack.mkv");
+    // 縮放演算法 → 高品質：放大用 ewa_lanczossharp、抗振鈴 0.6（mpv 的 high-quality 設定檔）
+    pick_picture_item(&mut h, &["縮放演算法"], "高品質");
+    assert_eq!(h.state().osd_text(), Some("縮放：高品質"));
+    wait_prop(&mut h, "scale", "ewa_lanczossharp");
+    wait_prop(&mut h, "scale-antiring", "0.600000");
+    assert_eq!(h.state().settings().video.quality, vitascope::picture::Quality::High);
+    assert_eq!(saved_video(&path)["quality"], "high");
+    // 個別指定放大的演算法：優先於畫質；抗振鈴照畫質
+    pick_picture_item(&mut h, &["縮放演算法", "放大（跟隨畫質）"], "Spline36");
+    assert_eq!(h.state().osd_text(), Some("放大：Spline36"));
+    wait_prop(&mut h, "scale", "spline36");
+    assert_eq!(prop(&h, "scale-antiring"), "0.600000");
+    assert_eq!(saved_video(&path)["scale"], "spline36");
+    pick_picture_item(&mut h, &["縮放演算法", "放大（Spline36）"], "跟隨畫質");
+    wait_prop(&mut h, "scale", "ewa_lanczossharp");
+    assert_eq!(saved_video(&path)["scale"], serde_json::Value::Null);
+    // 去色帶 → 中等：開啟，參數是中等的那一組（= mpv 的預設值）
+    pick_picture_item(&mut h, &["去色帶"], "中等");
+    assert_eq!(h.state().osd_text(), Some("去色帶：中等"));
+    wait_prop(&mut h, "deband", "yes");
+    for (name, value) in [
+        ("deband-iterations", "1"),
+        ("deband-threshold", "48.000000"),
+        ("deband-range", "16.000000"),
+        ("deband-grain", "32.000000"),
+    ] {
+        assert_eq!(prop(&h, name), value, "{name}");
+    }
+    assert_eq!(saved_video(&path)["deband"], "medium");
+    // 再改成強：參數跟著變
+    pick_picture_item(&mut h, &["去色帶"], "強");
+    // 非同步設定照順序生效：等最後一個
+    wait_prop(&mut h, "deband-grain", "48.000000");
+    assert_eq!(prop(&h, "deband-iterations"), "2");
+    assert_eq!(prop(&h, "deband-threshold"), "64.000000");
+    // 銳化 → 輕微
+    pick_picture_item(&mut h, &["銳化"], "輕微");
+    assert_eq!(h.state().osd_text(), Some("銳化：輕微"));
+    wait_prop(&mut h, "sharpen", "0.250000");
+    assert_eq!(saved_video(&path)["sharpen"], "light");
+    // HDR 色調映射 → Hable；這個影片不是 HDR，選單上註明
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "HDR 色調映射");
+    h.get_by_label("目前的影片不是 HDR");
+    h.get_by_label("Hable").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("HDR 色調映射：Hable"));
+    wait_prop(&mut h, "tone-mapping", "hable");
+    assert_eq!(saved_video(&path)["tone"]["curve"], "hable");
+    // 目標亮度
+    pick_picture_item(&mut h, &["HDR 色調映射", "目標亮度（自動）"], "400 nits");
+    assert_eq!(h.state().osd_text(), Some("HDR 目標亮度：400 nits"));
+    wait_prop(&mut h, "target-peak", "400");
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 400);
+    // 依畫面動態調整亮度（macOS 不顯示）
+    if cfg!(target_os = "macos") {
+        open_picture_menu(&mut h);
+        hover_menu_item(&mut h, "HDR 色調映射");
+        assert!(h.query_by_label("依畫面動態調整亮度").is_none());
+    } else {
+        pick_picture_item(&mut h, &["HDR 色調映射"], "依畫面動態調整亮度");
+        assert_eq!(h.state().osd_text(), Some("依畫面動態調整亮度：關"));
+        wait_prop(&mut h, "hdr-compute-peak", "no");
+        assert_eq!(saved_video(&path)["tone"]["compute_peak"], false);
+    }
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 換檔之後照舊（這些選項不是每個檔案各自的）
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    for (name, value) in [
+        ("scale", "ewa_lanczossharp"),
+        ("deband", "yes"),
+        ("sharpen", "0.250000"),
+        ("tone-mapping", "hable"),
+        ("target-peak", "400"),
+    ] {
+        assert_eq!(prop(&h, name), value, "{name}");
+    }
+}
+
+// 「目前的影片不是 HDR」只在 SDR 影片時出現：HDR10 影片時選單、設定頁都沒有，換成 SDR 影片後設定頁跟著顯示
+#[test]
+fn not_hdr_note_follows_the_video() {
+    let (_dir, _path, mut h) = video_settings_harness("hdr-note", "general/mkv_hevc10_hdr10.mkv");
+    step_until(&mut h, "知道是 HDR 影片", |s| s.video_hdr);
+    h.run_steps(2);
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "HDR 色調映射");
+    h.get_by_label("Hable");
+    assert!(h.query_by_label("目前的影片不是 HDR").is_none(), "HDR 影片的選單");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    h.get_by_label("HDR → SDR");
+    assert!(h.query_by_label("目前的影片不是 HDR").is_none(), "HDR 影片的設定頁");
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "換成 SDR 影片", |s| {
+        playing(s, "mp4_h264_aac.mp4") && !s.video_hdr
+    });
+    h.run_steps(2);
+    h.get_by_label("目前的影片不是 HDR");
+}
+
+#[test]
+fn deinterlace_menu_shows_the_current_state() {
+    let (_dir, path, mut h) = video_settings_harness("deint-menu", "common/mkv_multitrack.mkv");
+    let caps = *h.state().engine_caps();
+    if !caps.deint_auto || !caps.deint_status {
+        // 系統的 libmpv 0.37：沒有「自動」、看不到目前的狀態，只確認開關
+        open_picture_menu(&mut h);
+        hover_menu_item(&mut h, "去交錯");
+        assert!(h.query_by_label("自動（建議）").is_none(), "引擎不支援自動時不列");
+        h.get_by_label("開啟").click();
+        h.run_steps(2);
+        wait_prop(&mut h, "deinterlace", "yes");
+        assert_eq!(h.state().osd_text(), Some("去交錯：開啟"));
+        return;
+    }
+    assert_eq!(prop(&h, "deinterlace"), "auto", "預設自動");
+    // 逐行的影片：自動不去交錯
+    open_picture_menu(&mut h);
+    h.get_by_label("去交錯（目前：逐行影片） ⏵");
+    // 開啟：提示先寫「未去交錯」，mpv 換好濾鏡後跟著更新
+    pick_picture_item(&mut h, &["去交錯"], "開啟");
+    step_until(&mut h, "mpv 換好去交錯濾鏡", |s| s.deinterlace_active);
+    h.run_steps(2);
+    // 提示還在的話已經跟著更新（提示只顯示 1.5 秒，CI 很忙時可能已經消失）
+    let osd = h.state().osd_text();
+    assert!(
+        osd.is_none() || osd == Some("去交錯：開啟（目前：已去交錯）"),
+        "提示要跟著更新：{osd:?}"
+    );
+    assert_eq!(prop(&h, "deinterlace"), "yes");
+    assert_eq!(saved_video(&path)["deinterlace"], "on");
+    open_picture_menu(&mut h);
+    h.get_by_label("去交錯（目前：已去交錯） ⏵");
+    hover_menu_item(&mut h, "去交錯");
+    h.get_by_label("自動（建議）").click();
+    h.run_steps(2);
+    step_until(&mut h, "逐行的影片不再去交錯", |s| !s.deinterlace_active);
+    h.run_steps(2);
+    let osd = h.state().osd_text();
+    assert!(
+        osd.is_none() || osd == Some("去交錯：自動（目前：逐行影片）"),
+        "提示要跟著更新：{osd:?}"
+    );
+    assert_eq!(prop(&h, "deinterlace"), "auto");
+    assert_eq!(saved_video(&path)["deinterlace"], "auto");
+    // 交錯的影片：自動就會去交錯
+    let Some(interlaced) =
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated/general/ts_mpeg2_interlaced.ts"))
+            .filter(|p| p.exists())
+    else {
+        eprintln!("略過交錯的部分：沒有 general/ts_mpeg2_interlaced.ts（這個 FFmpeg 產生不了）");
+        return;
+    };
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    drop_file(&mut h, interlaced);
+    step_until(&mut h, "交錯的影片去交錯", |s| {
+        playing(s, "ts_mpeg2_interlaced.ts") && s.deinterlace_active
+    });
+    h.run_steps(5);
+    open_picture_menu(&mut h);
+    h.get_by_label("去交錯（目前：已去交錯） ⏵");
+}
+
+#[test]
+fn dumb_mode_greys_out_gpu_only_items() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.quality = vitascope::picture::Quality::High;
+    settings.video.deband = vitascope::picture::Strength::Strong;
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("gpu-dumb-mode".into(), "yes".into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mkv_multitrack.mkv");
+    assert!(h.state().engine_caps().dumb);
+    // 選項照樣對應（簡化流程的畫面輸出會忽略它們；設定跟 mpv 的值一致）
+    assert_eq!(prop(&h, "scale"), "ewa_lanczossharp");
+    assert_eq!(prop(&h, "deband"), "yes");
+    open_picture_menu(&mut h);
+    for label in ["去色帶", "銳化", "縮放演算法"] {
+        assert!(h.get_by_label_contains(label).accesskit_node().is_disabled(), "{label}");
+    }
+    // 去交錯是解碼後的濾鏡、影像調整與 HDR 色調映射在輸出到螢幕時做，簡化流程也有：照常
+    for label in ["去交錯", "影像調整…", "HDR 色調映射"] {
+        assert!(
+            !h.get_by_label_contains(label).accesskit_node().is_disabled(),
+            "{label}"
+        );
+    }
+    hover_menu_item(&mut h, "HDR 色調映射");
+    assert!(!h.get_by_label("Hable").accesskit_node().is_disabled());
+    assert!(!h.get_by_label_contains("目標亮度").accesskit_node().is_disabled());
+    h.get_by_label_contains("去色帶").hover();
+    h.run_steps(3);
+    h.get_by_label("軟體繪圖模式不支援");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 控制面板：銳化、去色帶停用，去交錯照常
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    for (label, disabled) in [("銳化", true), ("去色帶", true), ("去交錯", false)] {
+        let combo = combo_box(&h, label);
+        assert_eq!(combo.accesskit_node().is_disabled(), disabled, "{label}");
+    }
+    // 設定頁：一樣停用去色帶、銳化、縮放演算法，並註明原因；去交錯、HDR 照常
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    for (label, disabled) in [("去色帶", true), ("銳化", true), ("曲線", false), ("色域對應", false)] {
+        let combo = combo_box(&h, label);
+        assert_eq!(combo.accesskit_node().is_disabled(), disabled, "{label}");
+    }
+    for (label, disabled) in [("高品質", true), ("快速", true), ("開啟", false), ("自動", false)] {
+        assert_eq!(
+            h.get_by_label(label).accesskit_node().is_disabled(),
+            disabled,
+            "{label}"
+        );
+    }
+    h.get_by_label("軟體繪圖模式不支援");
+}
+
+/// 捲到看得到再點（設定頁比視窗長）。捲動有動畫，多跑幾幀等它停下來
+fn click_in_view(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    h.get_by_label(label).scroll_to_me();
+    h.run_steps(15);
+    h.get_by_label(label).click();
+    h.run_steps(2);
+}
+
+/// 捲到看得到、打開名稱是 `label` 的下拉選單
+fn combo_in_view(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    combo_box(h, label).scroll_to_me();
+    h.run_steps(15);
+    combo_box(h, label).click();
+    h.run_steps(2);
+}
+
+/// 名稱是 `label` 的下拉選單（左邊的名稱是它的無障礙標籤）
+fn combo_box<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ComboBox)
+        .unwrap_or_else(|| panic!("找不到下拉選單 {label}"))
+}
+
+// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定的畫質選項：影戲不去改它，介面上停用並說明
+#[test]
+fn video_options_set_by_mpv_opts_are_left_alone() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.deband = vitascope::picture::Strength::Off;
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![
+                ("deband".into(), "yes".into()),
+                ("tone-mapping".into(), "clip".into()),
+                ("scale".into(), "bicubic".into()),
+                ("deinterlace".into(), "yes".into()),
+            ],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mkv_multitrack.mkv");
+    assert_eq!(prop(&h, "deband"), "yes", "啟動時不能蓋掉");
+    assert_eq!(prop(&h, "tone-mapping"), "clip");
+    assert_eq!(prop(&h, "deinterlace"), "yes");
+    open_picture_menu(&mut h);
+    assert!(h.get_by_label_contains("去色帶").accesskit_node().is_disabled());
+    assert!(!h.get_by_label_contains("銳化").accesskit_node().is_disabled());
+    h.get_by_label_contains("去色帶").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    // 高品質：放大由使用者指定，其他照送
+    pick_picture_item(&mut h, &["縮放演算法"], "高品質");
+    wait_prop(&mut h, "scale-antiring", "0.600000");
+    assert_eq!(prop(&h, "scale"), "bicubic");
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "縮放演算法");
+    assert!(h.get_by_label_contains("放大（").accesskit_node().is_disabled());
+    assert!(!h.get_by_label_contains("縮小（").accesskit_node().is_disabled());
+    hover_menu_item(&mut h, "HDR 色調映射");
+    assert!(
+        h.get_by_label("Hable").accesskit_node().is_disabled(),
+        "曲線由使用者指定"
+    );
+    assert!(!h.get_by_label_contains("目標亮度").accesskit_node().is_disabled());
+    h.get_by_label("Hable").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 設定頁：去交錯的選項停用，滑鼠移上去說明原因；顯示 mpv 實際的值
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    let on = h.get_by_label("開啟");
+    assert!(on.accesskit_node().is_disabled());
+    assert_eq!(on.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+    assert!(combo_box(&h, "曲線").accesskit_node().is_disabled());
+    h.get_by_label("開啟").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+}
+
+// 控制面板「畫質」分頁的銳化、去色帶、去交錯
+#[test]
+fn control_panel_processing_combos() {
+    let (_dir, path, mut h) = video_settings_harness("panel-combos", "common/mkv_multitrack.mkv");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    combo_box(&h, "去色帶").click();
+    h.run_steps(2);
+    h.get_by_label("中等").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "deband", "yes");
+    assert_eq!(saved_video(&path)["deband"], "medium");
+    assert_eq!(h.state().osd_text(), Some("去色帶：中等"));
+    combo_box(&h, "銳化").click();
+    h.run_steps(2);
+    h.get_by_label("強").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "sharpen", "1.000000");
+    assert_eq!(saved_video(&path)["sharpen"], "strong");
+    let caps = *h.state().engine_caps();
+    if caps.deint_status {
+        h.get_by_label(if caps.deint_auto {
+            "（目前：逐行影片）"
+        } else {
+            "（目前：未去交錯）"
+        });
+    }
+    combo_box(&h, "去交錯").click();
+    h.run_steps(2);
+    h.get_by_label("開啟").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "deinterlace", "yes");
+    assert_eq!(saved_video(&path)["deinterlace"], "on");
+    if caps.deint_status {
+        step_until(&mut h, "mpv 換好去交錯濾鏡", |s| s.deinterlace_active);
+        h.run_steps(2);
+        h.get_by_label("（目前：已去交錯）");
+    }
+}
+
+// 「設定 → 畫質」的去交錯、去色帶／銳化、縮放演算法、HDR → SDR
+#[test]
+fn picture_page_processing_sections() {
+    let (_dir, path, mut h) = video_settings_harness("page-processing", "common/mkv_multitrack.mkv");
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    for title in ["去交錯", "去色帶／銳化", "縮放演算法", "HDR → SDR"] {
+        h.get_by_label(title);
+    }
+    h.get_by_label("目前的影片不是 HDR");
+    // 縮放演算法：三個按鈕；進階裡的放大 / 縮小 / 色度預設收起來
+    h.get_by_label("快速").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "cscale", "bilinear");
+    assert_eq!(prop(&h, "scale"), "bilinear");
+    assert_eq!(prop(&h, "dscale"), "bilinear");
+    assert_eq!(saved_video(&path)["quality"], "fast");
+    assert!(h.query_by_label("色度").is_none(), "進階預設收起來");
+    click_in_view(&mut h, "進階");
+    combo_in_view(&mut h, "縮小");
+    h.run_steps(2);
+    h.get_by_label("Catmull-Rom").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "dscale", "catmull_rom");
+    assert_eq!(saved_video(&path)["dscale"], "catmull_rom");
+    // HDR：曲線、目標亮度（取消自動 → 203 nits，可以拖）
+    combo_in_view(&mut h, "曲線");
+    h.run_steps(2);
+    h.get_by_label("BT.2390").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "tone-mapping", "bt.2390");
+    assert_eq!(saved_video(&path)["tone"]["curve"], "bt2390");
+    let peak = |h: &Harness<'_, VitascopeApp>| {
+        h.query_all_by_label("目標亮度")
+            .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+            .map(|n| n.accesskit_node().is_disabled())
+            .expect("找不到目標亮度的數值欄")
+    };
+    assert!(peak(&h), "自動時不能拖");
+    click_in_view(&mut h, "自動");
+    h.run_steps(2);
+    wait_prop(&mut h, "target-peak", "203");
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 203);
+    assert!(!peak(&h), "取消自動之後可以拖");
+    // 數值欄打字：馬上套用，按 Enter（離開欄位）才存檔
+    h.query_all_by_label("目標亮度")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+        .unwrap()
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text("500".into()));
+    h.run_steps(2);
+    wait_prop(&mut h, "target-peak", "500");
+    assert_eq!(h.state().settings().video.tone.target_peak, Some(500));
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 203, "還在打字，先不存");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 500);
+    combo_in_view(&mut h, "色域對應");
+    h.run_steps(2);
+    h.get_by_label("降低飽和度").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "gamut-mapping-mode", "desaturate");
+    assert_eq!(saved_video(&path)["tone"]["gamut"], "desaturate");
+    if cfg!(target_os = "macos") {
+        assert!(h.query_by_label("動態峰值偵測").is_none());
+    } else {
+        click_in_view(&mut h, "動態峰值偵測");
+        h.run_steps(2);
+        wait_prop(&mut h, "hdr-compute-peak", "no");
+    }
+    // 去交錯（引擎支援自動時三個都有；不支援時「自動」當成關閉，所以選開啟）
+    let caps = *h.state().engine_caps();
+    click_in_view(&mut h, "開啟");
+    wait_prop(&mut h, "deinterlace", "yes");
+    assert_eq!(saved_video(&path)["deinterlace"], "on");
+    assert_eq!(h.query_by_label("自動（建議）").is_some(), caps.deint_auto);
+}
+
+#[test]
+fn picture_page_processing_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Video quality").click();
+    h.run_steps(2);
+    for label in [
+        "Deinterlacing",
+        "Debanding / sharpening",
+        "Scaling",
+        "HDR → SDR",
+        "Advanced",
+        "Fast",
+        "Standard (mpv default)",
+        "High quality",
+        "Target brightness",
+        "The current video isn't HDR",
+    ] {
+        h.get_by_label(label);
+    }
+    for combo in ["Debanding", "Sharpening", "Curve", "Gamut mapping"] {
+        combo_box(&h, combo);
+    }
+    h.get_by_label("High quality").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Scaling: High quality"));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 右鍵選單
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Video quality ⏵");
+    for label in ["Debanding", "Sharpening", "Scaling", "HDR tone mapping"] {
+        h.get_by_label_contains(label);
+    }
+    hover_menu_item(&mut h, "Debanding");
+    h.get_by_label("Strong").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Debanding: Strong"));
+    assert!(h.query_by_label_contains("去色帶").is_none(), "沒有中文");
 }

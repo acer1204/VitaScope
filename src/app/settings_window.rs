@@ -1,8 +1,11 @@
 //! 設定視窗（F5、右鍵選單「設定…」）：改了馬上生效、馬上存檔。
 
+use super::control_panel::adjust_locked_hover;
+use super::quality::{combo, dumb_hover, scaler_choice};
 use super::{Action, VitascopeApp};
 use crate::i18n::{self, Lang};
 use crate::pacing::{Plan, SmoothMode};
+use crate::picture::{ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler};
 use crate::{tf, tr};
 use eframe::egui::{self, Id, pos2, vec2};
 
@@ -12,7 +15,7 @@ pub(super) enum Page {
     #[default]
     General,
     Playback,
-    /// 畫質（影像調整；之後加去交錯、縮放演算法、著色器、HDR）
+    /// 畫質（影像調整、去交錯、去色帶、銳化、縮放演算法、HDR；之後加著色器）
     Picture,
     Subtitles,
     Screenshot,
@@ -320,7 +323,7 @@ impl VitascopeApp {
         }
     }
 
-    /// 畫質頁：影像調整（滑桿在控制面板裡）
+    /// 畫質頁：影像調整（滑桿在控制面板裡），去交錯、去色帶、銳化、縮放演算法、HDR
     fn picture_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
         ui.strong(tr!("影像調整", "Image adjustments"));
         ui.label(tf!(
@@ -344,7 +347,225 @@ impl VitascopeApp {
         {
             self.set_keep_adjust(keep);
         }
-        // 之後的批次在這裡加去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR
+        self.processing_sections(ui, action);
+    }
+
+    /// 畫質頁的去交錯、去色帶／銳化、縮放演算法、HDR → SDR（選了馬上套用、存檔）
+    fn processing_sections(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        let v = self.settings.video.clone();
+        let dumb = self.caps.dumb;
+        ui.add_space(12.0);
+        ui.strong(tr!("去交錯", "Deinterlacing"));
+        let deint = self.deint_effective();
+        let deint_locked = self.video_locked("deinterlace");
+        ui.horizontal(|ui| {
+            for d in self.deint_choices() {
+                let r = ui
+                    .add_enabled(!deint_locked, egui::RadioButton::new(deint == d, d.menu_label()))
+                    .on_disabled_hover_text(adjust_locked_hover());
+                if r.clicked() && deint != d {
+                    *action = Some(Action::SetDeinterlace(d));
+                }
+            }
+        });
+        if let Some(now) = self.deint_status() {
+            ui.weak(tf!("目前：{now}", "Now: {now}"));
+        }
+        ui.weak(tr!(
+            "電視錄影、DVD 之類的交錯式影片才需要；自動 = 只處理交錯的影片",
+            "Needed for interlaced video such as TV recordings and DVDs; Auto handles only interlaced video"
+        ));
+
+        ui.add_space(12.0);
+        ui.strong(tr!("去色帶／銳化", "Debanding / sharpening"));
+        egui::Grid::new("settings_deband_sharpen")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                if let Some(s) = combo(
+                    ui,
+                    tr!("去色帶", "Debanding"),
+                    "settings_deband",
+                    v.deband,
+                    &Strength::ALL,
+                    Strength::label,
+                    self.video_disabled(true, "deband"),
+                ) {
+                    *action = Some(Action::SetDeband(s));
+                }
+                ui.end_row();
+                if let Some(s) = combo(
+                    ui,
+                    tr!("銳化", "Sharpening"),
+                    "settings_sharpen",
+                    v.sharpen,
+                    &Strength::ALL,
+                    Strength::label,
+                    self.video_disabled(true, "sharpen"),
+                ) {
+                    *action = Some(Action::SetSharpen(s));
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(12.0);
+        ui.strong(tr!("縮放演算法", "Scaling"));
+        ui.add_enabled_ui(!dumb, |ui| {
+            ui.horizontal(|ui| {
+                for q in Quality::ALL {
+                    if ui.selectable_label(v.quality == q, q.menu_label()).clicked() && v.quality != q {
+                        *action = Some(Action::SetQuality(q));
+                    }
+                }
+            });
+            egui::CollapsingHeader::new(tr!("進階", "Advanced"))
+                .id_salt("settings_scalers")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("settings_scalers_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            let ups: Vec<Option<Upscaler>> =
+                                std::iter::once(None).chain(Upscaler::ALL.map(Some)).collect();
+                            if let Some(s) = combo(
+                                ui,
+                                tr!("放大", "Upscaling"),
+                                "settings_scale",
+                                v.scale,
+                                &ups,
+                                |s| scaler_choice(s.map(Upscaler::label)),
+                                self.video_disabled(true, "scale"),
+                            ) {
+                                *action = Some(Action::SetUpscaler(s));
+                            }
+                            ui.end_row();
+                            let downs: Vec<Option<Downscaler>> =
+                                std::iter::once(None).chain(Downscaler::ALL.map(Some)).collect();
+                            if let Some(s) = combo(
+                                ui,
+                                tr!("縮小", "Downscaling"),
+                                "settings_dscale",
+                                v.dscale,
+                                &downs,
+                                |s| scaler_choice(s.map(Downscaler::label)),
+                                self.video_disabled(true, "dscale"),
+                            ) {
+                                *action = Some(Action::SetDownscaler(s));
+                            }
+                            ui.end_row();
+                            let chromas: Vec<Option<ChromaScaler>> =
+                                std::iter::once(None).chain(ChromaScaler::ALL.map(Some)).collect();
+                            if let Some(s) = combo(
+                                ui,
+                                tr!("色度", "Chroma"),
+                                "settings_cscale",
+                                v.cscale,
+                                &chromas,
+                                |s| scaler_choice(s.map(ChromaScaler::label)),
+                                self.video_disabled(true, "cscale"),
+                            ) {
+                                *action = Some(Action::SetChromaScaler(s));
+                            }
+                            ui.end_row();
+                        });
+                });
+        })
+        .response
+        .on_disabled_hover_text(dumb_hover());
+        if dumb {
+            ui.weak(dumb_hover());
+        }
+
+        // HDR：色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以不看 dumb
+        ui.add_space(12.0);
+        ui.strong("HDR → SDR");
+        let tone = v.tone;
+        // 拖曳、打字時馬上生效，放開滑鼠或離開欄位時才存檔（跟播放頁一樣）
+        let commit =
+            |r: &egui::Response| r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus());
+        egui::Grid::new("settings_hdr")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                if let Some(c) = combo(
+                    ui,
+                    tr!("曲線", "Curve"),
+                    "settings_tone",
+                    tone.curve,
+                    &ToneCurve::ALL,
+                    ToneCurve::label,
+                    self.video_disabled(false, "tone-mapping"),
+                ) {
+                    *action = Some(Action::SetTone(c));
+                }
+                ui.end_row();
+                let name = ui.label(tr!("目標亮度", "Target brightness"));
+                let locked = self.video_locked("target-peak");
+                ui.horizontal(|ui| {
+                    let mut auto = tone.target_peak.is_none();
+                    let r = ui
+                        .add_enabled(!locked, egui::Checkbox::new(&mut auto, tr!("自動", "Auto")))
+                        .on_disabled_hover_text(adjust_locked_hover());
+                    if r.changed() {
+                        // 取消自動時從 SDR 的參考白（203 nits）開始
+                        *action = Some(Action::SetTargetPeak((!auto).then_some(DEFAULT_PEAK)));
+                    }
+                    let mut nits = tone.target_peak.unwrap_or(DEFAULT_PEAK);
+                    let mut r = ui
+                        .add_enabled(
+                            !locked && !auto,
+                            egui::DragValue::new(&mut nits)
+                                .range(ToneSettings::MIN_PEAK..=ToneSettings::MAX_PEAK)
+                                .speed(5.0)
+                                .suffix(" nits"),
+                        )
+                        .labelled_by(name.id);
+                    if locked {
+                        r = r.on_disabled_hover_text(adjust_locked_hover());
+                    }
+                    if r.changed() && !auto {
+                        self.settings.video.tone.target_peak = Some(nits);
+                        self.apply_video();
+                    }
+                    if commit(&r) && !auto {
+                        self.save_settings();
+                    }
+                });
+                ui.end_row();
+                if let Some(g) = combo(
+                    ui,
+                    tr!("色域對應", "Gamut mapping"),
+                    "settings_gamut",
+                    tone.gamut,
+                    &Gamut::ALL,
+                    Gamut::label,
+                    self.video_disabled(false, "gamut-mapping-mode"),
+                ) {
+                    *action = Some(Action::SetGamut(g));
+                }
+                ui.end_row();
+            });
+        // macOS 的畫面輸出不支援動態峰值偵測（要 compute shader）
+        if !self.caps.macos {
+            let mut on = tone.compute_peak;
+            let r = ui
+                .add_enabled(
+                    !self.video_locked("hdr-compute-peak"),
+                    egui::Checkbox::new(&mut on, tr!("動態峰值偵測", "Dynamic peak detection")),
+                )
+                .on_hover_text(tr!(
+                    "依每個畫面的實際亮度調整色調映射，亮暗變化大的影片比較自然",
+                    "Adapts the tone mapping to the actual brightness of each scene"
+                ))
+                .on_disabled_hover_text(adjust_locked_hover());
+            if r.changed() {
+                *action = Some(Action::SetComputePeak(on));
+            }
+        }
+        if self.video_not_hdr() {
+            ui.weak(tr!("目前的影片不是 HDR", "The current video isn't HDR"));
+        }
     }
 
     fn subtitles_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
@@ -403,6 +624,9 @@ impl VitascopeApp {
         changed
     }
 }
+
+/// HDR 目標亮度取消「自動」時的起始值（nits；BT.2408 的 SDR 參考白）
+const DEFAULT_PEAK: u32 = 203;
 
 /// 快捷鍵一覽（唯讀）
 /// 快捷鍵說明裡的 Ctrl（macOS 是 ⌘）

@@ -1,7 +1,10 @@
 //! 畫質設定（亮度等影像調整、去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR 色調映射）：
-//! 設定的型別和純函式。影像調整已經套用到 mpv（`Adjust::mpv_options`），其他項目在之後的批次加上。
+//! 設定的型別和純函式。影像調整由 `Adjust::mpv_options` 對應到 mpv；去交錯、去色帶、銳化、
+//! 縮放演算法、HDR 由 `mpv_options` 對應；像素著色器在之後的批次加上。
 
+use crate::player::EngineCaps;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// 畫質設定（存在 settings.json 的 `video`）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,12 +187,48 @@ pub enum Deinterlace {
 }
 
 impl Deinterlace {
+    pub const ALL: [Deinterlace; 3] = [Deinterlace::Auto, Deinterlace::On, Deinterlace::Off];
+
     pub fn mpv(self) -> &'static str {
         match self {
             Deinterlace::Auto => "auto",
             Deinterlace::On => "yes",
             Deinterlace::Off => "no",
         }
+    }
+
+    /// 引擎實際用的值：不支援 auto 的引擎（系統的 libmpv 0.37）把「自動」當成關閉
+    pub fn effective(self, caps: &EngineCaps) -> Self {
+        match self {
+            Deinterlace::Auto if !caps.deint_auto => Deinterlace::Off,
+            d => d,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Deinterlace::Auto => crate::tr!("自動", "Auto"),
+            Deinterlace::On => crate::tr!("開啟", "On"),
+            Deinterlace::Off => crate::tr!("關閉", "Off"),
+        }
+    }
+
+    /// 選單上的名稱（「自動」是建議的設定）
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Deinterlace::Auto => crate::tr!("自動（建議）", "Auto (recommended)"),
+            d => d.label(),
+        }
+    }
+}
+
+/// 去交錯目前的狀態（「已去交錯」「逐行影片」）。`active` 是 mpv 的 deinterlace-active；
+/// 設定是自動卻沒有去交錯 = 影片本身是逐行的
+pub fn deinterlace_status(setting: Deinterlace, active: bool) -> &'static str {
+    match (active, setting) {
+        (true, _) => crate::tr!("已去交錯", "deinterlacing"),
+        (false, Deinterlace::Auto) => crate::tr!("逐行影片", "progressive video"),
+        (false, _) => crate::tr!("未去交錯", "not deinterlacing"),
     }
 }
 
@@ -213,7 +252,28 @@ pub struct Deband {
     pub grain: u32,
 }
 
+impl Deband {
+    /// mpv 的預設值（0.37 起都是這組）
+    pub const MPV_DEFAULT: Deband = Deband {
+        iterations: 1,
+        threshold: 48,
+        range: 16,
+        grain: 32,
+    };
+}
+
 impl Strength {
+    pub const ALL: [Strength; 4] = [Strength::Off, Strength::Light, Strength::Medium, Strength::Strong];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Strength::Off => crate::tr!("關閉", "Off"),
+            Strength::Light => crate::tr!("輕微", "Light"),
+            Strength::Medium => crate::tr!("中等", "Medium"),
+            Strength::Strong => crate::tr!("強", "Strong"),
+        }
+    }
+
     /// 銳化（mpv 的 sharpen，反銳利化遮罩的強度）
     pub fn sharpen(self) -> &'static str {
         match self {
@@ -237,7 +297,7 @@ impl Strength {
         match self {
             Strength::Off => None,
             Strength::Light => d(1, 32, 16, 16),
-            Strength::Medium => d(1, 48, 16, 32),
+            Strength::Medium => Some(Deband::MPV_DEFAULT),
             Strength::Strong => d(2, 64, 16, 48),
         }
     }
@@ -254,6 +314,44 @@ pub enum Quality {
     Standard,
     /// 放大用 ewa_lanczossharp（mpv 的 high-quality 設定檔）
     High,
+}
+
+impl Quality {
+    pub const ALL: [Quality; 3] = [Quality::Fast, Quality::Standard, Quality::High];
+
+    /// 短的名稱（提示、設定頁的按鈕）
+    pub fn label(self) -> &'static str {
+        match self {
+            Quality::Fast => crate::tr!("快速", "Fast"),
+            Quality::Standard => crate::tr!("標準", "Standard"),
+            Quality::High => crate::tr!("高品質", "High quality"),
+        }
+    }
+
+    /// 選單上的名稱
+    pub fn menu_label(self) -> &'static str {
+        match self {
+            Quality::Standard => crate::tr!("標準（mpv 預設）", "Standard (mpv default)"),
+            q => q.label(),
+        }
+    }
+}
+
+/// 縮放演算法的介面名稱（演算法本身的名字，中英文一樣）
+fn scaler_label(mpv: &str) -> &'static str {
+    match mpv {
+        "bilinear" => "Bilinear",
+        "bicubic" => "Bicubic",
+        "catmull_rom" => "Catmull-Rom",
+        "mitchell" => "Mitchell",
+        "hermite" => "Hermite",
+        "spline36" => "Spline36",
+        "lanczos" => "Lanczos",
+        "ewa_lanczos" => "EWA Lanczos",
+        "ewa_lanczossharp" => "EWA Lanczos Sharp",
+        "ewa_lanczos4sharpest" => "EWA Lanczos 4 Sharpest",
+        _ => "?",
+    }
 }
 
 /// 放大用的演算法。存檔的名稱就是 mpv 的名稱
@@ -305,6 +403,10 @@ impl Upscaler {
             Upscaler::EwaLanczos4Sharpest => "ewa_lanczos4sharpest",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        scaler_label(self.mpv())
+    }
 }
 
 /// 縮小用的演算法
@@ -344,6 +446,10 @@ impl Downscaler {
             Downscaler::Lanczos => "lanczos",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        scaler_label(self.mpv())
+    }
 }
 
 /// 色度（顏色資訊）放大用的演算法
@@ -374,6 +480,10 @@ impl ChromaScaler {
             ChromaScaler::Lanczos => "lanczos",
             ChromaScaler::EwaLanczos => "ewa_lanczos",
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        scaler_label(self.mpv())
     }
 }
 
@@ -485,9 +595,20 @@ impl Default for ToneSettings {
 impl ToneSettings {
     pub const MIN_PEAK: u32 = 100;
     pub const MAX_PEAK: u32 = 1000;
+    /// 選單上的目標亮度（nits）：一般 SDR 螢幕、BT.2408 的參考白、常見的 HDR 電視
+    pub const PEAK_PRESETS: [u32; 4] = [100, 203, 400, 1000];
 }
 
-/// 色調映射曲線（只列 vo_gpu 支援的）
+/// 目標亮度的名稱：「自動」「400 nits」
+pub fn peak_label(peak: Option<u32>) -> String {
+    match peak {
+        None => crate::tr!("自動", "Auto").to_owned(),
+        Some(nits) => format!("{nits} nits"),
+    }
+}
+
+/// 色調映射曲線（只列 vo_gpu 支援的）。不列 gamma：vo_gpu 的 gamma 曲線著色器對純量用了 .x，
+/// OpenGL 3.3／4.1（GLSL 4.20 以前）編譯不過，畫面變成一片藍（RTX 3090 實測）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToneCurve {
@@ -498,19 +619,17 @@ pub enum ToneCurve {
     Mobius,
     Reinhard,
     Clip,
-    Gamma,
     Linear,
 }
 
 impl ToneCurve {
-    pub const ALL: [ToneCurve; 8] = [
+    pub const ALL: [ToneCurve; 7] = [
         ToneCurve::Auto,
         ToneCurve::Bt2390,
         ToneCurve::Hable,
         ToneCurve::Mobius,
         ToneCurve::Reinhard,
         ToneCurve::Clip,
-        ToneCurve::Gamma,
         ToneCurve::Linear,
     ];
 
@@ -522,8 +641,19 @@ impl ToneCurve {
             ToneCurve::Mobius => "mobius",
             ToneCurve::Reinhard => "reinhard",
             ToneCurve::Clip => "clip",
-            ToneCurve::Gamma => "gamma",
             ToneCurve::Linear => "linear",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ToneCurve::Auto => crate::tr!("自動", "Auto"),
+            ToneCurve::Bt2390 => "BT.2390",
+            ToneCurve::Hable => "Hable",
+            ToneCurve::Mobius => "Mobius",
+            ToneCurve::Reinhard => "Reinhard",
+            ToneCurve::Clip => crate::tr!("裁切", "Clip"),
+            ToneCurve::Linear => crate::tr!("線性", "Linear"),
         }
     }
 }
@@ -539,6 +669,8 @@ pub enum Gamut {
 }
 
 impl Gamut {
+    pub const ALL: [Gamut; 3] = [Gamut::Auto, Gamut::Clip, Gamut::Desaturate];
+
     pub fn mpv(self) -> &'static str {
         match self {
             Gamut::Auto => "auto",
@@ -546,6 +678,93 @@ impl Gamut {
             Gamut::Desaturate => "desaturate",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Gamut::Auto => crate::tr!("自動", "Auto"),
+            Gamut::Clip => crate::tr!("裁切", "Clip"),
+            Gamut::Desaturate => crate::tr!("降低飽和度", "Desaturate"),
+        }
+    }
+}
+
+/// `mpv_options` 管理的 mpv 選項（依送出的順序）。影像調整另外由 `Adjust::mpv_options` 管
+pub const MANAGED: [&str; 15] = [
+    "deinterlace",
+    "deband",
+    "deband-iterations",
+    "deband-threshold",
+    "deband-range",
+    "deband-grain",
+    "sharpen",
+    "scale",
+    "dscale",
+    "cscale",
+    "scale-antiring",
+    "tone-mapping",
+    "target-peak",
+    "gamut-mapping-mode",
+    "hdr-compute-peak",
+];
+
+/// 「高品質」的放大演算法與抗振鈴（mpv 的 high-quality 設定檔）
+const HIGH_SCALE: &str = "ewa_lanczossharp";
+const HIGH_ANTIRING: &str = "0.6";
+
+/// 畫質設定 → mpv 選項。每次都回傳 `MANAGED` 的全部選項（套用時只送有變的，見 `Player::apply_picture`），
+/// 但使用者用 VITASCOPE_MPV_OPTS 指定的（`overrides`）不列。
+/// 軟體繪圖的簡化流程（`caps.dumb`）照樣對應：畫面輸出會忽略去色帶、縮放、HDR 這些選項，沒有害處，
+/// 而且設定跟 mpv 的值永遠一致（介面上這些項目停用，改不了）
+pub fn mpv_options(
+    v: &VideoSettings,
+    caps: &EngineCaps,
+    defaults: &PictureDefaults,
+    overrides: &HashSet<String>,
+) -> Vec<(&'static str, String)> {
+    // 關閉去色帶時參數用 mpv 的預設值（= 中等）：預設設定跟 mpv 原本的值完全一樣
+    let deband = v.deband.deband();
+    let params = deband.unwrap_or(Deband::MPV_DEFAULT);
+    let d = defaults;
+    let (scale, dscale, cscale, antiring) = match v.quality {
+        Quality::Fast => ("bilinear", "bilinear", "bilinear", d.scale_antiring.as_str()),
+        Quality::Standard => (
+            d.scale.as_str(),
+            d.dscale.as_str(),
+            d.cscale.as_str(),
+            d.scale_antiring.as_str(),
+        ),
+        Quality::High => (HIGH_SCALE, d.dscale.as_str(), d.cscale.as_str(), HIGH_ANTIRING),
+    };
+    // 個別指定的演算法優先
+    let scale = v.scale.map_or(scale, |s| s.mpv());
+    let dscale = v.dscale.map_or(dscale, |s| s.mpv());
+    let cscale = v.cscale.map_or(cscale, |s| s.mpv());
+    let t = &v.tone;
+    let opts: [(&'static str, String); 15] = [
+        ("deinterlace", v.deinterlace.effective(caps).mpv().to_owned()),
+        ("deband", if deband.is_some() { "yes" } else { "no" }.to_owned()),
+        ("deband-iterations", params.iterations.to_string()),
+        ("deband-threshold", params.threshold.to_string()),
+        ("deband-range", params.range.to_string()),
+        ("deband-grain", params.grain.to_string()),
+        ("sharpen", v.sharpen.sharpen().to_owned()),
+        ("scale", scale.to_owned()),
+        ("dscale", dscale.to_owned()),
+        ("cscale", cscale.to_owned()),
+        ("scale-antiring", antiring.to_owned()),
+        ("tone-mapping", t.curve.mpv().to_owned()),
+        (
+            "target-peak",
+            t.target_peak.map_or_else(|| "auto".to_owned(), |p| p.to_string()),
+        ),
+        ("gamut-mapping-mode", t.gamut.mpv().to_owned()),
+        (
+            "hdr-compute-peak",
+            if t.compute_peak { "auto" } else { "no" }.to_owned(),
+        ),
+    ];
+    debug_assert!(opts.iter().map(|(k, _)| *k).eq(MANAGED));
+    opts.into_iter().filter(|(k, _)| !overrides.contains(*k)).collect()
 }
 
 #[cfg(test)]
@@ -726,5 +945,239 @@ mod tests {
         let t = 1_790_000_000_000_000_000;
         assert_ne!(mix_preset_id(t, 0, 4242), mix_preset_id(t, 0, 4243));
         assert_ne!(mix_preset_id(t, 0, 4242), mix_preset_id(t + 1, 0, 4242));
+    }
+
+    /// 偵測到 deinterlace=auto 的引擎（本專案建置的）
+    fn caps() -> EngineCaps {
+        EngineCaps {
+            deint_auto: true,
+            deint_status: true,
+            ..EngineCaps::default()
+        }
+    }
+
+    fn opts(v: &VideoSettings) -> Vec<(&'static str, String)> {
+        mpv_options(v, &caps(), &PictureDefaults::default(), &HashSet::new())
+    }
+
+    /// 選項清單 → 名稱 → 值
+    fn get<'a>(opts: &'a [(&'static str, String)], name: &str) -> &'a str {
+        opts.iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_else(|| panic!("沒有 {name}：{opts:?}"))
+    }
+
+    #[test]
+    fn default_settings_keep_mpv_defaults_except_deinterlace() {
+        // 預設設定 = mpv 原本的值（mpv 文件、0.37 與本專案的引擎都一樣），只有去交錯改成自動
+        let expected = [
+            ("deinterlace", "auto"),
+            ("deband", "no"),
+            ("deband-iterations", "1"),
+            ("deband-threshold", "48"),
+            ("deband-range", "16"),
+            ("deband-grain", "32"),
+            ("sharpen", "0"),
+            ("scale", "lanczos"),
+            ("dscale", "hermite"),
+            ("cscale", ""),
+            ("scale-antiring", "0.000000"),
+            ("tone-mapping", "auto"),
+            ("target-peak", "auto"),
+            ("gamut-mapping-mode", "auto"),
+            ("hdr-compute-peak", "auto"),
+        ];
+        let got = opts(&VideoSettings::default());
+        let got: Vec<(&str, &str)> = got.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        assert_eq!(got, expected);
+        assert!(got.iter().map(|(k, _)| *k).eq(MANAGED), "每次都是完整的一組，順序固定");
+        // 不支援 auto 的引擎（系統的 libmpv 0.37）：自動 = 關閉，跟 mpv 的預設值一樣
+        let old = EngineCaps::default();
+        let o = mpv_options(
+            &VideoSettings::default(),
+            &old,
+            &PictureDefaults::default(),
+            &HashSet::new(),
+        );
+        assert_eq!(get(&o, "deinterlace"), "no");
+        let on = VideoSettings {
+            deinterlace: Deinterlace::On,
+            ..VideoSettings::default()
+        };
+        let o = mpv_options(&on, &old, &PictureDefaults::default(), &HashSet::new());
+        assert_eq!(get(&o, "deinterlace"), "yes", "開啟照樣是開啟");
+        assert_eq!(get(&opts(&on), "deinterlace"), "yes");
+        let off = VideoSettings {
+            deinterlace: Deinterlace::Off,
+            ..VideoSettings::default()
+        };
+        assert_eq!(get(&opts(&off), "deinterlace"), "no");
+    }
+
+    #[test]
+    fn quality_presets_give_the_full_scaler_set_and_overrides_win() {
+        // 這個引擎讀到的預設值（「標準」用的）跟 mpv 文件的不一樣也照用
+        let defaults = PictureDefaults {
+            scale: "spline36".into(),
+            dscale: "mitchell".into(),
+            cscale: "".into(),
+            scale_antiring: "0.100000".into(),
+        };
+        let scalers = |v: &VideoSettings| -> [String; 4] {
+            let o = mpv_options(v, &caps(), &defaults, &HashSet::new());
+            assert!(o.iter().map(|(k, _)| *k).eq(MANAGED), "{o:?}");
+            ["scale", "dscale", "cscale", "scale-antiring"].map(|k| get(&o, k).to_owned())
+        };
+        let with = |quality| VideoSettings {
+            quality,
+            ..VideoSettings::default()
+        };
+        assert_eq!(
+            scalers(&with(Quality::Fast)),
+            ["bilinear", "bilinear", "bilinear", "0.100000"]
+        );
+        assert_eq!(
+            scalers(&with(Quality::Standard)),
+            ["spline36", "mitchell", "", "0.100000"]
+        );
+        assert_eq!(
+            scalers(&with(Quality::High)),
+            ["ewa_lanczossharp", "mitchell", "", "0.6"]
+        );
+        // 個別指定的優先，其他照畫質
+        let mut v = with(Quality::High);
+        v.scale = Some(Upscaler::Spline36);
+        assert_eq!(scalers(&v), ["spline36", "mitchell", "", "0.6"]);
+        v.dscale = Some(Downscaler::CatmullRom);
+        v.cscale = Some(ChromaScaler::EwaLanczos);
+        assert_eq!(scalers(&v), ["spline36", "catmull_rom", "ewa_lanczos", "0.6"]);
+        v.quality = Quality::Fast;
+        assert_eq!(scalers(&v), ["spline36", "catmull_rom", "ewa_lanczos", "0.100000"]);
+        // 每個演算法都對應到它自己的 mpv 名稱
+        for s in Upscaler::ALL {
+            let v = VideoSettings {
+                scale: Some(s),
+                ..VideoSettings::default()
+            };
+            assert_eq!(scalers(&v)[0], s.mpv());
+        }
+    }
+
+    #[test]
+    fn deband_and_sharpen_tables() {
+        let deband = |s| {
+            let o = opts(&VideoSettings {
+                deband: s,
+                ..VideoSettings::default()
+            });
+            [
+                "deband",
+                "deband-iterations",
+                "deband-threshold",
+                "deband-range",
+                "deband-grain",
+            ]
+            .map(|k| get(&o, k).to_owned())
+        };
+        assert_eq!(deband(Strength::Off), ["no", "1", "48", "16", "32"]);
+        assert_eq!(deband(Strength::Light), ["yes", "1", "32", "16", "16"]);
+        assert_eq!(deband(Strength::Medium), ["yes", "1", "48", "16", "32"]);
+        assert_eq!(deband(Strength::Strong), ["yes", "2", "64", "16", "48"]);
+        let sharpen = |s| {
+            get(
+                &opts(&VideoSettings {
+                    sharpen: s,
+                    ..VideoSettings::default()
+                }),
+                "sharpen",
+            )
+            .to_owned()
+        };
+        assert_eq!(Strength::ALL.map(sharpen), ["0", "0.25", "0.5", "1"]);
+    }
+
+    #[test]
+    fn tone_mapping_options() {
+        let tone = |t: ToneSettings| {
+            let o = opts(&VideoSettings {
+                tone: t,
+                ..VideoSettings::default()
+            });
+            ["tone-mapping", "target-peak", "gamut-mapping-mode", "hdr-compute-peak"].map(|k| get(&o, k).to_owned())
+        };
+        assert_eq!(tone(ToneSettings::default()), ["auto", "auto", "auto", "auto"]);
+        assert_eq!(
+            tone(ToneSettings {
+                curve: ToneCurve::Hable,
+                target_peak: Some(400),
+                gamut: Gamut::Desaturate,
+                compute_peak: false,
+            }),
+            ["hable", "400", "desaturate", "no"]
+        );
+        for c in ToneCurve::ALL {
+            let t = ToneSettings {
+                curve: c,
+                ..ToneSettings::default()
+            };
+            assert_eq!(tone(t)[0], c.mpv());
+        }
+        for g in Gamut::ALL {
+            let t = ToneSettings {
+                gamut: g,
+                ..ToneSettings::default()
+            };
+            assert_eq!(tone(t)[2], g.mpv());
+        }
+        assert_eq!(peak_label(None), "自動");
+        assert_eq!(peak_label(Some(203)), "203 nits");
+    }
+
+    #[test]
+    fn user_overridden_options_are_skipped() {
+        let overrides: HashSet<String> = ["scale", "deinterlace", "hdr-compute-peak", "not-ours"]
+            .map(str::to_owned)
+            .into();
+        let v = VideoSettings {
+            quality: Quality::High,
+            ..VideoSettings::default()
+        };
+        let o = mpv_options(&v, &caps(), &PictureDefaults::default(), &overrides);
+        let names: Vec<&str> = o.iter().map(|(k, _)| *k).collect();
+        let expected: Vec<&str> = MANAGED
+            .into_iter()
+            .filter(|k| !["scale", "deinterlace", "hdr-compute-peak"].contains(k))
+            .collect();
+        assert_eq!(names, expected);
+        assert_eq!(get(&o, "scale-antiring"), "0.6", "同一組的其他選項照送");
+    }
+
+    #[test]
+    fn dumb_mode_still_maps_every_option() {
+        // 軟體繪圖的簡化流程：選項照樣對應（畫面輸出會忽略），設定跟 mpv 的值才一致
+        let dumb = EngineCaps { dumb: true, ..caps() };
+        let v = VideoSettings {
+            quality: Quality::High,
+            deband: Strength::Strong,
+            ..VideoSettings::default()
+        };
+        let plain = mpv_options(&v, &caps(), &PictureDefaults::default(), &HashSet::new());
+        assert_eq!(
+            mpv_options(&v, &dumb, &PictureDefaults::default(), &HashSet::new()),
+            plain
+        );
+    }
+
+    #[test]
+    fn deinterlace_status_text() {
+        assert_eq!(deinterlace_status(Deinterlace::Auto, true), "已去交錯");
+        assert_eq!(deinterlace_status(Deinterlace::Auto, false), "逐行影片");
+        assert_eq!(deinterlace_status(Deinterlace::On, true), "已去交錯");
+        assert_eq!(deinterlace_status(Deinterlace::Off, false), "未去交錯");
+        let old = EngineCaps::default();
+        assert_eq!(Deinterlace::Auto.effective(&old), Deinterlace::Off);
+        assert_eq!(Deinterlace::Auto.effective(&caps()), Deinterlace::Auto);
+        assert_eq!(Deinterlace::On.effective(&old), Deinterlace::On);
     }
 }
