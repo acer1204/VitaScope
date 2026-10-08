@@ -2,6 +2,7 @@
 
 use super::{Action, VitascopeApp};
 use crate::i18n::{self, Lang};
+use crate::pacing::{Plan, SmoothMode};
 use crate::{tf, tr};
 use eframe::egui::{self, Id, pos2, vec2};
 
@@ -266,7 +267,52 @@ impl VitascopeApp {
                 );
                 ui.end_row();
             });
+        ui.add_space(10.0);
+        self.smooth_section(ui);
         changed
+    }
+
+    /// 播放頁的「流暢播放」：兩個勾選對應三種設定
+    /// （「流暢播放」沒勾 = 關；「使用電池時暫停」勾 = 開但用電池時暫停、沒勾 = 一直開）。改了馬上生效、存檔
+    fn smooth_section(&mut self, ui: &mut egui::Ui) {
+        self.read_sync_numbers();
+        let mode = self.settings.smooth;
+        let locked = self.pacing_status().plan == Some(Plan::Untouched);
+        let (mut on, mut pause) = (mode != SmoothMode::Off, mode != SmoothMode::Always);
+        let mut toggled = false;
+        ui.add_enabled_ui(!locked, |ui| {
+            toggled |= ui
+                .checkbox(
+                    &mut on,
+                    tr!(
+                        "流暢播放（對齊螢幕更新率）",
+                        "Smooth playback (match the screen's refresh rate)"
+                    ),
+                )
+                .on_hover_text(super::tuning_menu::smooth_hover())
+                .on_disabled_hover_text(super::tuning_menu::smooth_locked_hover())
+                .changed();
+            ui.indent("smooth_battery", |ui| {
+                ui.add_enabled_ui(on, |ui| {
+                    toggled |= ui
+                        .checkbox(
+                            &mut pause,
+                            tr!("使用電池時暫停（省電）", "Pause on battery (saves power)"),
+                        )
+                        .changed();
+                });
+            });
+        });
+        ui.indent("smooth_status", |ui| {
+            ui.weak(self.pacing_status().describe());
+        });
+        if toggled {
+            self.set_smooth(match (on, pause) {
+                (false, _) => SmoothMode::Off,
+                (true, true) => SmoothMode::Auto,
+                (true, false) => SmoothMode::Always,
+            });
+        }
     }
 
     fn subtitles_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {

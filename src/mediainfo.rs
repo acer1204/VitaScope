@@ -109,6 +109,19 @@ pub struct LiveStats {
     pub vo_drops: Option<i64>,
     pub decoder_drops: Option<i64>,
     pub avsync: Option<f64>,
+    /// 顯示同步（流暢播放）。mpv 的 display-sync-active 播放中不會更新，用播放器狀態裡的
+    pub display_sync_active: bool,
+    /// mpv 用來同步的更新率（display-fps-override 或查到的）、mpv 量到的更新率
+    pub display_fps: Option<f64>,
+    pub estimated_display_fps: Option<f64>,
+    /// 每格影像顯示幾次螢幕更新、更新間隔的抖動（相對值）
+    pub vsync_ratio: Option<f64>,
+    pub vsync_jitter: Option<f64>,
+    /// 影片速度的修正倍數（1.001 = 快 0.1%）
+    pub video_speed_correction: Option<f64>,
+    /// 顯示時間跟預定的差太多的影格、晚了的影格
+    pub mistimed_frame_count: Option<i64>,
+    pub vo_delayed_frame_count: Option<i64>,
 }
 
 fn lenient_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -186,7 +199,58 @@ pub fn read_live(player: &Player) -> LiveStats {
         vo_drops: int("frame-drop-count"),
         decoder_drops: int("decoder-frame-drop-count"),
         avsync: float("avsync"),
+        display_sync_active: player.state.display_sync_active,
+        display_fps: float("display-fps"),
+        estimated_display_fps: float("estimated-display-fps"),
+        vsync_ratio: float("vsync-ratio"),
+        vsync_jitter: float("vsync-jitter"),
+        video_speed_correction: float("video-speed-correction"),
+        mistimed_frame_count: int("mistimed-frame-count"),
+        vo_delayed_frame_count: int("vo-delayed-frame-count"),
     }
+}
+
+/// 媒體資訊面板「播放流暢度」裡 mpv 回報的顯示同步數字，例如
+/// 「顯示同步：開 · 120.000 Hz（量到 119.998 Hz）」「每格 5.000 次更新 · 影片快 0.10% · 抖動 0.034」「錯時 0 · 延遲 0」
+pub fn sync_lines(live: &LiveStats) -> Vec<String> {
+    let hz = |v: Option<f64>| v.filter(|v| *v > 0.0).map(|v| format!("{v:.3} Hz"));
+    let mut first = if live.display_sync_active {
+        crate::tr!("顯示同步：開", "Display sync: on").to_owned()
+    } else {
+        crate::tr!("顯示同步：關", "Display sync: off").to_owned()
+    };
+    if let Some(fps) = hz(live.display_fps) {
+        first += &format!(" · {fps}");
+    }
+    if let Some(est) = hz(live.estimated_display_fps) {
+        first += &crate::tf!("（量到 {est}）", " (measured {est})");
+    }
+    let mut lines = vec![first];
+    if !live.display_sync_active {
+        return lines;
+    }
+    let mut timing = Vec::new();
+    if let Some(r) = live.vsync_ratio {
+        timing.push(crate::tf!("每格 {r:.3} 次更新", "{r:.3} refreshes per frame"));
+    }
+    if let Some(c) = live.video_speed_correction {
+        let pct = (c - 1.0) * 100.0;
+        timing.push(crate::tf!("影片速度 {pct:+.2}%", "video speed {pct:+.2}%"));
+    }
+    if let Some(j) = live.vsync_jitter {
+        timing.push(crate::tf!("抖動 {j:.3}", "jitter {j:.3}"));
+    }
+    if !timing.is_empty() {
+        lines.push(timing.join(" · "));
+    }
+    let n = |v: Option<i64>| v.map_or("-".to_owned(), |v| v.to_string());
+    lines.push(crate::tf!(
+        "錯時 {} · 延遲 {}",
+        "Mistimed {} · delayed {}",
+        n(live.mistimed_frame_count),
+        n(live.vo_delayed_frame_count)
+    ));
+    lines
 }
 
 // ───────────── 顯示 ─────────────
@@ -696,6 +760,45 @@ mod tests {
         .unwrap();
         assert_eq!(vp.par, None);
         assert_eq!(vp.real_pixelformat(), Some("p010"));
+    }
+
+    #[test]
+    fn display_sync_lines() {
+        let off = LiveStats {
+            estimated_display_fps: Some(119.9981),
+            ..Default::default()
+        };
+        assert_eq!(sync_lines(&off), vec!["顯示同步：關（量到 119.998 Hz）".to_owned()]);
+        let on = LiveStats {
+            display_sync_active: true,
+            display_fps: Some(120.0),
+            estimated_display_fps: Some(119.9981),
+            vsync_ratio: Some(5.0),
+            vsync_jitter: Some(0.0342),
+            video_speed_correction: Some(1.001),
+            mistimed_frame_count: Some(0),
+            vo_delayed_frame_count: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            sync_lines(&on),
+            vec![
+                "顯示同步：開 · 120.000 Hz（量到 119.998 Hz）".to_owned(),
+                "每格 5.000 次更新 · 影片速度 +0.10% · 抖動 0.034".to_owned(),
+                "錯時 0 · 延遲 2".to_owned(),
+            ]
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let en = sync_lines(&on);
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(
+            en,
+            vec![
+                "Display sync: on · 120.000 Hz (measured 119.998 Hz)".to_owned(),
+                "5.000 refreshes per frame · video speed +0.10% · jitter 0.034".to_owned(),
+                "Mistimed 0 · delayed 2".to_owned(),
+            ]
+        );
     }
 
     #[test]

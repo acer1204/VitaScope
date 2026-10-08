@@ -119,8 +119,10 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] 安裝程式：Windows 安裝檔（不需要系統管理員）、macOS `.dmg`、Linux AppImage
 - [x] 「通用」格式三平台全數通過自動測試
 
-### L3 進階調校（未開始）
+### L3 進階調校（進行中）
 
+- [x] **流暢播放**：依視窗所在螢幕的實際更新率（例如 119.88 Hz）微調播放速度，每格影像顯示的次數固定，
+  平移畫面不會忽快忽慢；使用電池時自動暫停。在「設定 → 播放」或右鍵選單「畫質」打開（目前預設關閉）
 - [ ] 影像調整：亮度、對比、飽和度、色相、Gamma
 - [ ] 去交錯、去色帶
 - [ ] 縮放演算法選擇
@@ -261,12 +263,21 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 vitascope 影片.mp4 --shot 截圖.png [--shot-delay 秒] [--fullscreen]
 ```
 
-排查顯示或播放問題時可以用兩個環境變數：
+排查顯示或播放問題時可以用這些環境變數：
 
 | 環境變數 | 作用 |
 |---|---|
-| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v` |
-| `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"` |
+| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v`。`VITASCOPE_DEBUG=pacing` 另外印出流暢播放的決定（螢幕更新率、電源、套用的設定） |
+| `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"`；指定了 `video-sync` 或 `display-fps-override` 時流暢播放不會去改它們 |
+| `VITASCOPE_PACING=off` | 流暢播放完全不動作（跟沒有這個功能時一樣） |
+
+流暢播放的實機量測（全螢幕播 1080p 平移影片，從 mpv 的記錄算每格顯示幾次螢幕更新；會在螢幕上開視窗約 15 秒）：
+
+```bash
+python scripts/gen_samples.py --tier pacing
+cargo test --test pacing_window -- --ignored --nocapture --test-threads=1
+python scripts/pacing_stats.py <暫存資料夾>/vitascope-pacing-window/display
+```
 
 Windows 的發佈版沒有主控台視窗，要把輸出存到檔案才看得到。請在「命令提示字元」（cmd）執行：
 

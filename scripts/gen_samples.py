@@ -5,11 +5,13 @@
   samples/generated/<tier>/<id>.<ext>   外掛字幕放在影片旁邊、同檔名
   samples/generated/manifest.json       測試程式（tests/formats.rs）讀這份清單比對預期結果
   samples/generated/general/dash_h264_aac/manifest.mpd   本機的 DASH（不在 manifest.json；tests/engine_build.rs 用）
+  samples/generated/pacing/pan_23976.mkv  流暢播放的實機測試（tests/pacing_window.rs）；只有 --tier pacing 才產生
 
 用法：
   python scripts/gen_samples.py                 # 產生全部等級
   python scripts/gen_samples.py --tier common   # 只產生「常見」
   python scripts/gen_samples.py --force         # 已存在也重新產生
+  python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p 平移影片（約 20 MB，CI 不需要）
 
 需要 FFmpeg 7.1 以上的 full build（VVC 樣本需要 libvvenc）。
 FFmpeg 無法編碼的格式（VC-1、RV40、PGS、Dolby Vision…）請把公開樣本放到 samples/external/。
@@ -560,6 +562,38 @@ def generate_dash(force: bool) -> str | None:
     return None
 
 
+# ───────────── 流暢播放（實機測試用，不在 manifest.json）─────────────
+# 1920×1080、23.976 fps、20 秒：每格往左平移 16 像素，左上角是影格編號。
+# 卡頓（某一格多停一次更新）在平移的畫面上最明顯；tests/pacing_window.rs 用 mpv 的記錄算每格顯示幾次更新
+PACING = OUT / "pacing" / "pan_23976.mkv"
+
+
+def generate_pacing(force: bool) -> str | None:
+    if PACING.exists() and not force:
+        print("  略過  pacing  pan_23976（已存在）")
+        return None
+    PACING.parent.mkdir(parents=True, exist_ok=True)
+    pan = r"crop=1920:1080:x='mod(n*16\,1920)':y=0"
+    font = find_font()
+    cwd = None
+    if font is not None:
+        # 在字型的資料夾裡執行、只給檔名：Windows 路徑的「C:」在濾鏡參數裡要跳脫
+        cwd = font.parent
+        pan += (f",drawtext=fontfile={font.name}:text='%{{frame_num}}':fontsize=120:fontcolor=white"
+                ":box=1:boxcolor=black@0.7:boxborderw=16:x=60:y=60")
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", "testsrc2=size=3840x1080:rate=24000/1001:duration=20",
+                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=20",
+                        "-map", "0:v", "-map", "1:a", "-vf", pan,
+                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-g", "48", "-pix_fmt", "yuv420p",
+                        *AAC, str(PACING)],
+                       cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"ffmpeg exit {r.returncode}"
+    print("  完成  pacing  pan_23976")
+    return None
+
+
 def manifest_entry(s: Sample) -> dict:
     e = {
         "id": s.id,
@@ -585,13 +619,19 @@ def main() -> int:
         stream.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=(*TIERS, "all"), default="all")
+    ap.add_argument("--tier", choices=(*TIERS, "all", "pacing"), default="all")
     ap.add_argument("--force", action="store_true", help="已存在的樣本也重新產生")
     args = ap.parse_args()
 
     if shutil.which("ffmpeg") is None:
         print("找不到 ffmpeg，請先安裝並加入 PATH", file=sys.stderr)
         return 1
+    if args.tier == "pacing":
+        err = generate_pacing(args.force)
+        if err:
+            print(f"  失敗  pacing  pan_23976: {err}")
+            return 2
+        return 0
 
     all_samples = samples()
     todo = [s for s in all_samples if args.tier in ("all", s.tier)]

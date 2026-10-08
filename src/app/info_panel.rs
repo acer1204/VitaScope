@@ -37,20 +37,22 @@ impl VitascopeApp {
         }
         let stale = lang_changed || self.info_cache.as_ref().is_none_or(|c| c.read_at.elapsed() >= REFRESH);
         if stale {
+            let live = mediainfo::read_live(&self.player);
+            // 「使用中」的說明（每格幾次更新、影片快多少）也用這次讀到的數字
+            self.set_sync_numbers(&live);
             self.info_cache = Some(InfoCache {
                 info: mediainfo::read(&self.player, self.audio_device.clone()),
-                live: mediainfo::read_live(&self.player),
+                live,
                 read_at: Instant::now(),
                 lang,
             });
         }
         let cache = self.info_cache.as_ref().expect("剛讀過");
         let mut sections = mediainfo::sections(&cache.info, &cache.live);
-        // 螢幕更新率、電源、流暢播放的狀態（跟著每一幀更新，不用快取）
-        sections.push((
-            crate::tr!("播放流暢度", "Smoothness"),
-            self.pacing_status().info_lines(),
-        ));
+        // 螢幕更新率、電源、流暢播放的狀態（跟著每一幀更新，不用快取），加上 mpv 的顯示同步數字（每秒讀一次）
+        let mut smooth = self.pacing_status().info_lines();
+        smooth.extend(mediainfo::sync_lines(&cache.live));
+        sections.push((crate::tr!("播放流暢度", "Smoothness"), smooth));
         sections
     }
 

@@ -13,6 +13,23 @@ pub struct AutoShot {
     delay: Duration,
     start: Option<Instant>,
     requested: bool,
+    /// 開始播放後這些時間依序縮到最小、還原（流暢播放的實機測試用，見 `parse_minimize`）
+    minimize: Vec<Duration>,
+    /// 已經做了幾個
+    minimize_done: usize,
+}
+
+/// `VITASCOPE_TEST_MINIMIZE=3,6`：開始播放後第 3 秒縮到最小、第 6 秒還原（可以再接下去，輪流）。
+/// 看不懂的部分略過
+pub fn parse_minimize(value: &str) -> Vec<Duration> {
+    let mut times: Vec<Duration> = value
+        .split(',')
+        .filter_map(|t| t.trim().parse::<f64>().ok())
+        .filter(|t| t.is_finite() && *t >= 0.0)
+        .map(Duration::from_secs_f64)
+        .collect();
+    times.sort();
+    times
 }
 
 impl AutoShot {
@@ -22,7 +39,15 @@ impl AutoShot {
             delay,
             start: None,
             requested: false,
+            minimize: Vec::new(),
+            minimize_done: 0,
         }
+    }
+
+    /// 截圖前在這些時間（開始播放後）輪流縮到最小、還原
+    pub fn minimize_at(mut self, times: Vec<Duration>) -> Self {
+        self.minimize = times;
+        self
     }
 
     /// 開始計時（播放開始、或確定沒有要開檔時呼叫）
@@ -30,18 +55,34 @@ impl AutoShot {
         self.start.get_or_insert_with(Instant::now);
     }
 
-    /// 每一幀呼叫：時間到就要求截圖，收到截圖就存檔並關閉視窗
-    pub fn tick(&mut self, ctx: &egui::Context) {
-        let Some(start) = self.start else { return };
+    /// 每一幀呼叫：時間到就要求截圖，收到截圖就存檔並關閉視窗。要求截圖的那一幀回傳 true
+    pub fn tick(&mut self, ctx: &egui::Context) -> bool {
+        let Some(start) = self.start else { return false };
         if !self.requested {
             let elapsed = start.elapsed();
+            // 依序縮到最小、還原（第 1、3… 個時間縮小，第 2、4… 個還原）
+            let before = self.minimize_done;
+            self.minimize_done += self.minimize[before..].iter().take_while(|t| **t <= elapsed).count();
+            if self.minimize_done > before {
+                let minimized = self.minimize_done % 2 == 1;
+                eprintln!(
+                    "[vitascope] 測試：{}（開始播放後 {:.1} 秒）",
+                    if minimized { "縮到最小" } else { "還原視窗" },
+                    elapsed.as_secs_f64()
+                );
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(minimized));
+            }
             if elapsed >= self.delay {
                 ctx.send_viewport_cmd(ViewportCommand::Screenshot(Default::default()));
                 self.requested = true;
-            } else {
-                ctx.request_repaint_after(self.delay - elapsed);
+                return true;
             }
-            return;
+            let next = self
+                .minimize
+                .get(self.minimize_done)
+                .map_or(self.delay, |t| (*t).min(self.delay));
+            ctx.request_repaint_after(next.saturating_sub(elapsed));
+            return false;
         }
         let image = ctx.input(|i| {
             i.raw.events.iter().find_map(|e| match e {
@@ -60,6 +101,7 @@ impl AutoShot {
         } else {
             ctx.request_repaint();
         }
+        false
     }
 }
 
@@ -85,4 +127,17 @@ fn save_png(path: &Path, image: &egui::ColorImage) -> Result<(), String> {
     let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
     let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
     writer.write_image_data(&bytes).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimize_times() {
+        let s = Duration::from_secs_f64;
+        assert_eq!(parse_minimize("3,6"), vec![s(3.0), s(6.0)]);
+        assert_eq!(parse_minimize(" 6 , 3,x,-1,1.5"), vec![s(1.5), s(3.0), s(6.0)]);
+        assert!(parse_minimize("").is_empty());
+    }
 }

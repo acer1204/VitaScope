@@ -6,6 +6,7 @@ mod pacing;
 mod playlist_panel;
 mod preview;
 mod settings_window;
+mod tuning_menu;
 
 use crate::autoshot::AutoShot;
 use crate::formats;
@@ -130,6 +131,8 @@ enum Action {
     ChooseScreenshotDir,
     /// 設定視窗（F5）
     Settings,
+    /// 流暢播放：開（使用電池時暫停）/ 關
+    ToggleSmooth,
 }
 
 pub struct VitascopeApp {
@@ -331,6 +334,8 @@ pub struct Launch {
     pub instance: Option<crate::instance::Primary>,
     /// 查螢幕更新率、電源的方法；None = 問作業系統（自動測試沒有視窗，查不到）
     pub platform: Option<Box<dyn PlatformProbe>>,
+    /// 環境變數 VITASCOPE_PACING（啟動時讀一次；自動測試預設沒有）
+    pub pacing: crate::pacing::Overrides,
 }
 
 impl VitascopeApp {
@@ -391,11 +396,7 @@ impl VitascopeApp {
             .platform
             .or_else(|| owner.map(|o| Box::new(pacing::RealProbe::new(o.window)) as Box<dyn PlatformProbe>));
         let user_sync = mpv_opts_override(&player, "video-sync") || mpv_opts_override(&player, "display-fps-override");
-        let pacing = pacing::PacingCtl::new(
-            probe,
-            user_sync,
-            crate::pacing::parse_overrides(std::env::var("VITASCOPE_PACING").ok().as_deref()),
-        );
+        let pacing = pacing::PacingCtl::new(probe, user_sync, launch.pacing);
 
         let mut app = Self {
             player,
@@ -545,8 +546,8 @@ impl VitascopeApp {
         self.osd.as_ref().map(|(text, _)| text.as_str())
     }
 
-    /// 啟動時（還沒開任何檔案）偵測播放引擎的功能。之後的批次在這裡同步套用畫質、音效設定；
-    /// 現在只偵測、記下來，不改任何 mpv 選項
+    /// 啟動時（還沒開任何檔案）偵測播放引擎的功能，同步套用要在第一個檔案就生效的設定
+    /// （流暢播放打開而且已經查得到更新率時）。之後的批次在這裡同步套用畫質、音效設定
     fn apply_startup(&mut self) {
         self.caps = self.player.probe_caps();
         self.picture_defaults = self.player.picture_defaults();
@@ -556,6 +557,8 @@ impl VitascopeApp {
                 self.caps, self.picture_defaults
             );
         }
+        // 要等軟體繪圖的判斷（caps.dumb）
+        self.pacing_startup();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -591,6 +594,10 @@ impl VitascopeApp {
     fn on_async_reply(&mut self, id: u64, k: AsyncKey, error: Option<String>) {
         let name = self.async_pending.remove(&id).unwrap_or_else(|| format!("{k:?}"));
         if let Some(e) = error {
+            // 流暢播放的設定 mpv 不接受：這次執行改回一般播放（改設定時再試）
+            if matches!(k, AsyncKey::VideoSync | AsyncKey::DisplayFps) {
+                self.pacing.apply_failed();
+            }
             self.async_failed(k, &name, &e);
         }
     }
@@ -905,6 +912,7 @@ impl VitascopeApp {
             }
             Action::ChooseScreenshotDir => self.choose_screenshot_dir(),
             Action::Settings => self.settings_open = !self.settings_open,
+            Action::ToggleSmooth => self.toggle_smooth(),
             Action::PlaylistRemove => {
                 if let Some(i) = self.playlist_selected {
                     self.remove_from_playlist(i);
@@ -2494,6 +2502,9 @@ impl VitascopeApp {
         if let Some(a) = self.view_menu(ui) {
             action = Some(a);
         }
+        if let Some(a) = self.picture_menu(ui) {
+            action = Some(a);
+        }
         let has_video = self.player.state.loaded && self.player.state.has_video();
         if let Some(a) = self.screenshot_menu(ui, has_video) {
             action = Some(a);
@@ -2789,6 +2800,7 @@ impl VitascopeApp {
         let g = self.geometry.clone();
         let mut action = None;
         ui.add_enabled_ui(has_video, |ui| {
+            // 英文是 View：新的「畫質」子選單叫 Picture
             ui.menu_button(crate::tr!("畫面", "Picture"), |ui| {
                 ui.menu_button(
                     crate::tf!("畫面比例（{}）", "Aspect ratio ({})", g.aspect_label()),
@@ -3252,8 +3264,11 @@ impl eframe::App for VitascopeApp {
         if self.frames >= 2 {
             self.remember_window(ctx);
         }
-        if let Some(shot) = &mut self.autoshot {
-            shot.tick(ctx);
+        if let Some(shot) = &mut self.autoshot
+            && shot.tick(ctx)
+        {
+            // 實機測試比對播放位置（縮到最小時聲音照樣播、位置照樣走）
+            eprintln!("[vitascope] 截圖時的播放位置：{:.3} 秒", self.player.state.time_pos);
         }
     }
 

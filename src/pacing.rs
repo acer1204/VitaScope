@@ -29,6 +29,12 @@ pub fn debug() -> bool {
     std::env::var("VITASCOPE_DEBUG").is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("pacing")))
 }
 
+/// 選單、提示上的更新率：119.88、120、59.94（最多三位小數，去掉多餘的 0）
+pub fn fmt_hz(hz: f64) -> String {
+    let s = format!("{hz:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 // ───────────── 決定 ─────────────
 
 /// 不用流暢播放（改用一般的音訊同步）的原因
@@ -361,6 +367,13 @@ pub struct Overrides {
     pub no_drain: bool,
 }
 
+impl Overrides {
+    /// 讀環境變數 VITASCOPE_PACING（啟動時讀一次；自動測試直接給 `Launch.pacing`，不看環境變數）
+    pub fn from_env() -> Self {
+        parse_overrides(std::env::var("VITASCOPE_PACING").ok().as_deref())
+    }
+}
+
 pub fn parse_overrides(env: Option<&str>) -> Overrides {
     let mut o = Overrides::default();
     for token in env.unwrap_or_default().split(',') {
@@ -409,6 +422,16 @@ pub fn defer(i: &FrameInfo, target_ns: i64, now_ns: i64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_rate_labels() {
+        assert_eq!(fmt_hz(119.88), "119.88");
+        assert_eq!(fmt_hz(120.0), "120");
+        assert_eq!(fmt_hz(120_000.0 / 1001.0), "119.88");
+        assert_eq!(fmt_hz(60_000.0 / 1001.0), "59.94");
+        assert_eq!(fmt_hz(143.856), "143.856");
+        assert_eq!(fmt_hz(50.0), "50");
+    }
 
     #[test]
     fn default_is_off_and_names_are_kebab_case() {

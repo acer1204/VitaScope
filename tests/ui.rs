@@ -2670,17 +2670,36 @@ fn extra_options_count_as_user_overrides() {
     assert_eq!(prop(&h, "deband"), "yes");
 }
 
-// ───────────── 流暢播放：偵測螢幕更新率與電源（只計算、只顯示） ─────────────
+// ───────────── 流暢播放：依螢幕更新率同步 ─────────────
 
-/// 假的螢幕與電源（自動測試沒有真的視窗，查不到）
-struct FakePlatform {
+/// 假的螢幕與電源（自動測試沒有真的視窗，查不到）。測試中可以改（拔掉電源、查不到更新率）
+#[derive(Clone)]
+struct FakePlatform(std::sync::Arc<std::sync::Mutex<FakeState>>);
+
+struct FakeState {
     hz: Option<f64>,
     power: PowerSource,
 }
 
+impl FakePlatform {
+    fn new(hz: Option<f64>, power: PowerSource) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(FakeState { hz, power })))
+    }
+
+    fn hz(&self) -> Option<f64> {
+        self.0.lock().unwrap().hz
+    }
+
+    /// 改假的平台資訊，並要播放器下一幀就重查（不用等 10 秒一次的電源檢查）
+    fn set(&self, h: &mut Harness<'_, VitascopeApp>, change: impl FnOnce(&mut FakeState)) {
+        change(&mut self.0.lock().unwrap());
+        h.state_mut().pacing_requery();
+    }
+}
+
 impl PlatformProbe for FakePlatform {
     fn refresh_rate(&self) -> Option<Refresh> {
-        self.hz.map(|hz| Refresh {
+        self.hz().map(|hz| Refresh {
             hz,
             source: RefreshSource::DisplayConfig,
         })
@@ -2689,22 +2708,38 @@ impl PlatformProbe for FakePlatform {
         Some(1)
     }
     fn power(&self) -> PowerSource {
-        self.power
+        self.0.lock().unwrap().power
     }
     fn remote_session(&self) -> bool {
         false
     }
 }
 
-/// 開一個影片，指定流暢播放的設定與假的螢幕（None = 跟真正的自動測試一樣沒有）；等到開始播放
-fn playing_with_platform(platform: Option<FakePlatform>, smooth: SmoothMode) -> Harness<'static, VitascopeApp> {
+/// 開一個檔案，指定流暢播放的設定與假的螢幕（None = 跟真正的自動測試一樣沒有）；等到開始播放。
+/// 假螢幕的更新率也給 vo=null（vo-null-fps）：不然依螢幕同步時 vo=null 用最快的速度跑，測試不穩
+fn playing_smooth(
+    platform: Option<&FakePlatform>,
+    smooth: SmoothMode,
+    file: &str,
+    lang: vitascope::i18n::Lang,
+) -> Harness<'static, VitascopeApp> {
     let mut settings = Settings::default();
     settings.auto_next = false;
     settings.smooth = smooth;
-    let mut h = harness_launch(
+    settings.language = lang;
+    let fps = platform.and_then(FakePlatform::hz);
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: fps
+                .map(|hz| ("vo-null-fps".to_owned(), hz.to_string()))
+                .into_iter()
+                .collect(),
+            ..Options::headless()
+        },
         Launch {
-            files: vec![sample("common/mkv_multitrack.mkv")],
-            platform: platform.map(|p| Box::new(p) as Box<dyn PlatformProbe>),
+            files: vec![sample(file)],
+            platform: platform.map(|p| Box::new(p.clone()) as Box<dyn PlatformProbe>),
             ..Default::default()
         },
         settings,
@@ -2716,7 +2751,16 @@ fn playing_with_platform(platform: Option<FakePlatform>, smooth: SmoothMode) -> 
     h
 }
 
-/// 這一版只計算：mpv 的同步設定一個都不能變
+fn playing_with_platform(platform: Option<&FakePlatform>, smooth: SmoothMode) -> Harness<'static, VitascopeApp> {
+    playing_smooth(
+        platform,
+        smooth,
+        "common/mkv_multitrack.mkv",
+        vitascope::i18n::Lang::ZhTw,
+    )
+}
+
+/// mpv 的同步設定是預設值（一般播放）
 fn sync_options_untouched(h: &Harness<'_, VitascopeApp>) {
     for name in ["video-sync", "display-fps-override"] {
         let default = prop(h, &format!("option-info/{name}/default-value"));
@@ -2726,15 +2770,39 @@ fn sync_options_untouched(h: &Harness<'_, VitascopeApp>) {
     assert!(!h.state().player().state.display_sync_active);
 }
 
+/// 等到 mpv 用這個更新率依螢幕同步
+fn wait_display_sync(h: &mut Harness<'_, VitascopeApp>, override_prefix: &str) {
+    step_until_app(h, &format!("依 {override_prefix} Hz 同步"), |app| {
+        let p = app.player();
+        p.get_string("video-sync").is_ok_and(|v| v == "display-resample")
+            && p.get_string("display-fps-override")
+                .is_ok_and(|v| v.starts_with(override_prefix))
+            && p.state.display_sync_active
+    });
+}
+
+/// 等到 mpv 改回一般播放（音訊同步）
+fn wait_audio_sync(h: &mut Harness<'_, VitascopeApp>, what: &str) {
+    step_until_app(h, what, |app| {
+        let p = app.player();
+        p.get_string("video-sync").is_ok_and(|v| v == "audio")
+            && p.get_f64("display-fps-override").is_ok_and(|v| v == 0.0)
+            && !p.state.display_sync_active
+    });
+}
+
+fn open_playback_settings(h: &mut Harness<'_, VitascopeApp>, page: &str) {
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label(page).click();
+    h.run_steps(2);
+}
+
 #[test]
 fn pacing_status_with_fake_probe() {
-    let mut h = playing_with_platform(
-        Some(FakePlatform {
-            hz: Some(119.88),
-            power: PowerSource::Ac,
-        }),
-        SmoothMode::Auto,
-    );
+    // 打開流暢播放、螢幕 119.88 Hz：啟動時（開檔之前）就同步設定好，第一個檔案一開始就依螢幕同步
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Ac);
+    let mut h = playing_with_platform(Some(&fake), SmoothMode::Auto);
     let status = h.state().pacing_status().clone();
     assert_eq!(
         status.plan,
@@ -2746,44 +2814,38 @@ fn pacing_status_with_fake_probe() {
     );
     assert_eq!(status.refresh.map(|r| r.hz), Some(119.88));
     assert_eq!(status.power, PowerSource::Ac);
-    assert!(!status.applied);
-    assert_eq!(status.describe(), "可以使用：119.880 Hz（尚未啟用）");
-    sync_options_untouched(&h);
+    assert!(status.applied);
+    assert_eq!(prop(&h, "display-fps-override"), "119.880000");
+    assert_eq!(prop(&h, "video-sync"), "display-resample");
+    wait_display_sync(&mut h, "119.88");
+    // 啟動時送的兩個設定之外沒有再送
+    assert_eq!(h.state().pacing_sets(), 2);
     // 開檔時通知了防呆（「跟不上」只算這個檔案）
     assert_eq!(h.state().pacing_guard_file(), 1);
-    // 媒體資訊面板的「播放流暢度」
+    // 媒體資訊面板的「播放流暢度」：mpv 回報每格幾次更新、影片速度修正
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
     h.run_steps(2);
     h.get_by_label_contains("播放流暢度");
     h.get_by_label_contains("螢幕更新率：119.880 Hz（QueryDisplayConfig）");
     h.get_by_label_contains("電源：接上電源");
-    h.get_by_label_contains("流暢播放：可以使用：119.880 Hz");
-    sync_options_untouched(&h);
+    h.get_by_label_contains("流暢播放：使用中：119.880 Hz（每格");
+    h.get_by_label_contains("顯示同步：開 · 119.880 Hz");
+    h.get_by_label_contains("錯時 ");
 }
 
 #[test]
 fn fake_probe_battery() {
-    let h = playing_with_platform(
-        Some(FakePlatform {
-            hz: Some(119.88),
-            power: PowerSource::Battery,
-        }),
-        SmoothMode::Auto,
-    );
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Battery);
+    let h = playing_with_platform(Some(&fake), SmoothMode::Auto);
     let status = h.state().pacing_status();
     assert_eq!(status.plan, Some(Plan::Audio(Reason::Battery)), "{status:?}");
     assert_eq!(status.describe(), "未使用：使用電池中");
     sync_options_untouched(&h);
+    assert_eq!(h.state().pacing_sets(), 0);
     // 「一直開」：用電池也會用
-    let h = playing_with_platform(
-        Some(FakePlatform {
-            hz: Some(119.88),
-            power: PowerSource::Battery,
-        }),
-        SmoothMode::Always,
-    );
+    let mut h = playing_with_platform(Some(&fake), SmoothMode::Always);
     assert!(matches!(h.state().pacing_status().plan, Some(Plan::Display { .. })));
-    sync_options_untouched(&h);
+    wait_display_sync(&mut h, "119.88");
 }
 
 #[test]
@@ -2800,6 +2862,7 @@ fn no_probe_no_refresh() {
     assert_eq!(status.plan, Some(Plan::Audio(Reason::NoRefresh)), "{status:?}");
     assert_eq!(status.describe(), "未使用：偵測不到這個螢幕的更新率");
     sync_options_untouched(&h);
+    assert_eq!(h.state().pacing_sets(), 0);
     // 複製媒體資訊也有這幾行
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
     h.run_steps(2);
@@ -2817,39 +2880,32 @@ fn no_probe_no_refresh() {
     assert!(
         copied.contains("播放流暢度")
             && copied.contains("螢幕更新率：偵測不到")
-            && copied.contains("流暢播放：未使用：偵測不到這個螢幕的更新率"),
+            && copied.contains("流暢播放：未使用：偵測不到這個螢幕的更新率")
+            && copied.contains("顯示同步：關"),
         "{copied}"
     );
 }
 
 #[test]
 fn pacing_status_in_english() {
-    let mut settings = Settings::default();
-    settings.auto_next = false;
-    settings.smooth = SmoothMode::Auto;
-    settings.language = vitascope::i18n::Lang::En;
-    let mut h = harness_launch(
-        Launch {
-            files: vec![sample("common/mkv_multitrack.mkv")],
-            platform: Some(Box::new(FakePlatform {
-                hz: None,
-                power: PowerSource::Unknown,
-            })),
-            ..Default::default()
-        },
-        settings,
+    let fake = FakePlatform::new(None, PowerSource::Unknown);
+    let mut h = playing_smooth(
+        Some(&fake),
+        SmoothMode::Auto,
+        "common/mkv_multitrack.mkv",
+        vitascope::i18n::Lang::En,
     );
-    step_until(&mut h, "開始播放", |s| s.loaded && s.time_pos > 0.0);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
     h.run_steps(3);
     h.get_by_label_contains("Smoothness");
     h.get_by_label_contains("Refresh rate: not detected");
     h.get_by_label_contains("Power: Unknown (treated as plugged in)");
     h.get_by_label_contains("Smooth playback: Not in use: can't detect this screen's refresh rate");
+    h.get_by_label_contains("Display sync: off");
 }
 
 #[test]
-fn user_sync_options_stand_down() {
+fn smooth_env_override_stands_down() {
     // VITASCOPE_MPV_OPTS（Options.extra）自己指定了同步方式或更新率：流暢播放完全不管，使用者的值留著
     for (name, value) in [("video-sync", "desync"), ("display-fps-override", "59.940000")] {
         let mut settings = Settings::default();
@@ -2857,15 +2913,13 @@ fn user_sync_options_stand_down() {
         settings.smooth = SmoothMode::Auto;
         let mut h = harness_launch_with(
             Options {
-                extra: vec![(name.into(), value.into())],
+                keep_open: true,
+                extra: vec![(name.into(), value.into()), ("vo-null-fps".into(), "119.88".into())],
                 ..Options::headless()
             },
             Launch {
                 files: vec![sample("common/mkv_multitrack.mkv")],
-                platform: Some(Box::new(FakePlatform {
-                    hz: Some(119.88),
-                    power: PowerSource::Ac,
-                })),
+                platform: Some(Box::new(FakePlatform::new(Some(119.88), PowerSource::Ac))),
                 ..Default::default()
             },
             settings,
@@ -2873,10 +2927,420 @@ fn user_sync_options_stand_down() {
         step_until(&mut h, "開始播放", |s| {
             s.loaded && s.time_pos > 0.0 && !s.tracks.is_empty()
         });
-        h.run_steps(3);
+        wait_real(&mut h, 0.8);
         let status = h.state().pacing_status();
         assert_eq!(status.plan, Some(Plan::Untouched), "{name}：{status:?}");
         assert_eq!(status.describe(), "已由 VITASCOPE_MPV_OPTS 指定");
         assert_eq!(prop(&h, name), value, "{name}");
+        assert_eq!(h.state().pacing_sets(), 0, "{name}：一個設定都不送");
+        // 選單、設定頁的選項停用
+        h.get_by_label("影片畫面").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("畫質 ⏵").hover();
+        h.run_steps(3);
+        let item = h.get_by_label("流暢播放（已由 VITASCOPE_MPV_OPTS 指定）");
+        assert!(item.accesskit_node().is_disabled(), "{name}");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        open_playback_settings(&mut h, "播放");
+        assert!(
+            h.get_by_label("流暢播放（對齊螢幕更新率）")
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+        assert_eq!(prop(&h, name), value, "{name}");
     }
+}
+
+#[test]
+fn smooth_pacing_off_stands_down() {
+    // VITASCOPE_PACING=off（main.rs 啟動時讀進 Launch.pacing）：設定打開了也不動 mpv 的同步設定
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.smooth = SmoothMode::Auto;
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![("vo-null-fps".into(), "119.88".into())],
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            platform: Some(Box::new(FakePlatform::new(Some(119.88), PowerSource::Ac))),
+            pacing: vitascope::pacing::parse_overrides(Some("off")),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "開始播放", |s| {
+        s.loaded && s.time_pos > 0.0 && !s.tracks.is_empty()
+    });
+    wait_real(&mut h, 0.8);
+    let status = h.state().pacing_status();
+    assert_eq!(status.plan, Some(Plan::Untouched), "{status:?}");
+    assert_eq!(status.describe(), "未使用：已由 VITASCOPE_PACING=off 關閉");
+    assert_eq!(h.state().pacing_sets(), 0);
+    sync_options_untouched(&h);
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("畫質 ⏵").hover();
+    h.run_steps(3);
+    assert!(
+        h.get_by_label("流暢播放（VITASCOPE_PACING=off）")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn smooth_default_off_changes_nothing() {
+    // 預設設定（關）：就算查得到 119.88 Hz、有影像，mpv 的同步設定一個都不送
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Ac);
+    let mut h = playing_with_platform(Some(&fake), SmoothMode::default());
+    assert_eq!(h.state().settings().smooth, SmoothMode::Off);
+    wait_real(&mut h, 1.0);
+    // 換螢幕更新率、拔掉電源也一樣
+    fake.set(&mut h, |f| f.hz = Some(60.0));
+    wait_real(&mut h, 0.6);
+    fake.set(&mut h, |f| f.power = PowerSource::Battery);
+    wait_real(&mut h, 0.6);
+    assert_eq!(h.state().pacing_sets(), 0);
+    assert_eq!(h.state().pacing_status().plan, Some(Plan::Audio(Reason::Setting)));
+    sync_options_untouched(&h);
+}
+
+#[test]
+fn smooth_follows_platform_probe() {
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Ac);
+    let mut h = playing_with_platform(Some(&fake), SmoothMode::Auto);
+    wait_display_sync(&mut h, "119.88");
+    assert!(
+        h.state().pacing_status().describe().starts_with("使用中：119.880 Hz"),
+        "{}",
+        h.state().pacing_status().describe()
+    );
+
+    // 拔掉電源（使用電池時暫停）：馬上改回一般播放，提示
+    fake.set(&mut h, |f| f.power = PowerSource::Battery);
+    step_until_app(&mut h, "提示使用電池", |app| {
+        app.osd_text() == Some("使用電池：流暢播放暫停（省電）")
+    });
+    wait_audio_sync(&mut h, "使用電池：改回音訊同步");
+    assert_eq!(h.state().pacing_status().plan, Some(Plan::Audio(Reason::Battery)));
+
+    // 接上電源：0.5 秒後恢復，提示
+    fake.set(&mut h, |f| f.power = PowerSource::Ac);
+    let asked = Instant::now();
+    h.run_steps(5);
+    // 慢的電腦上這幾幀可能就超過 0.5 秒了，那時不檢查
+    if asked.elapsed() < Duration::from_millis(400) {
+        assert_eq!(prop(&h, "video-sync"), "audio", "要先維持 0.5 秒");
+        assert!(h.state().pacing_status().describe().starts_with("準備中"));
+    }
+    step_until_app(&mut h, "提示接上電源", |app| {
+        app.osd_text() == Some("接上電源：流暢播放恢復")
+    });
+    wait_display_sync(&mut h, "119.88");
+
+    // 設定頁：用電池時也開（一直開）
+    fake.set(&mut h, |f| f.power = PowerSource::Battery);
+    wait_audio_sync(&mut h, "使用電池");
+    open_playback_settings(&mut h, "播放");
+    h.get_by_label_contains("未使用：使用電池中");
+    h.get_by_label("使用電池時暫停（省電）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().smooth, SmoothMode::Always);
+    wait_display_sync(&mut h, "119.88");
+    h.run_steps(2);
+    h.get_by_label_contains("使用中：119.880 Hz");
+    // 是設定改的、還在用電池：不能提示「接上電源」
+    assert_ne!(h.state().osd_text(), Some("接上電源：流暢播放恢復"));
+
+    // 查不到更新率
+    fake.set(&mut h, |f| f.hz = None);
+    wait_audio_sync(&mut h, "查不到更新率");
+    h.run_steps(2);
+    h.get_by_label("未使用：偵測不到這個螢幕的更新率");
+    fake.set(&mut h, |f| f.hz = Some(119.88));
+    wait_display_sync(&mut h, "119.88");
+
+    // 設定頁關掉：馬上改回一般播放
+    h.get_by_label("流暢播放（對齊螢幕更新率）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().smooth, SmoothMode::Off);
+    wait_audio_sync(&mut h, "關掉流暢播放");
+    h.get_by_label("未使用：設定為關閉");
+    // 「使用電池時暫停」跟著停用
+    assert!(h.get_by_label("使用電池時暫停（省電）").accesskit_node().is_disabled());
+
+    // 再打開（使用電池時暫停預設勾著）、播純音訊檔：沒有影像，一般播放
+    h.get_by_label("流暢播放（對齊螢幕更新率）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().smooth, SmoothMode::Auto);
+    fake.set(&mut h, |f| f.power = PowerSource::Ac);
+    wait_display_sync(&mut h, "119.88");
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until(&mut h, "播放純音訊檔", |s| playing(s, "audio_flac.flac"));
+    step_until_app(&mut h, "純音訊檔：一般播放", |app| {
+        app.pacing_status().plan == Some(Plan::Audio(Reason::NoVideo))
+            && app.player().get_string("video-sync").is_ok_and(|v| v == "audio")
+    });
+}
+
+#[test]
+fn picture_menu_has_smooth_checkbox() {
+    // 沒開檔也能用（整個程式共用的設定）
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Ac);
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![("vo-null-fps".into(), "119.88".into())],
+            ..Options::headless()
+        },
+        Launch {
+            platform: Some(Box::new(fake.clone())),
+            ..Default::default()
+        },
+        Settings::default(),
+    );
+    h.run_steps(3);
+    let open_menu = |h: &mut Harness<'_, VitascopeApp>| {
+        // 起始畫面中間是提示文字：在左上角按右鍵
+        let corner = egui::pos2(40.0, 40.0);
+        h.event(egui::Event::PointerMoved(corner));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: corner,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        h.run_steps(2);
+        // 「畫質」緊接在「畫面」後面
+        let view = h.get_by_label("畫面 ⏵").rect();
+        let picture = h.get_by_label("畫質 ⏵");
+        assert!(picture.rect().top() >= view.bottom() - 1.0);
+        assert!(!picture.accesskit_node().is_disabled(), "沒開檔也能用");
+        picture.hover();
+        h.run_steps(3);
+    };
+    open_menu(&mut h);
+    h.get_by_label("流暢播放（119.88 Hz）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().smooth, SmoothMode::Auto);
+    assert_eq!(h.state().osd_text(), Some("流暢播放：開（119.88 Hz）"));
+    // 沒有檔案時也先套用（0.5 秒後），開檔就是同步的
+    step_until_app(&mut h, "套用", |app| {
+        app.player()
+            .get_string("video-sync")
+            .is_ok_and(|v| v == "display-resample")
+    });
+    // 再點一次：關
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_menu(&mut h);
+    h.get_by_label("流暢播放（119.88 Hz）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().smooth, SmoothMode::Off);
+    assert_eq!(h.state().osd_text(), Some("流暢播放：關"));
+    // 關掉馬上生效（不等 0.5 秒）：已經送出改回音訊同步。mpv 那邊是非同步設定，等它做完再讀
+    let status = h.state().pacing_status();
+    assert!(
+        status.applied && status.plan == Some(Plan::Audio(Reason::Setting)),
+        "{status:?}"
+    );
+    wait_audio_sync(&mut h, "關掉流暢播放");
+    // 使用電池：選單上寫「暫停」
+    fake.set(&mut h, |f| f.power = PowerSource::Battery);
+    h.run_steps(2);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_menu(&mut h);
+    h.get_by_label("流暢播放（119.88 Hz）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("流暢播放：開（使用電池，暫停）"));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_menu(&mut h);
+    h.get_by_label("流暢播放（使用電池，暫停）");
+}
+
+#[test]
+fn settings_playback_page_smooth_section() {
+    for (lang, page, on, battery, status) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            "播放",
+            "流暢播放（對齊螢幕更新率）",
+            "使用電池時暫停（省電）",
+            "未使用：設定為關閉",
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            "Playback",
+            "Smooth playback (match the screen's refresh rate)",
+            "Pause on battery (saves power)",
+            "Not in use: turned off in Settings",
+        ),
+    ] {
+        let mut settings = Settings::default();
+        settings.language = lang;
+        let mut h = harness_with(None, settings);
+        h.step();
+        open_playback_settings(&mut h, page);
+        assert!(!h.get_by_label(on).accesskit_node().is_disabled());
+        assert!(h.get_by_label(battery).accesskit_node().is_disabled(), "流暢播放關著");
+        h.get_by_label(status);
+        // 打開：沒有螢幕資訊（自動測試）
+        h.get_by_label(on).click();
+        h.run_steps(2);
+        assert_eq!(h.state().settings().smooth, SmoothMode::Auto);
+        assert!(!h.get_by_label(battery).accesskit_node().is_disabled());
+        h.get_by_label_contains(if lang == vitascope::i18n::Lang::En {
+            "can't detect this screen's refresh rate"
+        } else {
+            "偵測不到這個螢幕的更新率"
+        });
+        assert_eq!(h.state().pacing_sets(), 0);
+    }
+}
+
+#[test]
+fn smooth_apply_failure_falls_back() {
+    // mpv 不接受流暢播放的設定（這裡用不合理的更新率）：提示、這次執行改用一般播放，改了設定才再試
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Ac);
+    let mut h = playing_with_platform(Some(&fake), SmoothMode::Auto);
+    wait_display_sync(&mut h, "119.88");
+    fake.set(&mut h, |f| f.hz = Some(-5.0));
+    step_until_app(&mut h, "設定失敗，改回一般播放", |app| {
+        app.pacing_status().plan == Some(Plan::Audio(Reason::ApplyFailed))
+            && app.player().get_string("video-sync").is_ok_and(|v| v == "audio")
+    });
+    assert!(
+        h.state()
+            .osd_text()
+            .is_some_and(|t| t.starts_with("無法套用 display-fps-override：")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    // 恢復正常的更新率也不再試（這次執行）
+    fake.set(&mut h, |f| f.hz = Some(119.88));
+    wait_real(&mut h, 0.8);
+    assert_eq!(prop(&h, "video-sync"), "audio");
+    assert_eq!(h.state().pacing_status().plan, Some(Plan::Audio(Reason::ApplyFailed)));
+    // 改了設定（關掉再打開）：重新來過
+    open_playback_settings(&mut h, "播放");
+    h.get_by_label("流暢播放（對齊螢幕更新率）").click();
+    h.run_steps(2);
+    h.get_by_label("流暢播放（對齊螢幕更新率）").click();
+    h.run_steps(2);
+    wait_display_sync(&mut h, "119.88");
+}
+
+#[test]
+fn smooth_sets_options_in_order() {
+    // 打開時先設更新率再換同步方式（不會有一瞬間用錯的更新率同步）；關掉時先換回音訊同步。
+    // 送出的順序看 mpv 的紀錄檔（每個 Set property 一行）
+    let dir = TempDir::new("smooth-order");
+    let log = dir.0.join("mpv.log");
+    let fake = FakePlatform::new(Some(119.88), PowerSource::Battery);
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.smooth = SmoothMode::Auto;
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![
+                ("vo-null-fps".into(), "119.88".into()),
+                ("log-file".into(), log.to_string_lossy().into_owned()),
+            ],
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            platform: Some(Box::new(fake.clone())),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "開始播放", |s| {
+        s.loaded && !s.paused && s.time_pos > 0.0 && !s.tracks.is_empty()
+    });
+    // 用電池：啟動時是一般播放，什麼都沒送；接上電源後由每一幀的套用（非同步）打開、再拔掉關掉
+    assert_eq!(h.state().pacing_sets(), 0);
+    fake.set(&mut h, |f| f.power = PowerSource::Ac);
+    wait_display_sync(&mut h, "119.88");
+    fake.set(&mut h, |f| f.power = PowerSource::Battery);
+    wait_audio_sync(&mut h, "使用電池：改回音訊同步");
+    assert_eq!(h.state().pacing_sets(), 4);
+    let sets = || -> Vec<String> {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_once("Set property: ").map(|(_, rest)| rest))
+            .filter(|rest| rest.starts_with("video-sync=") || rest.starts_with("display-fps-override="))
+            .map(|rest| rest.split(" -> ").next().unwrap_or(rest).replace('"', ""))
+            .collect()
+    };
+    // mpv 寫紀錄檔有延遲
+    let start = Instant::now();
+    while sets().len() < 4 && start.elapsed() < TIMEOUT {
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        sets(),
+        vec![
+            "display-fps-override=119.880000",
+            "video-sync=display-resample",
+            "video-sync=audio",
+            "display-fps-override=0",
+        ]
+    );
+}
+
+#[test]
+fn smooth_passthrough_drops_frames() {
+    // 音訊直通（ao=null 也接受 spdif）：聲音不能變速，改用略過或重複影格對齊螢幕
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.smooth = SmoothMode::Auto;
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![
+                ("vo-null-fps".into(), "119.88".into()),
+                ("audio-spdif".into(), "ac3".into()),
+            ],
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mkv_hevc_ac3.mkv")],
+            platform: Some(Box::new(FakePlatform::new(Some(119.88), PowerSource::Ac))),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "音訊直通播放中", |s| {
+        s.loaded && s.time_pos > 0.0 && s.audio_spdif.as_deref() == Some("ac3")
+    });
+    step_until_app(&mut h, "改用 display-vdrop", |app| {
+        let p = app.player();
+        p.get_string("video-sync").is_ok_and(|v| v == "display-vdrop")
+            && p.get_string("display-fps-override")
+                .is_ok_and(|v| v.starts_with("119.88"))
+    });
+    let status = h.state().pacing_status();
+    assert_eq!(
+        status.plan,
+        Some(Plan::Display {
+            hz: 119.88,
+            vdrop: true
+        }),
+        "{status:?}"
+    );
+    assert!(status.applied);
+    assert_eq!(status.describe(), "音訊直通中：以略過或重複影格對齊螢幕");
 }
