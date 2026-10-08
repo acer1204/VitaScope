@@ -19,7 +19,7 @@ const KEY_POLL: Duration = Duration::from_millis(500);
 const RECT_SETTLE: Duration = Duration::from_millis(300);
 /// 沒有任何變化也每隔這麼久重查一次（在系統設定改了更新率）
 const REQUERY: Duration = Duration::from_secs(5);
-/// 多久查一次電源、遠端桌面
+/// 多久查一次電源（只有「使用電池時暫停」才查）、遠端桌面
 const POWER_POLL: Duration = Duration::from_secs(10);
 /// 改成依螢幕同步之前，做法要先維持這麼久不變（拖曳到別的螢幕、開檔的空檔不會來回切換）；
 /// 改回一般播放馬上做
@@ -38,8 +38,23 @@ pub trait PlatformProbe {
     /// 視窗在哪個螢幕上（只用來比較有沒有換螢幕）
     fn monitor_key(&self) -> Option<u64>;
     fn power(&self) -> PowerSource;
+    /// 在背景查電源（Linux 讀 sysfs 可能要等 ACPI，不能在介面的執行緒上做）：開始查、回傳 true，
+    /// 查好的結果由 `power_update` 送來。回傳 false = 這個平台直接用 `power` 查（很快）
+    fn start_power(&self) -> bool {
+        false
+    }
+    /// 背景查的電源查好了：結果（每一幀問一次，不能等）
+    fn power_update(&self) -> Option<PowerSource> {
+        None
+    }
     /// 遠端桌面連線中
     fn remote_session(&self) -> bool;
+}
+
+/// 這一幀要不要查電源：只有「使用電池時暫停」（Auto）會用到電源；剛改成它（`was_auto` 是 false）時馬上查，
+/// 之後每 `POWER_POLL` 一次
+fn power_due(mode: SmoothMode, was_auto: bool, last: Option<Instant>, now: Instant) -> bool {
+    mode == SmoothMode::Auto && (!was_auto || last.is_none_or(|t| now.saturating_duration_since(t) >= POWER_POLL))
 }
 
 /// 問作業系統（主視窗的 handle）
@@ -48,14 +63,25 @@ pub(super) struct RealProbe {
     /// X11：自己的連線，留著重複用
     #[cfg(all(unix, not(target_os = "macos")))]
     x11: screens::X11Probe,
+    /// Linux：電源在背景執行緒讀 sysfs（可能要等 ACPI），查好之後要介面重畫一次來拿結果
+    #[cfg(all(unix, not(target_os = "macos")))]
+    power: power::Background,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    repaint: egui::Context,
 }
 
 impl RealProbe {
-    pub(super) fn new(window: RawWindowHandle) -> Self {
+    pub(super) fn new(window: RawWindowHandle, ctx: &egui::Context) -> Self {
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        let _ = ctx;
         Self {
             window,
             #[cfg(all(unix, not(target_os = "macos")))]
             x11: screens::X11Probe::default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            power: power::Background::default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            repaint: ctx.clone(),
         }
     }
 }
@@ -87,6 +113,31 @@ impl PlatformProbe for RealProbe {
         power::source()
     }
 
+    /// Linux 在背景查；Windows（GetSystemPowerStatus）、macOS（IOPSGetTimeRemainingEstimate）很快，直接問
+    fn start_power(&self) -> bool {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let ctx = self.repaint.clone();
+            self.power.start(power::source, move || ctx.request_repaint());
+            true
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            false
+        }
+    }
+
+    fn power_update(&self) -> Option<PowerSource> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.power.take()
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            None
+        }
+    }
+
     fn remote_session(&self) -> bool {
         screens::remote_session()
     }
@@ -108,6 +159,8 @@ pub struct PacingStatus {
     pub plan: Option<Plan>,
     pub refresh: Option<Refresh>,
     pub power: PowerSource,
+    /// 有查電源（只有「使用電池時暫停」才查；沒查時媒體資訊不列電源）
+    pub power_known: bool,
     /// 做法已經套用到 mpv（依螢幕同步要先維持 0.5 秒不變才套用）
     pub applied: bool,
     /// mpv 正在依螢幕同步
@@ -162,11 +215,12 @@ impl PacingStatus {
             ),
             None => crate::tr!("螢幕更新率：偵測不到", "Refresh rate: not detected").to_owned(),
         };
-        vec![
-            refresh,
-            crate::tf!("電源：{}", "Power: {}", self.power.label()),
-            crate::tf!("流暢播放：{}", "Smooth playback: {}", self.describe()),
-        ]
+        let mut lines = vec![refresh];
+        if self.power_known {
+            lines.push(crate::tf!("電源：{}", "Power: {}", self.power.label()));
+        }
+        lines.push(crate::tf!("流暢播放：{}", "Smooth playback: {}", self.describe()));
+        lines
     }
 }
 
@@ -314,6 +368,10 @@ pub(super) struct PacingCtl {
     /// 在設定頁改「使用電池時暫停」造成的切換不算
     power_changed: bool,
     remote: bool,
+    /// 現在的電源是這次「使用電池時暫停」期間查到的（剛改成它、還沒查到時不算：第一次查到不提示「接上電源」之類）
+    power_known: bool,
+    /// 上一幀的設定是「使用電池時暫停」（剛改成它時馬上查電源）
+    power_auto: bool,
     guard: Guard,
     /// mpv 不接受設定：這次執行不再試（改設定時重來）
     apply_failed: bool,
@@ -333,6 +391,7 @@ pub(super) struct PacingCtl {
     key_polled: Option<Instant>,
     refresh_queried: Option<Instant>,
     power_polled: Option<Instant>,
+    remote_polled: Option<Instant>,
     rect: Option<egui::Rect>,
     /// 視窗最後一次移動、改大小的時間（停下來之後重查更新率）
     rect_moved: Option<Instant>,
@@ -368,6 +427,8 @@ impl PacingCtl {
             power: PowerSource::Unknown,
             power_changed: false,
             remote: false,
+            power_known: false,
+            power_auto: false,
             guard: Guard::default(),
             apply_failed: false,
             status: PacingStatus {
@@ -382,6 +443,7 @@ impl PacingCtl {
             key_polled: None,
             refresh_queried: None,
             power_polled: None,
+            remote_polled: None,
             rect: None,
             rect_moved: None,
             fullscreen: None,
@@ -415,6 +477,23 @@ impl PacingCtl {
         self.power_changed = false;
     }
 
+    /// 使用者改了流暢播放的設定（`setting_changed` 之外）：改成「使用電池時暫停」時馬上查電源，
+    /// 選單、提示上的說明才會照現在的電源（其他設定不查電源）；在背景查的平台（Linux）開始查
+    pub(super) fn smooth_changed(&mut self, mode: SmoothMode, now: Instant) {
+        self.setting_changed();
+        let auto = mode == SmoothMode::Auto;
+        if auto && !self.power_auto {
+            // 之前查到的不算（可能是很久以前的）：在背景查的平台查好之前當成不知道（跟還沒查過一樣）
+            self.forget_power();
+            self.power_polled = Some(now);
+            let power = self.probe.as_ref().filter(|p| !p.start_power()).map(|p| p.power());
+            if let Some(power) = power {
+                self.got_power(power);
+            }
+        }
+        self.power_auto = auto;
+    }
+
     /// mpv 回覆 video-sync / display-fps-override 設定失敗：這次執行改用一般播放
     pub(super) fn apply_failed(&mut self) {
         if !self.apply_failed {
@@ -428,6 +507,7 @@ impl PacingCtl {
         self.key_polled = None;
         self.refresh_queried = None;
         self.power_polled = None;
+        self.remote_polled = None;
     }
 
     /// 啟動時（還沒開檔）就決定：已經要依螢幕同步的話回傳要同步設定的選項，第一個檔案一開始就同步。
@@ -436,9 +516,15 @@ impl PacingCtl {
         if let Some(p) = &self.probe {
             self.monitor_key = p.monitor_key();
             self.refresh = p.refresh_rate();
-            self.power = p.power();
+            // 電源只有「使用電池時暫停」會用到。啟動時還沒開始播放，在背景查的平台（Linux）也在這裡直接查一次：
+            // 不然用電池時第一個檔案會先依螢幕同步、過一下又改回一般播放
+            if mode == SmoothMode::Auto {
+                self.power = p.power();
+                self.power_known = true;
+            }
             self.remote = p.remote_session();
         }
+        self.power_auto = mode == SmoothMode::Auto;
         let inputs = Inputs {
             mode,
             power: self.power,
@@ -462,6 +548,7 @@ impl PacingCtl {
         self.status.plan = Some(plan);
         self.status.refresh = self.refresh;
         self.status.power = self.power;
+        self.status.power_known = self.power_known && self.power_auto;
         let send = rules::transition(self.applied.as_ref(), &plan);
         self.applied = Some(plan);
         self.status.applied = true;
@@ -488,6 +575,8 @@ impl PacingCtl {
         // 改設定時「沒等垂直同步」「mpv 不接受」會重來，用現在的
         let inputs = Inputs {
             mode,
+            // 剛改成「使用電池時暫停」時才查到的電源（見 `smooth_changed`）
+            power: self.power,
             guard: self.guard.state(),
             apply_failed: self.apply_failed,
             ..self.last_inputs?
@@ -548,18 +637,33 @@ impl PacingCtl {
                 self.refresh = refresh;
             }
         }
-        if due(self.power_polled, POWER_POLL) {
-            self.power_polled = Some(now);
+        if due(self.remote_polled, POWER_POLL) {
+            self.remote_polled = Some(now);
             if let Some(p) = &self.probe {
-                let (power, remote) = (p.power(), p.remote_session());
-                if (power, remote) != (self.power, self.remote) && rules::debug() {
-                    eprintln!("[vitascope] 流暢播放：電源 {power:?}、遠端桌面 {remote}");
+                let remote = p.remote_session();
+                if remote != self.remote && rules::debug() {
+                    eprintln!("[vitascope] 流暢播放：遠端桌面 {remote}");
                 }
-                if power != self.power {
-                    self.power_changed = true;
-                }
-                self.power = power;
                 self.remote = remote;
+            }
+        }
+        // 電源只有「使用電池時暫停」會用到：其他設定不查（Linux 讀 sysfs 可能要等 ACPI）。
+        // 剛改成它時馬上查，之前查到的不算（可能是很久以前的）
+        let auto = snap.mode == SmoothMode::Auto;
+        if auto && !self.power_auto {
+            self.forget_power();
+        }
+        let poll = power_due(snap.mode, self.power_auto, self.power_polled, now);
+        self.power_auto = auto;
+        if let Some(p) = &self.probe {
+            let polled = (poll && !p.start_power()).then(|| p.power());
+            // 背景查的（Linux）查好了
+            let update = p.power_update().filter(|_| auto);
+            if poll {
+                self.power_polled = Some(now);
+            }
+            for power in polled.into_iter().chain(update) {
+                self.got_power(power);
             }
         }
         // 換螢幕、換更新率：之前量到的結果不算
@@ -622,9 +726,28 @@ impl PacingCtl {
         self.status.applied = rules::transition(self.applied.as_ref(), &plan).is_empty();
         self.status.refresh = self.refresh;
         self.status.power = self.power;
+        self.status.power_known = self.power_known && auto;
         self.status.sync_active = snap.display_sync_active;
         self.status.loaded = snap.loaded;
         tick
+    }
+
+    /// 剛改成「使用電池時暫停」：之前查到的電源不算，查到之前當成不知道（規劃、選單的說明都不用舊的）
+    fn forget_power(&mut self) {
+        self.power_known = false;
+        self.power = PowerSource::Unknown;
+    }
+
+    /// 查到電源：接上、拔掉了的話記下來（提示用）。剛開始查（之前查到的不算）時第一個結果不算變了
+    fn got_power(&mut self, power: PowerSource) {
+        if power != self.power && rules::debug() {
+            eprintln!("[vitascope] 流暢播放：電源 {power:?}");
+        }
+        if power != self.power && self.power_known {
+            self.power_changed = true;
+        }
+        self.power = power;
+        self.power_known = true;
     }
 
     /// 跟目前套用的做法比：改回一般播放馬上送；改成依螢幕同步要先維持 0.5 秒不變
@@ -714,7 +837,7 @@ impl VitascopeApp {
             return;
         }
         self.settings.smooth = mode;
-        self.pacing.setting_changed();
+        self.pacing.smooth_changed(mode, Instant::now());
         self.save_settings();
     }
 
@@ -1172,6 +1295,186 @@ mod tests {
         ctl.tick(at(t, 20_000), &v, &snap());
         assert_eq!(ctl.status().plan, Some(Plan::Audio(Reason::RemoteSession)));
         assert_eq!(calls(&fake)[2], 3);
+    }
+
+    #[test]
+    fn power_is_polled_only_for_auto() {
+        let t = Instant::now();
+        // 純函式：只有 Auto 查；剛改成 Auto 馬上查，之後每 10 秒
+        for mode in [SmoothMode::Off, SmoothMode::Always] {
+            assert!(!power_due(mode, false, None, t), "{mode:?}");
+            assert!(!power_due(mode, true, None, t), "{mode:?}");
+        }
+        assert!(power_due(SmoothMode::Auto, true, None, t), "還沒查過");
+        assert!(power_due(SmoothMode::Auto, false, Some(t), at(t, 16)), "剛改成 Auto");
+        assert!(!power_due(SmoothMode::Auto, true, Some(t), at(t, 9_999)));
+        assert!(power_due(SmoothMode::Auto, true, Some(t), at(t, 10_000)));
+
+        // 接起來：預設的「關」、「一直開」都不查電源（Linux 讀 sysfs 會卡介面）
+        let (mut ctl, fake) = setup(Fake {
+            hz: Some(120.0),
+            key: Some(1),
+            power: PowerSource::Battery,
+            ..Default::default()
+        });
+        assert!(ctl.startup(SmoothMode::Off, false).is_empty());
+        let power_calls = |f: &Rc<RefCell<Fake>>| f.borrow().calls[2];
+        let off = Snapshot {
+            mode: SmoothMode::Off,
+            ..snap()
+        };
+        let always = Snapshot {
+            mode: SmoothMode::Always,
+            ..snap()
+        };
+        for ms in (0..30_000).step_by(500) {
+            ctl.tick(at(t, ms), &view(), if ms < 15_000 { &off } else { &always });
+        }
+        assert_eq!(power_calls(&fake), 0, "關、一直開都不查電源");
+        assert!(
+            !ctl.status().info_lines().iter().any(|l| l.starts_with("電源")),
+            "沒查過：媒體資訊不列電源"
+        );
+        // 改成「使用電池時暫停」：這一幀就查，馬上暫停
+        ctl.setting_changed();
+        ctl.tick(at(t, 30_016), &view(), &snap());
+        assert_eq!(power_calls(&fake), 1);
+        assert_eq!(ctl.status().plan, Some(Plan::Audio(Reason::Battery)));
+        assert!(ctl.status().info_lines().contains(&"電源：使用電池".to_owned()));
+        ctl.tick(at(t, 30_032), &view(), &snap());
+        assert_eq!(power_calls(&fake), 1, "之後每 10 秒");
+        ctl.tick(at(t, 40_016), &view(), &snap());
+        assert_eq!(power_calls(&fake), 2);
+        // 改回關又改成 Auto：之前查到的不算，第一次查到的不當成「接上電源」
+        ctl.tick(at(t, 40_100), &view(), &off);
+        fake.borrow_mut().power = PowerSource::Ac;
+        ctl.setting_changed();
+        ctl.tick(at(t, 40_200), &view(), &snap());
+        assert_eq!(power_calls(&fake), 3, "剛改成 Auto 馬上查");
+        assert!(!ctl.power_changed, "不是拔掉、接上電源造成的");
+        assert!(ctl.status().plan.is_some_and(|p| p.is_display()));
+    }
+
+    /// Linux 的做法：電源在背景查，`start_power` 只是開始，結果之後由 `power_update` 送來。
+    /// 只有啟動時（還沒開始播放）可以直接查：`sync` 給一次結果，之後再直接查就 panic
+    #[derive(Default)]
+    struct Background {
+        /// 開始在背景查的次數
+        starts: u32,
+        /// 背景查好的結果（下一幀拿走）
+        result: Option<PowerSource>,
+        /// 允許直接查一次的結果
+        sync: Option<PowerSource>,
+    }
+
+    struct BackgroundProbe(Rc<RefCell<Background>>);
+
+    impl PlatformProbe for BackgroundProbe {
+        fn refresh_rate(&self) -> Option<Refresh> {
+            Some(Refresh {
+                hz: 120.0,
+                source: RefreshSource::DisplayConfig,
+            })
+        }
+        fn monitor_key(&self) -> Option<u64> {
+            Some(1)
+        }
+        fn power(&self) -> PowerSource {
+            self.0
+                .borrow_mut()
+                .sync
+                .take()
+                .expect("在背景查的平台只有啟動時可以在介面的執行緒上查電源")
+        }
+        fn start_power(&self) -> bool {
+            self.0.borrow_mut().starts += 1;
+            true
+        }
+        fn power_update(&self) -> Option<PowerSource> {
+            self.0.borrow_mut().result.take()
+        }
+        fn remote_session(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn background_power_arrives_later() {
+        let fake = Rc::new(RefCell::new(Background {
+            sync: Some(PowerSource::Battery),
+            ..Default::default()
+        }));
+        let mut ctl = PacingCtl::new(
+            Some(Box::new(BackgroundProbe(fake.clone()))),
+            false,
+            Overrides::default(),
+        );
+        // 啟動時（還沒播放）直接查一次：用電池的話第一個檔案就是一般播放，不會先同步再改回來
+        assert!(ctl.startup(SmoothMode::Auto, false).is_empty());
+        assert_eq!(ctl.status().plan, Some(Plan::Audio(Reason::Battery)));
+        assert_eq!(fake.borrow().starts, 0);
+        assert!(fake.borrow().sync.is_none());
+        // 播放中在背景查：第一幀開始查，結果之後才到
+        let t = Instant::now();
+        ctl.tick(t, &view(), &snap());
+        assert_eq!(fake.borrow().starts, 1);
+        assert_eq!(ctl.status().plan, Some(Plan::Audio(Reason::Battery)));
+        fake.borrow_mut().result = Some(PowerSource::Battery);
+        ctl.tick(at(t, 16), &view(), &snap());
+        assert!(!ctl.power_changed);
+        // 10 秒後再查一次；這次查到接上電源才算變了
+        ctl.tick(at(t, 10_000), &view(), &snap());
+        assert_eq!(fake.borrow().starts, 2, "第一幀、10 秒後");
+        fake.borrow_mut().result = Some(PowerSource::Ac);
+        ctl.tick(at(t, 10_016), &view(), &snap());
+        assert_eq!(ctl.status().power, PowerSource::Ac);
+        assert!(ctl.power_changed, "接上電源：之後提示");
+        // 拔掉電源（查到的是用電池）之後設定關掉：之後送來的結果不用，也不再查
+        fake.borrow_mut().result = Some(PowerSource::Battery);
+        ctl.tick(at(t, 20_000), &view(), &snap());
+        assert_eq!(ctl.status().power, PowerSource::Battery);
+        let off = Snapshot {
+            mode: SmoothMode::Off,
+            ..snap()
+        };
+        ctl.smooth_changed(SmoothMode::Off, at(t, 20_100));
+        fake.borrow_mut().result = Some(PowerSource::Ac);
+        ctl.tick(at(t, 20_116), &view(), &off);
+        assert_eq!(ctl.status().power, PowerSource::Battery);
+        let starts = fake.borrow().starts;
+        ctl.tick(at(t, 40_000), &view(), &off);
+        assert_eq!(fake.borrow().starts, starts);
+        // 接上電源之後改成「使用電池時暫停」（選單、設定頁）：在背景開始查，不在介面的執行緒上查（會 panic）；
+        // 之前查到的「用電池」不算，查好之前當成不知道，不會先暫停
+        ctl.smooth_changed(SmoothMode::Auto, at(t, 40_100));
+        assert_eq!(fake.borrow().starts, starts + 1);
+        assert_ne!(
+            ctl.short_for(SmoothMode::Auto).as_deref(),
+            Some("使用電池，暫停"),
+            "選單的說明馬上不用舊的"
+        );
+        ctl.tick(at(t, 40_116), &view(), &snap());
+        assert_eq!(ctl.status().power, PowerSource::Unknown);
+        assert!(
+            ctl.status().plan.is_some_and(|p| p.is_display()),
+            "沒有用舊的「用電池」"
+        );
+        assert!(!ctl.status().info_lines().iter().any(|l| l.starts_with("電源")));
+        // 查好了：第一次查到的不算接上電源
+        fake.borrow_mut().result = Some(PowerSource::Ac);
+        ctl.tick(at(t, 40_132), &view(), &snap());
+        assert_eq!(ctl.status().power, PowerSource::Ac);
+        assert!(!ctl.power_changed);
+        // 不經過 smooth_changed 直接改成 Auto（例如另一個視窗改的設定）：一樣不用舊的「用電池」
+        fake.borrow_mut().result = Some(PowerSource::Battery);
+        ctl.tick(at(t, 40_148), &view(), &snap());
+        assert_eq!(ctl.status().plan, Some(Plan::Audio(Reason::Battery)));
+        ctl.tick(at(t, 40_200), &view(), &off);
+        let starts = fake.borrow().starts;
+        ctl.tick(at(t, 40_232), &view(), &snap());
+        assert_eq!(fake.borrow().starts, starts + 1, "剛改成 Auto 馬上開始查");
+        assert_eq!(ctl.status().power, PowerSource::Unknown);
+        assert!(ctl.status().plan.is_some_and(|p| p.is_display()));
     }
 
     #[test]
@@ -1805,8 +2108,12 @@ mod tests {
         fake.borrow_mut().power = PowerSource::Battery;
         ctl.requery();
         ctl.tick(at(t, 16), &view(), &off_snap);
+        // 關著時不查電源（Linux 讀 sysfs 會卡介面）：改成「使用電池時暫停」的那一刻才查，提示照查到的
+        assert_eq!(ctl.short_for(SmoothMode::Auto).as_deref(), Some("119.88 Hz"));
+        ctl.smooth_changed(SmoothMode::Auto, at(t, 20));
         assert_eq!(ctl.short_for(SmoothMode::Auto).as_deref(), Some("使用電池，暫停"));
         assert_eq!(ctl.short_for(SmoothMode::Always).as_deref(), Some("119.88 Hz"));
+        ctl.smooth_changed(SmoothMode::Off, at(t, 24));
         fake.borrow_mut().hz = None;
         ctl.requery();
         ctl.tick(at(t, 32), &view(), &off_snap);

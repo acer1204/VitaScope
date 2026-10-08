@@ -41,6 +41,13 @@ pub(super) fn adjust_locked_hover() -> &'static str {
 }
 
 impl VitascopeApp {
+    /// 打開控制面板的「畫質」分頁（右鍵選單、設定頁的「影像調整…」）；已經開著就換到這一頁。
+    /// Alt+G 只開關面板，分頁照上次的
+    pub(super) fn show_adjustments(&mut self) {
+        self.panel_open = true;
+        self.panel_tab = PanelTab::Picture;
+    }
+
     pub(super) fn control_panel(&mut self, ctx: &egui::Context) {
         if !self.panel_open {
             return;

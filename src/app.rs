@@ -145,8 +145,10 @@ enum Action {
     Adjust(AdjustKind, i32),
     /// 影像調整全部還原（Q）
     AdjustReset,
-    /// 控制面板（Alt+G）
+    /// 控制面板（Alt+G）：開關，記得上次的分頁
     ToggleControlPanel,
+    /// 「影像調整…」（右鍵選單、設定頁）：打開控制面板的畫質分頁
+    ShowAdjustments,
     /// 畫質（整個程式共用、存檔）：去交錯、去色帶、銳化、縮放演算法
     SetDeinterlace(Deinterlace),
     SetDeband(Strength),
@@ -351,6 +353,13 @@ pub struct VitascopeApp {
     devices_seen: Option<Vec<crate::sound::AudioDevice>>,
     /// 上次看到的音訊直通格式（開始直通時提示一次）
     spdif_seen: Option<String>,
+    /// 上次看到音訊輸出開不起來、改用 null（改用時提示一次）
+    ao_fallback_seen: bool,
+    /// 改用 null 之後重開了音訊輸出（換檔、裝置清單變了，見 `retry_audio_output`）：什麼時候送的，
+    /// 過一下再看結果（還是 null 的話再提示一次）
+    ao_retry: Option<Instant>,
+    /// 重開音訊輸出的次數（介面測試用）
+    ao_retries: u32,
     /// 上次看到 mpv 選的音軌（變了才更新 `audio_restore`）
     audio_seen: Option<i64>,
     /// 換輸出裝置之後要選回來的音軌：這個檔案最後選的音軌（使用者自己關掉音軌時是 None）。
@@ -491,9 +500,9 @@ impl VitascopeApp {
         }
         let owner = Owner::from_creation(cc);
         // 自動測試沒有真的視窗（沒有 handle），查不到更新率，跟以前一樣播放
-        let probe = launch
-            .platform
-            .or_else(|| owner.map(|o| Box::new(pacing::RealProbe::new(o.window)) as Box<dyn PlatformProbe>));
+        let probe = launch.platform.or_else(|| {
+            owner.map(|o| Box::new(pacing::RealProbe::new(o.window, &cc.egui_ctx)) as Box<dyn PlatformProbe>)
+        });
         let user_sync = mpv_opts_override(&player, "video-sync") || mpv_opts_override(&player, "display-fps-override");
         let pacing = pacing::PacingCtl::new(probe, user_sync, launch.pacing);
         // 影像調整預設每次啟動從 0 開始；勾了「下次開啟時沿用」才用上次存的
@@ -596,6 +605,9 @@ impl VitascopeApp {
             device_fallback: false,
             devices_seen: None,
             spdif_seen: None,
+            ao_fallback_seen: false,
+            ao_retry: None,
+            ao_retries: 0,
             audio_seen: None,
             audio_restore: None,
             af_applied: None,
@@ -1070,6 +1082,9 @@ impl VitascopeApp {
                 }
                 self.osd(sound::volume_osd(v));
             }
+            // 音訊直通中：靜音跟音量一樣沒有作用（mpv 的靜音是軟體音量，直通的資料不經過它），交給擴大機。
+            // 存下的靜音不動，改回一般輸出時照樣靜音
+            Action::ToggleMute if st.audio_spdif.is_some() => self.osd(sound::spdif_volume_hover()),
             Action::ToggleMute => {
                 let muted = !st.muted;
                 let _ = self.player.set_mute(muted);
@@ -1107,6 +1122,7 @@ impl VitascopeApp {
             Action::Adjust(kind, delta) => self.step_adjust(kind, delta),
             Action::AdjustReset => self.reset_adjust(),
             Action::ToggleControlPanel => self.panel_open = !self.panel_open,
+            Action::ShowAdjustments => self.show_adjustments(),
             Action::SetDeinterlace(d) => self.set_deinterlace(d),
             Action::SetDeband(s) => self.set_deband(s),
             Action::SetSharpen(s) => self.set_sharpen(s),
@@ -1331,11 +1347,21 @@ impl VitascopeApp {
             dialog = dialog.set_directory(dir);
         }
         let Some(path) = dialog.pick_file() else { return };
+        self.load_extra_file(&path, subtitle);
+    }
+
+    /// 載入字幕檔、音軌檔（`subtitle` = 字幕）並切換過去。音軌跟選單換音軌一樣：會直通的話先清空濾鏡鏈
+    #[doc(hidden)]
+    pub fn load_extra_file(&mut self, path: &Path, subtitle: bool) {
         let path_str = path.to_string_lossy().into_owned();
         let result = if subtitle {
             self.player.add_subtitle(&path_str)
         } else {
-            self.player.add_audio(&path_str)
+            match self.player.add_audio(&path_str) {
+                Ok(Some(id)) => self.switch_track(TrackKind::Audio, Some(id)),
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            }
         };
         let kind = if subtitle {
             crate::tr!("字幕", "subtitle")
@@ -1343,7 +1369,7 @@ impl VitascopeApp {
             crate::tr!("音軌", "audio track")
         };
         match result {
-            Ok(()) => self.osd(crate::tf!("載入{kind}：{}", "Loaded {kind}: {}", file_name(&path))),
+            Ok(()) => self.osd(crate::tf!("載入{kind}：{}", "Loaded {kind}: {}", file_name(path))),
             Err(e) => self.osd(crate::tf!("無法載入{kind}：{e}", "Cannot load {kind}: {e}")),
         }
     }
@@ -1610,27 +1636,34 @@ impl VitascopeApp {
         self.osd(msg);
     }
 
+    /// 切換軌道（不提示）。音軌：換成會直通的濾鏡鏈先清空（同步，排在選音軌之前），記下使用者選的音軌
+    fn switch_track(&mut self, kind: TrackKind, id: Option<i64>) -> crate::mpv::Result<()> {
+        if kind == TrackKind::Audio {
+            self.sound_before_track(id);
+        }
+        if let Err(e) = self.player.select_track(kind, id) {
+            if kind == TrackKind::Audio {
+                let current = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
+                self.sound_before_track(current);
+            }
+            return Err(e);
+        }
+        // 使用者自己選的音軌（包括關掉）：換裝置之後照這個
+        if kind == TrackKind::Audio {
+            self.audio_restore = id;
+        }
+        Ok(())
+    }
+
     fn select_track(&mut self, kind: TrackKind, id: Option<i64>) {
         let name = if kind == TrackKind::Sub {
             crate::tr!("字幕", "Subtitles")
         } else {
             crate::tr!("音軌", "Audio")
         };
-        // 換成會直通的音軌：濾鏡鏈先清空（同步，排在選音軌之前）
-        if kind == TrackKind::Audio {
-            self.sound_before_track(id);
-        }
-        if let Err(e) = self.player.select_track(kind, id) {
+        if let Err(e) = self.switch_track(kind, id) {
             self.osd(crate::tf!("無法切換{name}：{e}", "Cannot switch {name}: {e}"));
-            if kind == TrackKind::Audio {
-                let current = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
-                self.sound_before_track(current);
-            }
             return;
-        }
-        // 使用者自己選的音軌（包括關掉）：換裝置之後照這個
-        if kind == TrackKind::Audio {
-            self.audio_restore = id;
         }
         let label = id
             .and_then(|id| self.player.state.tracks_of(kind).find(|t| t.id == id))
@@ -1664,6 +1697,10 @@ impl VitascopeApp {
                 self.pacing.start_file(self.file_gen);
                 self.audio_seen = None;
                 self.audio_restore = None;
+                // 上一個檔案的音訊輸出開不起來、改用 null：mpv 換檔時沿用同一個輸出，不重開的話之後的檔案都沒有聲音
+                if self.player.audio_fell_back() {
+                    self.retry_audio_output();
+                }
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
             PlayerEvent::CommandReply { id, error } => match crate::player::async_key(id) {
@@ -3054,14 +3091,16 @@ impl VitascopeApp {
                 let _ = self.player.set_mute(false);
             }
         }
-        let icon = if self.player.state.muted || self.player.state.volume == 0.0 {
+        // 直通中靜音、0% 都沒有作用（擴大機照樣出聲）：不顯示靜音的圖示，按鈕停用
+        let icon = if !spdif && (muted || self.player.state.volume == 0.0) {
             "🔇"
         } else {
             "🔊"
         };
         if ui
-            .add(icon_button(icon))
+            .add_enabled(!spdif, icon_button(icon))
             .on_hover_text(crate::tr!("靜音（M）", "Mute (M)"))
+            .on_disabled_hover_text(sound::spdif_volume_hover())
             .clicked()
         {
             self.run(ui.ctx(), Action::ToggleMute);

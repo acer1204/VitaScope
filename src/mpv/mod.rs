@@ -210,6 +210,37 @@ type Callback = Box<dyn Fn() + Send + Sync + 'static>;
 /// 只在有 Lua 的 libmpv 才有的選項（影戲都是把它們關掉）
 const SCRIPT_OPTIONS: &[&str] = &["osc", "ytdl", "load-scripts", "load-stats-overlay"];
 
+/// `mpv_get_time_ns` 的型別（client.h）
+#[cfg(all(unix, not(target_os = "macos")))]
+type GetTimeNs = unsafe extern "C" fn(*mut sys::mpv_handle) -> i64;
+
+/// Linux：執行時才找 `mpv_get_time_ns`（libmpv 0.37 起才有）。Linux 版用系統的 libmpv，
+/// 直接連結的話舊的 libmpv 在程式開始之前就被系統的載入器擋掉（undefined symbol），
+/// `Mpv::new` 的版本檢查沒機會說明要更新 mpv。Windows、macOS 附帶自己的引擎，照常連結
+#[cfg(all(unix, not(target_os = "macos")))]
+fn get_time_ns() -> Option<GetTimeNs> {
+    static FOUND: std::sync::OnceLock<Option<GetTimeNs>> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        // SAFETY: RTLD_DEFAULT 在已經載入的程式庫（包括連結的 libmpv）裡找，名稱是 NUL 結尾的常數
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mpv_get_time_ns".as_ptr()) };
+        // SAFETY: 找到的就是 client.h 宣告的這個函式
+        (!found.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, GetTimeNs>(found) })
+    })
+}
+
+/// 找得到 `mpv_get_time_ns`（Linux 執行時才找；其他平台直接連結，一定有）。測試用
+#[doc(hidden)]
+pub fn has_time_ns() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        get_time_ns().is_some()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        true
+    }
+}
+
 pub struct Mpv {
     handle: NonNull<sys::mpv_handle>,
     wakeup: Option<Box<Callback>>,
@@ -268,7 +299,19 @@ impl Mpv {
     /// mpv 內部的時鐘（奈秒，跟 render API 的影格預定時間同一個基準）。
     /// 任何時候、在畫面輸出的執行緒上都能呼叫（client.h：safe from render threads）；libmpv 0.37 起才有
     pub fn time_ns(&self) -> i64 {
-        unsafe { sys::mpv_get_time_ns(self.raw()) }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            match get_time_ns() {
+                // SAFETY: 跟 client.h 的宣告一樣的函式，handle 有效
+                Some(f) => unsafe { f(self.raw()) },
+                // 不會發生（`new` 已經擋掉 0.37 以前的 libmpv）：用微秒的時鐘，同一個基準
+                None => self.time_us().saturating_mul(1000),
+            }
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            unsafe { sys::mpv_get_time_ns(self.raw()) }
+        }
     }
 
     /// 同 `time_ns`，單位是微秒

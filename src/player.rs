@@ -212,6 +212,8 @@ pub struct State {
     pub audio_spdif: Option<String>,
     /// 音訊輸出開著、是一般的 PCM（不是直通）
     pub audio_out_pcm: bool,
+    /// 目前的音訊輸出方式（"wasapi"、"pipewire"、"null"…）；None = 音訊輸出沒開
+    pub current_ao: Option<String>,
     /// 目前的影片是 HDR（video-params 的 gamma 是 pq 或 hlg）
     pub video_hdr: bool,
     /// 音訊輸出裝置清單（第一項是 auto）；None = 還沒讀過（見 `Player::read_audio_devices`、`watch_audio_devices`）
@@ -309,6 +311,8 @@ const OBSERVED: &[(&str, Format)] = &[
     ("audio-out-params", Format::String),
     // 影片的轉換函數（pq、hlg = HDR）；只在換影片設定時變
     ("video-params/gamma", Format::String),
+    // 音訊輸出開不起來時 mpv 改用 null（沒有聲音，見 Player::new 的 audio-fallback-to-null）
+    ("current-ao", Format::String),
 ];
 
 /// 非同步設定選項（`set_async`、`command_async_keyed`）的指令編號從這裡開始。
@@ -659,6 +663,8 @@ pub struct Player {
     shaders_inflight: HashSet<u64>,
     /// 音量超過 100% 時，經過限幅器放大的部分（%）：總音量 = mpv 的 volume + 這個（見 `set_volume_total`）
     boost_pct: f64,
+    /// ao 選項本來就有 null（headless、VITASCOPE_MPV_OPTS 指定）：用 null 輸出不是開不起來改用的
+    ao_null_wanted: bool,
 }
 
 impl Player {
@@ -681,6 +687,10 @@ impl Player {
             // 網站影片（yt-dlp）屬於 L3，先關掉避免開檔時意外呼叫外部程式
             ("ytdl", "no"),
             ("audio-client-name", "VitaScope"),
+            // 音訊輸出開不起來（獨佔模式不被允許、選的裝置拔掉了…）時改用 null 輸出、繼續播放（沒有聲音）。
+            // 不然 mpv 會把音軌關掉，純音樂檔整個停止；音訊輸出還在，之後改裝置、獨佔模式時 mpv 才會照新的設定重開。
+            // 改用 null 時介面提示（見 `Player::audio_fell_back`）。VITASCOPE_MPV_OPTS 可以改回來（排在後面）
+            ("audio-fallback-to-null", "yes"),
             // 畫面調整（長寬比、裁切、縮放、旋轉、翻轉）每個檔案各自的：換檔時 mpv 自動還原，不會閃一下
             ("reset-on-next-file", GEOMETRY_OPTIONS),
             // 截圖：8 位元 PNG（10 位元影片預設會存 16 位元，檔案大、壓縮慢）、壓縮快一點
@@ -727,6 +737,7 @@ impl Player {
         if !shader_base.is_empty() || user_overrides.iter().any(names_shader_list) {
             user_overrides.insert("glsl-shaders".to_owned());
         }
+        let ao_null_wanted = crate::sound::ao_list_has_null(&mpv.get_string("ao").unwrap_or_default());
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
@@ -758,6 +769,7 @@ impl Player {
             shader_flip: [None, None],
             shaders_inflight: HashSet::new(),
             boost_pct: 0.0,
+            ao_null_wanted,
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -888,6 +900,16 @@ impl Player {
     /// 非同步設定的音效選項 mpv 不接受：忘掉記下的值，下次套用時再送
     pub fn forget_sound(&mut self, name: &str) {
         self.options_applied.remove(name);
+    }
+
+    /// 音訊輸出開不起來，mpv 改用 null 輸出（沒有聲音；ao 本來就指定 null 的不算）
+    pub fn audio_fell_back(&self) -> bool {
+        !self.ao_null_wanted && self.state.current_ao.as_deref() == Some("null")
+    }
+
+    /// 同 `audio_fell_back`，直接問 mpv（重開音訊輸出之後，觀察到的值可能還是重開前的）
+    pub fn audio_fell_back_now(&self) -> bool {
+        !self.ao_null_wanted && self.get_string("current-ao").is_ok_and(|ao| ao == "null")
     }
 
     // ───────────── 音訊輸出裝置 ─────────────
@@ -1336,9 +1358,21 @@ impl Player {
         self.mpv.command_async(id, &["screenshot-to-file", path, mode])
     }
 
-    /// 載入外部音軌檔並切換過去
-    pub fn add_audio(&self, path: &str) -> mpv::Result<()> {
-        self.mpv.command(&["audio-add", path, "select"])
+    /// 載入外部音軌檔（先不切換），回傳新加入的音軌編號（檔案裡有好幾條時是第一條；沒有音軌時 None）。
+    /// 切換交給呼叫的人：跟選單換音軌走同一條路，開了音訊直通時才會先預測、清空濾鏡鏈
+    pub fn add_audio(&mut self, path: &str) -> mpv::Result<Option<i64>> {
+        // 直接讀當下的清單比對（屬性通知是非同步的，可能還沒到）
+        self.refresh_tracks();
+        let before: HashSet<i64> = self.state.tracks_of(TrackKind::Audio).map(|t| t.id).collect();
+        // audio-add 是同步指令：回傳時軌道已經加進清單
+        self.mpv.command(&["audio-add", path, "auto"])?;
+        self.refresh_tracks();
+        Ok(self
+            .state
+            .tracks_of(TrackKind::Audio)
+            .map(|t| t.id)
+            .filter(|id| !before.contains(id))
+            .min())
     }
 
     /// 外掛字幕的原始檔與自動判斷出的編碼（`track` 是 mpv 的軌道；內嵌字幕回傳 None）
@@ -1765,6 +1799,7 @@ impl Player {
                 s.audio_out_pcm = s.audio_spdif.is_none() && value.as_str().is_some_and(has_out_format);
             }
             "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
+            "current-ao" => s.current_ao = value.as_str().filter(|v| !v.is_empty()).map(str::to_owned),
             // 讀不到（Value::None）時保留上一次的清單
             "audio-device-list" if !self.fake_devices => {
                 if let Some(json) = value.as_str() {

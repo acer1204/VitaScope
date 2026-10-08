@@ -282,7 +282,8 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 
 影像
 - [x] 流暢播放：依螢幕的實際更新率同步影像（mpv display-resample + 精確更新率；使用電池、視窗縮小、
-  swap 沒等垂直同步、畫面跟不上時自動改回一般播放）（自動；實機 120 Hz 電視 240/240 格都是 5 次更新。
+  swap 沒等垂直同步、畫面跟不上時自動改回一般播放；電源只在「使用電池時暫停」時查，Linux 播放中在背景執行緒讀 sysfs、啟動時直接讀一次）
+  （自動；實機 120 Hz 電視 240/240 格都是 5 次更新。
   目前預設關閉，在 60 Hz 螢幕上量過之後再改成預設打開）
   - [ ] 手動確認：60 Hz 螢幕的實機節奏（量過之後才改成預設打開）
   - [ ] 手動確認：G-SYNC / FreeSync（VRR）、顯示卡驅動強制關閉垂直同步時改回一般播放並提示
@@ -342,12 +343,15 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 - [x] 選擇音訊輸出裝置：右鍵選單「音效 ▸ 輸出裝置」、「設定 → 音效」；預設裝置（跟隨系統）＋ 目前輸出方式的裝置
   （macOS 只列 coreaudio）。存了指定的裝置時啟動時同步讀一次裝置清單，不在就暫時用預設裝置並提示（設定照舊）；
   其他時候第一個畫面出來之後才開始觀察清單（列舉裝置可能很慢），清單變了就重新對照：裝置插回來自動切回去、播放中拔掉改用預設裝置
-  （mpv 會先用拔掉的裝置重開音訊輸出、開不起來就關掉音軌，所以換裝置後把原本的音軌選回來）。
+  （音訊輸出開不起來時 mpv 改用 null 輸出繼續播放（audio-fallback-to-null，純音樂檔也不會停）並提示一次，
+  之後換裝置、獨佔模式時照新的設定重開，換檔、裝置清單變了時也重開再試一次；音軌被關掉的話（例如 VITASCOPE_MPV_OPTS 改回 mpv 原本的做法），
+  換裝置、獨佔模式、轉成立體聲之後把原本的音軌選回來）。
   獨佔模式（audio-exclusive）在 Windows、macOS 顯示，Linux 只在 PipeWire 時顯示；多聲道轉成立體聲（audio-channels=stereo，
   ☑ 混音時避免破音 = audio-normalize-downmix，只在轉成立體聲時開，沒轉時跟 mpv 原本一樣）。
   VITASCOPE_MPV_OPTS（含 include=、profile= 間接）指定的音效選項不改、介面上停用
   （自動：`sound` 單元測試（wasapi、coreaudio、PipeWire 的裝置清單、對照存下的裝置）；`tests/sound.rs` 每個值 mpv 都接受、
   預設設定跟 mpv 原本的值一樣、只送有變的；kittest 選單、設定頁、找不到裝置時改用預設裝置、插回來切回去、拔掉後選回被關掉的音軌（假的裝置清單，CI 沒有音訊裝置也能跑）、
+  轉成立體聲之後選回被關掉的音軌、強制用不存在的裝置時改用 null 照樣播放並提示、換檔與裝置清單變了時重開再試（`tests/sound.rs` 對照：不改用 null 時純音樂檔直接結束）、
   媒體資訊跟著換裝置、直通中不能轉立體聲、
   轉成立體聲、使用者指定的不改、英文介面）
   - [ ] 手動確認：實際切換喇叭／HDMI 電視、播放中拔插 USB DAC、獨佔模式時其他程式沒有聲音
@@ -388,11 +392,14 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：150% / 200% 在筆電喇叭、耳機上的聽感（限幅器的失真）
 - [x] 音訊直通（AC-3 / DTS / TrueHD 經 HDMI、S/PDIF 送到擴大機）：右鍵選單「音效 ▸ 音訊直通」、「設定 → 音效」勾選格式
   （AC-3、E-AC-3、DTS 預設勾，DTS-HD、TrueHD 要 HDMI 支援 HBR 預設不勾）→ audio-spdif。直通中選單註明「（使用中：AC-3）」，
-  開始時提示；音量鍵、滾輪、音量滑桿與變速（C／X、選單的速度）不動作並提示（直通的資料不能調音量、不能重新取樣，改回正常速度可以）；
+  開始時提示；音量鍵、滾輪、音量滑桿、靜音（M、按鈕）與變速（C／X、選單的速度）不動作並提示（直通的資料不能調音量、
+  不能重新取樣，mpv 的靜音也只是軟體音量；改回正常速度可以，存下的靜音不動），開始直通時靜音或 0% 在提示裡註明，
+  速度不是 1× 就改回 1×（不然 mpv 丟掉、重複整個封包）；「載入音軌檔…」跟選單換音軌一樣先預測直通、清空濾鏡鏈；
   流暢播放改用略過或重複影格對齊螢幕（display-vdrop）。mpv 0.41 起播放中切換馬上生效；Linux tar.gz 用的系統 libmpv 0.40 以前
   要到下一個檔案才生效（提示「下一個檔案開始生效」）
   （自動：ao=null 也接受直通，`tests/sound.rs` AC-3、E-AC-3、DTS、TrueHD 樣本實際直通（audio-out-params 是 spdif-*），
-  跟 `predict_spdif` 的預測一致，播放中關掉、再打開也會切換（系統的 libmpv 0.37 重新開檔後切換）；kittest 選單、設定頁的格式、直通中擋音量與變速）
+  跟 `predict_spdif` 的預測一致，播放中關掉、再打開也會切換（系統的 libmpv 0.37 重新開檔後切換）；kittest 選單、設定頁的格式、直通中擋音量、
+  靜音與變速、1.5× 開始直通時改回 1×、載入 AC-3 音軌檔時濾鏡鏈先清空）
   - [ ] 手動確認：接 AV 擴大機／電視實際直通 AC-3、DTS、TrueHD（擴大機顯示格式）、直通時其他程式沒有聲音
 
 功能
@@ -469,11 +476,11 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 98 個樣本（常見 35、通用 37、罕見 26；CI 上 Linux、macOS 的 FFmpeg 少幾個編碼器，產生的樣本比較少） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 163 | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 171 | Windows、macOS、Linux |
 | 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
 | 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式、強制結束主視窗） | 6 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 241（其中 2 個預設略過：1 個需要網路、1 個只印出 Windows 偵測更新率的各種方法；單元測試有些只在特定平台編譯，數字是 Windows 的） | Windows、macOS、Linux |
-| 畫質 `tests/picture.rs`、音效 `tests/sound.rs`、非同步設定與引擎功能 `tests/async_opts.rs`、流暢播放 `tests/pacing.rs` | 10、13、8、2 | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` + 單元測試 | 4 + 248（smoke 在 Linux 多 1 個：執行檔引用的 libmpv 函式；其中 2 個預設略過：1 個需要網路、1 個只印出 Windows 偵測更新率的各種方法；單元測試有些只在特定平台編譯，數字是 Windows 的） | Windows、macOS、Linux |
+| 畫質 `tests/picture.rs`、音效 `tests/sound.rs`、非同步設定與引擎功能 `tests/async_opts.rs`、流暢播放 `tests/pacing.rs` | 10、14、8、2 | Windows、macOS、Linux |
 | 播放引擎的建置內容 `tests/engine_build.rs` | 7（舊的引擎、系統的 libmpv 略過 L3 元件的部分） | Windows、macOS、Linux |
 | 截圖檢查 `tests/picture_shot.rs`（會開視窗） | 6 + 2 個不開視窗的輔助測試 | Windows 本機（RTX 3090）、Linux 的 CI（虛擬螢幕）、macOS 的 libmpv 建置流程 |
 | 實機節奏 `tests/pacing_window.rs`（會開全螢幕視窗，手動跑） | 4 + 1 個不開視窗的輔助測試 | Windows 本機（RTX 3090 + 120 Hz 電視） |
@@ -601,6 +608,7 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **Git Bash 會把 `/D…` 之類的參數當成路徑轉換掉**：Inno Setup 的 ISCC 要在 PowerShell 或 cmd 執行。
 - **好幾個視窗共用一個設定檔時，關閉的那個不能把整份舊設定寫回去**：存檔時只寫這個視窗上次讀檔或存檔之後改過的設定，
   其他的保留檔案裡現在的值。新版寫的、這版讀不懂的設定也要保留（只有讀不懂的那一項用預設值）。
+  清單也一樣：整個陣列當成一個值的話，另一個視窗新增的像素著色器組合會不見；組合依編號合併，等化器的增益逐格合併。
 - **解除安裝時程式還開著，執行檔刪不掉，關閉時還會把設定寫回去**：程式啟動時建立一個具名 mutex，
   安裝程式用 `AppMutex` 先請使用者關掉。
 - **檔案關聯只認「登錄的那一個執行檔」**：同一台電腦上有安裝版、免安裝版、開發中的建置時，啟動時不能誰都去搶；
@@ -641,6 +649,15 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **字串清單選項設成 `""` 會變成有一個空項目的清單 `[""]`**，不是空清單；要清空用 `change-list <選項> clr ""`。
 - **Windows：觀察 `audio-device-list` 要讓程式一直有多執行緒 COM（MTA）**：mpv 在自己的執行緒初始化 MTA、關閉時拆掉，
   那是程式裡唯一的 MTA 時，系統的裝置通知還在用，關閉播放器時存取違規。啟動時先 `CoIncrementMTAUsage`，不再減回去。
+- **Linux 直接連結新版 libmpv 才有的函式，舊的 libmpv 在程式開始之前就被載入器擋掉**：Rust 預設 `-z now`（完整 RELRO），
+  `mpv_get_time_ns`（0.37 起）找不到時連 `--version` 都跑不了，`Mpv::new` 的版本檢查沒機會說明。Linux 改成執行時用
+  `dlsym(RTLD_DEFAULT, …)` 找；`tests/smoke.rs` 在 Linux 用 `nm -D --undefined-only` 確認執行檔不直接需要 client API 2.0 之後的函式。
+- **音訊輸出開不起來時 mpv 把音軌關掉，之後改裝置、獨佔模式也不會重開**（`reload_audio_output` 沒有輸出就直接返回），
+  純音樂檔還會整個停止。開 `audio-fallback-to-null` 改用 null 輸出繼續播放，輸出一直在，改選項時 mpv 照新的設定重開；
+  `current-ao` 變成 null（ao 不是自己指定 null）就是開不起來改用的，提示使用者。直通開不起來時 mpv 不用 null（先改回 PCM）。
+  不過換檔時 mpv 沿用同一個輸出（gapless-audio 預設 weak，格式一樣就不重開），預設裝置的清單變了也不會自己重開：
+  不處理的話之後的檔案一直沒有聲音，所以改用 null 之後換檔、裝置清單變了時送 `ao-reload` 再試真正的裝置。
+  重開之後觀察到的 `current-ao` 可能還是重開前的 null（值一樣不會再通知），等一下直接問 mpv 再決定要不要提示。
 - **產生的正弦波 WAV 可能被當成 MPEG-TS**：48 kHz 的 1 kHz 浮點正弦波每 192 位元組重複一次，剛好是 M2TS 的封包長度，
   FFmpeg 的偵測給 MPEG-TS 滿分、開不起來。測試指定 `demuxer-lavf-format=wav`。本專案建置的引擎也沒有 FFmpeg 的 `sine` 來源，
   測試用的聲音都在測試裡產生。

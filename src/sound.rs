@@ -332,6 +332,13 @@ pub fn spdif_label(format: &str) -> &str {
 
 // ───────────── 輸出裝置 ─────────────
 
+/// mpv 的 ao 選項（"null"、"wasapi,null"、"null:…"；沒指定是空的）裡有沒有 null 輸出：
+/// 有的話用 null 輸出是指定的，不是音訊輸出開不起來改用的
+pub fn ao_list_has_null(ao: &str) -> bool {
+    ao.split(',')
+        .any(|entry| entry.split([':', '=']).next().is_some_and(|name| name.trim() == "null"))
+}
+
 /// 預設裝置（跟隨系統）的 mpv 名稱
 pub const AUTO_DEVICE: &str = "auto";
 
@@ -863,6 +870,16 @@ mod tests {
         assert_eq!(spdif_label("dts-hd"), "DTS-HD");
         assert_eq!(spdif_label("dtshd"), "DTS-HD", "audio-out-params 的 spdif-dtshd");
         assert_eq!(spdif_label("mystery"), "mystery");
+    }
+
+    #[test]
+    fn ao_list_with_null() {
+        assert!(ao_list_has_null("null"));
+        assert!(ao_list_has_null("wasapi,null"));
+        assert!(ao_list_has_null("null:buffer=0.2"));
+        assert!(!ao_list_has_null(""), "沒指定：自動選，用 null 就是開不起來改用的");
+        assert!(!ao_list_has_null("pipewire,pulse"));
+        assert!(!ao_list_has_null("nullsink"));
     }
 
     #[test]

@@ -20,6 +20,9 @@ const SPDIF_GRACE: Duration = Duration::from_millis(1500);
 /// 等直通時多久問一次 mpv 解碼的格式（見 `spdif_refused`）
 const SPDIF_POLL: Duration = Duration::from_millis(100);
 
+/// 改用 null 之後重開音訊輸出（`retry_audio_output`）：等這麼久（而且檔案載入了）再看結果
+const AO_RETRY_SETTLE: Duration = Duration::from_secs(1);
+
 /// 音訊直通中：音量交給擴大機（音量鍵、滑桿不動作時的提示、停用的說明）
 pub(super) fn spdif_volume_hover() -> &'static str {
     tr!(
@@ -95,6 +98,11 @@ pub(super) fn volume_max_label(v: u32) -> &'static str {
     }
 }
 
+/// `restore`（最後選的音軌）還能選回來：有檔案、而且這個檔案還有這條音軌（外掛的音軌可能被移除了）
+fn restorable_track(restore: Option<i64>, st: &crate::player::State) -> Option<i64> {
+    restore.filter(|id| st.loaded && st.tracks_of(TrackKind::Audio).any(|t| t.id == *id))
+}
+
 impl VitascopeApp {
     /// 啟動時（還沒開檔）同步套用。存了指定的裝置時先同步讀一次裝置清單，裝置不在就暫時用預設裝置
     ///（沒存的話不讀：列舉裝置可能很慢，等第一個畫面出來之後再開始觀察，見 `sound_tick`）
@@ -147,23 +155,99 @@ impl VitascopeApp {
             }
         }
         if self.player.state.audio_devices != self.devices_seen {
+            // 第一次拿到清單不算變了（不是插拔）
+            let changed = self.devices_seen.is_some();
             self.devices_seen = self.player.state.audio_devices.clone();
             if let Some(list) = self.devices_seen.clone() {
                 self.check_saved_device(&list, true);
+            }
+            // 改用 null 中（例如預設裝置的電視關掉又打開）：裝置可能回來了，重開一次
+            //（上次重開還沒有結果的也再重開：那次可能比清單變早）
+            if changed && (self.player.audio_fell_back() || self.ao_retry.is_some()) {
+                self.retry_audio_output();
             }
         }
         self.af_tick();
         let spdif = self.player.state.audio_spdif.clone();
         if spdif != self.spdif_seen {
             if let Some(format) = &spdif {
-                let name = sound::spdif_label(format);
-                self.osd(tf!(
-                    "音訊直通：{name} → 擴大機（音量請用擴大機調整）",
-                    "Passthrough: {name} → amplifier (use the amplifier's volume)"
-                ));
+                self.spdif_started(format);
             }
             self.spdif_seen = spdif;
         }
+        // 音訊輸出開不起來、mpv 改用 null 繼續播放（沒有聲音）：提示一次。改裝置、獨佔模式之後會照新的設定重開。
+        // 重開了（`retry_audio_output`）的話等一下、直接問 mpv 結果：觀察到的值可能還是重開前的 null
+        let fell_back = match self.ao_retry {
+            Some(at) if at.elapsed() < AO_RETRY_SETTLE || !self.player.state.loaded => return,
+            Some(_) => {
+                self.ao_retry = None;
+                self.player.audio_fell_back_now()
+            }
+            None => self.player.audio_fell_back(),
+        };
+        if fell_back != self.ao_fallback_seen {
+            self.ao_fallback_seen = fell_back;
+            if fell_back {
+                let msg = if self.settings.audio.exclusive && !self.sound_locked("audio-exclusive") {
+                    tr!(
+                        "無法開啟音訊裝置（可能不允許獨佔模式），暫時沒有聲音",
+                        "Can't open the audio device (exclusive mode may not be allowed); no sound for now"
+                    )
+                } else {
+                    tr!(
+                        "無法開啟音訊裝置，暫時沒有聲音",
+                        "Can't open the audio device; no sound for now"
+                    )
+                };
+                self.osd(msg);
+            }
+        }
+    }
+
+    /// 音訊輸出開不起來、mpv 改用了 null：照設定重開一次（再試真正的裝置）。mpv 換檔時沿用同一個輸出
+    ///（gapless-audio 預設 weak），預設裝置的清單變了也不會自己重開，不重開的話之後一直沒有聲音。
+    /// 還是開不起來的話 mpv 又改用 null，等一下看結果、再提示一次（見 `sound_tick`）
+    pub(super) fn retry_audio_output(&mut self) {
+        self.command_async_keyed(AsyncKey::AudioDevice, &["ao-reload"]);
+        self.ao_retry = Some(Instant::now());
+        self.ao_fallback_seen = false;
+        self.ao_retries += 1;
+    }
+
+    /// 改用 null 之後重開音訊輸出的次數（介面測試用）
+    #[doc(hidden)]
+    pub fn audio_output_retries(&self) -> u32 {
+        self.ao_retries
+    }
+
+    /// 開始音訊直通：提示。靜音、音量 0% 對直通沒有作用（擴大機照樣出聲），提示裡註明；
+    /// 不是正常速度的話改回 1×（直通的資料不能變速，mpv 會丟掉或重複整個封包，擴大機的聲音斷斷續續）
+    fn spdif_started(&mut self, format: &str) {
+        let name = sound::spdif_label(format);
+        let st = &self.player.state;
+        let mut msg = if st.muted || self.player.volume_total() <= 0.0 {
+            tf!(
+                "音訊直通：{name} → 擴大機（靜音、音量請用擴大機調整）",
+                "Passthrough: {name} → amplifier (use the amplifier for mute and volume)"
+            )
+        } else {
+            tf!(
+                "音訊直通：{name} → 擴大機（音量請用擴大機調整）",
+                "Passthrough: {name} → amplifier (use the amplifier's volume)"
+            )
+        };
+        // 直接問 mpv：速度的通知可能還沒到
+        let speed = self.player.get_f64("speed").unwrap_or(st.speed);
+        if (speed - 1.0).abs() > 1e-9 {
+            match self.player.set_speed(1.0) {
+                Ok(()) => msg.push_str(tr!(
+                    "（直通時不能變速，已改回 1×）",
+                    " (the speed can't change during passthrough; set back to 1×)"
+                )),
+                Err(e) => eprintln!("[vitascope] 無法改回正常速度：{e}"),
+            }
+        }
+        self.osd(msg);
     }
 
     /// 存下的輸出裝置（None = 預設裝置）
@@ -210,12 +294,17 @@ impl VitascopeApp {
     /// 要重新選音軌才會用新的裝置開。音軌還開著的話選同一條不會有動作。
     /// 接在改 audio-device 後面送（非同步指令照順序執行）
     fn reopen_audio(&mut self) {
-        let Some(id) = self.audio_restore.filter(|_| self.player.state.loaded) else {
+        let Some(id) = self.restorable_audio() else {
             return;
         };
         // 重新選音軌會重新建立音訊（照設定試直通）：會直通的話濾鏡鏈先清空
         self.sound_before_reopen(Some(id));
         self.set_option_async(AsyncKey::AudioDevice, "aid", &id.to_string());
+    }
+
+    /// 要選回來的音軌：最後選的那一條（使用者自己關掉音軌時沒有），而且是這個檔案的
+    fn restorable_audio(&self) -> Option<i64> {
+        restorable_track(self.audio_restore, &self.player.state)
     }
 
     /// 交給 mpv 的裝置：存下的裝置；對照過裝置清單、它不在時暫時用預設裝置（還不知道清單時照存下的）
@@ -245,13 +334,20 @@ impl VitascopeApp {
         let opts = self.sound_options();
         // 換裝置、獨佔模式、聲道會重新開啟音訊輸出，mpv 會再試一次直通（之前不支援、改回 PCM 的也會）：
         // 目前的音軌會直通的話濾鏡鏈先清空（同步，排在這些非同步的設定之前）
-        if self
+        let reopens = self
             .player
             .pending_sound(&opts)
-            .any(|n| sound::REOPENS_OUTPUT.contains(&n))
-        {
-            let id = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
-            self.sound_before_reopen(id);
+            .any(|n| sound::REOPENS_OUTPUT.contains(&n));
+        // 之前音訊輸出開不起來、mpv 把音軌關掉了（沒有聲音）：音訊輸出已經關了，光改這些選項 mpv 不會重開，
+        // 送完之後把音軌選回來才會照新的設定開（跟拔掉裝置之後一樣，見 `reopen_audio`）
+        let selected = self.player.state.selected(TrackKind::Audio).map(|t| t.id);
+        let restore = if reopens && selected.is_none() {
+            self.restorable_audio()
+        } else {
+            None
+        };
+        if reopens {
+            self.sound_before_reopen(selected.or(restore));
         }
         for (name, key, result) in self.player.apply_sound(&opts, false) {
             match result {
@@ -261,6 +357,9 @@ impl VitascopeApp {
                 Ok(None) => {}
                 Err(e) => self.async_failed(key, name, &e.to_string()),
             }
+        }
+        if let Some(id) = restore {
+            self.set_option_async(AsyncKey::AudioDevice, "aid", &id.to_string());
         }
     }
 
@@ -755,7 +854,7 @@ impl VitascopeApp {
         }
     }
 
-    /// 打開控制面板的「音效」分頁（右鍵選單、設定頁的「等化器…」）
+    /// 打開控制面板的「音效」分頁（右鍵選單、設定頁的「等化器…」）；已經開著就換到這一頁
     pub(super) fn show_equalizer(&mut self) {
         self.panel_open = true;
         self.panel_tab = super::control_panel::PanelTab::Sound;
@@ -890,5 +989,36 @@ impl VitascopeApp {
         self.apply_sound();
         self.save_settings();
         self.osd(tf!("音量上限：{max}%", "Volume limit: {max}%"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::player::{State, Track};
+
+    fn track(id: i64, kind: &str) -> Track {
+        serde_json::from_value(serde_json::json!({ "id": id, "type": kind })).unwrap()
+    }
+
+    #[test]
+    fn only_tracks_of_this_file_are_restored() {
+        let mut st = State {
+            loaded: true,
+            tracks: vec![track(1, "video"), track(1, "audio"), track(2, "audio")],
+            ..Default::default()
+        };
+        assert_eq!(restorable_track(Some(2), &st), Some(2));
+        assert_eq!(restorable_track(None, &st), None, "使用者自己關掉音軌");
+        assert_eq!(
+            restorable_track(Some(3), &st),
+            None,
+            "不在這個檔案（例如移除了的外掛音軌）"
+        );
+        st.tracks = vec![track(3, "video")];
+        assert_eq!(restorable_track(Some(3), &st), None, "同編號的不是音軌");
+        st.tracks = vec![track(1, "audio")];
+        st.loaded = false;
+        assert_eq!(restorable_track(Some(1), &st), None, "沒有檔案");
     }
 }

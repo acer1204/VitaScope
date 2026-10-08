@@ -341,8 +341,8 @@ impl VitascopeApp {
             self.adjust_summary()
         ));
         ui.add_space(4.0);
-        if ui.button(tr!("影像調整…", "Image adjustments…")).clicked() && !self.panel_open {
-            *action = Some(Action::ToggleControlPanel);
+        if ui.button(tr!("影像調整…", "Image adjustments…")).clicked() {
+            *action = Some(Action::ShowAdjustments);
         }
         let mut keep = self.settings.video.keep_adjust;
         if ui

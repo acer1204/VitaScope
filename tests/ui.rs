@@ -6310,3 +6310,285 @@ fn sound_eq_ui_in_english() {
     assert!(h.query_by_label_contains("等化器").is_none(), "沒有中文");
     assert!(h.query_by_label_contains("音量").is_none(), "沒有中文");
 }
+
+/// 控制列的靜音按鈕（`icon` 是現在的圖示）
+fn mute_button<'a>(h: &'a Harness<'_, VitascopeApp>, icon: &'a str) -> egui_kittest::Node<'a> {
+    h.get_by_label(icon)
+}
+
+#[test]
+fn passthrough_mute_is_left_to_the_amplifier() {
+    // 上次存了靜音、開了直通：mpv 的靜音是軟體音量，直通的資料不經過它（擴大機照樣出聲）。
+    // 提示裡說要用擴大機，圖示不顯示靜音、按鈕停用，M 跟音量鍵一樣不動作；存下的靜音不動，改回一般輸出時照樣靜音
+    let (_dir, _path, mut h) = sound_harness("sound-spdif-mute", Some("common/mkv_hevc_ac3.mkv"), None, |s| {
+        s.audio.passthrough.enabled = true;
+        s.muted = true;
+    });
+    step_until(&mut h, "直通中", |s| {
+        s.audio_spdif.as_deref() == Some("ac3") && s.muted
+    });
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("音訊直通：AC-3 → 擴大機（靜音、音量請用擴大機調整）")
+    );
+    assert!(h.query_by_label("🔇").is_none(), "直通中不顯示靜音的圖示");
+    let button = mute_button(&h, "🔊");
+    assert!(button.accesskit_node().is_disabled());
+    button.hover();
+    h.run_steps(3);
+    h.get_by_label("音訊直通中：聲音由擴大機處理");
+    // M：不動作，說明交給擴大機
+    h.key_press(egui::Key::M);
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), Some("音訊直通中：聲音由擴大機處理"));
+    assert_eq!(prop(&h, "mute"), "yes", "存下的靜音不動");
+    // 關掉直通：照樣靜音，M、按鈕照常
+    pick_sound_item(&mut h, &[], "音訊直通（使用中：AC-3）");
+    if !h.state().engine_caps().spdif_live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    step_until(&mut h, "改回一般輸出", |s| s.loaded && s.audio_spdif.is_none());
+    h.run_steps(2);
+    assert!(!mute_button(&h, "🔇").accesskit_node().is_disabled());
+    h.key_press(egui::Key::M);
+    step_until(&mut h, "取消靜音", |s| !s.muted);
+    assert_eq!(h.state().osd_text(), Some("取消靜音"));
+
+    // 音量 0% 也一樣（直通中照樣出聲）
+    let (_dir, _path, mut h) = sound_harness("sound-spdif-zero", Some("common/mkv_hevc_ac3.mkv"), None, |s| {
+        s.audio.passthrough.enabled = true;
+        s.volume = 0.0;
+    });
+    step_until(&mut h, "直通中", |s| {
+        s.audio_spdif.as_deref() == Some("ac3") && s.volume == 0.0
+    });
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("音訊直通：AC-3 → 擴大機（靜音、音量請用擴大機調整）")
+    );
+    assert!(h.query_by_label("🔇").is_none());
+}
+
+#[test]
+fn passthrough_resets_the_speed() {
+    // 1.5× 播放中開始直通：直通的資料不能變速（mpv 會丟掉、重複整個封包，擴大機的聲音斷斷續續），改回 1× 並說明
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-spdif-speed",
+        Some("common/mkv_hevc_ac3.mkv"),
+        None,
+        &[LOOP_FILE],
+        |_| {},
+    );
+    for _ in 0..5 {
+        h.key_press(egui::Key::C);
+        h.run_steps(1);
+    }
+    step_until(&mut h, "1.5×", |s| close_to(s.speed, 1.5));
+    pick_sound_item(&mut h, &[], "音訊直通");
+    if !h.state().engine_caps().spdif_live {
+        // 舊的引擎要重開檔案才會直通（重開之後一開始直通就改回 1×，這裡不能再檢查速度：跟改回來的時機搶）
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    step_until(&mut h, "直通中", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("音訊直通：AC-3 → 擴大機（音量請用擴大機調整）（直通時不能變速，已改回 1×）")
+    );
+    step_until(&mut h, "改回 1×", |s| s.speed == 1.0);
+    assert_eq!(h.state().player().get_f64("speed").unwrap(), 1.0);
+}
+
+#[test]
+fn adjustments_item_opens_the_picture_tab() {
+    // 「等化器…」打開音效分頁之後，「影像調整…」（右鍵選單、設定頁）要打開畫質分頁；面板開著時換過去。
+    // Alt+G 只是開關，分頁照上次的
+    let (_dir, _path, mut h) = sound_harness("panel-tabs", Some("common/mp4_h264_aac.mp4"), None, |_| {});
+    pick_sound_item(&mut h, &[], "等化器…");
+    h.get_by_label("自動防止破音");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("控制面板").is_none());
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("自動防止破音");
+    // 面板開著（音效分頁）：右鍵選單「畫質 ▸ 影像調整…」沒有標成開著；按了換到畫質分頁
+    open_picture_menu_from_corner(&mut h);
+    assert_ne!(
+        h.get_by_label_contains("影像調整…").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "開著的是音效分頁"
+    );
+    h.get_by_label_contains("影像調整…").click();
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    h.get_by_label("亮度");
+    assert!(h.query_by_label("自動防止破音").is_none(), "不是音效分頁");
+    open_picture_menu_from_corner(&mut h);
+    assert_eq!(
+        h.get_by_label_contains("影像調整…").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "開著的是畫質分頁"
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("亮度");
+    // 換回音效分頁、關掉面板：設定頁畫質的「影像調整…」也打開畫質分頁
+    h.get_by_label("音效").click();
+    h.run_steps(2);
+    h.get_by_label("自動防止破音");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_settings_page(&mut h, "畫質");
+    click_in_view(&mut h, "影像調整…");
+    h.get_by_label("控制面板");
+    h.get_by_label("亮度");
+    assert!(h.query_by_label("自動防止破音").is_none(), "不是音效分頁");
+}
+
+#[test]
+fn changing_the_output_reselects_a_dropped_audio_track() {
+    // 音訊輸出開不起來時 mpv 把音軌關掉（這裡直接關掉模擬）：音訊輸出已經關了，光改轉成立體聲（裝置、獨佔模式也一樣）
+    // mpv 不會重開，要把音軌選回來
+    let (_dir, _path, mut h) = sound_harness("sound-reselect", Some("common/mp4_h264_aac.mp4"), None, |_| {});
+    let audio = h.state().player().state.selected(TrackKind::Audio).map(|t| t.id);
+    assert!(audio.is_some());
+    h.state_mut().set_option_async(AsyncKey::AudioDevice, "aid", "no");
+    step_until(&mut h, "mpv 關掉音軌", |s| s.selected(TrackKind::Audio).is_none());
+    h.run_steps(2);
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    wait_prop(&mut h, "audio-channels", "stereo");
+    step_until(&mut h, "選回原本的音軌", |s| {
+        s.selected(TrackKind::Audio).map(|t| t.id) == audio
+    });
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+}
+
+#[test]
+fn reselected_passthrough_track_clears_the_eq_chain_first() {
+    // 同上，被關掉的是會直通的 AC-3、等化器開著：選回來會直通，濾鏡鏈要在選回來之前清空
+    //（跟選單換音軌一樣），濾鏡不會碰到直通的資料
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-reselect-spdif",
+        Some("common/mkv_hevc_ac3.mkv"),
+        None,
+        &[LOOP_FILE],
+        spdif_with_rock,
+    );
+    if !has_af_filters(&h, "reselected_passthrough_track_clears_the_eq_chain_first") {
+        return;
+    }
+    // 啟動前就開了直通：舊的引擎（系統的 libmpv 0.37）也是第一個檔案就直通，不用重開檔案
+    step_until(&mut h, "直通中", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    let audio = h.state().player().state.selected(TrackKind::Audio).map(|t| t.id);
+    h.state_mut().set_option_async(AsyncKey::AudioDevice, "aid", "no");
+    step_until(&mut h, "mpv 關掉音軌", |s| s.selected(TrackKind::Audio).is_none());
+    wait_af(&mut h, "沒有直通：等化器設回來", |af| af.contains(ROCK_B1));
+    h.run_steps(2);
+    let errors_before = disabled_filters(&h).len();
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert_eq!(prop(&h, "af"), "", "選回會直通的音軌之前先清空");
+    step_until(&mut h, "選回原本的音軌、直通中", |s| {
+        s.selected(TrackKind::Audio).map(|t| t.id) == audio && s.audio_spdif.as_deref() == Some("ac3")
+    });
+    wait_real(&mut h, 0.5);
+    assert_eq!(prop(&h, "af"), "");
+    assert_eq!(disabled_filters(&h).len(), errors_before, "{:?}", disabled_filters(&h));
+}
+
+#[test]
+fn audio_output_failure_keeps_playing_with_a_notice() {
+    // 音訊輸出開不起來（ao 自動選、強制用不存在的裝置模擬）：mpv 改用 null 繼續播放，提示一次。
+    // 純音樂檔以前會直接結束（「無法開啟音訊裝置」）
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-ao-fallback",
+        None,
+        Some(&[SPEAKERS]),
+        &[
+            ("ao", ""),
+            ("audio-device", "wasapi/{00000000-0000-0000-0000-00000000dead}"),
+            LOOP_FILE,
+        ],
+        |_| {},
+    );
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until_app(&mut h, "提示沒有聲音", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+    });
+    step_until(&mut h, "照樣播放", |s| {
+        playing(s, "audio_flac.flac") && s.time_pos > 0.3
+    });
+    assert!(h.state().player().state.selected(TrackKind::Audio).is_some());
+    // 只提示一次：還是 null 也不會一直提示
+    step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+    wait_real(&mut h, 1.5);
+    assert_eq!(h.state().osd_text(), None);
+    assert!(h.state().player().audio_fell_back());
+    assert_eq!(h.state().audio_output_retries(), 0);
+    // 下一個檔案：mpv 會沿用改用的 null（同樣格式的不重開），要重開一次再試真正的裝置；還是開不起來就再提示
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until_app(&mut h, "換檔時重開音訊輸出", |app| {
+        app.audio_output_retries() == 1
+    });
+    step_until_app(&mut h, "還是開不起來：再提示", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+    });
+    step_until(&mut h, "照樣播放", |s| s.loaded && s.time_pos > 0.3);
+    // 真的重開了：這個檔案又試了一次指定的裝置（沒重開的話沿用 null，這個檔案沒有音訊輸出的錯誤）
+    let errors = h.state().player().recent_errors();
+    assert!(errors.iter().any(|e| e.starts_with("[ao")), "{errors:?}");
+    // 裝置清單變了（例如預設裝置的電視打開了）：也重開一次
+    step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+    h.state_mut().fake_audio_devices(fake_devices(&[SPEAKERS, DAC]));
+    h.run_steps(2);
+    assert_eq!(h.state().audio_output_retries(), 2);
+    step_until_app(&mut h, "還是開不起來：再提示", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+    });
+}
+
+#[test]
+fn audio_output_failure_in_exclusive_mode_mentions_it() {
+    // 開著獨佔模式時開不起來：提示可能是獨佔模式不被允許
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-ao-fallback-exclusive",
+        None,
+        None,
+        &[
+            ("ao", ""),
+            ("audio-device", "wasapi/{00000000-0000-0000-0000-00000000dead}"),
+        ],
+        |s| s.audio.exclusive = true,
+    );
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until_app(&mut h, "提示沒有聲音、可能是獨佔模式", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置（可能不允許獨佔模式），暫時沒有聲音")
+    });
+}
+
+#[test]
+fn loading_a_passthrough_audio_file_clears_the_eq_chain() {
+    // 「載入音軌檔…」載入會直通的音軌（AC-3）：跟選單換音軌一樣，選上之前先清空 af，濾鏡不會碰到直通的資料
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-spdif-load-audio",
+        Some("common/mp4_h264_aac.mp4"),
+        None,
+        &[LOOP_FILE],
+        spdif_with_rock,
+    );
+    if !has_af_filters(&h, "loading_a_passthrough_audio_file_clears_the_eq_chain") {
+        return;
+    }
+    wait_af(&mut h, "AAC 有等化器", |af| af.contains(ROCK_B1));
+    h.state_mut().load_extra_file(&sample("common/mkv_hevc_ac3.mkv"), false);
+    assert_eq!(prop(&h, "af"), "", "選會直通的音軌之前先清空");
+    assert_eq!(h.state().osd_text(), Some("載入音軌：mkv_hevc_ac3.mkv"));
+    step_until(&mut h, "換成外掛的 AC-3、直通中", |s| {
+        s.selected(TrackKind::Audio).is_some_and(|t| t.external) && s.audio_spdif.as_deref() == Some("ac3")
+    });
+    wait_real(&mut h, 0.5);
+    assert_eq!(prop(&h, "af"), "");
+    assert_eq!(disabled_filters(&h), Vec::<String>::new());
+}

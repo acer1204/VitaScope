@@ -33,11 +33,12 @@ impl VitascopeApp {
     pub(super) fn picture_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let mut action = None;
         ui.menu_button(crate::tr!("畫質", "Video quality"), |ui| {
-            let panel = egui::Button::selectable(self.panel_open, crate::tr!("影像調整…", "Image adjustments…"))
+            let shown = self.panel_open && self.panel_tab == super::control_panel::PanelTab::Picture;
+            let panel = egui::Button::selectable(shown, crate::tr!("影像調整…", "Image adjustments…"))
                 .shortcut_text(format!("{}+G", super::ALT_KEY));
-            // 跟設定頁的按鈕一樣只負責打開（已經開著就不動；Alt+G 才是開關）
-            if ui.add(panel).clicked() && !self.panel_open {
-                action = Some(Action::ToggleControlPanel);
+            // 跟設定頁的按鈕一樣只負責打開畫質分頁（已經開著就換到畫質分頁；Alt+G 才是開關）
+            if ui.add(panel).clicked() {
+                action = Some(Action::ShowAdjustments);
             }
             if super::menu_item(
                 ui,

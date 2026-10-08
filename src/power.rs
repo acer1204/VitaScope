@@ -2,7 +2,9 @@
 //!
 //! 每個平台問作業系統的方式不同，判斷的規則寫成純函式，各自有測試。
 
+use std::cell::RefCell;
 use std::path::Path;
+use std::sync::mpsc;
 
 /// 電源的來源
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,6 +32,53 @@ impl PowerSource {
 /// 目前的電源
 pub fn source() -> PowerSource {
     platform::source()
+}
+
+/// 在背景執行緒查電源：Linux 讀 sysfs 的電池、變壓器狀態，有些筆電要經過 ACPI、EC 等幾十毫秒，
+/// 在介面的執行緒上讀會讓播放卡一下。查好的結果用 channel 送回來，介面每一幀看一下（不等）
+#[derive(Default)]
+pub struct Background {
+    state: RefCell<BackgroundState>,
+}
+
+#[derive(Default)]
+struct BackgroundState {
+    /// 查詢中：結果從這裡送回來
+    pending: Option<mpsc::Receiver<PowerSource>>,
+}
+
+impl Background {
+    /// 開始查（`read` 在背景執行緒執行，查好之後呼叫 `done`，例如要介面重畫）；已經在查就不再開
+    pub fn start(&self, read: fn() -> PowerSource, done: impl FnOnce() + Send + 'static) {
+        let mut st = self.state.borrow_mut();
+        if st.pending.is_none() {
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("vitascope-power".into())
+                .spawn(move || {
+                    // 介面那邊不要了（關閉中）也沒關係
+                    let _ = tx.send(read());
+                    done();
+                });
+            match spawned {
+                Ok(_) => st.pending = Some(rx),
+                Err(e) => eprintln!("[vitascope] 無法查電源：{e}"),
+            }
+        }
+    }
+
+    /// 查好了：回傳結果（沒在查、還沒查好是 None）
+    pub fn take(&self) -> Option<PowerSource> {
+        let mut st = self.state.borrow_mut();
+        let result = match st.pending.as_ref()?.try_recv() {
+            Ok(power) => power,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            // 執行緒沒送就結束了（不會發生）：當成不知道
+            Err(mpsc::TryRecvError::Disconnected) => PowerSource::Unknown,
+        };
+        st.pending = None;
+        Some(result)
+    }
 }
 
 /// Windows `GetSystemPowerStatus`：BatteryFlag 的 128 = 沒有系統電池（桌機），但 255（讀不到電池狀態）
@@ -232,6 +281,36 @@ mod tests {
         // 沒有列出變壓器的筆電：電池正在充電 = 接著電源
         let charging = FakeSys::new("charging").supply("BAT1", &[("type", "Battery"), ("status", "Charging")]);
         assert_eq!(from_sysfs(&charging.0), PowerSource::Ac);
+    }
+
+    #[test]
+    fn background_read_does_not_block() {
+        fn slow() -> PowerSource {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            PowerSource::Battery
+        }
+        let bg = Background::default();
+        let (tx, rx) = mpsc::channel();
+        let started = std::time::Instant::now();
+        bg.start(slow, move || tx.send(()).unwrap());
+        assert!(started.elapsed() < std::time::Duration::from_millis(200), "不等查詢");
+        assert_eq!(bg.take(), None, "還沒查好");
+        // 查詢中再要求一次：不會再開一個
+        let (tx2, rx2) = mpsc::channel::<()>();
+        bg.start(slow, move || tx2.send(()).unwrap());
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("查好之後通知");
+        assert_eq!(bg.take(), Some(PowerSource::Battery));
+        assert_eq!(bg.take(), None, "結果只拿一次");
+        assert!(
+            rx2.recv_timeout(std::time::Duration::from_millis(500)).is_err(),
+            "沒有開第二個"
+        );
+        // 查好之後可以再查
+        let (tx3, rx3) = mpsc::channel();
+        bg.start(|| PowerSource::Ac, move || tx3.send(()).unwrap());
+        rx3.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(bg.take(), Some(PowerSource::Ac));
     }
 
     #[test]

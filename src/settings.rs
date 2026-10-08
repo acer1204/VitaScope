@@ -279,7 +279,7 @@ impl Settings {
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
         let merged = match (&self.baseline, on_disk) {
-            (Some(base), Some(disk)) => merge(&current, base, disk),
+            (Some(base), Some(disk)) => merge(&current, base, disk, &mut Vec::new()),
             _ => current.clone(),
         };
         if let Some(dir) = path.parent() {
@@ -343,15 +343,31 @@ fn slot<'a>(root: &'a mut serde_json::Value, path: &[String]) -> Option<&'a mut 
     )
 }
 
+/// 依編號（`id`）合併的清單：像素著色器的組合。兩個視窗各自新增、修改、刪除不同的組合，都留下
+const MERGE_BY_ID: &[&str] = &["video", "shaders", "presets"];
+/// 固定長度、逐格合併的陣列：等化器每一段的增益。兩個視窗各調了不同的段落，都留下
+const MERGE_BY_INDEX: &[&str] = &["audio", "eq", "gains"];
+
 /// 三方合併：`now` 跟 `base` 不同的地方寫進 `disk`，其他的保留 `disk` 的。
-/// 物件（例如字幕外觀）逐項合併：兩個視窗各改了一項，兩項都留下
-fn merge(now: &serde_json::Value, base: &serde_json::Value, disk: serde_json::Value) -> serde_json::Value {
+/// 物件（例如字幕外觀）逐項合併：兩個視窗各改了一項，兩項都留下。
+/// 陣列整個當成一個值，除了上面兩個（`path` 是目前的位置）
+fn merge(
+    now: &serde_json::Value,
+    base: &serde_json::Value,
+    disk: serde_json::Value,
+    path: &mut Vec<String>,
+) -> serde_json::Value {
     use serde_json::Value;
     match (now, base, disk) {
         (Value::Object(now), Value::Object(base), Value::Object(mut disk)) => {
             for (key, value) in now {
                 let merged = match (base.get(key), disk.remove(key)) {
-                    (Some(b), Some(d)) => merge(value, b, d),
+                    (Some(b), Some(d)) => {
+                        path.push(key.clone());
+                        let m = merge(value, b, d, path);
+                        path.pop();
+                        m
+                    }
                     // 檔案裡沒有（舊版的設定檔）、或上次讀的時候沒有：用現在的
                     _ => value.clone(),
                 };
@@ -359,14 +375,61 @@ fn merge(now: &serde_json::Value, base: &serde_json::Value, disk: serde_json::Va
             }
             Value::Object(disk)
         }
-        (now, base, disk) => {
-            if now != base {
-                now.clone()
-            } else {
-                disk
+        (Value::Array(n), Value::Array(b), Value::Array(d)) if path.as_slice() == MERGE_BY_ID => {
+            match merge_by_id(n, b, &d) {
+                Some(merged) => Value::Array(merged),
+                None => scalar_merge(now, base, Value::Array(d)),
             }
         }
+        (Value::Array(n), Value::Array(b), Value::Array(mut d))
+            if path.as_slice() == MERGE_BY_INDEX && n.len() == b.len() && b.len() == d.len() =>
+        {
+            for ((now, base), disk) in n.iter().zip(b).zip(d.iter_mut()) {
+                if now != base {
+                    *disk = now.clone();
+                }
+            }
+            Value::Array(d)
+        }
+        (now, base, disk) => scalar_merge(now, base, disk),
     }
+}
+
+/// 整個值：這個視窗改了就用現在的，沒改就保留檔案的
+fn scalar_merge(now: &serde_json::Value, base: &serde_json::Value, disk: serde_json::Value) -> serde_json::Value {
+    if now != base { now.clone() } else { disk }
+}
+
+/// 依編號合併清單：檔案裡的照原本的順序留下，這個視窗（跟上次讀檔、存檔時比）刪掉的拿掉、改過的換成現在的，
+/// 新增的（檔案裡沒有的）接在後面。這個視窗改過、另一個視窗刪掉的留下（改的比較新）。
+/// 有一項沒有編號（不是這個程式寫的）時 None：整個清單照一般的值合併
+fn merge_by_id(
+    now: &[serde_json::Value],
+    base: &[serde_json::Value],
+    disk: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
+    type Keyed<'a> = Vec<(u64, &'a serde_json::Value)>;
+    fn index(list: &[serde_json::Value]) -> Option<Keyed<'_>> {
+        list.iter().map(|v| Some((v.get("id")?.as_u64()?, v))).collect()
+    }
+    fn find<'a>(list: &Keyed<'a>, key: u64) -> Option<&'a serde_json::Value> {
+        list.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+    let (now, base, disk) = (index(now)?, index(base)?, index(disk)?);
+    // 這個視窗新增或改過的
+    let touched = |key: u64| find(&now, key).filter(|v| find(&base, key) != Some(*v));
+    let deleted = |key: u64| find(&now, key).is_none() && find(&base, key).is_some();
+    let mut merged: Vec<serde_json::Value> = disk
+        .iter()
+        .filter(|(key, _)| !deleted(*key))
+        .map(|(key, v)| touched(*key).unwrap_or(v).clone())
+        .collect();
+    merged.extend(
+        now.iter()
+            .filter(|(key, _)| find(&disk, *key).is_none() && touched(*key).is_some())
+            .map(|(_, v)| (*v).clone()),
+    );
+    Some(merged)
 }
 
 /// 設定與播放紀錄的資料夾
@@ -635,6 +698,88 @@ mod tests {
         assert_eq!(back.audio.device.as_deref(), Some("wasapi/{abc}"));
         assert!(back.audio.passthrough.truehd);
         assert!(back.audio.passthrough.ac3, "沒改的直通格式維持預設");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn two_windows_keep_each_others_shader_presets() {
+        use crate::picture::ShaderPreset;
+        let dir = temp_dir("shader-merge");
+        let path = dir.join("settings.json");
+        let preset = |id, name: &str, files: &[&str]| ShaderPreset {
+            id,
+            name: name.into(),
+            files: files.iter().map(|f| (*f).to_owned()).collect(),
+        };
+        let names = |s: &Settings| -> Vec<String> { s.video.shaders.presets.iter().map(|p| p.name.clone()).collect() };
+        // 一開始有兩個組合
+        let mut first = Settings::load_from(path.clone());
+        first.video.shaders.presets = vec![preset(1, "舊的 1", &["a.glsl"]), preset(2, "舊的 2", &["b.glsl"])];
+        first.save().unwrap();
+        // 兩個視窗都開著
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        // A 新增「組合 1」、加了檔案、開始使用，刪掉舊的 2
+        a.video.shaders.presets.push(preset(10, "組合 1", &["Anime4K.glsl"]));
+        a.video.shaders.presets.retain(|p| p.id != 2);
+        a.video.shaders.active = Some(10);
+        a.save().unwrap();
+        // B 新增自己的組合、把舊的 1 改名：A 的組合不能不見
+        b.video.shaders.presets.push(preset(20, "B 的組合", &["FSRCNNX.glsl"]));
+        b.video.shaders.presets[0].name = "改名".into();
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(names(&back), ["改名", "組合 1", "B 的組合"]);
+        assert_eq!(back.video.shaders.presets[1].files, ["Anime4K.glsl"]);
+        assert_eq!(back.video.shaders.active, Some(10), "A 用的組合還在，照樣使用中");
+        // A 沒再改組合、只改了別的設定：存檔時不會把 B 改的蓋回去
+        a.volume = 50.0;
+        a.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(names(&back), ["改名", "組合 1", "B 的組合"]);
+        assert_eq!(back.volume, 50.0);
+        // B 刪掉兩邊都有的那一個、A 改了自己組合裡的檔案：兩個都生效
+        b.video.shaders.presets.retain(|p| p.id != 1);
+        b.save().unwrap();
+        a.video.shaders.presets[1].files.push("Anime4K_2.glsl".into());
+        a.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(names(&back), ["組合 1", "B 的組合"]);
+        assert_eq!(back.video.shaders.presets[0].files, ["Anime4K.glsl", "Anime4K_2.glsl"]);
+        // 沒有編號的項目（不是這個程式寫的）：整個清單照一般的值合併
+        let odd = serde_json::json!([{"name": "沒有編號"}]);
+        assert_eq!(
+            merge_by_id(odd.as_array().unwrap(), &[], &[]),
+            None,
+            "沒有編號就不逐項合併"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn two_windows_change_different_eq_bands() {
+        let dir = temp_dir("eq-merge");
+        let path = dir.join("settings.json");
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.audio.eq.preset = crate::sound::EqPreset::Custom;
+        a.audio.eq.gains[0] = 5.0;
+        a.save().unwrap();
+        b.audio.eq.preset = crate::sound::EqPreset::Custom;
+        b.audio.eq.gains[9] = -3.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.audio.eq.gains[0], 5.0, "A 調的 31 Hz 不能被 B 蓋回去");
+        assert_eq!(back.audio.eq.gains[9], -3.0);
+        assert_eq!(back.audio.eq.preset, crate::sound::EqPreset::Custom);
+        // 兩個視窗調同一段：後存的為準
+        a.audio.eq.gains[0] = 2.0;
+        a.save().unwrap();
+        b.audio.eq.gains[0] = -1.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.audio.eq.gains[0], -1.0);
+        assert_eq!(back.audio.eq.gains[9], -3.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

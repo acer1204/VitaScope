@@ -1015,3 +1015,41 @@ fn closing_after_watching_the_device_list_does_not_crash() {
     r.watch_audio_devices();
     r.wait_state(TIMEOUT, |s| s.audio_devices.is_some()).unwrap();
 }
+
+/// 不存在的輸出裝置（拔掉的 USB DAC）：ao 自動選、強制用這個裝置，開不起來
+const DEAD_DEVICE: (&str, &str) = ("audio-device", "wasapi/{00000000-0000-0000-0000-00000000dead}");
+
+/// 音訊輸出開不起來（獨佔模式不被允許、選的裝置拔掉了）：mpv 改用 null 輸出繼續播放，純音樂檔也不會停，
+/// 音軌也沒被關掉（之後改裝置、獨佔模式時 mpv 才會照新的設定重開）。
+/// ao 改回自動選（不是 headless 的 null），強制用不存在的裝置模擬；三個平台都開不起來，不會真的出聲
+#[test]
+fn failed_audio_output_falls_back_to_null() {
+    let flac = sample("general/audio_flac.flac");
+    let mut p = player_with(&[("ao", ""), DEAD_DEVICE]);
+    assert_eq!(p.get_string("audio-fallback-to-null").unwrap(), "yes");
+    p.open(&flac).unwrap();
+    p.wait_state(TIMEOUT, |s| s.current_ao.is_some() && s.time_pos > 0.3)
+        .expect("照樣播放");
+    assert_eq!(p.state.current_ao.as_deref(), Some("null"));
+    assert!(p.audio_fell_back(), "開不起來改用的 null");
+    assert!(p.state.selected(TrackKind::Audio).is_some(), "音軌沒有被關掉");
+    // 改裝置：mpv 重開音訊輸出（還是開不起來就再用 null），檔案照樣播放
+    p.mpv()
+        .set_property("audio-device", "wasapi/{00000000-0000-0000-0000-00000000beef}")
+        .unwrap();
+    let t = p.state.time_pos;
+    p.wait_state(TIMEOUT, |s| s.time_pos > t + 0.3)
+        .expect("改裝置之後照樣播放");
+    assert!(p.state.loaded && p.state.selected(TrackKind::Audio).is_some());
+    // headless 本來就指定 null：不算開不起來
+    let mut headless = player_with(&[]);
+    headless.open(&flac).unwrap();
+    headless.wait_state(TIMEOUT, |s| s.current_ao.is_some()).unwrap();
+    assert_eq!(headless.state.current_ao.as_deref(), Some("null"));
+    assert!(!headless.audio_fell_back());
+    // 對照：mpv 原本的行為（不改用 null）純音樂檔直接結束，「無法開啟音訊裝置」
+    let mut old = player_with(&[("ao", ""), DEAD_DEVICE, ("audio-fallback-to-null", "no")]);
+    old.open(&flac).unwrap();
+    let err = old.wait_state(TIMEOUT, |s| s.time_pos > 1.0).unwrap_err();
+    assert!(err.contains("無法開啟音訊裝置"), "{err}");
+}
