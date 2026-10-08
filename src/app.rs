@@ -9,6 +9,7 @@ mod preview;
 mod quality;
 mod settings_window;
 mod shaders;
+mod sound;
 mod tuning_menu;
 
 use crate::autoshot::AutoShot;
@@ -161,6 +162,11 @@ enum Action {
     SetComputePeak(bool),
     /// 像素著色器：使用的組合（編號）；None = 不使用
     SetShaderPreset(Option<u32>),
+    /// 音效（整個程式共用、存檔）：獨佔模式、多聲道轉成立體聲、音訊直通（開 / 關）。
+    /// 輸出裝置的名稱是字串，在選單、設定頁裡直接處理
+    ToggleExclusive,
+    ToggleDownmix,
+    TogglePassthrough,
 }
 
 pub struct VitascopeApp {
@@ -330,6 +336,17 @@ pub struct VitascopeApp {
     shader_new: Option<u32>,
     /// 自動測試沒有畫面時當成畫了幾格（見 `simulate_video_frames`）
     simulated_frames: Option<u64>,
+    /// 存下的輸出裝置拔掉了，暫時用預設裝置（插回來時切回去）
+    device_fallback: bool,
+    /// 上次處理過的裝置清單（變了才重新對照存下的裝置）
+    devices_seen: Option<Vec<crate::sound::AudioDevice>>,
+    /// 上次看到的音訊直通格式（開始直通時提示一次）
+    spdif_seen: Option<String>,
+    /// 上次看到 mpv 選的音軌（變了才更新 `audio_restore`）
+    audio_seen: Option<i64>,
+    /// 換輸出裝置之後要選回來的音軌：這個檔案最後選的音軌（使用者自己關掉音軌時是 None）。
+    /// 播放中拔掉裝置時 mpv 會先自己重開音訊輸出、開不起來就把音軌關掉，之後改裝置也不會再開
+    audio_restore: Option<i64>,
 }
 
 /// 主視窗的 handle（給開檔對話框當擁有者）
@@ -549,6 +566,11 @@ impl VitascopeApp {
             shader_rejected: None,
             shader_new: None,
             simulated_frames: None,
+            device_fallback: false,
+            devices_seen: None,
+            spdif_seen: None,
+            audio_seen: None,
+            audio_restore: None,
         };
         app.engine_versions = short_versions(
             &app.player.get_string("mpv-version").unwrap_or_default(),
@@ -624,7 +646,7 @@ impl VitascopeApp {
     }
 
     /// 啟動時（還沒開任何檔案）偵測播放引擎的功能，同步套用要在第一個檔案就生效的設定
-    /// （流暢播放打開而且已經查得到更新率時）。之後的批次在這裡同步套用畫質、音效設定
+    /// （流暢播放打開而且已經查得到更新率時、畫質、音效）
     fn apply_startup(&mut self) {
         self.caps = self.player.probe_caps();
         self.picture_defaults = self.player.picture_defaults();
@@ -639,6 +661,8 @@ impl VitascopeApp {
         self.adjust_startup();
         // 去交錯（預設自動）、去色帶、銳化、縮放演算法、HDR：第一個檔案就要生效
         self.video_startup();
+        // 輸出裝置、獨佔模式、轉成立體聲、音訊直通
+        self.sound_startup();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -689,6 +713,8 @@ impl VitascopeApp {
             ) {
                 self.player.forget_picture(&name);
             }
+            // 音效選項也一樣
+            self.sound_reply_failed(k, &name);
             self.async_failed(k, &name, &e);
             // 像素著色器 mpv 不接受：剛換的組合就還原（提示換成「已還原」）
             if k == AsyncKey::Shaders {
@@ -966,6 +992,8 @@ impl VitascopeApp {
                     fmt_time(duration)
                 ));
             }
+            // 音訊直通中：音量交給擴大機
+            Action::Volume(_) if st.audio_spdif.is_some() => self.osd(sound::spdif_volume_hover()),
             Action::Volume(delta) => {
                 // 直接問 mpv 目前的音量：連續捲動滾輪時，屬性變化的通知可能還沒送到
                 let current = self.player.get_f64("volume").unwrap_or(st.volume);
@@ -1025,6 +1053,9 @@ impl VitascopeApp {
             Action::SetGamut(g) => self.set_gamut(g),
             Action::SetComputePeak(on) => self.set_compute_peak(on),
             Action::SetShaderPreset(id) => self.set_shader_preset(id),
+            Action::ToggleExclusive => self.set_exclusive(!self.settings.audio.exclusive),
+            Action::ToggleDownmix => self.set_downmix(!self.settings.audio.downmix),
+            Action::TogglePassthrough => self.set_passthrough(!self.settings.audio.passthrough.enabled),
             Action::PlaylistRemove => {
                 if let Some(i) = self.playlist_selected {
                     self.remove_from_playlist(i);
@@ -1471,6 +1502,10 @@ impl VitascopeApp {
 
     fn set_speed(&mut self, speed: f64) {
         let speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        // 音訊直通中不能變速（改回正常速度可以）
+        if self.speed_blocked(speed) {
+            return;
+        }
         let _ = self.player.set_speed(speed);
         self.osd(crate::tf!("速度 {}×", "Speed {}×", fmt_speed(speed)));
     }
@@ -1514,6 +1549,10 @@ impl VitascopeApp {
             self.osd(crate::tf!("無法切換{name}：{e}", "Cannot switch {name}: {e}"));
             return;
         }
+        // 使用者自己選的音軌（包括關掉）：換裝置之後照這個
+        if kind == TrackKind::Audio {
+            self.audio_restore = id;
+        }
         let label = id
             .and_then(|id| self.player.state.tracks_of(kind).find(|t| t.id == id))
             .map_or_else(|| crate::tr!("關閉", "Off").to_owned(), |t| t.label());
@@ -1544,6 +1583,8 @@ impl VitascopeApp {
                 self.last_autosave = Instant::now();
                 self.file_gen += 1;
                 self.pacing.start_file(self.file_gen);
+                self.audio_seen = None;
+                self.audio_restore = None;
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
             PlayerEvent::CommandReply { id, error } => match crate::player::async_key(id) {
@@ -2647,6 +2688,9 @@ impl VitascopeApp {
         if let Some(a) = self.picture_menu(ui) {
             action = Some(a);
         }
+        if let Some(a) = self.sound_menu(ui) {
+            action = Some(a);
+        }
         let has_video = self.player.state.loaded && self.player.state.has_video();
         if let Some(a) = self.screenshot_menu(ui, has_video) {
             action = Some(a);
@@ -2910,11 +2954,13 @@ impl VitascopeApp {
         let slider = egui::Slider::new(&mut volume, 0.0..=100.0)
             .show_value(false)
             .trailing_fill(true);
-        let response = ui.add_sized([70.0, 20.0], slider).on_hover_text(crate::tf!(
-            "音量 {:.0}%（↑ ↓）",
-            "Volume {:.0}% (↑ ↓)",
-            st.volume
-        ));
+        // 音訊直通中：音量交給擴大機，滑桿停用
+        let spdif = st.audio_spdif.is_some();
+        let response = ui
+            .add_enabled_ui(!spdif, |ui| ui.add_sized([70.0, 20.0], slider))
+            .inner
+            .on_hover_text(crate::tf!("音量 {:.0}%（↑ ↓）", "Volume {:.0}% (↑ ↓)", st.volume))
+            .on_disabled_hover_text(sound::spdif_volume_hover());
         if response.changed() {
             let _ = self.player.set_volume(volume);
             if st.muted {
@@ -3365,6 +3411,7 @@ impl eframe::App for VitascopeApp {
             self.on_player_event(ev);
         }
         self.shader_tick();
+        self.sound_tick();
         // 視窗出現之後才有螢幕可查
         if self.frames >= 2 {
             self.pacing_tick(ctx);

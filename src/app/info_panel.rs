@@ -37,6 +37,10 @@ impl VitascopeApp {
         }
         let stale = lang_changed || self.info_cache.as_ref().is_none_or(|c| c.read_at.elapsed() >= REFRESH);
         if stale {
+            // 輸出裝置播放中也會換（選單、設定頁、拔掉 / 插回來）：已經在觀察裝置清單時不用再列舉，每次都重讀
+            if self.audio_device.is_some() && self.player.state.audio_devices.is_some() {
+                self.audio_device = mediainfo::audio_device_name(&self.player);
+            }
             let live = mediainfo::read_live(&self.player);
             // 「使用中」的說明（每格幾次更新、影片快多少）也用這次讀到的數字
             self.set_sync_numbers(&live);

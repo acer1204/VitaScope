@@ -61,7 +61,11 @@ fn harness_launch(launch: Launch, settings: Settings) -> Harness<'static, Vitasc
 
 /// 自己指定播放器的選項（例如用 `extra` 加 mpv 選項：vo-null-fps 之類的）
 fn harness_launch_with(opts: Options, launch: Launch, settings: Settings) -> Harness<'static, VitascopeApp> {
-    let player = Player::new(opts).unwrap();
+    harness_with_player(Player::new(opts).unwrap(), launch, settings)
+}
+
+/// 用準備好的播放器（例如先放了假的音訊裝置清單）
+fn harness_with_player(player: Player, launch: Launch, settings: Settings) -> Harness<'static, VitascopeApp> {
     Harness::builder()
         .with_size([960.0, 600.0])
         .build_eframe(move |cc| VitascopeApp::new(cc, player, settings, launch))
@@ -2605,6 +2609,10 @@ fn status_quo_options() {
         "glsl-shaders",
         "volume-max",
         "audio-device",
+        "audio-exclusive",
+        "audio-channels",
+        "audio-normalize-downmix",
+        "audio-spdif",
     ] {
         let default = prop(&h, &format!("option-info/{name}/default-value"));
         let expected = if name == "deinterlace" && caps.deint_auto {
@@ -4921,4 +4929,611 @@ fn shader_section_in_english() {
     h.run_steps(2);
     assert_eq!(h.state().osd_text(), Some("Pixel shaders: Preset 1 (0 files)"));
     assert!(h.query_by_label_contains("著色器").is_none(), "沒有中文");
+}
+
+// ───────────── 音效：輸出裝置、獨佔模式、轉成立體聲、音訊直通 ─────────────
+
+/// 開右鍵選單、把滑鼠移到「音效」上（子選單打開）。有檔案時在影片中間按，沒有時在左上角按（中間是起始畫面的按鈕）
+fn open_sound_menu(h: &mut Harness<'_, VitascopeApp>) {
+    if h.state().player().state.loaded {
+        h.get_by_label("影片畫面").click_secondary();
+    } else {
+        let corner = egui::pos2(40.0, 40.0);
+        h.event(egui::Event::PointerMoved(corner));
+        for pressed in [true, false] {
+            h.event(egui::Event::PointerButton {
+                pos: corner,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+    }
+    h.run_steps(2);
+    hover_menu_item(h, "音效 ⏵");
+}
+
+/// 右鍵選單「音效」→ 子選單（`path`）→ 點 `item`（完整標籤）
+fn pick_sound_item(h: &mut Harness<'_, VitascopeApp>, path: &[&str], item: &str) {
+    open_sound_menu(h);
+    for sub in path {
+        hover_menu_item(h, sub);
+    }
+    h.get_by_label(item).click();
+    h.run_steps(2);
+}
+
+/// 設定檔裡存的 `audio`
+fn saved_audio(path: &std::path::Path) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    v["audio"].clone()
+}
+
+/// 假的裝置清單：auto + 這些（名稱, 說明）。用 coreaudio 的名稱：macOS 固定列 coreaudio，其他系統照清單上第一種，
+/// 三個平台列出的都一樣；Linux 不是 PipeWire，不顯示獨佔模式
+fn fake_devices(devices: &[(&str, &str)]) -> Vec<vitascope::sound::AudioDevice> {
+    std::iter::once(("auto", "Autoselect device"))
+        .chain(devices.iter().copied())
+        .map(|(name, description)| vitascope::sound::AudioDevice {
+            name: name.into(),
+            description: description.into(),
+        })
+        .collect()
+}
+
+/// 控制列的音量滑桿停用了沒（控制列上另一個滑桿是進度條）
+fn volume_slider_disabled(h: &Harness<'_, VitascopeApp>) -> bool {
+    let volume: Vec<_> = h
+        .query_all_by_role(egui::accesskit::Role::Slider)
+        .filter(|s| s.accesskit_node().label().as_deref() != Some("進度"))
+        .collect();
+    assert_eq!(volume.len(), 1, "控制列只有一個音量滑桿");
+    volume[0].accesskit_node().is_disabled()
+}
+
+/// 舊的引擎播放中改 audio-spdif 不會馬上生效：重新開檔（下一個檔案就照新的設定）
+fn reopen_for_spdif(h: &mut Harness<'_, VitascopeApp>, file: &str) {
+    drop_file(h, sample(file));
+    let name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+    settle(h, &name);
+}
+
+const SPEAKERS: (&str, &str) = ("coreaudio/BuiltInSpeakerDevice", "內建喇叭");
+const DAC: (&str, &str) = ("coreaudio/AppleUSBAudioEngine:DAC:1", "USB DAC");
+
+/// 用暫存資料夾的設定檔（`change` 先改設定）、假的裝置清單啟動，播放 `file`（None = 不開檔）
+fn sound_harness(
+    name: &str,
+    file: Option<&str>,
+    devices: Option<&[(&str, &str)]>,
+    change: impl FnOnce(&mut Settings),
+) -> (TempDir, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    change(&mut settings);
+    let mut player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    if let Some(list) = devices {
+        player.set_fake_audio_devices(fake_devices(list));
+    }
+    let launch = Launch {
+        files: file.map(sample).into_iter().collect(),
+        ..Default::default()
+    };
+    let mut h = harness_with_player(player, launch, settings);
+    match file {
+        Some(f) => {
+            let file_name = PathBuf::from(f).file_name().unwrap().to_string_lossy().into_owned();
+            settle(&mut h, &file_name);
+        }
+        None => h.run_steps(3),
+    }
+    (dir, path, h)
+}
+
+#[test]
+fn sound_menu_follows_picture_and_works_without_a_file() {
+    let (_dir, _path, mut h) = sound_harness("sound-menu-place", None, None, |_| {});
+    open_sound_menu(&mut h);
+    // 「音效」緊接在「畫質」後面，沒開檔也能用；「音軌」照舊（每個檔案各自的）
+    let picture = h.get_by_label("畫質 ⏵").rect();
+    let sound = h.get_by_label("音效 ⏵");
+    assert!(sound.rect().top() >= picture.bottom() - 1.0);
+    assert!(sound.rect().top() <= picture.bottom() + 12.0, "緊接在後面");
+    assert!(!sound.accesskit_node().is_disabled(), "沒開檔也能用");
+    assert!(h.get_by_label("音軌 ⏵").accesskit_node().is_disabled());
+    for item in ["多聲道轉成立體聲（5.1／7.1 → 2.0）", "輸出裝置 ⏵", "音訊直通"] {
+        h.get_by_label(item);
+    }
+}
+
+#[test]
+fn audio_device_list_is_watched_after_the_first_frame() {
+    // 沒存裝置、也沒打開選單或設定頁：第一個畫面出來之後就開始觀察裝置清單（mpv 同時開始偵測插拔），
+    // 存下的裝置拔掉、插回來才接得到（真的清單；CI 沒有音訊裝置時只有 auto）
+    let (_dir, _path, mut h) = sound_harness("sound-watch-devices", None, None, |_| {});
+    step_until(&mut h, "開始觀察裝置清單", |s| s.audio_devices.is_some());
+    let list = h.state().player().state.audio_devices.clone().unwrap();
+    assert_eq!(list[0].name, vitascope::sound::AUTO_DEVICE, "{list:?}");
+}
+
+#[test]
+fn downmix_toggle_sets_audio_channels() {
+    let (_dir, path, mut h) = sound_harness("sound-downmix", Some("common/mp4_h264_aac.mp4"), None, |_| {});
+    assert_eq!(prop(&h, "audio-channels"), "auto-safe");
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert_eq!(h.state().osd_text(), Some("轉成立體聲：開"));
+    wait_prop(&mut h, "audio-channels", "stereo");
+    // 混音時避免破音（預設開）跟著轉成立體聲生效
+    wait_prop(&mut h, "audio-normalize-downmix", "yes");
+    assert!(h.state().settings().audio.downmix);
+    assert_eq!(saved_audio(&path)["downmix"], true);
+    // 再點一次：關，回到 mpv 原本的值
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert_eq!(h.state().osd_text(), Some("轉成立體聲：關"));
+    wait_prop(&mut h, "audio-channels", "auto-safe");
+    wait_prop(&mut h, "audio-normalize-downmix", "no");
+    assert_eq!(saved_audio(&path)["downmix"], false);
+    // 播放沒有中斷
+    step_until(&mut h, "照樣播放", |s| s.loaded && !s.paused);
+}
+
+#[test]
+fn passthrough_toggle_sets_audio_spdif() {
+    let (_dir, path, mut h) = sound_harness("sound-passthrough", Some("common/mkv_hevc_ac3.mkv"), None, |_| {});
+    assert_eq!(h.state().player().state.audio_spdif, None);
+    let live = h.state().engine_caps().spdif_live;
+    // 點了之後馬上看提示：新的引擎很快就開始直通，開始直通的提示會蓋掉它
+    open_sound_menu(&mut h);
+    h.get_by_label("音訊直通").click();
+    h.run_steps(1);
+    let engaged = "音訊直通：AC-3 → 擴大機（音量請用擴大機調整）";
+    let osd = h.state().osd_text();
+    if live {
+        assert!(osd == Some("音訊直通：開") || osd == Some(engaged), "{osd:?}");
+    } else {
+        // 舊的引擎（系統的 libmpv 0.40 以前）播放中改了要到下一個檔案才生效：提示說明
+        assert_eq!(osd, Some("音訊直通：開（下一個檔案開始生效）"));
+    }
+    wait_prop(&mut h, "audio-spdif", "ac3,eac3,dts");
+    assert_eq!(saved_audio(&path)["passthrough"]["enabled"], true);
+    if !live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    // ao=null 也接受直通：開始直通時提示
+    step_until(&mut h, "開始直通", |s| s.audio_spdif.as_deref() == Some("ac3"));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some(engaged));
+    // 選單上註明使用中的格式
+    open_sound_menu(&mut h);
+    h.get_by_label("音訊直通（使用中：AC-3）").click();
+    h.run_steps(2);
+    let off = if live {
+        "音訊直通：關"
+    } else {
+        "音訊直通：關（下一個檔案開始生效）"
+    };
+    assert_eq!(h.state().osd_text(), Some(off));
+    wait_prop(&mut h, "audio-spdif", "");
+    if !live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    step_until(&mut h, "改回一般輸出", |s| s.loaded && s.audio_spdif.is_none());
+    assert_eq!(saved_audio(&path)["passthrough"]["enabled"], false);
+}
+
+#[test]
+fn passthrough_blocks_volume_and_speed() {
+    let (_dir, _path, mut h) = sound_harness("sound-spdif-block", Some("common/mkv_hevc_ac3.mkv"), None, |s| {
+        s.audio.passthrough.enabled = true;
+    });
+    step_until(&mut h, "直通中", |s| {
+        s.audio_spdif.as_deref() == Some("ac3") && s.volume == 100.0
+    });
+    let blocked = "音訊直通中：聲音由擴大機處理";
+    // 控制列的音量滑桿停用，滑鼠移上去說明原因（還沒按音量鍵：說明不會跟 OSD 混在一起）
+    assert!(volume_slider_disabled(&h));
+    h.query_all_by_role(egui::accesskit::Role::Slider)
+        .find(|s| s.accesskit_node().label().as_deref() != Some("進度"))
+        .unwrap()
+        .hover();
+    h.run_steps(3);
+    h.get_by_label(blocked);
+    // 轉成立體聲也停用（直通的資料不經過混音）：右鍵選單、設定頁
+    open_sound_menu(&mut h);
+    let downmix = "多聲道轉成立體聲（5.1／7.1 → 2.0）";
+    assert!(h.get_by_label(downmix).accesskit_node().is_disabled());
+    h.get_by_label(downmix).hover();
+    h.run_steps(3);
+    h.get_by_label(blocked);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_settings_page(&mut h, "音效");
+    assert!(h.get_by_label(downmix).accesskit_node().is_disabled());
+    assert!(h.get_by_label("混音時避免破音").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label(downmix).is_none(), "設定視窗關了");
+    assert!(!h.state().settings().audio.downmix);
+    // 音量鍵
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), Some(blocked));
+    assert_eq!(h.state().player().state.volume, 100.0);
+    assert_eq!(h.state().player().get_f64("volume").unwrap(), 100.0);
+    // 滾輪
+    h.get_by_label("影片畫面").hover();
+    h.run_steps(1);
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -2.0),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.run_steps(3);
+    assert_eq!(h.state().player().get_f64("volume").unwrap(), 100.0);
+    // 控制列的音量滑桿停用（進度條照常）
+    assert!(volume_slider_disabled(&h));
+    // 變速鍵、右鍵選單的速度
+    for key in [egui::Key::C, egui::Key::X] {
+        h.key_press(key);
+        h.run_steps(3);
+        assert_eq!(h.state().osd_text(), Some("音訊直通中無法變速"));
+        assert_eq!(h.state().player().get_f64("speed").unwrap(), 1.0);
+    }
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("播放速度").click();
+    h.run_steps(2);
+    h.get_by_label("2×").click();
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), Some("音訊直通中無法變速"));
+    assert_eq!(h.state().player().get_f64("speed").unwrap(), 1.0);
+    // 恢復正常速度（Z）不擋
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::Z);
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), Some("速度 1×"));
+    // 關掉直通之後照常
+    pick_sound_item(&mut h, &[], "音訊直通（使用中：AC-3）");
+    if !h.state().engine_caps().spdif_live {
+        reopen_for_spdif(&mut h, "common/mkv_hevc_ac3.mkv");
+    }
+    step_until(&mut h, "改回一般輸出", |s| s.loaded && s.audio_spdif.is_none());
+    h.key_press(egui::Key::ArrowDown);
+    step_until(&mut h, "音量 95", |s| s.volume == 95.0);
+    h.key_press(egui::Key::C);
+    step_until(&mut h, "加快到 1.1×", |s| close_to(s.speed, 1.1));
+    assert!(!volume_slider_disabled(&h));
+}
+
+#[test]
+fn missing_audio_device_falls_back_to_auto() {
+    // 存下的裝置不在這台電腦上（真的裝置清單；CI 沒有音訊裝置也一樣）
+    let gone = "wasapi/{00000000-0000-0000-0000-00000000dead}";
+    let set_gone = |s: &mut Settings| {
+        s.audio.device = Some(gone.into());
+        s.audio.device_label = Some("拔掉的 USB DAC".into());
+    };
+    // 啟動時同步讀裝置清單：建好視窗（第一幀，還沒開始觀察清單）時就已經是預設裝置，拔掉的裝置沒送給 mpv
+    {
+        let dir = TempDir::new("sound-missing-device-startup");
+        let mut settings = Settings::load_from(dir.0.join("settings.json"));
+        set_gone(&mut settings);
+        let h = harness_launch(Launch::default(), settings);
+        assert_eq!(prop(&h, "audio-device"), "auto", "啟動時就用預設裝置");
+        assert_eq!(
+            h.state().osd_text(),
+            Some("找不到音訊裝置「拔掉的 USB DAC」，改用預設裝置")
+        );
+    }
+    let (_dir, path, mut h) = sound_harness("sound-missing-device", None, None, set_gone);
+    assert_eq!(prop(&h, "audio-device"), "auto", "暫時用預設裝置");
+    assert_eq!(
+        h.state().osd_text(),
+        Some("找不到音訊裝置「拔掉的 USB DAC」，改用預設裝置")
+    );
+    // 存下的名稱留著（插回來時切回去）
+    assert_eq!(h.state().settings().audio.device.as_deref(), Some(gone));
+    // 開檔照樣播放（有聲音輸出的路徑）
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    assert_eq!(prop(&h, "audio-device"), "auto");
+    // 選單列出它（不能選），存檔時名稱照舊
+    open_sound_menu(&mut h);
+    hover_menu_item(&mut h, "輸出裝置");
+    let item = h.get_by_label("拔掉的 USB DAC（找不到，暫用預設裝置）");
+    assert!(item.accesskit_node().is_disabled());
+    h.get_by_label("預設裝置（跟隨系統）");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    pick_sound_item(&mut h, &[], "多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert_eq!(saved_audio(&path)["device"], gone);
+    assert_eq!(saved_audio(&path)["device_label"], "拔掉的 USB DAC");
+    assert_eq!(prop(&h, "audio-device"), "auto");
+}
+
+#[test]
+fn audio_device_switches_back_when_plugged_in() {
+    let (_dir, path, mut h) = sound_harness(
+        "sound-device-back",
+        Some("common/mp4_h264_aac.mp4"),
+        Some(&[SPEAKERS]),
+        |s| {
+            s.audio.device = Some(DAC.0.into());
+            s.audio.device_label = Some(DAC.1.into());
+        },
+    );
+    assert_eq!(prop(&h, "audio-device"), "auto");
+    // 插回來：自動切回去
+    h.state_mut().fake_audio_devices(fake_devices(&[SPEAKERS, DAC]));
+    wait_prop(&mut h, "audio-device", DAC.0);
+    assert_eq!(h.state().osd_text(), Some("已切換回 USB DAC"));
+    // 播放中又拔掉：mpv 先用拔掉的裝置重開音訊輸出，開不起來就把音軌關掉（這裡直接關掉音軌模擬）。
+    // 改用預設裝置，再提示一次，並把音軌選回來（不然整個檔案都沒有聲音）
+    let audio = h.state().player().state.selected(TrackKind::Audio).map(|t| t.id);
+    assert!(audio.is_some());
+    h.state_mut().set_option_async(AsyncKey::AudioDevice, "aid", "no");
+    step_until(&mut h, "mpv 關掉音軌", |s| s.selected(TrackKind::Audio).is_none());
+    h.run_steps(2);
+    h.state_mut().fake_audio_devices(fake_devices(&[SPEAKERS]));
+    wait_prop(&mut h, "audio-device", "auto");
+    assert_eq!(h.state().osd_text(), Some("找不到音訊裝置「USB DAC」，改用預設裝置"));
+    step_until(&mut h, "選回原本的音軌", |s| {
+        s.selected(TrackKind::Audio).map(|t| t.id) == audio
+    });
+    // 只提示一次：清單又變了（多了別的裝置）但 USB DAC 還是不在，不再提示
+    h.key_press(egui::Key::ArrowDown);
+    step_until(&mut h, "音量 95", |s| s.volume == 95.0);
+    let volume_osd = h.state().osd_text().map(str::to_owned);
+    assert!(
+        volume_osd.as_deref().is_some_and(|t| t.contains("95")),
+        "{volume_osd:?}"
+    );
+    h.state_mut()
+        .fake_audio_devices(fake_devices(&[SPEAKERS, ("coreaudio/Headphones", "耳機")]));
+    h.run_steps(5);
+    assert_eq!(h.state().osd_text().map(str::to_owned), volume_osd);
+    assert_eq!(prop(&h, "audio-device"), "auto");
+    // 選了別的裝置：不再等 USB DAC
+    pick_sound_item(&mut h, &["輸出裝置"], "內建喇叭");
+    wait_prop(&mut h, "audio-device", SPEAKERS.0);
+    h.state_mut().fake_audio_devices(fake_devices(&[SPEAKERS, DAC]));
+    h.run_steps(5);
+    assert_eq!(prop(&h, "audio-device"), SPEAKERS.0);
+    assert_eq!(saved_audio(&path)["device"], SPEAKERS.0);
+}
+
+#[test]
+fn sound_menu_device_items() {
+    let (_dir, path, mut h) = sound_harness(
+        "sound-devices",
+        Some("common/mp4_h264_aac.mp4"),
+        Some(&[SPEAKERS, DAC]),
+        |_| {},
+    );
+    open_sound_menu(&mut h);
+    hover_menu_item(&mut h, "輸出裝置");
+    for item in ["預設裝置（跟隨系統）", "內建喇叭", "USB DAC"] {
+        h.get_by_label(item);
+    }
+    // 獨佔模式：Windows、macOS 顯示；Linux 只有 PipeWire 才有
+    let desktop = cfg!(any(windows, target_os = "macos"));
+    assert_eq!(h.query_by_label("獨佔模式").is_some(), desktop);
+    h.get_by_label("USB DAC").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("音訊輸出：USB DAC"));
+    wait_prop(&mut h, "audio-device", DAC.0);
+    assert_eq!(saved_audio(&path)["device"], DAC.0);
+    assert_eq!(saved_audio(&path)["device_label"], "USB DAC");
+    // 媒體資訊的輸出裝置：顯示裝置的說明；面板開著時換裝置也跟著換（每秒重讀）
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("· USB DAC");
+    pick_sound_item(&mut h, &["輸出裝置"], "內建喇叭");
+    wait_prop(&mut h, "audio-device", SPEAKERS.0);
+    let start = Instant::now();
+    while h.query_by_label_contains("· 內建喇叭").is_none() {
+        assert!(start.elapsed() < TIMEOUT, "媒體資訊沒有跟著換裝置");
+        h.step();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(h.query_by_label_contains("· USB DAC").is_none());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    // 預設裝置 = auto，存檔是 null
+    pick_sound_item(&mut h, &["輸出裝置"], "預設裝置（跟隨系統）");
+    assert_eq!(h.state().osd_text(), Some("音訊輸出：預設裝置（跟隨系統）"));
+    wait_prop(&mut h, "audio-device", "auto");
+    assert_eq!(saved_audio(&path)["device"], serde_json::Value::Null);
+    if desktop {
+        pick_sound_item(&mut h, &["輸出裝置"], "獨佔模式");
+        assert_eq!(h.state().osd_text(), Some("獨佔模式：開"));
+        wait_prop(&mut h, "audio-exclusive", "yes");
+        assert_eq!(saved_audio(&path)["exclusive"], true);
+    }
+}
+
+#[test]
+fn sound_settings_page() {
+    let (_dir, path, mut h) = sound_harness("sound-page", None, Some(&[SPEAKERS, DAC]), |_| {});
+    open_settings_page(&mut h, "音效");
+    for title in ["輸出裝置", "聲道", "音訊直通"] {
+        h.get_by_label(title);
+    }
+    let desktop = cfg!(any(windows, target_os = "macos"));
+    assert_eq!(h.query_by_label("獨佔模式").is_some(), desktop);
+    h.get_by_label(if desktop {
+        "直通時會獨佔這個裝置，其他程式暫時沒有聲音；TrueHD／DTS-HD 需要 HDMI 支援 HBR"
+    } else {
+        "需要 HDMI／IEC958 裝置"
+    });
+    // 輸出裝置的下拉選單
+    combo_box(&h, "裝置").click();
+    h.run_steps(2);
+    h.get_by_label("USB DAC").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "audio-device", DAC.0);
+    assert_eq!(saved_audio(&path)["device"], DAC.0);
+    // 混音時避免破音：轉成立體聲之後才能改
+    assert!(h.get_by_label("混音時避免破音").accesskit_node().is_disabled());
+    h.get_by_label("多聲道轉成立體聲（5.1／7.1 → 2.0）").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "audio-normalize-downmix", "yes");
+    let normalize = h.get_by_label("混音時避免破音");
+    assert!(!normalize.accesskit_node().is_disabled());
+    normalize.click();
+    h.run_steps(2);
+    wait_prop(&mut h, "audio-normalize-downmix", "no");
+    assert_eq!(saved_audio(&path)["normalize_downmix"], false);
+    assert_eq!(prop(&h, "audio-channels"), "stereo");
+    // 音訊直通：格式要先啟用才能勾
+    assert!(h.get_by_label("TrueHD").accesskit_node().is_disabled());
+    click_in_view(&mut h, "啟用");
+    wait_prop(&mut h, "audio-spdif", "ac3,eac3,dts");
+    for (codec, value) in [("TrueHD", "ac3,eac3,dts,truehd"), ("AC-3", "eac3,dts,truehd")] {
+        click_in_view(&mut h, codec);
+        wait_prop(&mut h, "audio-spdif", value);
+    }
+    let saved = saved_audio(&path)["passthrough"].clone();
+    assert_eq!(saved["truehd"], true);
+    assert_eq!(saved["ac3"], false);
+    // 關掉時格式記著，mpv 的 audio-spdif 清空
+    click_in_view(&mut h, "啟用");
+    wait_prop(&mut h, "audio-spdif", "");
+    assert_eq!(saved_audio(&path)["passthrough"]["truehd"], true);
+}
+
+#[test]
+fn sound_ui_in_english() {
+    let (_dir, _path, mut h) = sound_harness("sound-en", Some("common/mkv_hevc_ac3.mkv"), Some(&[DAC]), |s| {
+        s.language = vitascope::i18n::Lang::En;
+        s.audio.passthrough.enabled = true;
+    });
+    step_until(&mut h, "passthrough", |s| s.audio_spdif.is_some());
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("Passthrough: AC-3 → amplifier (use the amplifier's volume)")
+    );
+    h.key_press(egui::Key::ArrowUp);
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("Passthrough is on: the amplifier handles the sound")
+    );
+    h.key_press(egui::Key::C);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Can't change the speed during passthrough"));
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Sound ⏵");
+    for label in ["Downmix to stereo (5.1/7.1 → 2.0)", "Passthrough (active: AC-3)"] {
+        h.get_by_label(label);
+    }
+    hover_menu_item(&mut h, "Output device");
+    h.get_by_label("Default device (follow the system)");
+    h.get_by_label("USB DAC").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Audio output: USB DAC"));
+    open_settings_page(&mut h, "Sound");
+    for label in [
+        "Output device",
+        "Channels",
+        "Avoid clipping when downmixing",
+        "Enable",
+        "E-AC-3",
+    ] {
+        h.get_by_label(label);
+    }
+    h.get_by_label("Active: AC-3");
+    assert!(h.query_by_label_contains("音").is_none(), "沒有中文");
+}
+
+// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定的音效選項：影戲不去改它，介面上停用並說明
+#[test]
+fn sound_options_set_by_mpv_opts_are_left_alone() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    // 存了指定的裝置也不管（使用者自己指定了 audio-device）
+    settings.audio.device = Some("wasapi/{00000000-0000-0000-0000-00000000dead}".into());
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![
+                ("audio-channels".into(), "stereo".into()),
+                ("audio-device".into(), "auto".into()),
+            ],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample("common/mp4_h264_aac.mp4")],
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mp4_h264_aac.mp4");
+    assert_eq!(prop(&h, "audio-channels"), "stereo", "啟動時不能蓋掉");
+    assert_eq!(h.state().osd_text(), None, "使用者指定了裝置：不檢查存下的裝置");
+    open_sound_menu(&mut h);
+    let downmix = h.get_by_label("多聲道轉成立體聲（5.1／7.1 → 2.0）");
+    assert!(downmix.accesskit_node().is_disabled());
+    assert!(!h.get_by_label("音訊直通").accesskit_node().is_disabled());
+    h.get_by_label("多聲道轉成立體聲（5.1／7.1 → 2.0）").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    // 指定了 audio-device：子選單照樣打得開，只停用裝置；獨佔模式（audio-exclusive）照常可以改
+    assert!(!h.get_by_label("輸出裝置 ⏵").accesskit_node().is_disabled());
+    hover_menu_item(&mut h, "輸出裝置");
+    let auto = h.get_by_label("預設裝置（跟隨系統）");
+    assert!(auto.accesskit_node().is_disabled());
+    auto.hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    if cfg!(any(windows, target_os = "macos")) {
+        assert!(!h.get_by_label("獨佔模式").accesskit_node().is_disabled());
+    }
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 直通照常可以改（不是使用者指定的）；聲道還是使用者的
+    pick_sound_item(&mut h, &[], "音訊直通");
+    wait_prop(&mut h, "audio-spdif", "ac3,eac3,dts");
+    assert_eq!(prop(&h, "audio-channels"), "stereo");
+    open_settings_page(&mut h, "音效");
+    assert!(combo_box(&h, "裝置").accesskit_node().is_disabled());
+    assert!(
+        h.get_by_label("多聲道轉成立體聲（5.1／7.1 → 2.0）")
+            .accesskit_node()
+            .is_disabled()
+    );
+}
+
+#[test]
+fn passthrough_codecs_set_by_mpv_opts_say_why() {
+    // 使用者指定了 audio-spdif：啟用和每個格式都停用，滑鼠移上去說明原因
+    let mut settings = Settings::default();
+    settings.audio.passthrough.enabled = true;
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("audio-spdif".into(), "ac3".into())],
+            ..Options::headless()
+        },
+        Launch::default(),
+        settings,
+    );
+    h.run_steps(3);
+    open_settings_page(&mut h, "音效");
+    for item in ["啟用", "AC-3", "TrueHD"] {
+        let node = h.get_by_label(item);
+        assert!(node.accesskit_node().is_disabled(), "{item}");
+        node.hover();
+        h.run_steps(3);
+        h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    }
 }

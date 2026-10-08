@@ -1,7 +1,8 @@
-//! 右鍵選單的「畫質」（之後還有「音效」）：整個程式共用的設定，沒有開檔也能改。
+//! 右鍵選單的「畫質」與「音效」：整個程式共用的設定，沒有開檔也能改。
 //! 跟每個檔案各自的「畫面」（長寬比、裁切、旋轉…）、「音軌」分開。
 
 use super::quality::{dumb_hover, follow_quality, scaler_choice};
+use super::sound::auto_device_label;
 use super::{Action, VitascopeApp};
 use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{ChromaScaler, Downscaler, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_label};
@@ -209,6 +210,134 @@ impl VitascopeApp {
         action
     }
 
+    /// 右鍵選單的「音效」（緊接在「畫質」後面）：多聲道轉成立體聲、輸出裝置（＋獨佔模式）、音訊直通。
+    /// 一直可以用（設定是整個程式共用的）。等化器、音量平衡、音量上限之後加在分隔線上面
+    pub(super) fn sound_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let mut action = None;
+        let a = self.settings.audio.clone();
+        ui.menu_button(tr!("音效", "Sound"), |ui| {
+            let mut downmix = a.downmix;
+            let disabled = self.downmix_disabled();
+            let r = ui
+                .add_enabled(
+                    disabled.is_none(),
+                    egui::Checkbox::new(
+                        &mut downmix,
+                        tr!(
+                            "多聲道轉成立體聲（5.1／7.1 → 2.0）",
+                            "Downmix to stereo (5.1/7.1 → 2.0)"
+                        ),
+                    ),
+                )
+                .on_hover_text(downmix_hover())
+                .on_disabled_hover_text(disabled.unwrap_or_default());
+            if r.changed() {
+                action = Some(Action::ToggleDownmix);
+            }
+            ui.separator();
+            if let Some(a) = self.device_menu(ui) {
+                action = Some(a);
+            }
+            let mut passthrough = a.passthrough.enabled;
+            let label = match self.spdif_active() {
+                Some(f) => tf!(
+                    "音訊直通（使用中：{}）",
+                    "Passthrough (active: {})",
+                    crate::sound::spdif_label(f)
+                ),
+                None => tr!("音訊直通", "Passthrough").to_owned(),
+            };
+            let r = ui
+                .add_enabled(
+                    !self.sound_locked("audio-spdif"),
+                    egui::Checkbox::new(&mut passthrough, label),
+                )
+                .on_hover_text(passthrough_hover())
+                .on_disabled_hover_text(super::control_panel::adjust_locked_hover());
+            if r.changed() {
+                action = Some(Action::TogglePassthrough);
+            }
+        });
+        action
+    }
+
+    /// 「音效 ▸ 輸出裝置」：預設裝置 + 目前輸出方式的裝置；下面是獨佔模式。選裝置直接處理（名稱是字串）
+    fn device_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let mut action = None;
+        let devices = self.device_choices();
+        let saved = self
+            .settings
+            .audio
+            .device
+            .clone()
+            .filter(|d| d != crate::sound::AUTO_DEVICE);
+        let saved_label = self.settings.audio.device_label.clone();
+        let missing = self.device_missing();
+        let exclusive_shown = self.exclusive_shown();
+        let mut chosen: Option<Option<crate::sound::AudioDevice>> = None;
+        // VITASCOPE_MPV_OPTS 指定了 audio-device：只停用裝置，子選單照樣打得開（獨佔模式是另一個選項）
+        let locked = self.sound_disabled("audio-device");
+        ui.menu_button(tr!("輸出裝置", "Output device"), |ui| {
+            ui.add_enabled_ui(locked.is_none(), |ui| {
+                let item = |ui: &mut egui::Ui, on: bool, label: &str| {
+                    let r = ui.selectable_label(on, label);
+                    match locked {
+                        Some(why) => r.on_disabled_hover_text(why),
+                        None => r,
+                    }
+                };
+                if item(ui, saved.is_none(), auto_device_label()).clicked() {
+                    chosen = Some(None);
+                }
+                for d in &devices {
+                    if item(ui, saved.as_deref() == Some(d.name.as_str()), d.label())
+                        .on_hover_text(&d.name)
+                        .clicked()
+                    {
+                        chosen = Some(Some(d.clone()));
+                    }
+                }
+                // 存下的裝置拔掉了（或還不知道在不在）：照樣列出但不能選，插回來時會自動切回去
+                if let Some(name) = saved.as_deref()
+                    && (missing || !devices.iter().any(|d| d.name == name))
+                {
+                    let label = saved_label.as_deref().unwrap_or(name);
+                    let text = if missing {
+                        tf!(
+                            "{label}（找不到，暫用預設裝置）",
+                            "{label} (not found; using the default)"
+                        )
+                    } else {
+                        label.to_owned()
+                    };
+                    ui.add_enabled(false, egui::Button::selectable(true, text))
+                        .on_disabled_hover_text(locked.unwrap_or(tr!(
+                            "裝置插回來時會自動切回去",
+                            "VitaScope switches back when the device is plugged in again"
+                        )));
+                }
+            });
+            if exclusive_shown {
+                ui.separator();
+                let mut on = self.settings.audio.exclusive;
+                let r = ui
+                    .add_enabled(
+                        !self.sound_locked("audio-exclusive"),
+                        egui::Checkbox::new(&mut on, tr!("獨佔模式", "Exclusive mode")),
+                    )
+                    .on_hover_text(exclusive_hover())
+                    .on_disabled_hover_text(super::control_panel::adjust_locked_hover());
+                if r.changed() {
+                    action = Some(Action::ToggleExclusive);
+                }
+            }
+        });
+        if let Some(d) = chosen {
+            self.select_audio_device(d.as_ref());
+        }
+        action
+    }
+
     /// 選單切換流暢播放：關 ↔ 開（使用電池時暫停）
     pub(super) fn toggle_smooth(&mut self) {
         let mode = if self.settings.smooth == SmoothMode::Off {
@@ -224,6 +353,32 @@ impl VitascopeApp {
         };
         self.osd(msg);
     }
+}
+
+/// 「多聲道轉成立體聲」的說明（右鍵選單、設定頁共用）
+pub(super) fn downmix_hover() -> &'static str {
+    tr!(
+        "5.1／7.1 聲道的影片混成雙聲道，用耳機、電視喇叭時對白比較清楚；切換時聲音會中斷一下",
+        "Mixes 5.1/7.1 audio down to two channels, so dialogue is clearer on headphones and TV speakers. \
+         The sound cuts out briefly when you switch."
+    )
+}
+
+/// 「音訊直通」的說明（右鍵選單、設定頁共用）
+pub(super) fn passthrough_hover() -> &'static str {
+    tr!(
+        "AC-3、DTS 之類的音訊不解碼，原封不動經 HDMI、光纖送到擴大機（格式在「設定 → 音效」選）",
+        "Sends AC-3, DTS and similar audio undecoded to your amplifier over HDMI or S/PDIF \
+         (choose the formats in Settings → Sound)"
+    )
+}
+
+/// 「獨佔模式」的說明（右鍵選單、設定頁共用）
+pub(super) fn exclusive_hover() -> &'static str {
+    tr!(
+        "直接使用音訊裝置、不經過系統混音（其他程式暫時沒有聲音）",
+        "Uses the audio device directly, bypassing the system mixer (other apps go silent meanwhile)"
+    )
 }
 
 /// 子選單；`disabled` 有值時整個停用，滑鼠移上去顯示原因

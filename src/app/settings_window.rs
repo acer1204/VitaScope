@@ -2,10 +2,12 @@
 
 use super::control_panel::adjust_locked_hover;
 use super::quality::{combo, dumb_hover, scaler_choice};
+use super::sound::auto_device_label;
 use super::{Action, VitascopeApp};
 use crate::i18n::{self, Lang};
 use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler};
+use crate::sound::{AUTO_DEVICE, AudioDevice, SPDIF_CODECS, spdif_label};
 use crate::{tf, tr};
 use eframe::egui::{self, Id, pos2, vec2};
 
@@ -17,6 +19,8 @@ pub(super) enum Page {
     Playback,
     /// 畫質（影像調整、去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR）
     Picture,
+    /// 音效（輸出裝置、獨佔模式、轉成立體聲、音訊直通）
+    Sound,
     Subtitles,
     Screenshot,
     System,
@@ -24,10 +28,11 @@ pub(super) enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 7] = [
+    const ALL: [Page; 8] = [
         Page::General,
         Page::Playback,
         Page::Picture,
+        Page::Sound,
         Page::Subtitles,
         Page::Screenshot,
         Page::System,
@@ -39,6 +44,7 @@ impl Page {
             Page::General => tr!("一般", "General"),
             Page::Playback => tr!("播放", "Playback"),
             Page::Picture => tr!("畫質", "Video quality"),
+            Page::Sound => tr!("音效", "Sound"),
             Page::Subtitles => tr!("字幕", "Subtitles"),
             Page::Screenshot => tr!("截圖", "Screenshots"),
             Page::System => tr!("系統", "System"),
@@ -83,6 +89,7 @@ impl VitascopeApp {
                                 Page::General => changed |= self.general_page(ui, &mut action),
                                 Page::Playback => changed |= self.playback_page(ui),
                                 Page::Picture => self.picture_page(ui, &mut action),
+                                Page::Sound => self.sound_page(ui, &mut action),
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
                                 Page::System => changed |= self.system_page(ui),
@@ -569,6 +576,165 @@ impl VitascopeApp {
         }
         if self.video_not_hdr() {
             ui.weak(tr!("目前的影片不是 HDR", "The current video isn't HDR"));
+        }
+    }
+
+    /// 音效頁：輸出裝置、獨佔模式、轉成立體聲、音訊直通（選了馬上套用、存檔）。
+    /// 等化器、音量平衡、音量上限之後加在「轉成立體聲」上面
+    fn sound_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        let a = self.settings.audio.clone();
+        ui.strong(tr!("輸出裝置", "Output device"));
+        let devices = self.device_choices();
+        let saved = a.device.clone().filter(|d| d != AUTO_DEVICE);
+        // 下拉選單的文字：存下的裝置（拔掉了就註明）或預設裝置
+        let current = match &saved {
+            None => auto_device_label().to_owned(),
+            Some(name) => {
+                let label = devices
+                    .iter()
+                    .find(|d| &d.name == name)
+                    .map(|d| d.label().to_owned())
+                    .or_else(|| a.device_label.clone())
+                    .unwrap_or_else(|| name.clone());
+                if self.device_missing() {
+                    tf!(
+                        "{label}（找不到，暫用預設裝置）",
+                        "{label} (not found; using the default)"
+                    )
+                } else {
+                    label
+                }
+            }
+        };
+        let mut chosen: Option<Option<AudioDevice>> = None;
+        let disabled = self.sound_disabled("audio-device");
+        ui.horizontal(|ui| {
+            let name = ui.label(tr!("裝置", "Device"));
+            let r = ui
+                .add_enabled_ui(disabled.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("settings_audio_device")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(saved.is_none(), auto_device_label()).clicked() && saved.is_some() {
+                                chosen = Some(None);
+                            }
+                            for d in &devices {
+                                let on = saved.as_deref() == Some(d.name.as_str());
+                                if ui.selectable_label(on, d.label()).on_hover_text(&d.name).clicked() && !on {
+                                    chosen = Some(Some(d.clone()));
+                                }
+                            }
+                        })
+                        .response
+                })
+                .inner
+                .labelled_by(name.id);
+            if let Some(why) = disabled {
+                r.on_disabled_hover_text(why);
+            }
+        });
+        if let Some(d) = chosen {
+            self.select_audio_device(d.as_ref());
+        }
+        if self.exclusive_shown() {
+            let mut on = a.exclusive;
+            let r = ui
+                .add_enabled(
+                    !self.sound_locked("audio-exclusive"),
+                    egui::Checkbox::new(&mut on, tr!("獨佔模式", "Exclusive mode")),
+                )
+                .on_hover_text(super::tuning_menu::exclusive_hover())
+                .on_disabled_hover_text(adjust_locked_hover());
+            if r.changed() {
+                *action = Some(Action::ToggleExclusive);
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.strong(tr!("聲道", "Channels"));
+        let mut downmix = a.downmix;
+        let disabled = self.downmix_disabled();
+        let r = ui
+            .add_enabled(
+                disabled.is_none(),
+                egui::Checkbox::new(
+                    &mut downmix,
+                    tr!(
+                        "多聲道轉成立體聲（5.1／7.1 → 2.0）",
+                        "Downmix to stereo (5.1/7.1 → 2.0)"
+                    ),
+                ),
+            )
+            .on_hover_text(super::tuning_menu::downmix_hover())
+            .on_disabled_hover_text(disabled.unwrap_or_default());
+        if r.changed() {
+            *action = Some(Action::ToggleDownmix);
+        }
+        ui.indent("settings_normalize_downmix", |ui| {
+            let mut on = a.normalize_downmix;
+            let locked = self.sound_locked("audio-normalize-downmix");
+            let r = ui
+                .add_enabled(
+                    a.downmix && !locked && disabled.is_none(),
+                    egui::Checkbox::new(&mut on, tr!("混音時避免破音", "Avoid clipping when downmixing")),
+                )
+                .on_hover_text(tr!(
+                    "混音時先把音量降低一些，大聲的地方不會破音（整體會小聲一點）",
+                    "Lowers the level while mixing so loud parts don't clip (overall a little quieter)"
+                ));
+            let r = match (locked, disabled) {
+                (true, _) => r.on_disabled_hover_text(adjust_locked_hover()),
+                (false, Some(why)) => r.on_disabled_hover_text(why),
+                (false, None) => r,
+            };
+            if r.changed() {
+                self.set_normalize_downmix(on);
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.strong(tr!("音訊直通", "Passthrough"));
+        let p = a.passthrough;
+        let locked = self.sound_locked("audio-spdif");
+        let mut on = p.enabled;
+        let r = ui
+            .add_enabled(!locked, egui::Checkbox::new(&mut on, tr!("啟用", "Enable")))
+            .on_hover_text(super::tuning_menu::passthrough_hover())
+            .on_disabled_hover_text(adjust_locked_hover());
+        if r.changed() {
+            *action = Some(Action::TogglePassthrough);
+        }
+        let mut codecs = p;
+        ui.indent("settings_spdif_codecs", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for c in SPDIF_CODECS {
+                    let mut ticked = codecs.codec(c);
+                    let r = ui.add_enabled(p.enabled && !locked, egui::Checkbox::new(&mut ticked, spdif_label(c)));
+                    let r = if locked {
+                        r.on_disabled_hover_text(adjust_locked_hover())
+                    } else {
+                        r
+                    };
+                    if r.changed() {
+                        codecs.set_codec(c, ticked);
+                    }
+                }
+            });
+            if let Some(f) = self.spdif_active() {
+                ui.weak(tf!("使用中：{}", "Active: {}", spdif_label(f)));
+            }
+            ui.weak(if cfg!(any(windows, target_os = "macos")) {
+                tr!(
+                    "直通時會獨佔這個裝置，其他程式暫時沒有聲音；TrueHD／DTS-HD 需要 HDMI 支援 HBR",
+                    "Passthrough takes over the device, so other apps go silent meanwhile; \
+                     TrueHD and DTS-HD need HDMI with HBR support"
+                )
+            } else {
+                tr!("需要 HDMI／IEC958 裝置", "Needs an HDMI or IEC958 (S/PDIF) device")
+            });
+        });
+        if codecs != p {
+            self.set_passthrough_codecs(codecs);
         }
     }
 

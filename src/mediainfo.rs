@@ -170,18 +170,16 @@ pub fn read(player: &Player, audio_device: Option<String>) -> MediaInfo {
 }
 
 /// 音訊裝置的名稱。查裝置清單第一次要十幾毫秒，面板打開時查一次就好
+///（已經在觀察清單時直接用觀察到的，不再查）
 pub fn audio_device_name(player: &Player) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Device {
-        name: String,
-        #[serde(default)]
-        description: String,
-    }
     let current = player.get_string("audio-device").ok()?;
-    if current == "auto" {
+    if current == crate::sound::AUTO_DEVICE {
         return Some(crate::tr!("預設裝置", "Default device").to_owned());
     }
-    let list: Vec<Device> = json(player, "audio-device-list").unwrap_or_default();
+    let list = match &player.state.audio_devices {
+        Some(list) => list.clone(),
+        None => crate::sound::parse_devices(&player.get_string("audio-device-list").unwrap_or_default()),
+    };
     Some(
         list.into_iter()
             .find(|d| d.name == current && !d.description.is_empty())

@@ -212,6 +212,8 @@ pub struct State {
     pub audio_spdif: Option<String>,
     /// 目前的影片是 HDR（video-params 的 gamma 是 pq 或 hlg）
     pub video_hdr: bool,
+    /// 音訊輸出裝置清單（第一項是 auto）；None = 還沒讀過（見 `Player::read_audio_devices`、`watch_audio_devices`）
+    pub audio_devices: Option<Vec<crate::sound::AudioDevice>>,
 }
 
 impl State {
@@ -384,6 +386,22 @@ pub struct EngineCaps {
     /// 軟體繪圖的簡化流程（gpu-dumb-mode）：不跑著色器、縮放演算法之類的效果
     pub dumb: bool,
     pub macos: bool,
+    /// 播放中改 audio-spdif 馬上生效（mpv 0.41 起會重新開啟音訊解碼器；
+    /// 系統的 libmpv 0.37–0.40 要到下一個檔案才生效）
+    pub spdif_live: bool,
+}
+
+/// mpv 的版本（`mpv-version`：「mpv 0.37.0」「mpv v0.41.0-1102-g6c092d978」）→（主版本, 次版本）；看不懂時 None
+fn mpv_version(text: &str) -> Option<(u32, u32)> {
+    let v = text.strip_prefix("mpv ")?.trim_start_matches('v');
+    let mut parts = v.split(['.', '-']);
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// 這個版本播放中改 audio-spdif 會不會馬上生效（0.41 起 audio-spdif 有 UPDATE_AD）。
+/// 看不懂的版本字串（自己建置的、git 版）當成新版
+fn spdif_live(version: &str) -> bool {
+    mpv_version(version).is_none_or(|v| v >= (0, 41))
 }
 
 /// 等化器、音量平衡用到的 FFmpeg 音訊濾鏡，各自有沒有
@@ -447,6 +465,19 @@ fn is_render_log(prefix: &str) -> bool {
 fn is_hdr_gamma(gamma: &str) -> bool {
     matches!(gamma, "pq" | "hlg")
 }
+
+/// 音效選項 → 非同步設定時的種類（回覆依種類分派）
+fn sound_key(name: &str) -> AsyncKey {
+    match name {
+        "audio-device" => AsyncKey::AudioDevice,
+        "audio-exclusive" => AsyncKey::Exclusive,
+        "audio-spdif" => AsyncKey::Spdif,
+        _ => AsyncKey::Downmix,
+    }
+}
+
+/// 觀察 audio-device-list 用的編號（接在 OBSERVED 後面；要用時才觀察，見 `Player::watch_audio_devices`）
+const DEVICE_LIST_ID: u64 = OBSERVED.len() as u64 + 1;
 
 /// 畫質選項 → 非同步設定時的種類（回覆依種類分派）
 fn picture_key(name: &str) -> AsyncKey {
@@ -575,8 +606,12 @@ pub struct Player {
     /// 偵測引擎功能失敗時 mpv 會記一筆錯誤；這些不是真的問題，不放進 recent_errors。
     /// 每一項的兩個字串都出現在記錄裡才算（記錄訊息比較晚送達，可能開檔之後才收到）
     probe_noise: Vec<[String; 2]>,
-    /// 上次由 `apply_picture` 送出的畫質選項值（只送有變的）
-    picture_applied: HashMap<&'static str, String>,
+    /// 上次由 `apply_picture`、`apply_sound` 送出的畫質、音效選項值（只送有變的）
+    options_applied: HashMap<&'static str, String>,
+    /// 已經開始觀察 audio-device-list（mpv 同時開始偵測裝置插拔）
+    watching_devices: bool,
+    /// 測試用的假裝置清單：有的話不讀 mpv 的（見 `set_fake_audio_devices`）
+    fake_devices: bool,
     /// 像素著色器：使用者的組合（app 給的；VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時是使用者原本的清單，不改）
     shader_user: Vec<String>,
     /// 翻轉用的著色器（左右、上下）；每個檔案各自的，開新檔時拿掉
@@ -624,9 +659,9 @@ impl Player {
             .chain(opts.extra.iter().map(|(k, _)| k.clone()))
             .collect();
         let mut mpv = Mpv::new(&options)?;
-        // profile=high-quality、include=… 之類間接改到的畫質選項也算使用者指定的：
-        // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是畫質選項）
-        for name in crate::picture::MANAGED {
+        // profile=high-quality、include=… 之類間接改到的畫質、音效選項也算使用者指定的：
+        // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是這些選項）
+        for name in crate::picture::MANAGED.into_iter().chain(crate::sound::MANAGED) {
             if let (Ok(now), Ok(default)) = (
                 mpv.get_string(name),
                 mpv.get_string(&format!("option-info/{name}/default-value")),
@@ -669,7 +704,9 @@ impl Player {
             user_overrides,
             render_errors: VecDeque::new(),
             probe_noise: Vec::new(),
-            picture_applied: HashMap::new(),
+            options_applied: HashMap::new(),
+            watching_devices: false,
+            fake_devices: false,
             shaders_applied: Some(shader_base.clone()),
             shader_user: shader_base,
             shader_flip: [None, None],
@@ -743,24 +780,44 @@ impl Player {
         opts: &[(&'static str, String)],
         sync: bool,
     ) -> Vec<(&'static str, AsyncKey, mpv::Result<Option<u64>>)> {
+        self.apply_cached(opts, sync, picture_key)
+    }
+
+    /// 套用音效選項（`sound::mpv_options` 的結果），跟 `apply_picture` 一樣只送有變的；
+    /// 非同步時依選項分成輸出裝置、獨佔模式、轉成立體聲、音訊直通幾種回覆。
+    /// 改輸出裝置、獨佔模式、聲道會重新開啟音訊輸出（聲音中斷一下），所以沒變的一定不能送
+    pub fn apply_sound(
+        &mut self,
+        opts: &[(&'static str, String)],
+        sync: bool,
+    ) -> Vec<(&'static str, AsyncKey, mpv::Result<Option<u64>>)> {
+        self.apply_cached(opts, sync, sound_key)
+    }
+
+    fn apply_cached(
+        &mut self,
+        opts: &[(&'static str, String)],
+        sync: bool,
+        key_of: fn(&str) -> AsyncKey,
+    ) -> Vec<(&'static str, AsyncKey, mpv::Result<Option<u64>>)> {
         debug_assert!(
             !sync || (!self.state.loaded && !self.state.loading),
             "同步設定只能在開檔之前用"
         );
         let mut sent = Vec::new();
         for (name, value) in opts {
-            if self.user_overrides.contains(*name) || self.picture_applied.get(name) == Some(value) {
+            if self.user_overrides.contains(*name) || self.options_applied.get(name) == Some(value) {
                 continue;
             }
-            let key = picture_key(name);
+            let key = key_of(name);
             let result = if sync {
                 self.mpv.set_property(name, value.as_str()).map(|()| None)
             } else {
                 self.set_async(key, name, value).map(Some)
             };
             match &result {
-                Ok(_) => self.picture_applied.insert(name, value.clone()),
-                Err(_) => self.picture_applied.remove(name),
+                Ok(_) => self.options_applied.insert(name, value.clone()),
+                Err(_) => self.options_applied.remove(name),
             };
             sent.push((*name, key, result));
         }
@@ -769,7 +826,42 @@ impl Player {
 
     /// 非同步設定的畫質選項 mpv 不接受：忘掉記下的值，下次套用時再送
     pub fn forget_picture(&mut self, name: &str) {
-        self.picture_applied.remove(name);
+        self.options_applied.remove(name);
+    }
+
+    /// 非同步設定的音效選項 mpv 不接受：忘掉記下的值，下次套用時再送
+    pub fn forget_sound(&mut self, name: &str) {
+        self.options_applied.remove(name);
+    }
+
+    // ───────────── 音訊輸出裝置 ─────────────
+
+    /// 同步讀一次裝置清單（啟動時存了指定的裝置才用：要知道它還在不在）。
+    /// 第一次讀要列舉所有輸出方式的裝置（Windows 約 30 毫秒；PulseAudio、PipeWire 不正常時會更久），
+    /// 所以平常改用 `watch_audio_devices`。讀不到時回傳 None
+    pub fn read_audio_devices(&mut self) -> Option<&[crate::sound::AudioDevice]> {
+        if !self.fake_devices {
+            let json = self.mpv.get_string("audio-device-list").ok()?;
+            self.state.audio_devices = Some(crate::sound::parse_devices(&json));
+        }
+        self.state.audio_devices.as_deref()
+    }
+
+    /// 開始觀察裝置清單（`state.audio_devices` 跟著插拔更新；mpv 同時開始偵測插拔）。只做一次
+    pub fn watch_audio_devices(&mut self) {
+        if std::mem::replace(&mut self.watching_devices, true) {
+            return;
+        }
+        if let Err(e) = self.mpv.observe(DEVICE_LIST_ID, "audio-device-list", Format::String) {
+            eprintln!("[vitascope] 無法觀察音訊裝置清單：{e}");
+        }
+    }
+
+    /// 測試用：當成 mpv 的裝置清單是這些（自動測試的電腦不一定有音訊裝置；之後 mpv 的清單不再蓋掉它）
+    #[doc(hidden)]
+    pub fn set_fake_audio_devices(&mut self, list: Vec<crate::sound::AudioDevice>) {
+        self.fake_devices = true;
+        self.state.audio_devices = Some(list);
     }
 
     // ───────────── 像素著色器（glsl-shaders） ─────────────
@@ -868,6 +960,7 @@ impl Player {
                 .is_ok_and(|list| list.split(',').any(|name| name == "deinterlace-active")),
             dumb: self.mpv.get_string("gpu-dumb-mode").is_ok_and(|v| v == "yes"),
             macos: cfg!(target_os = "macos"),
+            spdif_live: spdif_live(&self.mpv.get_string("mpv-version").unwrap_or_default()),
         }
     }
 
@@ -1577,6 +1670,12 @@ impl Player {
             "deinterlace-active" => s.deinterlace_active = value.as_bool().unwrap_or(false),
             "audio-out-params" => s.audio_spdif = value.as_str().and_then(spdif_format),
             "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
+            // 讀不到（Value::None）時保留上一次的清單
+            "audio-device-list" if !self.fake_devices => {
+                if let Some(json) = value.as_str() {
+                    s.audio_devices = Some(crate::sound::parse_devices(json));
+                }
+            }
             _ => {}
         }
     }
@@ -1699,7 +1798,8 @@ fn failure_reason(code: i32) -> &'static str {
 mod tests {
     use super::{
         ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, debug_log_level, display_size,
-        env_option_names, env_options, is_harmless_error, is_hdr_gamma, is_render_log, picture_key, spdif_format,
+        env_option_names, env_options, is_harmless_error, is_hdr_gamma, is_render_log, mpv_version, picture_key,
+        sound_key, spdif_format, spdif_live,
     };
 
     #[test]
@@ -1765,7 +1865,8 @@ mod tests {
             spdif_format(r#"{"samplerate":48000,"channel-count":2,"format":"spdif-ac3"}"#).as_deref(),
             Some("ac3")
         );
-        assert_eq!(spdif_format(r#"{"format":"spdif-dts-hd"}"#).as_deref(), Some("dts-hd"));
+        // mpv 的名稱是 spdif-dtshd（audio/format.c），不是 audio-spdif 選項的 dts-hd
+        assert_eq!(spdif_format(r#"{"format":"spdif-dtshd"}"#).as_deref(), Some("dtshd"));
         assert_eq!(spdif_format(r#"{"format":"floatp"}"#), None);
         assert_eq!(spdif_format(r#"{"samplerate":48000}"#), None);
         assert_eq!(spdif_format("not json"), None);
@@ -1798,6 +1899,34 @@ mod tests {
                 Tone
             ]
         );
+    }
+
+    #[test]
+    fn sound_keys() {
+        // 音效選項的回覆依種類分派：每個選項都要歸到它那一組
+        let keys: Vec<AsyncKey> = crate::sound::MANAGED.into_iter().map(sound_key).collect();
+        use AsyncKey::*;
+        assert_eq!(keys, [AudioDevice, Exclusive, Downmix, Downmix, Spdif]);
+    }
+
+    #[test]
+    fn spdif_is_live_from_mpv_0_41() {
+        assert_eq!(mpv_version("mpv 0.37.0"), Some((0, 37)));
+        assert_eq!(mpv_version("mpv v0.41.0-1102-g6c092d978"), Some((0, 41)));
+        assert_eq!(mpv_version("mpv 0.40"), Some((0, 40)));
+        assert_eq!(mpv_version("mpv git-2024"), None);
+        assert_eq!(mpv_version("libmpv 1.0"), None);
+        assert!(!spdif_live("mpv 0.37.0"));
+        assert!(!spdif_live("mpv 0.40.0"));
+        assert!(spdif_live("mpv v0.41.0-1102-g6c092d978"));
+        assert!(spdif_live("mpv 1.0.0"));
+        assert!(spdif_live("mpv git-2024"), "看不懂的當成新版");
+    }
+
+    #[test]
+    fn device_list_is_not_observed_at_startup() {
+        // 裝置清單要用時才觀察（列舉裝置慢），不能放在一開始就觀察的清單裡
+        assert!(super::OBSERVED.iter().all(|(name, _)| *name != "audio-device-list"));
     }
 
     #[test]
