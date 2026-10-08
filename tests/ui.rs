@@ -130,6 +130,14 @@ fn arrow_keys_seek() {
         "Ctrl+→ 前進 30 秒（片長 20 秒，停在結尾）",
         |s| s.time_pos >= 15.0,
     );
+    // 跳轉途中 mpv 會短暫回報目標時間，要看最後停在哪裡：超過片尾的相對跳轉，mpv 會退回最後一個關鍵影格（這個檔案是 10.4 秒）
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let t = h.state().player().state.time_pos;
+    assert!(t >= 19.0, "Ctrl+→ 之後停在 {t:.2} 秒，不是結尾");
 }
 
 #[test]

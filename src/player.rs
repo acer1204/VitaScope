@@ -463,6 +463,14 @@ impl Player {
 
     /// 相對跳轉（秒），可為負數
     pub fn seek_relative(&self, seconds: f64) -> mpv::Result<()> {
+        // 往後跳會超過片尾時，精準跳到最後一格：相對跳轉對齊關鍵影格，超過片尾時 mpv 會退回最後一個關鍵影格
+        // （可能在很前面），播放中還會從那裡繼續播
+        if seconds > 0.0
+            && let Some(duration) = self.state.duration
+            && self.state.time_pos + seconds >= duration
+        {
+            return self.mpv.command(&["seek", "100", "absolute-percent+exact"]);
+        }
         self.mpv.command(&["seek", &format!("{seconds}"), "relative"])
     }
 
