@@ -389,20 +389,11 @@ pub fn parse_overrides(env: Option<&str>) -> Overrides {
 
 // ───────────── 取影格的時機（畫面輸出不卡住介面） ─────────────
 
-/// `target_raw` 看起來是微秒（離目前的微秒時間比較近）。libmpv 0.37 起都是 `mp_time_ns` 的奈秒
-/// （render.h 的註解寫微秒，已經過時），呼叫 `mpv_get_time_ns` 就代表是 0.37 以上，照理不會發生
-pub fn target_is_us(raw: i64, now_ns: i64, now_us: i64) -> bool {
-    // 0 以下 = 沒有指定時間；abs_diff 不會溢位（mpv 給了奇怪的值也不會 panic）
-    raw > 0 && raw.abs_diff(now_us) < raw.abs_diff(now_ns)
-}
-
-/// 影格該顯示的時間（奈秒）。只在除錯版檢查單位：能呼叫 `mpv_get_time_ns` 的 libmpv 一定是奈秒，
-/// 執行時換算的分支永遠用不到
-pub fn target_ns(raw: i64, now_ns: i64, now_us: i64) -> i64 {
-    debug_assert!(
-        !target_is_us(raw, now_ns, now_us),
-        "target_time 看起來是微秒：{raw}（現在 {now_ns} ns）"
-    );
+/// 影格該顯示的時間（奈秒）。libmpv 0.37 起 `target_time` 都是 `mp_time_ns` 的奈秒（render.h 的註解寫微秒，已經過時）；
+/// `Mpv::new` 已經要求 client API 2.2 以上（0.37），所以不換算。
+/// 不在執行時猜單位：mpv 的時鐘從程式啟動算起，剛啟動時奈秒的數值還很小，跟微秒分不出來
+/// （CI 實際碰過：剛開檔時 0.19 秒前的影格被誤判成微秒）
+pub fn target_ns(raw: i64, _now_ns: i64, _now_us: i64) -> i64 {
     raw
 }
 
@@ -1427,29 +1418,12 @@ mod tests {
 
     #[test]
     fn target_time_units() {
+        // 奈秒照原樣用，包括剛啟動時數值還很小的時候（以前除錯版在這裡誤判成微秒而中止）
+        assert_eq!(target_ns(194_038_828, 393_790_596, 393_790), 194_038_828);
         let (now_ns, now_us) = (5_000_000_000_000i64, 5_000_000_000i64);
-        // 奈秒（libmpv 0.37 起）：不變
-        let ns = now_ns + 40_000_000;
-        assert!(!target_is_us(ns, now_ns, now_us));
-        assert_eq!(target_ns(ns, now_ns, now_us), ns);
+        assert_eq!(target_ns(now_ns + 40_000_000, now_ns, now_us), now_ns + 40_000_000);
         assert_eq!(target_ns(0, now_ns, now_us), 0);
-        // 微秒（0.37 以前）：認得出來（除錯版的 target_ns 會報錯）
-        let us = now_us + 40_000;
-        assert!(target_is_us(us, now_ns, now_us));
-        // 沒有時間、奇怪的值：不算微秒，也不會溢位
-        assert!(!target_is_us(-1, now_ns, now_us));
-        assert!(!target_is_us(i64::MIN, now_ns, now_us));
         assert_eq!(target_ns(i64::MIN, now_ns, now_us), i64::MIN);
-        assert!(!target_is_us(i64::MAX, now_ns, now_us));
-        assert!(!target_is_us(i64::MAX, i64::MAX, i64::MIN));
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "微秒")]
-    fn target_in_microseconds_is_a_bug() {
-        let (now_ns, now_us) = (5_000_000_000_000i64, 5_000_000_000i64);
-        target_ns(now_us + 40_000, now_ns, now_us);
     }
 
     #[test]
