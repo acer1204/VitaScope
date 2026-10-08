@@ -8,12 +8,12 @@
 # 版本固定在下面的 tag 與 SHA-256（取自該 release 的 SHA256SUMS），更新時一起改。（macOS 內建的 bash 3.2 也能跑）
 set -euo pipefail
 case "$(uname -s)-$(uname -m)" in
-  Darwin-arm64) plat=macos-arm64; tag=libmpv-macos-arm64-r2; ext=zip
-    sha=8bf980f3d202ec4d063c00b4a5b5fa9d72e9f56434923202fdc457a5c5155991
-    src_sha=cf3fcd16a05c842ce2eb4c0f693b45c1381ba27935d7155ae220c7b7cba70341 ;;
-  Linux-x86_64) plat=linux-x64; tag=libmpv-linux-x64-r1; ext=tar.xz
-    sha=317a28bdf0cbbdeef03ad94b4319b5db6558393f214798b36a9454688351818e
-    src_sha=bec1f62bc646344458974424635b4a9457ffdab8af4143ec54f6b6ffc4d7e311 ;;
+  Darwin-arm64) plat=macos-arm64; tag=libmpv-macos-arm64-r4; ext=zip
+    sha=04a7ffd60397274eb58ea2d2c83222c9530b30e067c5355349c412f61b7e61f4
+    src_sha=e6c43a43ad4579fb5928eb54a90c2343a7c1df63c009e9814b62f70c63db58aa ;;
+  Linux-x86_64) plat=linux-x64; tag=libmpv-linux-x64-r3; ext=tar.xz
+    sha=03156173bf1f30bd477170eff1778b203e224b0dd2c2566de2916d2e22b40e11
+    src_sha=a13f2cf1cc0f8d447b1cc377e08324b5132865c2da54eda3a63389221f5b10cc ;;
   Darwin-*) echo "Intel Mac 沒有本專案建置的 libmpv：請用 Homebrew 的 mpv（brew install mpv），不用執行這個腳本" >&2; exit 1 ;;
   *) echo "這個平台沒有本專案建置的 libmpv：$(uname -s) $(uname -m)" >&2; exit 1 ;;
 esac

@@ -61,8 +61,9 @@ src/
 三個平台的 libmpv 都由本專案從原始碼建置（`.github/workflows/libmpv-*.yml`）：每個元件固定版本並核對雜湊，
 建置兩次確認逐位元相同，發佈成 prerelease `libmpv-<平台>-rN`，連同完整對應原始碼。版本與建置腳本在
 `packaging/<平台>/libmpv/`，三個平台共同的元件版本必須一致（`packaging/libmpv/check-pins.sh`）。
-自建的 libmpv 只開影戲目前用得到的解碼器、濾鏡、封裝格式、協定；之後的功能需要更多時（例如 DASH 要 libxml2、
-錄製要 muxer），把元件或選項加進 pins.json / build.sh，build_id 加一，重新建置三個平台。
+自建的 libmpv 只開影戲用得到的解碼器、濾鏡、封裝格式、協定。L3 需要的元件在 2026-10 一次加齊（Windows r3、macOS r4、
+Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編碼器、等化器與音量正規化等音訊濾鏡、輸出時 HDR 轉 SDR 用的 zimg。
+之後還需要更多時，把元件或選項加進 pins.json / build.sh，build_id 加一，重新建置三個平台。
 
 授權：影戲 VitaScope 採用 GPL-3.0-or-later。內含的 libmpv 以 LGPL 選項建置（mpv `-Dgpl=false`、FFmpeg 不加 GPL 選項），
 整體是 LGPL-2.1-or-later，不含與 GPL-3.0 不相容的元件，也不會限制影戲本身的授權。原則：別人建置的函式庫有授權或來源問題時，
@@ -295,7 +296,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 功能
 - [ ] 自訂快捷鍵（提供 PotPlayer 風格的預設組）
 - [ ] 書籤：在檔案中標記時間點並命名
-- [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；本專案建置的 libmpv 要先加上 libxml2，MIT）
+- [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；播放引擎已含 libxml2，本機的 DASH 有自動測試）
 - [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
 - [ ] 線上搜尋字幕（OpenSubtitles API）
 - [ ] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF
@@ -497,3 +498,9 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   等太久先開了前面的，後面到的要接在同一個清單裡，不能把前面的換掉。
 - **用腳本改程式碼，每一處都要確認真的改到了**：第四批有兩個修正因為腳本中途出錯沒有寫進去，
   測試也沒抓到（無畫面測試走不到那條路），是第六批的複查才發現。改完要看 diff，修正要有會失敗的測試。
+- **FFmpeg 的 DASH 分離器被中斷時回傳「成功但沒有封包」**：H.264 需要解析器，上一層收到空封包會再要一次、自己不檢查中斷，
+  兩層之間無限循環；mpv 換檔時等不到分離器結束，整個播放器卡死。只在中斷剛好落在重開片段的時候發生，
+  快的電腦幾乎碰不到，macOS 的 CI 虛擬機約三成。卡住的程式用 `sample` / `lldb` 抓堆疊，沒有符號就用
+  LC_FUNCTION_STARTS 找出函式、看它參照的字串認出是哪一個。修正檔 `ffmpeg-0002`。
+- **macOS 連結器的 LC_UUID 是對 strip 之前的內容算的**：那部分偶爾不固定，兩次建置就只差在 UUID。
+  strip 之後用最終內容重新計算 UUID 再簽章。

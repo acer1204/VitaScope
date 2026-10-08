@@ -22,7 +22,7 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定�
 | 元件 | 授權 | 原始碼 |
 |---|---|---|
 | mpv | LGPL-2.1-or-later（以 `-Dgpl=false` 建置） | https://github.com/mpv-player/mpv |
-| FFmpeg | LGPL-2.1-or-later（不含 GPL 選項） | https://ffmpeg.org/download.html |
+| FFmpeg | LGPL-2.1-or-later（不含 GPL 選項）；編譯進去的檔案裡有些另外帶 MIT、BSD 等寬鬆授權聲明，原文在 `licenses/ffmpeg/permissive/`（索引見其中的 `README.txt`） | https://ffmpeg.org/download.html |
 | libplacebo | LGPL-2.1-or-later | https://code.videolan.org/videolan/libplacebo |
 | libass | ISC | https://github.com/libass/libass |
 | FreeType | FreeType License（FTL） | https://freetype.org |
@@ -32,6 +32,7 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定�
 | dav1d | BSD-2-Clause AND ISC | https://code.videolan.org/videolan/dav1d |
 | zimg | WTFPL | https://github.com/sekrit-twc/zimg |
 | zlib | Zlib | https://zlib.net |
+| libxml2（FFmpeg 的 DASH 分離器用） | MIT AND ISC-Veillard | https://gitlab.gnome.org/GNOME/libxml2 |
 | nv-codec-headers（Windows、Linux） | MIT | https://github.com/FFmpeg/nv-codec-headers |
 
 各元件的確切版本、下載位置與雜湊列在各平台的清單檔。

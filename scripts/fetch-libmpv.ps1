@@ -12,9 +12,9 @@
 # 必須確定每次拿到的都是同一份。更新版本時一起改。
 
 param(
-    [string]$Tag = "libmpv-win64-r1",
-    [string]$Sha256 = "5baeccae8e86eea1e1afe0aac5d43c1d4843739d8f7e3e085124f5711788c337",
-    [string]$SourceSha256 = "98f4518e116ed7099b9061230c66571dbb5da586c24ebdaa114310dded51631d",
+    [string]$Tag = "libmpv-win64-r3",
+    [string]$Sha256 = "480cd1987d476f387e20eaa892d7ebc7caa7e19949b33b6d26b664e771a6301b",
+    [string]$SourceSha256 = "22bdfc355ff818f505f675853363776eb0414e148122b03ce1f1b555bba75bc6",
     [string]$WithSource = ""
 )
 
