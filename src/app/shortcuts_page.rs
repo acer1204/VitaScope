@@ -611,9 +611,18 @@ fn fixed_rows(platform: keymap::Platform, backspace_free: bool) -> Vec<(String, 
             },
         ),
         (
-            format!("{cmd} + V / X"),
-            tr!("保留給貼上、剪下", "Reserved for paste and cut"),
+            // egui-winit 只有 Windows 把 Shift+Insert 變成貼上
+            if platform == keymap::Platform::Windows {
+                format!("{cmd} + V / Shift + Insert")
+            } else {
+                format!("{cmd} + V")
+            },
+            tr!(
+                "開啟剪貼簿裡的網址或檔案路徑（貼上）",
+                "Open the URL or file path on the clipboard (paste)"
+            ),
         ),
+        (format!("{cmd} + X"), tr!("保留給剪下", "Reserved for cut")),
         (
             format!("{cmd} + {}", tr!("滾輪", "wheel")),
             tr!(
@@ -632,6 +641,32 @@ mod tests {
     /// 「固定的按鍵」的 Delete 那一列（按鍵、說明）
     fn delete_row(platform: keymap::Platform, backspace_free: bool) -> (String, &'static str) {
         fixed_rows(platform, backspace_free).swap_remove(1)
+    }
+
+    /// 貼上是固定的按鍵：開剪貼簿裡的網址或路徑（C3）。Shift+Insert 只有 Windows 會變成貼上
+    #[test]
+    fn fixed_paste_row_per_platform() {
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let paste = |p| {
+            fixed_rows(p, true)
+                .into_iter()
+                .find(|(k, _)| k.contains("+ V"))
+                .unwrap()
+        };
+        assert_eq!(
+            paste(keymap::Platform::Windows),
+            (
+                "Ctrl + V / Shift + Insert".to_owned(),
+                "開啟剪貼簿裡的網址或檔案路徑（貼上）"
+            )
+        );
+        assert_eq!(paste(keymap::Platform::Linux).0, "Ctrl + V");
+        assert_eq!(paste(keymap::Platform::Mac).0, "Cmd + V");
+        assert!(
+            fixed_rows(keymap::Platform::Windows, true)
+                .iter()
+                .any(|(k, w)| k == "Ctrl + X" && *w == "保留給剪下")
+        );
     }
 
     /// macOS 的 Backspace 有條件（滑鼠在面板上或最後點的是面板），表上要寫出來

@@ -86,6 +86,8 @@ enum Action {
     ToggleFullscreen,
     ExitFullscreen,
     Open,
+    /// 「開啟網址」對話框（Ctrl+U）
+    OpenUrl,
     About,
     /// 播放清單的上一個 / 下一個檔案
     PrevFile,
@@ -282,8 +284,15 @@ pub struct VitascopeApp {
     bookmark_edit: Option<bookmarks_panel::RenameEdit>,
     /// 「全部刪除…」的確認對話框開著：要刪的是哪個檔案的書籤（開對話框時的檔案；之後換了檔也不會刪錯）
     bookmarks_clear: Option<String>,
-    /// 同資料夾的播放清單（開網址時沒有）
+    /// 播放清單：同資料夾的檔案、一次開的幾個檔案或網址（開一個網址時只有它自己）
     playlist: Option<Playlist>,
+    /// 網址的標題（網址 → 標題）：播放清單、最近開啟、「下一個」的提示顯示標題，不是網址。
+    /// 來源：播放紀錄存的、m3u 的 `#EXTINF`、mpv 讀到的影片標題
+    titles: HashMap<String, String>,
+    /// 「開啟網址」對話框（開著時）
+    url_dialog: Option<network::UrlDialog>,
+    /// 打開「開啟網址」時等讀剪貼簿的結果多久（介面測試改成確定的值，不靠電腦快慢）
+    url_prefill_wait: Duration,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
     was_eof: bool,
     /// 滑鼠滾輪還沒湊滿一格的量（觸控板的捲動是連續的）
@@ -317,6 +326,8 @@ pub struct VitascopeApp {
     keys_held: Vec<Key>,
     /// Ctrl（⌘）+C 按著沒放：之後的「複製」是自動重複
     copy_held: bool,
+    /// Ctrl（⌘）+V、Shift+Insert 按著沒放：之後的「貼上」是自動重複（不要每一下都重開一次網址）
+    paste_held: bool,
     /// 「字幕外觀」視窗
     sub_style_open: bool,
     /// 正在逐格（暫停中）：mpv 逐格時會短暫取消暫停，這段期間不算「播放中」，到結尾也不換檔
@@ -533,6 +544,8 @@ pub struct Launch {
     /// 測試用：當成是 / 不是 Wayland（不能設置頂）；None = 看視窗（介面測試沒有視窗：不是）
     #[doc(hidden)]
     pub wayland: Option<bool>,
+    /// 網址的標題（網址 → 標題）：還原的播放清單裡 `#EXTINF` 寫的
+    pub titles: HashMap<String, String>,
 }
 
 impl VitascopeApp {
@@ -631,6 +644,9 @@ impl VitascopeApp {
         };
 
         let keymap = Keymap::build(&settings.keys, Platform::current());
+        // 網址的標題：播放紀錄存的，加上還原的播放清單寫的
+        let mut titles: HashMap<String, String> = launch.history.titles.clone().into_iter().collect();
+        titles.extend(launch.titles);
         let mut bookmarks = launch.bookmarks;
         // 存檔失敗的回覆要叫醒介面（顯示提示）
         let ctx = cc.egui_ctx.clone();
@@ -666,6 +682,9 @@ impl VitascopeApp {
             bookmark_edit: None,
             bookmarks_clear: None,
             playlist: launch.playlist.clone(),
+            titles,
+            url_dialog: None,
+            url_prefill_wait: network::PREFILL_WAIT,
             was_eof: false,
             wheel: 0.0,
             right_controls_width: 0.0,
@@ -684,6 +703,7 @@ impl VitascopeApp {
             keys_ui: Default::default(),
             keys_held: Vec::new(),
             copy_held: false,
+            paste_held: false,
             sub_style_open: false,
             frame_stepping: false,
             stepping_unpaused_since: None,
@@ -1012,7 +1032,11 @@ impl VitascopeApp {
         if !in_list {
             self.playlist_scan = None;
             self.playlist = None;
-            if !is_url(&path.to_string_lossy()) {
+            let text = path.to_string_lossy();
+            if crate::net::is_network(&text) {
+                // 網路串流自己成一份清單（沒有資料夾可以掃）：播放清單面板看得到它，貼上、拖放的接在它後面
+                self.playlist = Some(Playlist::from_files(vec![path.clone()]));
+            } else if !is_url(&text) {
                 self.playlist = Some(Playlist::from_files(vec![path.clone()]));
                 let (tx, rx) = mpsc::channel();
                 let (scan_path, ctx) = (path.clone(), self.egui_ctx.clone());
@@ -1153,7 +1177,7 @@ impl VitascopeApp {
                 self.osd(crate::tf!(
                     "{dir}（{pos}/{len}）：{}",
                     "{dir} ({pos}/{len}): {}",
-                    file_name(&path)
+                    display_label(&self.titles, &path)
                 ));
             }
             None => self.osd(if forward {
@@ -1263,6 +1287,7 @@ impl VitascopeApp {
             }
             Action::ExitFullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false)),
             Action::Open => self.open_dialog(),
+            Action::OpenUrl => self.open_url_dialog(ctx),
             Action::About => self.about_open = true,
             Action::TogglePlaylist => self.toggle_side(ctx, SideTab::Playlist),
             Action::ToggleBookmarks => self.toggle_side(ctx, SideTab::Bookmarks),
@@ -1829,12 +1854,7 @@ impl VitascopeApp {
 
     /// 多選的檔案很多時，送來的檔案被切成兩批：清單換成整串，正在播的照樣播
     fn continue_burst(&mut self, paths: Vec<PathBuf>) {
-        let mut media: Vec<PathBuf> = paths
-            .iter()
-            .map(|p| crate::playlist::absolute(p))
-            .filter(|p| formats::media_kind(p).is_some())
-            .collect();
-        crate::playlist::sort_by_name(&mut media);
+        let media = media_in_order(&paths);
         let current = self.player.state.path.clone().map(PathBuf::from);
         let mut list = Playlist::from_files(media).manual();
         match current {
@@ -2071,6 +2091,9 @@ impl VitascopeApp {
             }
         }
         if is_url(&path) {
+            if crate::net::is_network(&path) {
+                self.remember_url(&path);
+            }
             self.adjust_reminder();
             return;
         }
@@ -2143,7 +2166,7 @@ impl VitascopeApp {
             self.osd(crate::tf!(
                 "下一個（{pos}/{len}）：{}",
                 "Next ({pos}/{len}): {}",
-                file_name(&next)
+                display_label(&self.titles, &next)
             ));
         }
     }
@@ -2153,7 +2176,8 @@ impl VitascopeApp {
     /// 3. 「關於」、對話框（`egui::Modal`）開著、正在輸入文字時，按鍵都不當快捷鍵；
     /// 4. Esc 依序關掉開著的視窗（[`ESC_WINDOWS`]）；
     /// 5. 全螢幕時 Esc 離開全螢幕；
-    /// 6. 快捷鍵對照表（`keymap`）。固定的按鍵：側邊面板開著時，只按 Delete 一定是移除選取的項目（播放清單分頁移出清單、
+    /// 6. 快捷鍵對照表（`keymap`）。貼上（Ctrl+V、Shift+Insert）開剪貼簿裡的網址或路徑（[`Self::paste_text`]）。
+    ///    固定的按鍵：側邊面板開著時，只按 Delete 一定是移除選取的項目（播放清單分頁移出清單、
     ///    書籤分頁刪掉書籤；排在對照表前面，自己指定的按鍵拿不走）；Shift／Alt+Delete 排在對照表後面，對照表沒用到才移除
     ///    （跟以前一樣）；macOS 的 Backspace 也排在後面，另外要滑鼠在面板上或最後點的是面板（[`Self::side_backspace_removes`]）。
     fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -2173,7 +2197,7 @@ impl VitascopeApp {
             });
         }
         // 每一幀都要看（包括錄按鍵、對話框開著時），按著的鍵才不會記錯
-        let copy_repeat = self.mark_repeats(ctx);
+        let (copy_repeat, paste_repeat) = self.mark_repeats(ctx);
         // 設定頁正在錄按鍵：按鍵都給它（Esc 取消錄，不關設定視窗）
         if self.capture_key(ctx) {
             return;
@@ -2222,6 +2246,19 @@ impl VitascopeApp {
         if deleted {
             actions.push(remove);
         }
+        // 固定的按鍵：Ctrl（⌘）+ V、Shift+Insert 開剪貼簿裡的網址或檔案路徑。egui 把它們變成「貼上」（剪貼簿有文字時才有），
+        // 不是按鍵事件，所以不在對照表裡。正在輸入文字、對話框開著、正在錄按鍵時前面就回傳了（貼到輸入框、給錄按鍵）
+        let pasted = ctx.input_mut(|i| {
+            let mut text = None;
+            i.events.retain(|e| match e {
+                egui::Event::Paste(t) => {
+                    text.get_or_insert_with(|| t.clone());
+                    false
+                }
+                _ => true,
+            });
+            text
+        });
         // 先把快捷鍵吃掉，避免同一個按鍵又觸發 egui 的按鈕（例如空白鍵按下有焦點的按鈕）
         ctx.input_mut(|i| {
             // Ctrl+C 不會變成按鍵事件：egui 把它轉成「複製」（Event::Copy）。有選取文字時是複製文字
@@ -2278,11 +2315,16 @@ impl VitascopeApp {
                 }
             });
         }
-        if !actions.is_empty() {
+        // 按著 Ctrl+V 不放：每一下自動重複都是一個「貼上」，只算第一下（不然網址每秒重開幾十次）
+        let pasted = pasted.filter(|_| !paste_repeat);
+        if !actions.is_empty() || pasted.is_some() {
             self.last_activity = Instant::now();
         }
         for a in actions {
             self.run(ctx, a);
+        }
+        if let Some(text) = pasted {
+            self.paste_text(&text);
         }
     }
 
@@ -2291,12 +2333,16 @@ impl VitascopeApp {
     /// egui 用按下時的按鍵（邏輯鍵）記「按著」，放開時才拿掉；Windows 放開時的邏輯鍵看的是放開那一刻的修飾鍵，
     /// 先放開 Shift 再放開 = 時，按下是 `+`、放開是 `=`，`+` 就一直留在 egui 的「按著」裡，之後每一次按 `+`
     /// 都被當成自動重複（開關類的指令、錄按鍵都不理）。這裡改用實體按鍵記（按下、放開一定一樣；沒有實體按鍵時用邏輯鍵）。
-    /// Ctrl+C 不是按鍵事件（egui 變成「複製」，自動重複也是一個個「複製」）：放開 C、放開 Ctrl 之前的都算重複
-    fn mark_repeats(&mut self, ctx: &egui::Context) -> bool {
+    /// Ctrl+C 不是按鍵事件（egui 變成「複製」，自動重複也是一個個「複製」）：放開 C、放開 Ctrl 之前的都算重複。
+    /// 「貼上」（Ctrl+V、Shift+Insert）一樣：放開 V／Insert、放開 Ctrl 和 Shift 之前的都算重複。
+    /// 回傳（這一幀的「複製」都是自動重複，這一幀的「貼上」都是自動重複）
+    fn mark_repeats(&mut self, ctx: &egui::Context) -> (bool, bool) {
         let held = &mut self.keys_held;
         let copy_held = &mut self.copy_held;
+        let paste_held = &mut self.paste_held;
         ctx.input_mut(|i| {
             let (mut saw_copy, mut fresh_copy) = (false, false);
+            let (mut saw_paste, mut fresh_paste) = (false, false);
             for e in &mut i.events {
                 match e {
                     egui::Event::Key {
@@ -2317,6 +2363,9 @@ impl VitascopeApp {
                             if *key == Key::C || id == Key::C {
                                 *copy_held = false;
                             }
+                            if matches!(*key, Key::V | Key::Insert) || matches!(id, Key::V | Key::Insert) {
+                                *paste_held = false;
+                            }
                         }
                     }
                     egui::Event::Copy => {
@@ -2324,10 +2373,17 @@ impl VitascopeApp {
                         fresh_copy |= !*copy_held;
                         *copy_held = true;
                     }
+                    egui::Event::Paste(_) => {
+                        saw_paste = true;
+                        fresh_paste |= !*paste_held;
+                        // 按鍵送來的「貼上」一定按著 Ctrl（⌘）或 Shift；沒有的是程式要的（「開啟網址」讀剪貼簿），不算按著
+                        *paste_held = i.modifiers.command || i.modifiers.shift;
+                    }
                     // 切到別的視窗時收不到放開（例如 Ctrl+O 開了檔案對話框）：全部當成放開了
                     egui::Event::WindowFocused(false) => {
                         held.clear();
                         *copy_held = false;
+                        *paste_held = false;
                     }
                     _ => {}
                 }
@@ -2335,7 +2391,10 @@ impl VitascopeApp {
             if !saw_copy && !i.modifiers.command {
                 *copy_held = false;
             }
-            saw_copy && !fresh_copy
+            if !saw_paste && !i.modifiers.command && !i.modifiers.shift {
+                *paste_held = false;
+            }
+            (saw_copy && !fresh_copy, saw_paste && !fresh_paste)
         })
     }
 
@@ -2416,6 +2475,7 @@ impl VitascopeApp {
             Command::About => Action::About,
             Command::CycleTheme => Action::CycleTheme,
             Command::OpenFile => Action::Open,
+            Command::OpenUrl => Action::OpenUrl,
             Command::Screenshot => Action::Screenshot,
             Command::CopyFrame => Action::CopyFrame,
             Command::AbSetStart => Action::AbSet(0),
@@ -2465,22 +2525,18 @@ impl VitascopeApp {
         self.open_paths(dropped, true);
     }
 
-    /// 開一組檔案（拖放、命令列、別的程式送來的）：好幾個影音檔 = 依檔名排序的播放清單；
-    /// 只有字幕 = 加到正在播的影片；播放清單檔照樣開。`dropped` = 拖放進來的（播放清單開著時加到清單最後）
+    /// 開一組檔案（拖放、命令列、別的程式送來的、貼上、「開啟網址」）：好幾個影音檔 = 依檔名排序的播放清單；
+    /// 有網址時照給的順序（網址一律當成影音，副檔名不算數；字幕的網址還是字幕）；只有字幕 = 加到正在播的影片；播放清單檔照樣開。
+    /// `from_drop` = 拖放、貼上的（播放清單開著時加到清單最後）
     pub(super) fn open_paths(&mut self, dropped: Vec<PathBuf>, from_drop: bool) {
         let dropped: Vec<PathBuf> = dropped.iter().map(|p| crate::playlist::absolute(p)).collect();
         let Some(first) = dropped.first().cloned() else { return };
         let dropped_count = dropped.len();
         let dropped_paths = dropped.clone();
+        // 字幕的網址也是字幕（加到正在播的影片，mpv 讀得到網路上的字幕）
         let mut subs: Vec<PathBuf> = dropped.iter().filter(|p| formats::is_subtitle(p)).cloned().collect();
         crate::playlist::sort_by_name(&mut subs);
-        // 一次拖放多個影音檔：播放清單就是這幾個檔案，依檔名排序
-        //（拖放的順序跟系統有關，Windows 會把滑鼠抓著的那個檔案放在最前面）
-        let mut media: Vec<PathBuf> = dropped
-            .into_iter()
-            .filter(|p| formats::media_kind(p).is_some())
-            .collect();
-        crate::playlist::sort_by_name(&mut media);
+        let media = media_in_order(&dropped);
         let all_subs = subs.len() == dropped_count;
         if media.is_empty() && all_subs {
             // 只拖了字幕檔：加到正在播（或正在開）的影片
@@ -3205,12 +3261,15 @@ impl VitascopeApp {
         if self.cmd_item(ui, true, crate::tr!("開啟檔案…", "Open file…"), Command::OpenFile) {
             action = Some(Action::Open);
         }
+        if self.cmd_item(ui, true, crate::tr!("開啟網址…", "Open URL…"), Command::OpenUrl) {
+            action = Some(Action::OpenUrl);
+        }
         let recent: Vec<String> = self.history.recent.iter().take(RECENT_IN_MENU).cloned().collect();
         let mut clear_recent = false;
         ui.add_enabled_ui(!recent.is_empty(), |ui| {
             ui.menu_button(crate::tr!("最近開啟的檔案", "Recent files"), |ui| {
                 for p in &recent {
-                    if ui.button(file_name(Path::new(p))).on_hover_text(p).clicked() {
+                    if ui.button(recent_label(&self.titles, p)).on_hover_text(p).clicked() {
                         open_recent = Some(p.clone());
                     }
                 }
@@ -3410,7 +3469,7 @@ impl VitascopeApp {
         } else {
             40.0 + 24.0 * recent.len() as f32
         };
-        ui.add_space((rect.height() / 2.0 - 90.0 - recent_height / 2.0).max(0.0));
+        ui.add_space((rect.height() / 2.0 - 100.0 - recent_height / 2.0).max(0.0));
         ui.label(
             egui::RichText::new(app_name())
                 .size(32.0)
@@ -3421,6 +3480,12 @@ impl VitascopeApp {
             egui::RichText::new(self.keymap.drop_hint())
                 .size(16.0)
                 .color(Color32::from_gray(140)),
+        );
+        // 第二行：開啟網址、貼上網址
+        ui.label(
+            egui::RichText::new(self.keymap.url_hint())
+                .size(14.0)
+                .color(Color32::from_gray(120)),
         );
         // 兩種錯誤都要顯示：影片畫面初始化失敗時，開檔錯誤也不能被蓋掉
         for msg in [self.fatal.as_deref(), self.player.state.last_error.as_deref()]
@@ -3445,7 +3510,7 @@ impl VitascopeApp {
             );
             ui.add_space(4.0);
             for path in recent {
-                let name = egui::RichText::new(file_name(Path::new(path)))
+                let name = egui::RichText::new(recent_label(&self.titles, path))
                     .size(14.0)
                     .color(Color32::from_gray(200));
                 if ui
@@ -3570,15 +3635,27 @@ impl VitascopeApp {
                 {
                     self.run(ui.ctx(), Action::ToggleFullscreen);
                 }
-                if ui
-                    .add(icon_button("🗁"))
-                    .on_hover_text(
-                        self.keymap
-                            .labeled(crate::tr!("開啟檔案", "Open file"), Command::OpenFile),
-                    )
-                    .clicked()
-                {
+                // 按右鍵：開啟檔案 / 開啟網址
+                let open = ui.add(icon_button("🗁")).on_hover_text(crate::tf!(
+                    "{}・按右鍵開啟網址",
+                    "{} · right-click to open a URL",
+                    self.keymap
+                        .labeled(crate::tr!("開啟檔案", "Open file"), Command::OpenFile)
+                ));
+                if open.clicked() {
                     self.run(ui.ctx(), Action::Open);
+                }
+                let mut picked = None;
+                open.context_menu(|ui| {
+                    if self.cmd_item(ui, true, crate::tr!("開啟檔案…", "Open file…"), Command::OpenFile) {
+                        picked = Some(Action::Open);
+                    }
+                    if self.cmd_item(ui, true, crate::tr!("開啟網址…", "Open URL…"), Command::OpenUrl) {
+                        picked = Some(Action::OpenUrl);
+                    }
+                });
+                if let Some(a) = picked {
+                    self.run(ui.ctx(), a);
                 }
                 if ui
                     .add(icon_button("ℹ"))
@@ -4245,6 +4322,7 @@ impl eframe::App for VitascopeApp {
         // 這一幀畫的對話框自己記下來（下一幀的 handle_keys 看）
         self.modal_open = false;
         self.about_window(&ctx);
+        self.url_dialog_window(&ctx);
         self.bookmarks_clear_modal(&ctx);
         self.subtitle_style_window(&ctx);
         self.settings_window(&ctx);
@@ -4293,6 +4371,27 @@ impl eframe::App for VitascopeApp {
 /// 網址（串流、mpv 的 av:// 之類），不是本機檔案
 fn is_url(path: &str) -> bool {
     path.contains("://")
+}
+
+/// 一次開好幾個時算不算影音：副檔名是影音的檔案，或任何網址（`watch?v=…` 這類網址沒有副檔名）；
+/// 字幕的網址除外（照以前一樣加到正在播的影片）
+fn is_media_or_url(path: &Path) -> bool {
+    formats::media_kind(path).is_some() || (is_url(&path.to_string_lossy()) && !formats::is_subtitle(path))
+}
+
+/// 一批要開的（拖放、命令列、別的程式送來的、貼上）裡的影音，照要播的順序：
+/// 只有檔案時依檔名排序（拖放的順序跟系統有關，Windows 會把滑鼠抓著的那個檔案放在最前面）；
+/// 有網址時照給的順序（網址沒有能排的檔名，命令列、貼上好幾個網址的順序就是使用者要的）
+fn media_in_order(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut media: Vec<PathBuf> = paths
+        .iter()
+        .map(|p| crate::playlist::absolute(p))
+        .filter(|p| is_media_or_url(p))
+        .collect();
+    if !media.iter().any(|p| is_url(&p.to_string_lossy())) {
+        crate::playlist::sort_by_name(&mut media);
+    }
+    media
 }
 
 /// 延遲：0 →「0 秒」、0.3 →「+0.3 秒」、-0.25 →「-0.25 秒」
@@ -4435,6 +4534,26 @@ fn file_name(path: &Path) -> String {
     )
 }
 
+/// 播放清單、「下一個」的提示上的名稱：知道標題的網址（IPTV 的 udp 群播也算）用標題；
+/// 不知道標題的網路串流用網址的最後一段；其他照檔名
+fn display_label(titles: &HashMap<String, String>, path: &Path) -> String {
+    let s = path.to_string_lossy();
+    match titles.get(s.as_ref()) {
+        Some(title) => title.clone(),
+        None if crate::net::is_network(&s) => crate::net::display_name(&s, None),
+        None => file_name(path),
+    }
+}
+
+/// 最近開啟（右鍵選單、起始畫面、「開啟網址」對話框）的名稱：網路串流是「標題 · 主機名稱」
+fn recent_label(titles: &HashMap<String, String>, path: &str) -> String {
+    let name = display_label(titles, Path::new(path));
+    match crate::net::is_network(path).then(|| crate::net::host(path)).flatten() {
+        Some(host) if host != name => format!("{name} · {host}"),
+        _ => name,
+    }
+}
+
 /// 「mpv v0.41.0-1102-g6c092d978」「N-127218-g47313ad3f」→「mpv 0.41.0 · FFmpeg N-127218」
 /// （去掉 git 雜湊，「關於」視窗才放得下）
 fn short_versions(mpv: &str, ffmpeg: &str) -> String {
@@ -4489,8 +4608,34 @@ fn next_track(ids: &[i64], current: Option<i64>, allow_off: bool) -> Option<Opti
 #[cfg(test)]
 mod tests {
     use super::{
-        fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, mpv_opts_override, next_track, short_versions,
+        fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, media_in_order, mpv_opts_override, next_track,
+        short_versions,
     };
+    use std::path::PathBuf;
+
+    /// 一批要開的（拖放、命令列、別的程式接著送來的）：只有檔案時依檔名排序；有網址時照給的順序。
+    /// 沒有影音副檔名的網址也算；字幕（本機的、網址的）不算，是加到影片的字幕
+    #[test]
+    fn media_order_for_a_batch() {
+        let local = |n: &str| std::env::temp_dir().join(n);
+        assert_eq!(
+            media_in_order(&[local("第2集.mp4"), local("a.srt"), local("第1集.mkv"), local("x.txt")]),
+            [local("第1集.mkv"), local("第2集.mp4")]
+        );
+        let urls = [
+            "https://x.example/b.mkv?v=1",
+            "https://x.example/watch?v=abc",
+            "https://x.example/sub.srt",
+            "https://x.example/a.mp4",
+        ]
+        .map(PathBuf::from);
+        assert_eq!(
+            media_in_order(&urls),
+            [urls[0].clone(), urls[1].clone(), urls[3].clone()]
+        );
+        let mixed = [PathBuf::from("https://x.example/z.mp4"), local("a.mp4")];
+        assert_eq!(media_in_order(&mixed), mixed);
+    }
 
     #[test]
     fn next_track_cycles() {

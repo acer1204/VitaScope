@@ -6,7 +6,7 @@
 //! 每一列是同一個能點也能拖的元件（`Ui::dnd_drag_source` 一按下就算開始拖，點擊會被吃掉）；
 //! 放下的位置看滑鼠在第幾列之間（列與列的空隙也算），拖到上下邊緣會自動捲動。
 
-use super::{DialogKind, Pick, VitascopeApp, file_name, icon_button};
+use super::{DialogKind, Pick, VitascopeApp, display_label, file_name, icon_button};
 use crate::formats;
 use crate::keymap::Command;
 use crate::m3u;
@@ -299,7 +299,8 @@ impl VitascopeApp {
             ui.spacing_mut().item_spacing.y = 0.0;
             for i in range {
                 let path = &list.items()[i];
-                let name = format!("{}. {}", i + 1, file_name(path));
+                // 網址顯示標題（m3u 的 #EXTINF、影片的標題），滑鼠停在上面看完整的網址
+                let name = format!("{}. {}", i + 1, display_label(&self.titles, path));
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 // 無障礙資訊：螢幕閱讀器、介面測試找得到每一列
                 resp.widget_info(|| {
@@ -537,11 +538,20 @@ impl VitascopeApp {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let path = path.as_path();
         let base = path.parent().unwrap_or(Path::new(""));
-        let files: Vec<PathBuf> = m3u::parse(text, base)
+        let entries: Vec<m3u::Entry> = m3u::parse(text, base)
             .into_iter()
-            .map(|e| e.path)
-            .filter(|p| m3u::keep_entry(p))
+            .filter(|e| m3u::keep_entry(&e.path))
             .collect();
+        // 網址的 #EXTINF 標題（IPTV 的頻道名稱之類）：清單上顯示標題。本機檔案照樣顯示檔名
+        for e in &entries {
+            let url = e.path.to_string_lossy();
+            if m3u::is_url(&url)
+                && let Some(t) = e.title.as_deref().and_then(|t| crate::net::useful_title(&url, t))
+            {
+                self.titles.insert(url.into_owned(), t);
+            }
+        }
+        let files: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
         let Some(first) = files.first().cloned() else {
             self.osd(crate::tf!(
                 "播放清單是空的：{}",
@@ -582,7 +592,8 @@ impl VitascopeApp {
             .iter()
             .map(|p| m3u::Entry {
                 path: p.clone(),
-                title: None,
+                // 網址寫標題（本機檔案寫檔名）
+                title: self.titles.get(p.to_string_lossy().as_ref()).cloned(),
                 duration: None,
             })
             .collect();
@@ -612,7 +623,7 @@ impl VitascopeApp {
             Some(list) if list.is_manual() => (list.items(), list.resume_index()),
             _ => (&[], None),
         };
-        if let Err(e) = m3u::save_session(items, current) {
+        if let Err(e) = m3u::save_session(items, current, &self.titles) {
             eprintln!("[vitascope] 無法儲存播放清單：{e}");
         }
     }

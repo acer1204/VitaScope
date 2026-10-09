@@ -89,8 +89,20 @@ fn parse_args() -> (Launch, bool) {
         launch.bookmarks = vitascope::bookmarks::Bookmarks::load();
         launch.persist_playlist = true;
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
-        if launch.files.is_empty() {
-            launch.playlist = vitascope::m3u::load_session().map(|(items, current)| Playlist::restored(items, current));
+        if launch.files.is_empty()
+            && let Some((entries, current)) = vitascope::m3u::load_session_entries()
+        {
+            // 網址的標題（#EXTINF）：清單上照樣顯示標題，不是網址的最後一段
+            launch.titles = entries
+                .iter()
+                .filter_map(|e| {
+                    let url = e.path.to_string_lossy();
+                    let title = vitascope::net::useful_title(&url, e.title.as_deref()?)?;
+                    vitascope::m3u::is_url(&url).then(|| (url.into_owned(), title))
+                })
+                .collect();
+            let items = entries.into_iter().map(|e| e.path).collect();
+            launch.playlist = Some(Playlist::restored(items, current));
         }
     }
     (launch, new_window)

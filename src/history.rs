@@ -1,8 +1,9 @@
-//! 播放紀錄：最近開啟的檔案、每個檔案上次看到哪裡（續播）。
+//! 播放紀錄：最近開啟的檔案（含網址）、每個檔案上次看到哪裡（續播）、「開啟網址」輸入過的網址與網址的標題。
 //! 跟設定分開存（`history.json`，和 settings.json 放在同一個資料夾），設定檔才不會越來越大。
 
 use crate::playlist::same_file;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 const MAX_RECENT: usize = 20;
 /// 續播位置最多記幾個檔案（超過就丟掉最舊的）
 const MAX_POSITIONS: usize = 300;
+/// 「開啟網址」對話框輸入過的網址最多記幾個
+pub const MAX_URLS: usize = 30;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -18,6 +21,11 @@ pub struct History {
     pub recent: Vec<String>,
     /// 上次看到的位置，最新的在前面
     pub positions: Vec<Position>,
+    /// 「開啟網址」對話框輸入過的網址，最新的在前面（最多 [`MAX_URLS`] 個）
+    pub urls: Vec<String>,
+    /// 網址的標題（最近開啟、對話框的清單顯示標題，不是網址）；存檔時只留還在 `recent`、`urls` 裡的。
+    /// 舊版存檔時會把這兩項拿掉（只是少了標題與對話框的清單，不影響播放）
+    pub titles: BTreeMap<String, String>,
     /// 存檔位置；None = 只放在記憶體（自動測試用）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -71,8 +79,13 @@ impl History {
         {
             self.recent = disk.recent;
             self.positions = disk.positions;
+            self.urls = disk.urls;
+            self.titles = disk.titles;
         }
         change(self);
+        // 標題只留還用得到的（不然開過的網址越記越多）
+        let (recent, urls) = (&self.recent, &self.urls);
+        self.titles.retain(|url, _| recent.contains(url) || urls.contains(url));
         self.save()
     }
 
@@ -123,6 +136,23 @@ impl History {
 
     pub fn clear_recent(&mut self) {
         self.recent.clear();
+    }
+
+    /// 記下「開啟網址」輸入的網址（放到最前面；一字不差的才算同一個）
+    pub fn add_url(&mut self, url: &str) {
+        self.urls.retain(|u| u != url);
+        self.urls.insert(0, url.to_owned());
+        self.urls.truncate(MAX_URLS);
+    }
+
+    /// 「開啟網址」的「清除記錄」
+    pub fn clear_urls(&mut self) {
+        self.urls.clear();
+    }
+
+    /// 記下網址的標題（存檔時沒有在最近開啟、對話框清單上的會拿掉）
+    pub fn set_title(&mut self, url: &str, title: &str) {
+        self.titles.insert(url.to_owned(), title.to_owned());
     }
 
     /// 忘掉某個檔案的續播位置
@@ -299,5 +329,79 @@ mod tests {
         let h: History = serde_json::from_str(r#"{ "recent": ["a.mp4"] }"#).unwrap();
         assert_eq!(h.recent, ["a.mp4"]);
         assert!(h.positions.is_empty());
+    }
+
+    #[test]
+    fn urls_are_unique_exact_and_capped() {
+        // 舊版的紀錄檔沒有這兩項
+        let old: History = serde_json::from_str(r#"{ "recent": ["a.mp4"] }"#).unwrap();
+        assert!(old.urls.is_empty() && old.titles.is_empty());
+        let mut h = History::default();
+        for i in 0..40 {
+            h.add_url(&format!("https://x.example/{i}"));
+        }
+        h.add_url("https://x.example/5");
+        assert_eq!(h.urls.len(), MAX_URLS);
+        assert_eq!(h.urls[0], "https://x.example/5");
+        assert_eq!(h.urls.iter().filter(|u| *u == "https://x.example/5").count(), 1);
+        // 大小寫不同是不同的網址（YouTube 的影片代號分大小寫）
+        h.add_url("https://x.example/watch?v=AbC");
+        h.add_url("https://x.example/watch?v=abc");
+        assert_eq!(
+            &h.urls[..2],
+            ["https://x.example/watch?v=abc", "https://x.example/watch?v=AbC"]
+        );
+        h.clear_urls();
+        assert!(h.urls.is_empty());
+    }
+
+    #[test]
+    fn titles_round_trip_and_are_pruned() {
+        let path = temp_file("titles");
+        let mut h = History::load_from(path.clone());
+        h.update(|h| {
+            h.add_recent("https://x.example/a.mp4");
+            h.set_title("https://x.example/a.mp4", "第一部");
+            h.add_url("https://x.example/b.m3u8");
+            h.set_title("https://x.example/b.m3u8", "直播");
+            // 不在任何清單上：存檔時拿掉
+            h.set_title("https://x.example/gone.mp4", "不見了");
+        })
+        .unwrap();
+        let back = History::load_from(path.clone());
+        assert_eq!(back.urls, ["https://x.example/b.m3u8"]);
+        assert_eq!(
+            back.titles
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("https://x.example/a.mp4", "第一部"),
+                ("https://x.example/b.m3u8", "直播")
+            ]
+        );
+        // 清掉最近開啟：只在那裡的標題跟著拿掉
+        let mut h = back;
+        h.update(History::clear_recent).unwrap();
+        assert_eq!(History::load_from(path.clone()).titles.len(), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn another_window_keeps_its_urls_and_titles() {
+        let path = temp_file("urls-two-players");
+        let mut a = History::load_from(path.clone());
+        let mut b = History::load_from(path.clone());
+        a.update(|h| {
+            h.add_url("https://a.example/1");
+            h.set_title("https://a.example/1", "A");
+        })
+        .unwrap();
+        b.update(|h| h.add_url("https://b.example/2")).unwrap();
+        let disk = History::load_from(path.clone());
+        assert_eq!(disk.urls, ["https://b.example/2", "https://a.example/1"]);
+        assert_eq!(disk.titles.get("https://a.example/1").map(String::as_str), Some("A"));
+        assert_eq!(b.urls, disk.urls, "update 讀回別的視窗存的網址");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

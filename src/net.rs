@@ -481,6 +481,85 @@ pub fn storable(url: &str) -> bool {
         && segs[1..].iter().all(|s| !s.is_empty()))
 }
 
+/// 標題最長幾個字（太長的截掉；選單、清單放不下）
+const MAX_TITLE_CHARS: usize = 300;
+
+/// 值得記下的標題（m3u 的 `#EXTINF`、mpv 的 media-title）：空白整理成一個、太長的截掉；
+/// 空的、跟沒有標題時顯示的名稱一樣（例如 m3u 存檔時自動寫的檔名）的不算。
+/// v0.3.0 存清單時網址寫的是網址最後一段去掉副檔名（`…/index.m3u8` 寫 `index`），那也不算：
+/// 不然還原舊的清單後，這個自動寫的名稱會蓋過影片真正的標題
+pub fn useful_title(url: &str, title: &str) -> Option<String> {
+    let t: String = title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_TITLE_CHARS)
+        .collect();
+    let old_auto = std::path::Path::new(url)
+        .file_stem()
+        .is_some_and(|stem| stem.to_string_lossy() == t);
+    (!t.is_empty() && t != display_name(url, None) && !old_auto).then_some(t)
+}
+
+/// 網路串流的標題（mpv 的 media-title）。網路電台（Icecast、Shoutcast）沒有標題時，media-title 是正在播的歌名
+/// （`icy-title`，每首歌都會變），不能當成電台的標題：改用電台名稱（`icy-name`），沒有就不記
+pub fn stream_title<'a>(media_title: &'a str, icy_title: Option<&str>, icy_name: Option<&'a str>) -> Option<&'a str> {
+    match icy_title.map(str::trim) {
+        Some(song) if !song.is_empty() && song == media_title.trim() => {
+            icy_name.map(str::trim).filter(|n| !n.is_empty())
+        }
+        _ => Some(media_title),
+    }
+}
+
+/// 貼上的文字只有一個檔名（沒有資料夾，副檔名是影音、字幕或播放清單）：macOS 的 Finder 複製檔案時
+/// 另外放的文字就是這樣，開不了（不知道在哪個資料夾）
+pub fn bare_file_name(text: &str) -> bool {
+    let t = unwrap_quotes(text.trim());
+    let p = std::path::Path::new(t);
+    !t.is_empty()
+        && !t.contains(['\n', '\r', '/', '\\'])
+        && (crate::formats::media_kind(p).is_some() || crate::formats::is_subtitle(p) || crate::formats::is_playlist(p))
+}
+
+/// 貼上的文字是本機檔案的路徑（一行一個，前後的引號拿掉；也接受 `file://` 網址）。
+/// 不檢查檔案在不在：網路磁碟連不上時檢查會卡住畫面，打不開時 mpv 會說明原因。
+/// 看起來是完整路徑才算：Windows 是磁碟代號（`C:\`）或網路路徑（`\\server\share`），其他系統是 `/` 或 `~/` 開頭。
+/// 有一行不是就整個不算（None）
+pub fn pasted_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from);
+    pasted_paths_for(text, cfg!(windows), home.as_deref())
+}
+
+fn pasted_paths_for(text: &str, windows: bool, home: Option<&std::path::Path>) -> Option<Vec<std::path::PathBuf>> {
+    let mut paths = Vec::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let line = unwrap_quotes(line);
+        if line.is_empty() || line.chars().any(char::is_control) {
+            return None;
+        }
+        if line.len() > 7 && line.get(..7).is_some_and(|h| h.eq_ignore_ascii_case("file://")) {
+            paths.push(crate::m3u::file_url_to_path(&line[7..]));
+            continue;
+        }
+        let b = line.as_bytes();
+        let path = if windows {
+            let drive = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/');
+            let unc = b.len() > 2 && b.starts_with(b"\\\\") && b[2] != b'\\';
+            (drive || unc).then(|| std::path::PathBuf::from(line))?
+        } else if line.starts_with('/') {
+            std::path::PathBuf::from(line)
+        } else if line == "~" || line.starts_with("~/") {
+            home?.join(line.trim_start_matches('~').trim_start_matches('/'))
+        } else {
+            return None;
+        };
+        paths.push(path);
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
 // ───────────── 連線失敗的說明 ─────────────
 
 /// 開網址失敗的原因（從 mpv、FFmpeg 的記錄判斷）
@@ -900,6 +979,117 @@ mod tests {
         }
         let long = format!("https://example.com/{}", "a".repeat(5000));
         assert!(!storable(&long));
+    }
+
+    #[test]
+    fn titles_worth_keeping() {
+        let url = "https://x.example/dir/a%20b.mp4";
+        assert_eq!(useful_title(url, "  我的\n影片 "), Some("我的 影片".to_owned()));
+        assert_eq!(useful_title(url, "   "), None);
+        // 跟沒有標題時顯示的一樣（m3u 存檔時自動寫的）：不算
+        assert_eq!(useful_title(url, "a b.mp4"), None);
+        let long = "長".repeat(500);
+        assert_eq!(useful_title(url, &long).unwrap().chars().count(), MAX_TITLE_CHARS);
+        // v0.3.0 存清單時自動寫的（網址最後一段去掉副檔名）：不算，影片真正的標題才記得到
+        assert_eq!(useful_title("https://x.example/live/index.m3u8", "index"), None);
+        assert_eq!(useful_title("https://x.example/watch?v=abc.def", "watch?v=abc"), None);
+        assert_eq!(useful_title("https://x.example/a%20b.mp4", "a%20b"), None);
+        assert_eq!(
+            useful_title("https://x.example/live/index.m3u8", "新聞台"),
+            Some("新聞台".to_owned())
+        );
+    }
+
+    #[test]
+    fn radio_song_is_not_the_station_title() {
+        // 一般的串流：media-title 就是標題
+        assert_eq!(stream_title("新聞台", None, None), Some("新聞台"));
+        assert_eq!(stream_title("新聞台", Some(""), None), Some("新聞台"));
+        // 有標題（title 標籤排在 icy-title 前面）時，歌名不一樣：照用標題
+        assert_eq!(stream_title("台北電台", Some("某首歌"), Some("電台")), Some("台北電台"));
+        // media-title 是正在播的歌：改用電台名稱，沒有就不記
+        assert_eq!(
+            stream_title("某首歌", Some("某首歌"), Some(" 古典電台 ")),
+            Some("古典電台")
+        );
+        assert_eq!(stream_title("某首歌", Some("某首歌"), None), None);
+        assert_eq!(stream_title("某首歌", Some("某首歌"), Some("  ")), None);
+    }
+
+    #[test]
+    fn bare_file_names_from_finder() {
+        for t in ["a.mp4", " 影片 1.MKV\n", "\"字幕.srt\"", "清單.m3u8"] {
+            assert!(bare_file_name(t), "{t:?}");
+        }
+        for t in [
+            "",
+            "hello",
+            "a.docx",
+            "dir/a.mp4",
+            r"C:\a.mp4",
+            "a.mp4\nb.mp4",
+            "https://x.example/a.mp4",
+        ] {
+            assert!(!bare_file_name(t), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn pasted_text_that_looks_like_paths() {
+        use std::path::{Path, PathBuf};
+        let win = |t: &str| pasted_paths_for(t, true, None);
+        let unix = |t: &str| pasted_paths_for(t, false, Some(Path::new("/home/me")));
+        // Windows：磁碟代號、網路路徑；檔案總管的「複製路徑」會加引號，選好幾個是一行一個
+        assert_eq!(win(r"C:\影片\a b.mp4"), Some(vec![PathBuf::from(r"C:\影片\a b.mp4")]));
+        assert_eq!(win("d:/a.mkv"), Some(vec![PathBuf::from("d:/a.mkv")]));
+        assert_eq!(
+            win(r"\\nas\share\a.mp4"),
+            Some(vec![PathBuf::from(r"\\nas\share\a.mp4")])
+        );
+        assert_eq!(
+            win("\"C:\\a.mp4\"\r\n\"C:\\b c.mp4\"\r\n"),
+            Some(vec![PathBuf::from(r"C:\a.mp4"), PathBuf::from(r"C:\b c.mp4")])
+        );
+        for t in [
+            "a.mp4",
+            r"影片\a.mp4",
+            "C:",
+            "C:a.mp4",
+            "/home/a.mp4",
+            r"\\\x",
+            "~/a.mp4",
+            "",
+            "  \n ",
+        ] {
+            assert_eq!(win(t), None, "{t:?}");
+        }
+        assert_eq!(win("C:\\a.mp4\nhello"), None, "有一行不是路徑就整個不算");
+        // 其他系統：/、~/ 開頭
+        assert_eq!(
+            unix("/home/me/影片/a b.mp4"),
+            Some(vec![PathBuf::from("/home/me/影片/a b.mp4")])
+        );
+        assert_eq!(unix("'~/a.mp4'"), Some(vec![PathBuf::from("/home/me/a.mp4")]));
+        assert_eq!(unix("~"), Some(vec![PathBuf::from("/home/me")]));
+        assert_eq!(pasted_paths_for("~/a.mp4", false, None), None, "不知道家目錄");
+        for t in [
+            "a.mp4",
+            r"C:\a.mp4",
+            "~me/a.mp4",
+            "hello world",
+            "/a.mp4\nb.mp4",
+            "/a\u{0}b",
+        ] {
+            assert_eq!(unix(t), None, "{t:?}");
+        }
+        // file:// 網址照 m3u 的規則轉成路徑（照執行的平台）
+        let got = pasted_paths("file:///C:/%E5%BD%B1%E7%89%87/a%20b.mp4").unwrap();
+        if cfg!(windows) {
+            assert_eq!(got, [PathBuf::from(r"C:\影片\a b.mp4")]);
+        } else {
+            assert_eq!(got, [PathBuf::from("/C:/影片/a b.mp4")]);
+        }
+        assert_eq!(pasted_paths("file://"), None);
     }
 
     #[test]

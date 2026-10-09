@@ -8,6 +8,7 @@
 //! - HLS 串流的 .m3u8（有 `#EXT-X-` 標籤）不是播放清單，整個交給 mpv 播
 //! - 手動編輯過的清單在關閉程式時存起來（`playlist.m3u8`，在設定資料夾），下次開啟時還在
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 /// 清單裡的一項
@@ -141,7 +142,7 @@ pub fn is_url(s: &str) -> bool {
 }
 
 /// `file:///C:/影片/a.mp4`、`file:///home/a.mp4`、`file://server/share/a.mp4`（`file://` 之後的部分）
-fn file_url_to_path(rest: &str) -> PathBuf {
+pub(crate) fn file_url_to_path(rest: &str) -> PathBuf {
     let decoded = percent_decode(strip_localhost(rest));
     let s = decoded.as_str();
     if cfg!(windows) {
@@ -208,16 +209,22 @@ pub fn format(entries: &[Entry], playlist_path: &Path) -> String {
     let base = playlist_path.parent().unwrap_or(Path::new(""));
     let mut out = String::from("#EXTM3U\n");
     for e in entries {
-        let title = e
-            .title
-            .clone()
-            .or_else(|| e.path.file_stem().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_default();
+        let text = e.path.to_string_lossy();
+        // 沒有標題：檔案寫檔名（不含副檔名），網址寫顯示的名稱（路徑的最後一段、主機名稱）
+        let title = e.title.clone().unwrap_or_else(|| {
+            if is_url(&text) {
+                crate::net::display_name(&text, None)
+            } else {
+                e.path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            }
+        });
         let duration = e.duration.map_or(-1, |d| d.round() as i64);
         // 標題裡的換行會讓下一行變成路徑
         let title = title.replace(['\r', '\n'], " ");
         out.push_str(&format!("#EXTINF:{duration},{title}\n"));
-        let text = e.path.to_string_lossy();
         let line = if is_url(&text) {
             text.into_owned()
         } else {
@@ -259,13 +266,27 @@ fn session_path() -> Option<PathBuf> {
     crate::settings::config_dir().map(|d| d.join("playlist.m3u8"))
 }
 
-/// 存下手動整理的清單（完整路徑）與目前的位置；`items` 是空的就刪掉存檔
-pub fn save_session(items: &[PathBuf], current: Option<usize>) -> std::io::Result<()> {
+/// 存下手動整理的清單（完整路徑）與目前的位置；`items` 是空的就刪掉存檔。
+/// 網址的標題（`titles`：網址 → 標題）寫在 `#EXTINF`，下次還原時清單上照樣顯示標題
+pub fn save_session(
+    items: &[PathBuf],
+    current: Option<usize>,
+    titles: &HashMap<String, String>,
+) -> std::io::Result<()> {
     let Some(path) = session_path() else { return Ok(()) };
-    save_session_to(&path, items, current)
+    save_session_titled_to(&path, items, current, titles)
 }
 
 pub fn save_session_to(path: &Path, items: &[PathBuf], current: Option<usize>) -> std::io::Result<()> {
+    save_session_titled_to(path, items, current, &HashMap::new())
+}
+
+pub fn save_session_titled_to(
+    path: &Path,
+    items: &[PathBuf],
+    current: Option<usize>,
+    titles: &HashMap<String, String>,
+) -> std::io::Result<()> {
     if items.is_empty() {
         return match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -277,10 +298,14 @@ pub fn save_session_to(path: &Path, items: &[PathBuf], current: Option<usize>) -
     }
     let entries: Vec<Entry> = items
         .iter()
-        .map(|p| Entry {
-            path: p.clone(),
-            title: None,
-            duration: None,
+        .map(|p| {
+            let text = p.to_string_lossy();
+            Entry {
+                path: p.clone(),
+                // 本機檔案寫檔名就好（顯示的也是檔名）
+                title: is_url(&text).then(|| titles.get(text.as_ref()).cloned()).flatten(),
+                duration: None,
+            }
         })
         .collect();
     // 寫完整路徑（設定資料夾跟影片沒有關係）：base 給一個不會是前綴的路徑
@@ -296,19 +321,24 @@ pub fn save_session_to(path: &Path, items: &[PathBuf], current: Option<usize>) -
     })
 }
 
-/// 上次存下的清單與位置
-pub fn load_session() -> Option<(Vec<PathBuf>, Option<usize>)> {
-    load_session_from(&session_path()?)
+/// 上次存下的清單（含 `#EXTINF` 的標題）與位置
+pub fn load_session_entries() -> Option<(Vec<Entry>, Option<usize>)> {
+    load_session_entries_from(&session_path()?)
 }
 
-pub fn load_session_from(path: &Path) -> Option<(Vec<PathBuf>, Option<usize>)> {
+pub fn load_session_entries_from(path: &Path) -> Option<(Vec<Entry>, Option<usize>)> {
     let text = read_text(path).ok()?;
-    let items: Vec<PathBuf> = parse(&text, Path::new("")).into_iter().map(|e| e.path).collect();
+    let entries = parse(&text, Path::new(""));
     let current = text
         .lines()
         .find_map(|l| l.trim().strip_prefix(CURRENT_TAG)?.trim().parse::<usize>().ok())
-        .filter(|i| *i < items.len());
-    (!items.is_empty()).then_some((items, current))
+        .filter(|i| *i < entries.len());
+    (!entries.is_empty()).then_some((entries, current))
+}
+
+/// 上次存下的清單與位置（只要路徑）
+pub fn load_session_from(path: &Path) -> Option<(Vec<PathBuf>, Option<usize>)> {
+    load_session_entries_from(path).map(|(entries, current)| (entries.into_iter().map(|e| e.path).collect(), current))
 }
 
 #[cfg(test)]
@@ -461,6 +491,31 @@ mod tests {
         save_session_to(&path, &[], None).unwrap();
         assert!(!path.exists());
         assert!(load_session_from(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 網址的標題寫在 #EXTINF、讀回來；沒有標題的網址寫顯示的名稱（不是「watch?v=…」的副檔名前面那段）
+    #[test]
+    fn session_keeps_url_titles() {
+        let dir = std::env::temp_dir().join(format!("vitascope-session-titles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("playlist.m3u8");
+        let items = vec![
+            dir.join("a.mp4"),
+            PathBuf::from("https://x.example/live/index.m3u8"),
+            PathBuf::from("https://x.example/watch?v=abc.def"),
+        ];
+        let mut titles = HashMap::new();
+        titles.insert("https://x.example/live/index.m3u8".to_owned(), "新聞台".to_owned());
+        // 本機檔案的標題不寫（顯示的是檔名）
+        titles.insert(dir.join("a.mp4").to_string_lossy().into_owned(), "不寫".to_owned());
+        save_session_titled_to(&path, &items, Some(2), &titles).unwrap();
+        let (back, current) = load_session_entries_from(&path).unwrap();
+        assert_eq!(back.iter().map(|e| e.path.clone()).collect::<Vec<_>>(), items);
+        assert_eq!(current, Some(2));
+        assert_eq!(back[0].title.as_deref(), Some("a"));
+        assert_eq!(back[1].title.as_deref(), Some("新聞台"));
+        assert_eq!(back[2].title.as_deref(), Some("watch"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

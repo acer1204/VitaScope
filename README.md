@@ -200,6 +200,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | F、Enter、雙擊畫面 | 全螢幕 |
 | Esc | 離開全螢幕（控制面板、設定、媒體資訊開著時先關掉它們） |
 | Ctrl（macOS：⌘）+ O | 開啟檔案 |
+| Ctrl（macOS：⌘）+ U | 開啟網址（HTTP、HLS、DASH；好幾個網址用空白分開，照順序變成播放清單） |
+| Ctrl（macOS：⌘）+ V（Windows 也可以 Shift + Insert） | 開啟剪貼簿裡的網址或檔案路徑（播放清單開著時加到最後；不能改）。複製的是檔案本身（檔案總管、Finder 裡選檔案按複製）時打不開，請用「複製路徑」或直接拖放 |
 | F1 | 關於 / 檢查更新 |
 | F5 | 設定（介面語言、硬體解碼、跳轉秒數、畫質、音效、截圖資料夾…） |
 | 單擊畫面 | 播放 / 暫停 |
@@ -301,7 +303,7 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 |---|---|
 | `tests/formats.rs` | 格式測試矩陣：每個樣本檢查編碼、解碼、字幕文字、旋轉 / HDR 中繼資料、跳轉、播到結尾 |
 | `tests/smoke.rs` | libmpv 載入、開檔、錯誤訊息 |
-| `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、播放清單面板、截圖、設定視窗、「關於」與檢查更新 |
+| `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、貼上、「開啟網址」對話框（本機的 HTTP 伺服器）、播放清單面板、截圖、設定視窗、「關於」與檢查更新 |
 | `tests/instance.rs` | 單一執行個體：同時啟動好幾個程式，檔案都送到同一個視窗；第一個關掉後由下一個接手 |
 | `tests/mediainfo.rs`、`tests/thumbs.rs` | 媒體資訊、進度條預覽縮圖 |
 | `tests/hwdec.rs` | 硬體解碼確實走 GPU，Hi10P 自動退回軟解 |

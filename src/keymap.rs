@@ -442,6 +442,7 @@ commands! {
     CopyFrame => "copy-frame", Files, once, ("擷取畫面（剪貼簿）", "Copy frame");
     ScreenshotAs => "screenshot-as", Files, once, ("另存截圖…", "Save screenshot as…");
     LoadSubtitle => "load-subtitle", Files, once, ("載入字幕檔…", "Load subtitle file…");
+    OpenUrl => "open-url", Files, once, ("開啟網址…", "Open URL…");
     BookmarkAdd => "bookmark-add", Bookmarks, once, ("新增書籤", "Add bookmark");
     BookmarkPrev => "bookmark-prev", Bookmarks, once, ("上一個書籤", "Previous bookmark");
     BookmarkNext => "bookmark-next", Bookmarks, once, ("下一個書籤", "Next bookmark");
@@ -572,6 +573,8 @@ fn vitascope_preset(platform: Platform) -> Vec<(Command, Chord)> {
         (C::Settings, Chord::new(N, Key::F5)),
         (C::About, Chord::new(N, Key::F1)),
         (C::OpenFile, Chord::new(CMD, Key::O)),
+        // 開啟網址：Ctrl+U（macOS ⌘U），跟 PotPlayer 一樣。只按 U 是飽和度 +，有 Ctrl 的不會混在一起
+        (C::OpenUrl, Chord::new(CMD, Key::U)),
         (C::Screenshot, Chord::new(CMD, Key::E)),
         // egui 送的是「複製」（Event::Copy），不是按鍵事件
         (C::CopyFrame, Chord::new(CMD, Key::C)),
@@ -1253,6 +1256,21 @@ impl Keymap {
         }
     }
 
+    /// 起始畫面的第二行：「按 Ctrl+U 開啟網址，或按 Ctrl+V 貼上網址」。貼上是固定的按鍵（不在對照表裡）；
+    /// 開啟網址沒有按鍵時只寫貼上
+    pub fn url_hint(&self) -> String {
+        let paste = Chord::new(Mods::CMD, Key::V).display(self.platform);
+        let key = self.hint(Command::OpenUrl);
+        if key.is_empty() {
+            crate::tf!("按 {paste} 貼上網址", "Press {paste} to paste a URL")
+        } else {
+            crate::tf!(
+                "按 {key} 開啟網址，或按 {paste} 貼上網址",
+                "Press {key} to open a URL, or {paste} to paste one"
+            )
+        }
+    }
+
     /// 「按鍵 動作」的片段，沒有按鍵的片段不寫
     fn segments(&self, parts: &[(Command, &str)], sep: &str) -> String {
         parts
@@ -1383,6 +1401,8 @@ mod tests {
         "bookmark-next",
         // B2
         "bookmark-list",
+        // C3
+        "open-url",
     ];
 
     #[test]
@@ -1512,6 +1532,7 @@ mod tests {
                 | C::ToggleSmooth
                 | C::ScreenshotAs
                 | C::LoadSubtitle
+                | C::OpenUrl
                 | C::BookmarkAdd
                 | C::BookmarkPrev
                 | C::BookmarkNext
@@ -1871,10 +1892,12 @@ mod tests {
     }
 
     /// v0.3.0 之後刻意改的按鍵（批次二 B1、B2）：P 新增書籤、H 書籤清單（以前都沒有作用）；Shift+PgUp / PgDn 上一個 / 下一個書籤
-    /// （以前多按的 Shift 不影響，是換檔）。Ctrl+P、Ctrl+Shift+PgUp 之類有 Ctrl 的照舊
+    /// （以前多按的 Shift 不影響，是換檔）。Ctrl+P、Ctrl+Shift+PgUp 之類有 Ctrl 的照舊。
+    /// C3：Ctrl（⌘）+ U 開啟網址（以前沒有作用；只按 U 照舊是飽和度 +）
     fn changed_after_v030(mods: Modifiers, key: Key) -> Option<Option<Command>> {
         let no_ctrl = !mods.ctrl && !mods.command && !mods.mac_cmd;
         match key {
+            Key::U if mods.command => Some(Some(Command::OpenUrl)),
             Key::P if no_ctrl => Some(Some(Command::BookmarkAdd)),
             Key::H if no_ctrl => Some(Some(Command::BookmarkList)),
             Key::PageUp if no_ctrl && mods.shift => Some(Some(Command::BookmarkPrev)),
@@ -2533,6 +2556,45 @@ mod tests {
             keymap(Platform::Windows).bookmarks_empty_hint(),
             "Press P to bookmark the current position"
         );
+        set_lang(Lang::ZhTw);
+    }
+
+    /// C3：Ctrl（⌘）+ U 開啟網址（兩組預設都是）；起始畫面的第二行跟著按鍵改，沒有按鍵時只寫貼上
+    #[test]
+    fn open_url_key_and_hint() {
+        set_lang(Lang::ZhTw);
+        for preset in KeyPreset::ALL {
+            for p in Platform::ALL {
+                let map = Keymap::build(
+                    &KeySettings {
+                        preset,
+                        ..Default::default()
+                    },
+                    p,
+                );
+                let cmd = if p == Platform::Mac {
+                    Modifiers::MAC_CMD | Modifiers::COMMAND
+                } else {
+                    Modifiers::COMMAND
+                };
+                assert_eq!(map.lookup(Key::U, cmd), Some(Command::OpenUrl), "{preset:?} {p:?}");
+                assert_eq!(map.lookup(Key::U, cmd | Modifiers::SHIFT), Some(Command::OpenUrl));
+                assert_eq!(map.lookup(Key::U, Modifiers::NONE), Some(Command::SaturationUp));
+                let c = if p == Platform::Mac { "Cmd" } else { "Ctrl" };
+                assert_eq!(map.hint(Command::OpenUrl), format!("{c}+U"));
+                assert_eq!(map.url_hint(), format!("按 {c}+U 開啟網址，或按 {c}+V 貼上網址"));
+            }
+        }
+        let map = Keymap::build(&custom(&[("open-url", &[])]), Platform::Windows);
+        assert_eq!(map.url_hint(), "按 Ctrl+V 貼上網址");
+        let map = Keymap::build(&custom(&[("open-url", &["F3"])]), Platform::Windows);
+        assert_eq!(map.url_hint(), "按 F3 開啟網址，或按 Ctrl+V 貼上網址");
+        set_lang(Lang::En);
+        assert_eq!(
+            keymap(Platform::Windows).url_hint(),
+            "Press Ctrl+U to open a URL, or Ctrl+V to paste one"
+        );
+        assert_eq!(Command::OpenUrl.label(), "Open URL…");
         set_lang(Lang::ZhTw);
     }
 }

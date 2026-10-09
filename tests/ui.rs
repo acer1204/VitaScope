@@ -3,11 +3,14 @@
 //! 播放器用 headless 模式（不出畫面、不出聲音），所以不需要 GPU，CI 也能跑。
 //! 影片畫面本身的渲染另外用 `--shot` 自動截圖驗證。
 
+mod support;
+
 use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use support::http::Server;
 use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
 use vitascope::keymap::Platform;
 use vitascope::pacing::{Plan, Reason, SmoothMode};
@@ -2438,6 +2441,742 @@ fn rejected_network_option_is_sent_again() {
         })
         .collect();
     assert_eq!(sent, ["hls-bitrate"], "失敗的那一項再送一次，其他的不送");
+}
+
+// ───────────── 開啟網址 ─────────────
+
+/// 同一幀按下、放開一個鍵，回傳這一幀送給視窗的指令（`key_press` 是兩個事件、各跑一幀，指令只留得到後一幀的）
+fn press_in_one_frame(
+    h: &mut Harness<'_, VitascopeApp>,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Vec<egui::ViewportCommand> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+    h.step();
+    viewport_commands(h)
+}
+
+/// 按 Ctrl（⌘）+ U 打開「開啟網址」對話框；回傳按下那一幀送給視窗的指令
+fn open_url_dialog(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    let cmds = press_in_one_frame(h, egui::Modifiers::COMMAND, egui::Key::U);
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open(), "Ctrl+U 打開「開啟網址」");
+    cmds
+}
+
+/// 對話框的輸入框（對話框開著時只有這一個輸入框）
+fn url_field<'a>(h: &'a Harness<'_, VitascopeApp>) -> egui_kittest::Node<'a> {
+    h.get_by_role(egui::accesskit::Role::TextInput)
+}
+
+/// 輸入框的內容換成 `text`（全選再打字）
+fn retype_url(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    url_field(h).type_text(text);
+    h.run_steps(2);
+}
+
+fn playing_url(s: &State, url: &str) -> bool {
+    s.loaded && s.path.as_deref() == Some(url)
+}
+
+fn playlist_items(app: &VitascopeApp) -> Vec<String> {
+    app.playlist()
+        .map(|l| l.items().iter().map(|p| p.to_string_lossy().into_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// Ctrl+U 打開對話框（Windows、Linux 同時讀剪貼簿），輸入框有焦點；Enter 開啟（不是全螢幕），網址記進對話框的清單和最近開啟
+#[test]
+fn ctrl_u_opens_a_url_and_remembers_it() {
+    let server = Server::start();
+    let url = server.file_url("common/mp4_h264_aac.mp4");
+    let mut h = harness(None);
+    h.step();
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    h.get_by_label(&format!("按 {cmd}+U 開啟網址，或按 {cmd}+V 貼上網址"));
+    let cmds = open_url_dialog(&mut h);
+    assert_eq!(
+        cmds.contains(&egui::ViewportCommand::RequestPaste),
+        !cfg!(target_os = "macos"),
+        "Windows、Linux 打開時讀剪貼簿，macOS 不讀：{cmds:?}"
+    );
+    assert!(url_field(&h).is_focused(), "輸入框有焦點，可以直接打字");
+    url_field(&h).type_text(&url);
+    h.run_steps(2);
+    // 開之前看得到實際會開的網址
+    h.get_by_label(&format!("會開啟：{url}"));
+    let cmds = press_in_one_frame(&mut h, egui::Modifiers::NONE, egui::Key::Enter);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "Enter 是開啟，不是全螢幕：{cmds:?}"
+    );
+    assert!(!h.state().url_dialog_open());
+    step_until(&mut h, "播放輸入的網址", |s| playing_url(s, &url));
+    h.run_steps(2);
+    assert_eq!(h.state().history().urls, std::slice::from_ref(&url));
+    assert_eq!(
+        h.state().history().recent,
+        std::slice::from_ref(&url),
+        "載入完成後也加進最近開啟"
+    );
+    assert!(!server.requests_to("/f/common/mp4_h264_aac.mp4").is_empty());
+}
+
+/// 不是網址、不支援的網址：說明原因，「開啟」「加入播放清單」不能按，Enter 也不開（焦點留在輸入框，接著打字）；
+/// 對話框開著時貼上、空白鍵不給後面正在播的影片；按一次 Esc 就關掉（輸入框有焦點也是：egui 的 Window 要按兩次）
+#[test]
+fn url_dialog_explains_bad_input_and_one_escape_closes_it() {
+    let mut h = playing_multitrack();
+    // 不等讀剪貼簿：下面的貼上不會被當成讀剪貼簿的結果拿走（要確定是對話框擋住的）
+    h.state_mut().set_url_prefill_wait(Duration::ZERO);
+    open_url_dialog(&mut h);
+    url_field(&h).type_text("hello world");
+    h.run_steps(2);
+    h.get_by_label("這不是網址");
+    let disabled = |h: &Harness<'_, VitascopeApp>, label: &str| h.get_by_label(label).accesskit_node().is_disabled();
+    assert!(disabled(&h, "開啟") && disabled(&h, "加入播放清單"));
+    for (text, why) in [
+        ("ftp://x.example/a.mp4", "不支援 ftp:// 網址"),
+        ("javascript:alert(1)", "不支援 javascript: 網址"),
+    ] {
+        retype_url(&mut h, text);
+        h.get_by_label(why);
+        assert!(disabled(&h, "開啟"), "{text}");
+    }
+    retype_url(&mut h, "abc");
+    h.get_by_label("這不是網址");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open(), "不是網址時 Enter 不開");
+    // 單行輸入框按 Enter 會交出焦點：打不開時留在輸入框，接著打的字接在後面
+    assert!(url_field(&h).is_focused(), "Enter 打不開時焦點留在輸入框");
+    url_field(&h).type_text(".example.com/a.mp4");
+    h.run_steps(2);
+    assert_eq!(url_field(&h).value().as_deref(), Some("abc.example.com/a.mp4"));
+    h.get_by_label("會開啟：https://abc.example.com/a.mp4");
+    // 點對話框的標題：輸入框沒有焦點（擋住按鍵的只有對話框本身，不是「正在輸入文字」）
+    h.get_by_label("開啟網址").click();
+    h.run_steps(2);
+    assert!(!url_field(&h).is_focused());
+    assert!(h.state().url_dialog_open());
+    // 貼上、空白鍵不給後面的播放器：不開剪貼簿的網址、不暫停、沒有提示
+    let osd = h.state().osd_text().map(str::to_owned);
+    h.event(egui::Event::Paste("https://x.example/a.mp4".into()));
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    let st = &h.state().player().state;
+    assert!(playing(st, "mkv_multitrack.mkv") && !st.paused, "{st:#?}");
+    assert_eq!(h.state().osd_text().map(str::to_owned), osd);
+    // 一次 Esc：輸入框有焦點時也直接關
+    url_field(&h).focus();
+    h.run_steps(2);
+    assert!(url_field(&h).is_focused());
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert!(!h.state().url_dialog_open(), "按一次 Esc 就關");
+    assert!(h.state().history().urls.is_empty());
+}
+
+/// 全螢幕時對話框開著：Esc 只關對話框，不離開全螢幕；再按一次才離開
+#[test]
+fn escape_in_the_url_dialog_keeps_fullscreen() {
+    let mut h = playing_multitrack();
+    set_fullscreen(&mut h, true);
+    open_url_dialog(&mut h);
+    assert!(url_field(&h).is_focused());
+    let cmds = press_in_one_frame(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(!h.state().url_dialog_open());
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    // 輸入框沒有焦點時也一樣（擋住 Esc 的是對話框，不是「正在輸入文字」）
+    open_url_dialog(&mut h);
+    h.get_by_label("開啟網址").click();
+    h.run_steps(2);
+    assert!(!url_field(&h).is_focused());
+    let cmds = press_in_one_frame(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(!h.state().url_dialog_open(), "Esc 關掉對話框");
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+}
+
+/// 打開時讀剪貼簿：是網址就先填好；不是網址就留空（Windows、Linux）
+#[test]
+fn url_dialog_prefills_from_the_clipboard() {
+    if cfg!(target_os = "macos") {
+        // macOS 不讀剪貼簿（系統會跳出隱私提示）：打開時是空的，自己貼上
+        let mut h = harness(None);
+        h.step();
+        let cmds = open_url_dialog(&mut h);
+        assert!(!cmds.contains(&egui::ViewportCommand::RequestPaste));
+        return;
+    }
+    let mut h = harness(None);
+    // 讀剪貼簿的結果一定等得到（CI 很慢時，打開到測試送出貼上可能超過半秒）
+    h.state_mut().set_url_prefill_wait(Duration::from_secs(600));
+    h.step();
+    // 剪貼簿裡不是網址：不填
+    open_url_dialog(&mut h);
+    h.event(egui::Event::Paste("隨便一段文字".into()));
+    h.run_steps(2);
+    assert_eq!(url_field(&h).value().as_deref(), Some(""));
+    assert!(h.query_by_label("這不是網址").is_none(), "沒有填，就沒有錯誤");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 是網址（好幾行的也算）：填進輸入框，換行變成空白
+    open_url_dialog(&mut h);
+    h.event(egui::Event::Paste(
+        "https://a.example/1.m3u8\nhttps://b.example/2.mpd\n".into(),
+    ));
+    h.run_steps(2);
+    assert_eq!(
+        url_field(&h).value().as_deref(),
+        Some("https://a.example/1.m3u8 https://b.example/2.mpd")
+    );
+    h.get_by_label("2 個網址，會變成播放清單：");
+    h.get_by_label("1. https://a.example/1.m3u8");
+    h.get_by_label("2. https://b.example/2.mpd");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 一行的照原樣填（只去掉前後的空白）：全形空白、連續的空白各自換成 %xx，跟直接貼進輸入框一樣
+    open_url_dialog(&mut h);
+    h.event(egui::Event::Paste(
+        " https://x.example/影片\u{3000}第1集  完.mp4\n".into(),
+    ));
+    h.run_steps(2);
+    assert_eq!(
+        url_field(&h).value().as_deref(),
+        Some("https://x.example/影片\u{3000}第1集  完.mp4")
+    );
+    h.get_by_label("會開啟：https://x.example/影片%E3%80%80第1集%20%20完.mp4");
+}
+
+/// 對話框裡貼上好幾個網址：照貼上的順序變成播放清單（依檔名排序的話 mkv 會排在前面）；
+/// 網址沒有影音的副檔名也算（查詢字串、網站的網址）；路徑裡有空白的一個網址會先顯示換成 %20 的樣子
+#[test]
+fn several_urls_become_a_playlist_in_the_given_order() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = format!("{}?v=1", server.file_url("common/mkv_multitrack.mkv"));
+    let mut h = harness(None);
+    // 不等讀剪貼簿：之後的貼上是使用者自己貼進輸入框的
+    h.state_mut().set_url_prefill_wait(Duration::ZERO);
+    h.step();
+    open_url_dialog(&mut h);
+    // 路徑裡有空白、後面沒有別的網址：一個網址，先讓人看到換成 %20 的樣子（C2 的 parse_input）
+    url_field(&h).type_text("https://x.example/a.mp4 some note");
+    h.run_steps(2);
+    h.get_by_label("會開啟：https://x.example/a.mp4%20some%20note");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    h.event(egui::Event::Paste(format!("{a}\n{b}")));
+    h.run_steps(2);
+    h.get_by_label("2 個網址，會變成播放清單：");
+    h.get_by_label(&format!("1. {a}"));
+    h.get_by_label(&format!("2. {b}"));
+    h.run_steps(3);
+    h.get_by_label("開啟").click();
+    step_until(&mut h, "播第一個網址", |s| playing_url(s, &a));
+    assert_eq!(playlist_items(h.state()), [a.clone(), b.clone()]);
+    assert_eq!(h.state().history().urls, [a.clone(), b.clone()], "第一個在最前面");
+    // 下一個：沒有副檔名的網址照樣播
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "播第二個網址", |s| playing_url(s, &b));
+}
+
+/// 「加入播放清單」：加到最後，正在播的照樣播
+#[test]
+fn url_dialog_adds_to_the_playlist() {
+    let server = Server::start();
+    let url = server.file_url("common/mkv_multitrack.mkv");
+    let mut h = opened(sample("common/mp4_h264_aac.mp4"));
+    step_until_app(&mut h, "掃描完同資料夾", |app| playlist_len(app) > 1);
+    let before = playlist_len(h.state());
+    open_url_dialog(&mut h);
+    url_field(&h).type_text(&url);
+    // 多了一行「會開啟：…」：按鈕往下移（等版面穩定再點）
+    h.run_steps(5);
+    h.get_by_label("加入播放清單").click();
+    h.run_steps(2);
+    assert!(!h.state().url_dialog_open());
+    assert_eq!(h.state().osd_text(), Some("加入播放清單：1 個檔案"));
+    assert_eq!(
+        h.state().history().urls,
+        std::slice::from_ref(&url),
+        "加入播放清單的也記進對話框的清單"
+    );
+    assert_eq!(playlist_len(h.state()), before + 1);
+    assert_eq!(playlist_items(h.state()).last(), Some(&url));
+    assert!(playing(&h.state().player().state, "mp4_h264_aac.mp4"), "正在播的照樣播");
+}
+
+/// 在播放器上貼上：網址就開；播放清單開著時加到最後（跟拖放一樣）；不是網址、不是路徑的提示一下
+#[test]
+fn pasting_on_the_player_opens_urls() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste("hello world".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("剪貼簿裡沒有網址或檔案路徑"));
+    // macOS 的 Finder 複製檔案時另外放的文字只有檔名：說清楚是少了路徑
+    h.event(egui::Event::Paste("影片 1.mp4".into()));
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("剪貼簿裡只有檔名，沒有完整路徑（請複製路徑或拖放）")
+    );
+    h.event(egui::Event::Paste(format!("  {a}\n")));
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("開啟剪貼簿的網址：mp4_h264_aac.mp4"));
+    step_until(&mut h, "播貼上的網址", |s| playing_url(s, &a));
+    assert!(h.state().history().urls.is_empty(), "對話框的清單只記對話框輸入的");
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(b.clone()));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("加入播放清單：1 個檔案"));
+    assert_eq!(playlist_items(h.state()), [a.clone(), b.clone()]);
+    assert!(playing_url(&h.state().player().state, &a), "正在播的照樣播");
+}
+
+/// 貼上好幾個網址：照貼上的順序變成播放清單（依檔名排序的話 mkv 在前面），提示開了幾個
+#[test]
+fn pasting_several_urls_keeps_their_order() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(format!("{a}\n{b}\n")));
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("開啟剪貼簿的網址：2 個"));
+    step_until(&mut h, "播第一個網址", |s| playing_url(s, &a));
+    assert_eq!(playlist_items(h.state()), [a, b]);
+}
+
+/// 按著 Ctrl+V 不放：自動重複的「貼上」不再開一次（網址不會一直重新連線）；放開 V 或 Ctrl 之後再按才算
+#[test]
+fn holding_paste_opens_the_clipboard_once() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    let b_path = "/f/common/mkv_multitrack.mkv";
+    let mut h = harness(None);
+    h.step();
+    let release_v = || egui::Event::Key {
+        key: egui::Key::V,
+        physical_key: Some(egui::Key::V),
+        pressed: false,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+    h.event(egui::Event::Paste(a.clone()));
+    step_until(&mut h, "播貼上的網址", |s| playing_url(s, &a));
+    // 還按著：自動重複的「貼上」（剪貼簿換了也一樣）不開。
+    // （同一個網址有沒有重開不用請求數看：mpv 播放中本來就會再讀）
+    h.event(egui::Event::Paste(b.clone()));
+    h.event(egui::Event::Paste(a.clone()));
+    h.run_steps(5);
+    assert!(playing_url(&h.state().player().state, &a), "按著不放不換");
+    assert!(server.requests_to(b_path).is_empty());
+    // 放開 V 再按：開
+    h.event(release_v());
+    h.event(egui::Event::Paste(b.clone()));
+    step_until(&mut h, "放開 V 再貼上", |s| playing_url(s, &b));
+    // 放開 Ctrl 也算放開（V 的放開可能沒收到）
+    h.event(egui::Event::Paste(a.clone()));
+    h.run_steps(3);
+    assert!(playing_url(&h.state().player().state, &b));
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.step();
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+    h.event(egui::Event::Paste(a.clone()));
+    step_until(&mut h, "放開 Ctrl 再貼上", |s| playing_url(s, &a));
+    h.event(release_v());
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+}
+
+/// 貼上（拖放、命令列也一樣）字幕的網址：加到正在播的影片，不是換掉影片
+#[test]
+fn pasted_subtitle_url_is_added_to_the_video() {
+    let server = Server::start();
+    let sub = server.file_url("common/extsub_srt_utf8.srt");
+    let mut h = playing_multitrack();
+    let subs_before = h
+        .state()
+        .player()
+        .state
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Sub)
+        .count();
+    h.event(egui::Event::Paste(sub.clone()));
+    h.step();
+    // 提示會過期：貼上的那一幀就看（不是「開啟剪貼簿的網址」）
+    assert_eq!(h.state().osd_text(), Some("載入字幕：extsub_srt_utf8.srt"));
+    step_until(&mut h, "多一條外部字幕", |s| {
+        s.tracks.iter().filter(|t| t.kind == TrackKind::Sub).count() > subs_before
+            && s.tracks.iter().any(|t| t.kind == TrackKind::Sub && t.external)
+    });
+    assert!(playing(&h.state().player().state, "mkv_multitrack.mkv"), "影片照樣播");
+}
+
+/// 還原上次的播放清單：網址顯示存下的標題（playlist.m3u8 的 #EXTINF），不是網址的最後一段
+#[test]
+fn restored_playlist_shows_saved_titles() {
+    let url = "https://x.example/live/index.m3u8".to_owned();
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            playlist: Some(vitascope::playlist::Playlist::restored(vec![PathBuf::from(&url)], None)),
+            titles: [(url.clone(), "新聞台".to_owned())].into(),
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 新聞台");
+    assert_eq!(h.state().url_title(&url), Some("新聞台"));
+}
+
+/// 貼上的是完整路徑：不先檢查在不在（網路磁碟連不上時會卡住畫面），直接交給 mpv，打不開由它說明原因
+#[test]
+fn pasted_path_opens_without_checking_that_it_exists() {
+    let missing = if cfg!(windows) {
+        r"Z:\不存在\沒有這個檔案.mkv"
+    } else {
+        "/不存在/沒有這個檔案.mkv"
+    };
+    let mut h = harness(None);
+    h.step();
+    // 檔案總管的「複製路徑」會加引號
+    h.event(egui::Event::Paste(format!("\"{missing}\"")));
+    h.step();
+    assert_ne!(h.state().osd_text(), Some("剪貼簿裡沒有網址或檔案路徑"));
+    step_until(&mut h, "交給 mpv 開（開檔失敗）", |s| s.last_error.is_some());
+    h.run_steps(5);
+    let err = h.state().player().state.last_error.clone().unwrap();
+    assert!(err.contains("無法載入檔案"), "{err}");
+    let real = sample("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(real.to_string_lossy().into_owned()));
+    step_until(&mut h, "貼上真的檔案的路徑", |s| {
+        playing(s, "mp4_h264_aac.mp4")
+    });
+}
+
+/// 本機 m3u 的 #EXTINF 標題：清單上的網址顯示標題（本機檔案照樣是檔名），「下一個」的提示也是；
+/// edl:// 之類的特殊網址不開；存成清單檔時網址寫標題
+#[test]
+fn m3u_titles_name_url_entries() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    // 這首有自己的標題（測試歌曲）：清單寫的標題優先
+    let c = server.file_url("general/audio_mp3_cover.mp3");
+    let dir = TempDir::new("m3u url titles");
+    let local = dir.clip("第2集.mp4");
+    let list = dir.0.join("清單.m3u8");
+    std::fs::write(
+        &list,
+        format!(
+            "#EXTM3U\n#EXTINF:-1 tvg-name=\"x, y\",第一台\n{a}\n#EXTINF:-1,特殊\nedl://{}\n\
+             #EXTINF:-1,本機的標題不用\n第2集.mp4\n#EXTINF:-1,第二台\n{b}\n#EXTINF:-1,第三台\n{c}\n",
+            local.display()
+        ),
+    )
+    .unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, list);
+    step_until(&mut h, "播清單的第一個網址", |s| playing_url(s, &a));
+    assert_eq!(
+        playlist_items(h.state()),
+        [a.clone(), local.to_string_lossy().into_owned(), b.clone(), c.clone()]
+    );
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 第一台");
+    h.get_by_label("2. 第2集.mp4");
+    h.get_by_label("3. 第二台");
+    h.get_by_label("4. 第三台");
+    assert!(h.query_by_label_contains("特殊").is_none());
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（2/4）：第2集.mp4"));
+    step_until(&mut h, "第2集", |s| playing(s, "第2集.mp4"));
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（3/4）：第二台"));
+    step_until(&mut h, "第二台", |s| playing_url(s, &b));
+    // 影片自己的標題（mp3 的標籤「測試歌曲」）不蓋過清單寫的
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（4/4）：第三台"));
+    step_until(&mut h, "第三台", |s| playing_url(s, &c));
+    h.run_steps(3);
+    assert_eq!(h.state().url_title(&c), Some("第三台"));
+    h.get_by_label("4. 第三台");
+    assert!(h.query_by_label("4. 測試歌曲").is_none());
+    h.state_mut()
+        .on_dialog_result(DialogKind::PlaylistSave, vec![dir.0.join("存檔")]);
+    let saved = std::fs::read_to_string(dir.0.join("存檔.m3u8")).unwrap();
+    assert!(saved.contains(&format!("#EXTINF:-1,第一台\n{a}\n")), "{saved}");
+    assert!(saved.contains(&format!("#EXTINF:-1,第二台\n{b}\n")), "{saved}");
+    assert!(saved.contains(&format!("#EXTINF:-1,第三台\n{c}\n")), "{saved}");
+    assert!(saved.contains("#EXTINF:-1,第2集\n"), "本機檔案寫檔名：{saved}");
+}
+
+/// 最近開啟（右鍵選單、起始畫面）的網址顯示「標題 · 主機」；標題來自影片本身（mp3 的標籤）
+#[test]
+fn recent_list_shows_urls_by_title() {
+    let server = Server::start();
+    let song = server.file_url("general/audio_mp3_cover.mp3");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(song.clone()));
+    step_until(&mut h, "播放網址", |s| playing_url(s, &song));
+    h.run_steps(2);
+    assert_eq!(h.state().history().recent, std::slice::from_ref(&song));
+    assert_eq!(
+        h.state().history().titles.get(&song).map(String::as_str),
+        Some("測試歌曲")
+    );
+    assert_eq!(h.state().url_title(&song), Some("測試歌曲"));
+    let label = "測試歌曲 · 127.0.0.1";
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    open_exact_submenu(&mut h, "最近開啟的檔案 ⏵");
+    h.get_by_label(label);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("⏹").click();
+    step_until(&mut h, "停止", |s| !s.loaded && !s.loading);
+    h.run_steps(2);
+    h.get_by_label(label).click();
+    step_until(&mut h, "從起始畫面再開", |s| playing_url(s, &song));
+}
+
+/// 網址裡有帳號密碼的、關掉「記住開啟過的網址」時：照樣播，但不記進最近開啟、對話框的清單
+#[test]
+fn urls_with_passwords_or_with_remembering_off_are_not_stored() {
+    let server = Server::start();
+    let plain = server.file_url("common/mp4_h264_aac.mp4");
+    let secret = plain.replacen("http://", "http://user:pass@", 1);
+    let mut h = harness(None);
+    h.step();
+    open_url_dialog(&mut h);
+    url_field(&h).type_text(&secret);
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    step_until(&mut h, "播有密碼的網址", |s| playing_url(s, &secret));
+    h.run_steps(2);
+    let hist = h.state().history();
+    assert!(hist.recent.is_empty() && hist.urls.is_empty(), "{hist:?}");
+    h.state_mut().change_net(|n| n.remember_urls = false);
+    open_url_dialog(&mut h);
+    url_field(&h).type_text(&plain);
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    step_until(&mut h, "播一般的網址", |s| playing_url(s, &plain));
+    h.run_steps(2);
+    let hist = h.state().history();
+    assert!(hist.recent.is_empty() && hist.urls.is_empty(), "{hist:?}");
+}
+
+/// 像人一樣雙擊：兩下之間隔幾幀（第一下之後介面先畫幾次，版面變了第二下就點在新的版面上），全部在雙擊的時間內
+fn double_click_with_frames_between(h: &mut Harness<'_, VitascopeApp>, pos: egui::Pos2) {
+    let mut now = h.ctx.input(|i| i.time) + 1.0;
+    let mut frame = |h: &mut Harness<'_, VitascopeApp>, events: &[egui::Event]| {
+        for e in events {
+            h.event(e.clone());
+        }
+        h.input_mut().time = Some(now);
+        h.step();
+        now += 0.02;
+    };
+    frame(
+        h,
+        &[
+            egui::Event::PointerMoved(pos),
+            left_button(pos, true),
+            left_button(pos, false),
+        ],
+    );
+    for _ in 0..4 {
+        frame(h, &[]);
+    }
+    frame(h, &[left_button(pos, true), left_button(pos, false)]);
+    h.input_mut().time = None;
+    h.run_steps(2);
+}
+
+/// 雙擊對話框裡最近的網址：直接開。第一下填進輸入框、多出「會開啟：…」，清單不能因此移動
+/// （第二下才點得到同一列）：一次點在列的上緣（清單往下移就點到上一列），一次點在下緣（往上移就點到下一列）
+#[test]
+fn double_clicking_a_recent_url_opens_it() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    for (url, label, top) in [
+        (&b, "mkv_multitrack.mkv · 127.0.0.1", true),
+        (&a, "mp4_h264_aac.mp4 · 127.0.0.1", false),
+    ] {
+        // 每次都是剛啟動的視窗（播過影片後視窗大小會變）
+        let mut history = vitascope::history::History::default();
+        history.urls = vec![a.clone(), b.clone()];
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        let mut h = harness_launch(
+            Launch {
+                history,
+                ..Default::default()
+            },
+            settings,
+        );
+        h.step();
+        open_url_dialog(&mut h);
+        h.run_steps(3);
+        assert_eq!(url_field(&h).value().as_deref(), Some(""));
+        let rect = h.get_by_label(label).rect();
+        let y = if top { rect.top() + 2.0 } else { rect.bottom() - 2.0 };
+        double_click_with_frames_between(&mut h, egui::pos2(rect.center().x, y));
+        step_until(&mut h, &format!("雙擊 → 開 {label}"), |s| playing_url(s, url));
+        assert!(!h.state().url_dialog_open());
+    }
+}
+
+/// 對話框列出最近輸入的網址（有標題的顯示標題）：點一下填進輸入框，「清除記錄」清掉
+#[test]
+fn url_dialog_lists_recent_urls() {
+    let mut history = vitascope::history::History::default();
+    history.urls = vec![
+        "https://a.example/live/index.m3u8".into(),
+        "https://b.example/v.mp4".into(),
+    ];
+    history
+        .titles
+        .insert("https://a.example/live/index.m3u8".into(), "新聞台".into());
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            history,
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    open_url_dialog(&mut h);
+    h.get_by_label("最近開啟的網址");
+    h.get_by_label("v.mp4 · b.example");
+    h.get_by_label("新聞台 · a.example").click();
+    // 多了一行「會開啟：…」：下面的按鈕往下移（等版面穩定再點）
+    h.run_steps(5);
+    assert_eq!(
+        url_field(&h).value().as_deref(),
+        Some("https://a.example/live/index.m3u8")
+    );
+    h.get_by_label("會開啟：https://a.example/live/index.m3u8");
+    h.get_by_label("清除記錄").click();
+    h.run_steps(2);
+    assert!(h.state().history().urls.is_empty());
+    assert!(h.query_by_label("最近開啟的網址").is_none());
+    assert!(h.state().url_dialog_open(), "清除記錄不關對話框");
+}
+
+/// 右鍵選單「開啟網址…」（按鍵寫在右邊）、控制列 🗁 按右鍵的選單都能打開對話框
+#[test]
+fn open_url_from_the_menu_and_the_folder_button() {
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    let mut h = playing_multitrack();
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label(&format!("開啟網址… {cmd}+U")).click();
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open());
+    h.get_by_label("取消").click();
+    h.run_steps(2);
+    assert!(!h.state().url_dialog_open());
+    h.get_by_label("🗁").click_secondary();
+    h.run_steps(2);
+    h.get_by_label(&format!("開啟檔案… {cmd}+O"));
+    h.get_by_label(&format!("開啟網址… {cmd}+U")).click();
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open());
+}
+
+/// 命令列給的網址（或網址和檔案混在一起）照給的順序，沒有影音副檔名的網址也算
+#[test]
+fn command_line_urls_keep_their_order() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = format!("{}?id=2", server.file_url("common/mkv_multitrack.mkv"));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![PathBuf::from(&a), PathBuf::from(&b)],
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "播第一個", |s| playing_url(s, &a));
+    assert_eq!(playlist_items(h.state()), [a, b]);
+}
+
+/// 英文介面：對話框、選單、起始畫面的說明
+#[test]
+fn url_dialog_in_english() {
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.get_by_label(&format!("Press {cmd}+U to open a URL, or {cmd}+V to paste one"));
+    open_url_dialog(&mut h);
+    h.get_by_label("Open URL");
+    h.get_by_label("Add to playlist");
+    h.get_by_label("Cancel");
+    url_field(&h).type_text("hello");
+    h.run_steps(2);
+    h.get_by_label("This is not a URL");
+    assert!(h.get_by_label("Open").accesskit_node().is_disabled());
+    retype_url(&mut h, "https://x.example/a b.mp4");
+    h.get_by_label("Will open: https://x.example/a%20b.mp4");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste("hello".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("The clipboard has no URL or file path"));
+    // 起始畫面中間是說明文字（點到的是文字，不是影片畫面）：先開一個檔案
+    h.event(egui::Event::Paste(
+        sample("common/mp4_h264_aac.mp4").to_string_lossy().into_owned(),
+    ));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    h.get_by_label(&format!("Open URL… {cmd}+U"));
 }
 
 // ───────────── 媒體資訊 ─────────────
