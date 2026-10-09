@@ -91,7 +91,14 @@ fn step_until(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&Stat
 
 /// 開啟多軌樣本並等到開始播放
 fn playing_multitrack() -> Harness<'static, VitascopeApp> {
-    let mut h = harness(Some(sample("common/mkv_multitrack.mkv")));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    playing_multitrack_with(settings)
+}
+
+/// 同上，用指定的設定
+fn playing_multitrack_with(settings: Settings) -> Harness<'static, VitascopeApp> {
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
     step_until(&mut h, "開始播放", |s| {
         s.loaded && !s.paused && s.time_pos > 0.0 && !s.tracks.is_empty() && s.video_size.is_some()
     });
@@ -2450,6 +2457,18 @@ fn single_window_can_be_switched_off_on_the_system_page() {
 
 // ───────────── 外觀：深色／淺色 ─────────────
 
+/// 「切換深色／淺色」預設沒有按鍵：測試在設定裡指定 F12（也順便測自己改的按鍵）
+fn with_theme_key(mut settings: Settings) -> Settings {
+    settings.keys.custom.insert("cycle-theme".into(), vec!["F12".into()]);
+    settings
+}
+
+/// 按 F12（`with_theme_key`）切換深色／淺色
+fn cycle_theme(h: &mut Harness<'_, VitascopeApp>) {
+    h.key_press(egui::Key::F12);
+    h.step();
+}
+
 /// 跟真正的播放器（eframe）一樣：建立 App 之前主題偏好是「跟隨系統」（egui 的預設），之後也沒有人改它；
 /// 作業系統回報的深淺色是 `system`（Windows、macOS 有，Linux 是 None）。
 /// kittest 建好 App 之後會自己把主題設成深色，這裡改回 App 設的，不然測不出系統是淺色時的問題
@@ -2681,9 +2700,9 @@ fn idle_screen_stays_dark_in_the_light_theme() {
 fn media_info_stays_dark_in_the_light_theme() {
     let mut settings = Settings::default();
     settings.auto_next = false;
-    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), with_theme_key(settings));
     settle(&mut h, "mp4_h264_aac.mp4");
-    h.state_mut().cycle_theme();
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.ctx.theme(), egui::Theme::Light);
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
@@ -2698,8 +2717,10 @@ fn media_info_stays_dark_in_the_light_theme() {
 
 #[test]
 fn ab_section_follows_the_theme() {
-    let mut h = playing_multitrack();
-    h.state_mut().cycle_theme();
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(with_theme_key(settings));
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.ctx.theme(), egui::Theme::Light);
     h.key_press(egui::Key::L);
@@ -2714,7 +2735,7 @@ fn ab_section_follows_the_theme() {
     let light = vitascope::theme::Palette::of(&egui::Visuals::light());
     assert!(has_rect_filled(&h, light.ab.gamma_multiply(0.6)), "淺色的 A-B 區段");
     assert!(!has_rect_filled(&h, dark.ab.gamma_multiply(0.6)));
-    h.state_mut().cycle_theme();
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert!(has_rect_filled(&h, dark.ab.gamma_multiply(0.6)), "深色跟以前一樣");
 }
@@ -2723,12 +2744,12 @@ fn ab_section_follows_the_theme() {
 fn fullscreen_controls_stay_dark_in_the_light_theme() {
     let mut settings = Settings::default();
     settings.auto_next = false;
-    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), with_theme_key(settings));
     settle(&mut h, "mp4_long.mp4");
     // 暫停：全螢幕播放中滑鼠不動 2 秒控制列會藏起來（CI 的機器慢，載入就可能超過 2 秒）
     h.key_press(egui::Key::Space);
     step_until(&mut h, "暫停", |s| s.paused);
-    h.state_mut().cycle_theme();
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.ctx.theme(), egui::Theme::Light);
     let button_fill = |h: &Harness<'_, VitascopeApp>| {
@@ -2746,14 +2767,16 @@ fn fullscreen_controls_stay_dark_in_the_light_theme() {
 
 #[test]
 fn cycle_theme_switches_dark_and_light() {
-    let mut h = harness(None);
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(None, with_theme_key(settings));
     h.step();
-    h.state_mut().cycle_theme();
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.state().settings().theme, ThemeChoice::Light);
     assert_eq!(h.ctx.theme(), egui::Theme::Light);
     assert_eq!(h.state().osd_text(), Some("外觀：淺色"));
-    h.state_mut().cycle_theme();
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.state().settings().theme, ThemeChoice::Dark);
     assert_eq!(h.ctx.theme(), egui::Theme::Dark);
@@ -2761,8 +2784,8 @@ fn cycle_theme_switches_dark_and_light() {
     // 跟隨系統（系統是淺色）：換成跟現在看到的相反
     let mut settings = Settings::default();
     settings.theme = ThemeChoice::System;
-    let mut h = harness_like_eframe(settings, Some(egui::Theme::Light));
-    h.state_mut().cycle_theme();
+    let mut h = harness_like_eframe(with_theme_key(settings), Some(egui::Theme::Light));
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.state().settings().theme, ThemeChoice::Dark);
     assert_eq!(h.ctx.theme(), egui::Theme::Dark);
@@ -2773,7 +2796,7 @@ fn theme_labels_in_english() {
     let mut settings = Settings::default();
     settings.language = vitascope::i18n::Lang::En;
     settings.theme = ThemeChoice::System;
-    let mut h = harness_like_eframe(settings, None);
+    let mut h = harness_like_eframe(with_theme_key(settings), None);
     h.key_press(egui::Key::F5);
     h.run_steps(2);
     h.get_by_label("Appearance");
@@ -2784,9 +2807,332 @@ fn theme_labels_in_english() {
     h.get_by_label("Light").click();
     h.run_steps(2);
     assert_eq!(h.state().settings().theme, ThemeChoice::Light);
-    h.state_mut().cycle_theme();
+    cycle_theme(&mut h);
     h.run_steps(2);
     assert_eq!(h.state().osd_text(), Some("Appearance: dark"));
+}
+
+// ───────────── 快捷鍵對照表 ─────────────
+
+/// 這一幀有沒有畫出內容剛好是 `text` 的文字
+fn painted(h: &Harness<'_, VitascopeApp>, text: &str) -> bool {
+    fn walk(shape: &egui::Shape, text: &str) -> bool {
+        match shape {
+            egui::Shape::Text(t) => t.galley.text() == text,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|s| walk(s, text)),
+            _ => false,
+        }
+    }
+    h.output().shapes.iter().any(|c| walk(&c.shape, text))
+}
+
+#[test]
+fn custom_shortcut_moves_the_key_and_the_menu_hint() {
+    let dir = TempDir::new("custom-keys");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        dir.clip(name);
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("next-file".into(), vec!["N".into()]);
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    step_until(&mut h, "播放第1集", |s| playing(s, "第1集.mp4"));
+    step_until_app(&mut h, "掃描到兩個影片", |app| playlist_len(app) == 2);
+    settle(&mut h, "第1集.mp4");
+    assert_eq!(h.state().keymap().hint(vitascope::keymap::Command::NextFile), "N");
+    // 右鍵選單上「下一個檔案」的按鍵跟著改；沒改的照舊
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    assert!(painted(&h, "N"), "選單上寫 N");
+    assert!(!painted(&h, "PgDn"), "PgDn 已經不是下一個檔案");
+    assert!(painted(&h, "PgUp"));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "Esc 先關選單");
+    // PgDn 不再換檔，N 才會
+    h.key_press(egui::Key::PageDown);
+    h.run_steps(5);
+    wait_real(&mut h, 0.3);
+    assert!(playing(&h.state().player().state, "第1集.mp4"));
+    h.key_press(egui::Key::N);
+    step_until(&mut h, "N → 第2集", |s| playing(s, "第2集.mp4"));
+}
+
+#[test]
+fn unbound_restart_drops_the_resume_hint() {
+    let long = sample("common/mp4_long.mp4"); // 90 秒
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    // 空陣列 = 不指定按鍵
+    settings.keys.custom.insert("restart".into(), vec![]);
+    let mut h = harness_with(Some(long.clone()), settings);
+    step_until(&mut h, "開始播放", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "換檔", |s| playing(s, "mp4_h264_aac.mp4"));
+    drop_file(&mut h, long);
+    step_until_app(&mut h, "續播的提示", |app| {
+        app.osd_text().is_some_and(|t| t.contains("繼續播放"))
+    });
+    let osd = h.state().osd_text().unwrap().to_owned();
+    assert!(
+        !osd.contains("從頭播放") && !osd.contains('（'),
+        "沒有按鍵就不寫括號：{osd}"
+    );
+    step_until(&mut h, "從上次的位置繼續", |s| s.time_pos >= 28.0);
+    // Home 不再從頭播放
+    h.key_press(egui::Key::Home);
+    h.run_steps(5);
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.time_pos >= 28.0);
+}
+
+#[test]
+fn about_dialog_takes_the_keys_and_esc_closes_only_it() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.key_press(egui::Key::F1);
+    h.run_steps(2);
+    h.get_by_label("acer1204/VitaScope");
+    // 對話框開著：空白鍵不會暫停
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert!(!h.state().player().state.paused);
+    // Esc 只關對話框，設定視窗還開著
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert!(h.query_by_label("acer1204/VitaScope").is_none(), "對話框關掉了");
+    // 關掉對話框的下一幀，按鍵照常有作用
+    h.key_press(egui::Key::Space);
+    h.step();
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.get_by_label("一般");
+    // 下一個 Esc 才關設定視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_none(), "設定視窗關掉了");
+}
+
+#[test]
+fn key_hints_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings.clone());
+    h.step();
+    let open = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
+    h.get_by_label(&format!("Drop a video here, or press {open} to open a file"));
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    for key in [open, "Space", "PgUp", "PgDn", "L"] {
+        assert!(painted(&h, key), "{key}");
+    }
+}
+
+#[test]
+fn esc_closes_one_window_at_a_time_in_order() {
+    let mut h = playing_multitrack();
+    let panel = |h: &Harness<'_, VitascopeApp>| h.query_by_label("控制面板").is_some();
+    let settings = |h: &Harness<'_, VitascopeApp>| h.query_by_label("一般").is_some();
+    let info = |h: &Harness<'_, VitascopeApp>| h.query_by_label_contains("640×360（16:9）").is_some();
+    assert!(!panel(&h) && !settings(&h) && !info(&h));
+    // 媒體資訊、設定、控制面板都開著
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F1);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    assert!(panel(&h) && settings(&h) && info(&h));
+    // Esc 一次關一個：控制面板 → 設定 → 媒體資訊
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        open.push([panel(&h), settings(&h), info(&h)]);
+    }
+    assert_eq!(
+        open,
+        [[false, true, true], [false, false, true], [false, false, false]],
+        "[控制面板, 設定, 媒體資訊]"
+    );
+}
+
+#[test]
+fn a_key_counts_once_per_frame() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    h.step();
+    let press = |key, modifiers, repeat| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat,
+        modifiers,
+    };
+    // 介面卡住時累積的 E（含自動重複、多按了 Shift）：跟以前的 consume_key 一樣，同一幀只加一次
+    for (mods, repeat) in [
+        (egui::Modifiers::NONE, false),
+        (egui::Modifiers::NONE, true),
+        (egui::Modifiers::SHIFT, true),
+    ] {
+        h.input_mut().events.push(press(egui::Key::E, mods, repeat));
+    }
+    // 不同的按鍵各算各的
+    h.input_mut()
+        .events
+        .push(press(egui::Key::U, egui::Modifiers::NONE, false));
+    h.step();
+    h.run_steps(2);
+    assert_eq!(h.state().adjust().brightness, 1);
+    assert_eq!(h.state().adjust().saturation, 1);
+}
+
+#[test]
+fn a_custom_delete_key_does_not_take_delete_from_the_playlist() {
+    let dir = three_episodes("panel-delete-custom");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings
+        .keys
+        .custom
+        .insert("toggle-pause".into(), vec!["Delete".into()]);
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 第1集.mp4").click();
+    h.run_steps(2);
+    // 清單開著：Delete 是移出清單（固定的按鍵），不是自己指定的暫停
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused);
+    // 清單關著：Delete 就是自己指定的指令
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    h.key_press(egui::Key::Delete);
+    step_until(&mut h, "Delete 暫停", |s| s.paused);
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+}
+
+/// 選單已經打開：捲到標籤剛好是 `label` 的子選單、把滑鼠移上去打開它（`hover_menu_item` 比對的是部分文字）
+fn open_exact_submenu(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    let screen = h.ctx.content_rect();
+    for _ in 0..10 {
+        let item = h.get_by_label(label).rect();
+        if item.bottom() <= screen.bottom() {
+            break;
+        }
+        h.event(egui::Event::PointerMoved(egui::pos2(
+            item.center().x,
+            screen.center().y,
+        )));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -120.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.run_steps(2);
+    }
+    h.get_by_label(label).hover();
+    h.run_steps(3);
+}
+
+/// 右鍵選單、子選單上每個按鍵說明都跟 v0.3.0 一樣，而且接在對的項目上（標籤 = 「項目 按鍵」）
+#[test]
+fn menu_shortcut_hints_match_v030() {
+    let mac = cfg!(target_os = "macos");
+    let (cmd, alt) = if mac { ("Cmd", "Option") } else { ("Ctrl", "Alt") };
+    let crop = if mac { "Control+Q" } else { "Ctrl+Q" };
+    let info = if mac { "Cmd+I" } else { "Ctrl+F1" };
+    let mut h = opened(sample("common/mkv_chapters.mkv"));
+    step_until(&mut h, "讀到三個章節", |s| s.chapters.len() == 3);
+    let expect = |h: &Harness<'_, VitascopeApp>, labels: &[String]| {
+        for l in labels {
+            assert!(h.query_by_label(l).is_some(), "選單上沒有「{l}」");
+        }
+    };
+    // 每個子選單都重新開一次選單：視窗窄的時候，開著的子選單會蓋住主選單的其他項目
+    let reopen = |h: &mut Harness<'_, VitascopeApp>| {
+        if egui::Popup::is_any_open(&h.ctx) {
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+        }
+        h.get_by_label("影片畫面").click_secondary();
+        h.run_steps(2);
+    };
+    reopen(&mut h);
+    assert!(h.query_by_label("暫停 空白鍵").is_some() || h.query_by_label("播放 空白鍵").is_some());
+    expect(
+        &h,
+        &[
+            format!("開啟檔案… {cmd}+O"),
+            "停止".into(),
+            "上一個檔案 PgUp".into(),
+            "下一個檔案 PgDn".into(),
+            "逐格前進 .".into(),
+            "逐格後退 ,".into(),
+            "A-B 重播：設定起點 L".into(),
+            "全螢幕 F".into(),
+            "播放清單 F6".into(),
+            format!("媒體資訊 {info}"),
+            format!("視窗置頂 {cmd}+T"),
+            "設定… F5".into(),
+            "關於影戲 F1".into(),
+        ],
+    );
+    open_exact_submenu(&mut h, "章節 ⏵");
+    expect(&h, &[format!("上一章 / 下一章：{cmd}+PgUp / PgDn")]);
+    reopen(&mut h);
+    open_exact_submenu(&mut h, "畫質 ⏵");
+    expect(&h, &[format!("影像調整… {alt}+G"), "還原影像調整 Q".into()]);
+    reopen(&mut h);
+    open_exact_submenu(&mut h, "擷取畫面 ⏵");
+    expect(
+        &h,
+        &[format!("存到截圖資料夾 {cmd}+E"), format!("複製到剪貼簿 {cmd}+C")],
+    );
+    reopen(&mut h);
+    open_exact_submenu(&mut h, "畫面 ⏵");
+    expect(
+        &h,
+        &[
+            "放大 9".into(),
+            "縮小 1".into(),
+            "重設縮放（100%） 5".into(),
+            format!("左右翻轉（鏡像） {cmd}+Z"),
+            format!("上下翻轉 {cmd}+P"),
+            format!("重設畫面 {alt}+Backspace"),
+        ],
+    );
+    open_exact_submenu(&mut h, "移動畫面 ⏵");
+    expect(
+        &h,
+        &[
+            format!("左移 {alt}+←"),
+            format!("右移 {alt}+→"),
+            format!("上移 {alt}+↑"),
+            format!("下移 {alt}+↓"),
+            format!("置中 {cmd}+5"),
+        ],
+    );
+    hover_menu_item(&mut h, "畫面比例（");
+    expect(&h, &[format!("A 或 {cmd}+F6 依序切換")]);
+    hover_menu_item(&mut h, "裁切（");
+    expect(&h, &[format!("{crop} 依序切換")]);
+    hover_menu_item(&mut h, "旋轉（");
+    expect(&h, &[format!("{alt}+K 依序旋轉")]);
 }
 
 // ───────────── 單一執行個體 ─────────────

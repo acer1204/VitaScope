@@ -15,6 +15,7 @@ pub mod history;
 pub mod i18n;
 pub mod icon;
 pub mod instance;
+pub mod keymap;
 pub mod m3u;
 #[cfg(target_os = "macos")]
 pub mod macos_open;

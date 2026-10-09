@@ -6,6 +6,7 @@
 //! 視窗位置大小也自己存，不用 eframe 的機制：eframe 會連「全螢幕」一起記住，
 //! 下次啟動直接全螢幕，跟一般播放器的習慣不同。
 
+pub use crate::keymap::KeySettings;
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
 pub use crate::sound::AudioSettings;
@@ -54,6 +55,8 @@ pub struct Settings {
     pub smooth: SmoothMode,
     /// 外觀：深色 / 淺色 / 跟隨系統
     pub theme: ThemeChoice,
+    /// 快捷鍵（預設組、自己改過的）
+    pub keys: KeySettings,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -183,6 +186,7 @@ impl Default for Settings {
             audio: AudioSettings::default(),
             smooth: SmoothMode::default(),
             theme: ThemeChoice::default(),
+            keys: KeySettings::default(),
             path: None,
             baseline: None,
         }
@@ -266,6 +270,7 @@ impl Settings {
         }
         a.volume_max = crate::sound::snap_volume_max(a.volume_max);
         self.volume = self.volume.clamp(0.0, f64::from(a.volume_max));
+        self.keys = self.keys.sanitized();
         self
     }
 
@@ -579,6 +584,8 @@ mod tests {
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::Off, "流暢播放先預設關");
         assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
+        assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
+        assert!(s.keys.custom.is_empty());
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -622,6 +629,57 @@ mod tests {
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::default());
         assert_eq!(s.theme, ThemeChoice::Dark, "升級後外觀不變");
+        assert_eq!(s.keys, KeySettings::default(), "升級後快捷鍵不變");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shortcut_settings_load_leniently_and_save() {
+        let dir = temp_dir("keys");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.keys
+            .custom
+            .insert("toggle-pause".into(), vec!["Space".into(), "Shift+K".into()]);
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""preset": "vitascope""#), "{text}");
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.keys.custom["toggle-pause"], ["Space", "Shift+K"]);
+        // 一項讀不懂（不是按鍵清單）：只有那一項不讀，其他自己改過的照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "keys": {"custom": {"toggle-pause": 3, "toggle-mute": ["N"], "future-cmd": ["F9"]}}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert!(!s.keys.custom.contains_key("toggle-pause"));
+        assert_eq!(s.keys.custom["toggle-mute"], ["N"]);
+        assert_eq!(s.keys.custom["future-cmd"], ["F9"], "認不得的指令照樣保留");
+        // 新版的預設組（這版沒有）：用影戲的，自己改過的照樣讀進來
+        let s = lenient(r#"{"keys": {"preset": "potplayer-2030", "custom": {"stop": ["S"]}}, "seek_short": 7.0}"#);
+        assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope);
+        assert_eq!(s.keys.custom["stop"], ["S"]);
+        assert_eq!(s.seek_short, 7.0);
+        // 讀檔時整理：去掉重複的、每個指令最多 4 組
+        std::fs::write(
+            &path,
+            r#"{"keys": {"custom": {"stop": ["A", "A", "B", "C", "D", "E"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load_from(path.clone()).keys.custom["stop"],
+            ["A", "B", "C", "D"]
+        );
+        // 兩個視窗各改了不同的指令：兩個都留下
+        std::fs::remove_file(&path).unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.keys.custom.insert("stop".into(), vec!["S".into()]);
+        a.save().unwrap();
+        b.keys.custom.insert("restart".into(), vec!["Backspace".into()]);
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.keys.custom["stop"], ["S"]);
+        assert_eq!(back.keys.custom["restart"], ["Backspace"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

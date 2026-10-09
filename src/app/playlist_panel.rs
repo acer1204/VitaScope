@@ -103,7 +103,10 @@ impl VitascopeApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(icon_button("×"))
-                    .on_hover_text(crate::tr!("關閉（F6）", "Close (F6)"))
+                    .on_hover_text(
+                        self.keymap
+                            .labeled(crate::tr!("關閉", "Close"), crate::keymap::Command::Playlist),
+                    )
                     .clicked()
                 {
                     op = Some(ListOp::Close);

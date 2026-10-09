@@ -17,6 +17,7 @@ use crate::autoshot::AutoShot;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
+use crate::keymap::{Chord, Command, Keymap, Platform};
 use crate::picture::{
     Adjust, AdjustKind, ChromaScaler, Deinterlace, Downscaler, Gamut, PictureDefaults, Quality, Strength, ToneCurve,
     Upscaler,
@@ -184,6 +185,22 @@ enum Action {
     CycleTheme,
 }
 
+/// Esc 會關掉的視窗，依這個順序一次關一個（之後的批次把自己的視窗加進來：匯出、線上搜尋字幕…）
+#[derive(Debug, Clone, Copy)]
+enum EscWindow {
+    SubtitleStyle,
+    ControlPanel,
+    Settings,
+    MediaInfo,
+}
+
+const ESC_WINDOWS: [EscWindow; 4] = [
+    EscWindow::SubtitleStyle,
+    EscWindow::ControlPanel,
+    EscWindow::Settings,
+    EscWindow::MediaInfo,
+];
+
 pub struct VitascopeApp {
     player: Player,
     video: Option<VideoView>,
@@ -253,6 +270,10 @@ pub struct VitascopeApp {
     resume_after_drag: bool,
     /// 上一幀結束時有文字輸入框在輸入（快捷鍵先停用）
     typing_last_frame: bool,
+    /// 上一幀有對話框（`egui::Modal`）開著：按鍵都交給對話框（Esc 只關對話框）
+    modal_open: bool,
+    /// 快捷鍵對照表（預設組 + 設定裡自己改過的）；選單、提示上的按鍵說明也從這裡來
+    keymap: Keymap,
     /// 「字幕外觀」視窗
     sub_style_open: bool,
     /// 正在逐格（暫停中）：mpv 逐格時會短暫取消暫停，這段期間不算「播放中」，到結尾也不換檔
@@ -549,6 +570,7 @@ impl VitascopeApp {
             Adjust::default()
         };
 
+        let keymap = Keymap::build(&settings.keys, Platform::current());
         let mut app = Self {
             player,
             video,
@@ -589,6 +611,8 @@ impl VitascopeApp {
             video_click_time: None,
             resume_after_drag: false,
             typing_last_frame: false,
+            modal_open: false,
+            keymap,
             sub_style_open: false,
             frame_stepping: false,
             stepping_unpaused_since: None,
@@ -755,11 +779,9 @@ impl VitascopeApp {
         Palette::of(&self.egui_ctx.global_style().visuals)
     }
 
-    /// 「切換深色／淺色」（還沒有預設的快捷鍵；介面測試用）
-    #[doc(hidden)]
-    pub fn cycle_theme(&mut self) {
-        let ctx = self.egui_ctx.clone();
-        self.run(&ctx, Action::CycleTheme);
+    /// 目前的快捷鍵對照表（介面測試用）
+    pub fn keymap(&self) -> &Keymap {
+        &self.keymap
     }
 
     /// 啟動時（還沒開任何檔案）偵測播放引擎的功能，同步套用要在第一個檔案就生效的設定
@@ -1888,11 +1910,7 @@ impl VitascopeApp {
             if duration.is_none_or(|d| crate::history::worth_resuming(t, d)) {
                 let _ = self.player.seek_to(t, true);
                 self.resume_target = Some((t, Instant::now()));
-                self.osd(crate::tf!(
-                    "從 {} 繼續播放（Home 從頭播放）",
-                    "Resuming from {} (Home plays from the start)",
-                    fmt_time(t)
-                ));
+                self.osd(self.keymap.resume_osd(&fmt_time(t)));
             } else {
                 self.update_history(|h| h.forget(&path));
             }
@@ -1955,6 +1973,13 @@ impl VitascopeApp {
         }
     }
 
+    /// 按鍵的處理順序：
+    /// 1. 播完後的倒數、2. 設定頁正在錄按鍵（之後的批次加在最前面）；
+    /// 3. 「關於」、對話框（`egui::Modal`）開著、正在輸入文字時，按鍵都不當快捷鍵；
+    /// 4. Esc 依序關掉開著的視窗（[`ESC_WINDOWS`]）；
+    /// 5. 全螢幕時 Esc 離開全螢幕；
+    /// 6. 快捷鍵對照表（`keymap`）。固定的按鍵：清單開著時，只按 Delete 一定是移出清單（排在對照表前面，
+    ///    自己指定的按鍵拿不走）；Shift／Alt+Delete、macOS 的 Backspace 排在對照表後面，對照表沒用到才移出（跟以前一樣）。
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if std::env::var_os("VITASCOPE_DEBUG_KEYS").is_some() {
             ctx.input(|i| {
@@ -1971,145 +1996,183 @@ impl VitascopeApp {
                 }
             });
         }
-        // 「關於」視窗開著時，按鍵都交給它（Esc 關閉視窗，而不是離開全螢幕）；
+        // 「關於」、確認對話框開著時，按鍵都交給它（Esc 關閉對話框，而不是關掉後面的視窗或離開全螢幕）；
         // 正在輸入文字（例如字幕外觀的字型名稱）時，字母鍵不能變成快捷鍵。
         // 也看上一幀：在輸入框按 Esc 時，egui 會先取消焦點，這一幀的 Esc 不能拿去離開全螢幕
-        if self.about_open || self.typing_last_frame || ctx.text_edit_focused() {
+        if self.about_open || self.modal_open || self.typing_last_frame || ctx.text_edit_focused() {
             return;
         }
-        // Esc 先關「字幕外觀」視窗（不要直接離開全螢幕）
-        if self.sub_style_open
-            && !egui::Popup::is_any_open(ctx)
+        // Esc 只在沒有選單開著時才用：有選單時留給 egui 關選單
+        let menu_open = egui::Popup::is_any_open(ctx);
+        // Esc 先關開著的視窗（不要直接離開全螢幕），一次關一個
+        if !menu_open
+            && let Some(w) = ESC_WINDOWS.iter().copied().find(|w| self.esc_window_open(*w))
             && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
         {
-            self.sub_style_open = false;
-            self.save_settings();
+            self.close_esc_window(w);
             return;
         }
-        // Esc 也先關控制面板
-        if self.panel_open
-            && !egui::Popup::is_any_open(ctx)
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-        {
-            self.panel_open = false;
-            return;
+        let mut actions = Vec::new();
+        if !menu_open && is_fullscreen(ctx) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            actions.push(Action::ExitFullscreen);
         }
-        // Esc 也先關設定視窗
-        if self.settings_open
-            && !egui::Popup::is_any_open(ctx)
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-        {
-            self.settings_open = false;
-            return;
-        }
-        // Esc 也先關媒體資訊
-        if self.info_open
-            && !egui::Popup::is_any_open(ctx)
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-        {
-            self.info_open = false;
-            return;
-        }
-        // Esc 只在全螢幕、而且沒有選單開著時才用來離開全螢幕；其他時候留給 egui 關選單
-        let esc_exits_fullscreen = is_fullscreen(ctx) && !egui::Popup::is_any_open(ctx);
         let playlist_open = self.settings.show_playlist;
-        let (seek_short, seek_long) = (self.settings.seek_short, self.settings.seek_long);
         let text_selected = ctx
             .with_plugin::<egui::text_selection::LabelSelectionState, _>(|s| s.has_selection())
             .unwrap_or(false);
+        let keymap = &self.keymap;
+        let mut commands = Vec::new();
+        // 固定的按鍵：清單開著時只按 Delete 就是移出清單，不看對照表（一幀只算一次，跟 consume_key 一樣）
+        let deleted = playlist_open
+            && ctx.input_mut(|i| {
+                let before = i.events.len();
+                i.events.retain(|e| {
+                    !matches!(e, egui::Event::Key { key: Key::Delete, pressed: true, modifiers, .. } if modifiers.is_none())
+                });
+                i.events.len() != before
+            });
+        if deleted {
+            actions.push(Action::PlaylistRemove);
+        }
         // 先把快捷鍵吃掉，避免同一個按鍵又觸發 egui 的按鈕（例如空白鍵按下有焦點的按鈕）
-        let mut actions = Vec::new();
         ctx.input_mut(|i| {
             // Ctrl+C 不會變成按鍵事件：egui 把它轉成「複製」（Event::Copy）。有選取文字時是複製文字
-            if !text_selected && i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
-                actions.push(Action::CopyFrame);
+            if !text_selected
+                && i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                && let Some(cmd) = keymap.on_copy()
+            {
+                commands.push(cmd);
             }
-            let mut key = |mods: Modifiers, key: Key, action: Action| {
-                if i.consume_key(mods, key) {
-                    actions.push(action);
+            // 對照表的同一組按鍵在同一幀只算一次（跟以前每組按鍵一次 consume_key 一樣：E 跟 Shift+E 同一幀只加一次；
+            // 介面卡住時累積的自動重複也不會一次全做）
+            let mut fired: Vec<(Command, Chord)> = Vec::new();
+            i.events.retain(|e| {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = e
+                else {
+                    return true;
+                };
+                let Some((cmd, chord)) = keymap.lookup_chord(*key, *modifiers) else {
+                    return true;
+                };
+                // 按住不放（自動重複）照樣每一下都做，跟以前一樣；`Command::repeatable` 先記著，
+                // 等快捷鍵設定頁那一批再讓開關類的指令不重複
+                let once = (cmd, chord);
+                if !fired.contains(&once) {
+                    fired.push(once);
+                    commands.push(cmd);
                 }
-            };
-            // Alt + 方向鍵要排在沒有修飾鍵的方向鍵前面：egui 比對時會忽略多按的 Alt
-            key(Modifiers::ALT, Key::ArrowLeft, Action::Pan(-PAN_STEP, 0.0));
-            key(Modifiers::ALT, Key::ArrowRight, Action::Pan(PAN_STEP, 0.0));
-            key(Modifiers::ALT, Key::ArrowUp, Action::Pan(0.0, -PAN_STEP));
-            key(Modifiers::ALT, Key::ArrowDown, Action::Pan(0.0, PAN_STEP));
-            key(Modifiers::ALT, Key::K, Action::RotateCw);
-            key(Modifiers::ALT, Key::Backspace, Action::ResetView);
-            key(Modifiers::ALT, Key::G, Action::ToggleControlPanel);
-            // 裁切用 Ctrl（macOS 也是 Control 鍵）：Cmd+Q 是結束程式
-            key(Modifiers::CTRL, Key::Q, Action::CropCycle);
-            key(Modifiers::COMMAND, Key::Z, Action::Flip(true));
-            key(Modifiers::COMMAND, Key::P, Action::Flip(false));
-            key(Modifiers::COMMAND, Key::T, Action::ToggleOnTop);
-            key(Modifiers::COMMAND, Key::Num5, Action::PanCenter);
-            key(Modifiers::COMMAND, Key::F6, Action::AspectCycle);
-            key(Modifiers::NONE, Key::A, Action::AspectCycle);
-            key(Modifiers::NONE, Key::Num9, Action::Zoom(ZOOM_STEP));
-            key(Modifiers::NONE, Key::Num1, Action::Zoom(-ZOOM_STEP));
-            key(Modifiers::NONE, Key::Num5, Action::ZoomReset);
-            key(Modifiers::COMMAND, Key::O, Action::Open);
-            key(Modifiers::COMMAND, Key::ArrowLeft, Action::Seek(-seek_long));
-            key(Modifiers::COMMAND, Key::ArrowRight, Action::Seek(seek_long));
-            key(Modifiers::COMMAND, Key::PageUp, Action::Chapter(-1));
-            key(Modifiers::COMMAND, Key::PageDown, Action::Chapter(1));
-            key(Modifiers::NONE, Key::PageUp, Action::PrevFile);
-            key(Modifiers::NONE, Key::PageDown, Action::NextFile);
-            key(Modifiers::NONE, Key::C, Action::SpeedStep(1));
-            key(Modifiers::NONE, Key::X, Action::SpeedStep(-1));
-            key(Modifiers::NONE, Key::Z, Action::SpeedReset);
-            key(Modifiers::NONE, Key::Period, Action::FrameStep(true));
-            key(Modifiers::NONE, Key::Comma, Action::FrameStep(false));
-            key(Modifiers::NONE, Key::L, Action::AbLoop);
-            key(Modifiers::NONE, Key::Home, Action::Restart);
-            key(Modifiers::NONE, Key::OpenBracket, Action::SubDelay(Some(-0.1)));
-            key(Modifiers::NONE, Key::CloseBracket, Action::SubDelay(Some(0.1)));
-            key(Modifiers::NONE, Key::Minus, Action::AudioDelay(Some(-0.1)));
-            key(Modifiers::NONE, Key::Equals, Action::AudioDelay(Some(0.1)));
-            // 數字鍵盤的 +、德文鍵盤的 + 鍵是 Plus，不是 Equals
-            key(Modifiers::NONE, Key::Plus, Action::AudioDelay(Some(0.1)));
-            key(Modifiers::NONE, Key::ArrowLeft, Action::Seek(-seek_short));
-            key(Modifiers::NONE, Key::ArrowRight, Action::Seek(seek_short));
-            key(Modifiers::NONE, Key::ArrowUp, Action::Volume(5.0));
-            key(Modifiers::NONE, Key::ArrowDown, Action::Volume(-5.0));
-            key(Modifiers::NONE, Key::Space, Action::TogglePause);
-            key(Modifiers::NONE, Key::M, Action::ToggleMute);
-            key(Modifiers::NONE, Key::F, Action::ToggleFullscreen);
-            key(Modifiers::NONE, Key::Enter, Action::ToggleFullscreen);
-            key(Modifiers::COMMAND, Key::E, Action::Screenshot);
-            key(Modifiers::COMMAND, Key::F1, Action::ToggleInfo);
-            key(Modifiers::COMMAND, Key::I, Action::ToggleInfo);
-            key(Modifiers::NONE, Key::F1, Action::About);
-            key(Modifiers::NONE, Key::F6, Action::TogglePlaylist);
-            key(Modifiers::NONE, Key::F5, Action::Settings);
-            // 影像調整（PotPlayer 的按鍵）：排在所有 Ctrl / Cmd 組合鍵後面。egui 比對時會分辨 Ctrl / Cmd，
-            // 所以 Ctrl+E（截圖）、Ctrl+T（置頂）、Ctrl+I（媒體資訊）、Ctrl+Q（裁切）不會變成調整
-            key(Modifiers::NONE, Key::Q, Action::AdjustReset);
-            for (kind, minus, plus) in [
-                (AdjustKind::Brightness, Key::W, Key::E),
-                (AdjustKind::Contrast, Key::R, Key::T),
-                (AdjustKind::Saturation, Key::Y, Key::U),
-                (AdjustKind::Hue, Key::I, Key::O),
-            ] {
-                key(Modifiers::NONE, minus, Action::Adjust(kind, -1));
-                key(Modifiers::NONE, plus, Action::Adjust(kind, 1));
-            }
-            if playlist_open {
-                key(Modifiers::NONE, Key::Delete, Action::PlaylistRemove);
-                // Mac 的鍵盤沒有 Delete 鍵（Alt+Backspace 已經在前面處理掉了）
-                if cfg!(target_os = "macos") {
-                    key(Modifiers::NONE, Key::Backspace, Action::PlaylistRemove);
-                }
-            }
-            if esc_exits_fullscreen {
-                key(Modifiers::NONE, Key::Escape, Action::ExitFullscreen);
-            }
+                false
+            });
         });
+        actions.extend(commands.into_iter().map(|c| self.command_action(c)));
+        // 固定的按鍵（不在對照表裡）：Shift／Alt+Delete 也移出清單（以前的 consume_key 會多容許 Shift、Alt）
+        if playlist_open {
+            ctx.input_mut(|i| {
+                if i.consume_key(Modifiers::NONE, Key::Delete) && !deleted {
+                    actions.push(Action::PlaylistRemove);
+                }
+                // Mac 的鍵盤沒有 Delete 鍵（Alt+Backspace 是對照表的，前面已經拿走了）
+                if cfg!(target_os = "macos") && i.consume_key(Modifiers::NONE, Key::Backspace) {
+                    actions.push(Action::PlaylistRemove);
+                }
+            });
+        }
         if !actions.is_empty() {
             self.last_activity = Instant::now();
         }
         for a in actions {
             self.run(ctx, a);
+        }
+    }
+
+    /// 指令 → 操作（跳轉秒數之類的參數看設定）
+    fn command_action(&self, cmd: Command) -> Action {
+        let (short, long) = (self.settings.seek_short, self.settings.seek_long);
+        match cmd {
+            Command::TogglePause => Action::TogglePause,
+            Command::Stop => Action::Stop,
+            Command::Restart => Action::Restart,
+            Command::SeekBack => Action::Seek(-short),
+            Command::SeekForward => Action::Seek(short),
+            Command::SeekBackLong => Action::Seek(-long),
+            Command::SeekForwardLong => Action::Seek(long),
+            Command::FrameNext => Action::FrameStep(true),
+            Command::FramePrev => Action::FrameStep(false),
+            Command::SpeedUp => Action::SpeedStep(1),
+            Command::SpeedDown => Action::SpeedStep(-1),
+            Command::SpeedReset => Action::SpeedReset,
+            Command::AbLoop => Action::AbLoop,
+            Command::PrevFile => Action::PrevFile,
+            Command::NextFile => Action::NextFile,
+            Command::PrevChapter => Action::Chapter(-1),
+            Command::NextChapter => Action::Chapter(1),
+            Command::VolumeUp => Action::Volume(5.0),
+            Command::VolumeDown => Action::Volume(-5.0),
+            Command::ToggleMute => Action::ToggleMute,
+            Command::AudioDelayDown => Action::AudioDelay(Some(-0.1)),
+            Command::AudioDelayUp => Action::AudioDelay(Some(0.1)),
+            Command::SubDelayDown => Action::SubDelay(Some(-0.1)),
+            Command::SubDelayUp => Action::SubDelay(Some(0.1)),
+            Command::AspectCycle => Action::AspectCycle,
+            Command::CropCycle => Action::CropCycle,
+            Command::ZoomIn => Action::Zoom(ZOOM_STEP),
+            Command::ZoomOut => Action::Zoom(-ZOOM_STEP),
+            Command::ZoomReset => Action::ZoomReset,
+            Command::PanLeft => Action::Pan(-PAN_STEP, 0.0),
+            Command::PanRight => Action::Pan(PAN_STEP, 0.0),
+            Command::PanUp => Action::Pan(0.0, -PAN_STEP),
+            Command::PanDown => Action::Pan(0.0, PAN_STEP),
+            Command::PanCenter => Action::PanCenter,
+            Command::Rotate => Action::RotateCw,
+            Command::FlipH => Action::Flip(true),
+            Command::FlipV => Action::Flip(false),
+            Command::ResetView => Action::ResetView,
+            Command::BrightnessDown => Action::Adjust(AdjustKind::Brightness, -1),
+            Command::BrightnessUp => Action::Adjust(AdjustKind::Brightness, 1),
+            Command::ContrastDown => Action::Adjust(AdjustKind::Contrast, -1),
+            Command::ContrastUp => Action::Adjust(AdjustKind::Contrast, 1),
+            Command::SaturationDown => Action::Adjust(AdjustKind::Saturation, -1),
+            Command::SaturationUp => Action::Adjust(AdjustKind::Saturation, 1),
+            Command::HueDown => Action::Adjust(AdjustKind::Hue, -1),
+            Command::HueUp => Action::Adjust(AdjustKind::Hue, 1),
+            Command::AdjustReset => Action::AdjustReset,
+            Command::Fullscreen => Action::ToggleFullscreen,
+            Command::OnTop => Action::ToggleOnTop,
+            Command::ControlPanel => Action::ToggleControlPanel,
+            Command::Playlist => Action::TogglePlaylist,
+            Command::MediaInfo => Action::ToggleInfo,
+            Command::Settings => Action::Settings,
+            Command::About => Action::About,
+            Command::CycleTheme => Action::CycleTheme,
+            Command::OpenFile => Action::Open,
+            Command::Screenshot => Action::Screenshot,
+            Command::CopyFrame => Action::CopyFrame,
+        }
+    }
+
+    fn esc_window_open(&self, w: EscWindow) -> bool {
+        match w {
+            EscWindow::SubtitleStyle => self.sub_style_open,
+            EscWindow::ControlPanel => self.panel_open,
+            EscWindow::Settings => self.settings_open,
+            EscWindow::MediaInfo => self.info_open,
+        }
+    }
+
+    fn close_esc_window(&mut self, w: EscWindow) {
+        match w {
+            EscWindow::SubtitleStyle => {
+                self.sub_style_open = false;
+                self.save_settings();
+            }
+            EscWindow::ControlPanel => self.panel_open = false,
+            EscWindow::Settings => self.settings_open = false,
+            EscWindow::MediaInfo => self.info_open = false,
         }
     }
 
@@ -2457,6 +2520,7 @@ impl VitascopeApp {
                 self.update_status = None;
             }
         }
+        self.modal_open |= self.about_open;
     }
 
     /// 「字幕外觀」視窗：改了馬上套用（影片繼續播，看得到效果），關掉時存檔
@@ -2775,7 +2839,7 @@ impl VitascopeApp {
         let mut set_speed = None;
         let mut seek_chapter = None;
 
-        if menu_item(ui, true, crate::tr!("開啟檔案…", "Open file…"), OPEN_SHORTCUT) {
+        if self.cmd_item(ui, true, crate::tr!("開啟檔案…", "Open file…"), Command::OpenFile) {
             action = Some(Action::Open);
         }
         let recent: Vec<String> = self.history.recent.iter().take(RECENT_IN_MENU).cloned().collect();
@@ -2801,25 +2865,26 @@ impl VitascopeApp {
             .playlist
             .as_ref()
             .map_or((false, false), |l| (l.prev().is_some(), l.next().is_some()));
-        if menu_item(
-            ui,
-            loaded,
-            if loaded && !st.paused {
-                crate::tr!("暫停", "Pause")
-            } else {
-                crate::tr!("播放", "Play")
-            },
-            crate::tr!("空白鍵", "Space"),
-        ) {
+        let pause_label = if loaded && !st.paused {
+            crate::tr!("暫停", "Pause")
+        } else {
+            crate::tr!("播放", "Play")
+        };
+        if self.cmd_item(ui, loaded, pause_label, Command::TogglePause) {
             action = Some(Action::TogglePause);
         }
-        if menu_item(ui, loaded, crate::tr!("停止", "Stop"), "") {
+        if self.cmd_item(ui, loaded, crate::tr!("停止", "Stop"), Command::Stop) {
             action = Some(Action::Stop);
         }
-        if menu_item(ui, has_prev, crate::tr!("上一個檔案", "Previous file"), "PgUp") {
+        if self.cmd_item(
+            ui,
+            has_prev,
+            crate::tr!("上一個檔案", "Previous file"),
+            Command::PrevFile,
+        ) {
             action = Some(Action::PrevFile);
         }
-        if menu_item(ui, has_next, crate::tr!("下一個檔案", "Next file"), "PgDn") {
+        if self.cmd_item(ui, has_next, crate::tr!("下一個檔案", "Next file"), Command::NextFile) {
             action = Some(Action::NextFile);
         }
         let mut settings_changed = ui
@@ -2837,6 +2902,7 @@ impl VitascopeApp {
         ui.separator();
 
         let speed = st.speed;
+        let speed_keys = self.keymap.speed_keys();
         ui.menu_button(
             crate::tf!("播放速度（{}×）", "Speed ({}×)", fmt_speed(speed)),
             |ui| {
@@ -2846,14 +2912,16 @@ impl VitascopeApp {
                         set_speed = Some(preset);
                     }
                 }
-                ui.separator();
-                ui.weak(crate::tr!("C 加快、X 減慢、Z 恢復正常", "C faster, X slower, Z normal"));
+                if !speed_keys.is_empty() {
+                    ui.separator();
+                    ui.weak(speed_keys);
+                }
             },
         );
-        if menu_item(ui, loaded, crate::tr!("逐格前進", "Next frame"), ".") {
+        if self.cmd_item(ui, loaded, crate::tr!("逐格前進", "Next frame"), Command::FrameNext) {
             action = Some(Action::FrameStep(true));
         }
-        if menu_item(ui, loaded, crate::tr!("逐格後退", "Previous frame"), ",") {
+        if self.cmd_item(ui, loaded, crate::tr!("逐格後退", "Previous frame"), Command::FramePrev) {
             action = Some(Action::FrameStep(false));
         }
         let ab_label = match st.ab_loop {
@@ -2861,12 +2929,13 @@ impl VitascopeApp {
             [Some(_), None] => crate::tr!("A-B 重播：設定終點", "A-B loop: set end"),
             [Some(_), Some(_)] => crate::tr!("取消 A-B 重播", "Cancel A-B loop"),
         };
-        if menu_item(ui, loaded, ab_label, "L") {
+        if self.cmd_item(ui, loaded, ab_label, Command::AbLoop) {
             action = Some(Action::AbLoop);
         }
         if !st.chapters.is_empty() {
             let chapters = st.chapters.clone();
             let current = st.chapter;
+            let chapter_keys = self.keymap.pair(Command::PrevChapter, Command::NextChapter);
             ui.menu_button(crate::tr!("章節", "Chapters"), |ui| {
                 // 章節很多（例如整季合集）時選單會超出畫面，要能捲動
                 let max_height = (ui.ctx().content_rect().height() - 80.0).max(120.0);
@@ -2878,11 +2947,13 @@ impl VitascopeApp {
                         }
                     }
                 });
-                ui.separator();
-                ui.weak(crate::tf!(
-                    "上一章 / 下一章：{CHAPTER_SHORTCUT}",
-                    "Previous / next chapter: {CHAPTER_SHORTCUT}"
-                ));
+                if !chapter_keys.is_empty() {
+                    ui.separator();
+                    ui.weak(crate::tf!(
+                        "上一章 / 下一章：{chapter_keys}",
+                        "Previous / next chapter: {chapter_keys}"
+                    ));
+                }
             });
         }
         ui.separator();
@@ -2902,16 +2973,16 @@ impl VitascopeApp {
             action = Some(a);
         }
         ui.separator();
-        if menu_item(ui, true, crate::tr!("全螢幕", "Fullscreen"), "F") {
+        if self.cmd_item(ui, true, crate::tr!("全螢幕", "Fullscreen"), Command::Fullscreen) {
             action = Some(Action::ToggleFullscreen);
         }
         let playlist = egui::Button::selectable(self.settings.show_playlist, crate::tr!("播放清單", "Playlist"))
-            .shortcut_text("F6");
+            .shortcut_text(self.keymap.hint(Command::Playlist));
         if ui.add(playlist).clicked() {
             action = Some(Action::TogglePlaylist);
         }
-        let info =
-            egui::Button::selectable(self.info_open, crate::tr!("媒體資訊", "Media info")).shortcut_text(INFO_SHORTCUT);
+        let info = egui::Button::selectable(self.info_open, crate::tr!("媒體資訊", "Media info"))
+            .shortcut_text(self.keymap.hint(Command::MediaInfo));
         if ui.add_enabled(loaded, info).clicked() {
             action = Some(Action::ToggleInfo);
         }
@@ -2919,14 +2990,14 @@ impl VitascopeApp {
             action = Some(Action::CopyInfo);
         }
         let on_top = egui::Button::selectable(self.settings.always_on_top, crate::tr!("視窗置頂", "Always on top"))
-            .shortcut_text(ON_TOP_SHORTCUT);
+            .shortcut_text(self.keymap.hint(Command::OnTop));
         if ui.add(on_top).clicked() {
             action = Some(Action::ToggleOnTop);
         }
-        if menu_item(ui, true, crate::tr!("設定…", "Settings…"), "F5") {
+        if self.cmd_item(ui, true, crate::tr!("設定…", "Settings…"), Command::Settings) {
             action = Some(Action::Settings);
         }
-        if menu_item(ui, true, crate::tr!("關於影戲", "About VitaScope"), "F1") {
+        if self.cmd_item(ui, true, crate::tr!("關於影戲", "About VitaScope"), Command::About) {
             action = Some(Action::About);
         }
 
@@ -2983,12 +3054,9 @@ impl VitascopeApp {
         );
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new(crate::tf!(
-                "把影片拖放到這裡，或按 {OPEN_SHORTCUT} 開啟檔案",
-                "Drop a video here, or press {OPEN_SHORTCUT} to open a file"
-            ))
-            .size(16.0)
-            .color(Color32::from_gray(140)),
+            egui::RichText::new(self.keymap.drop_hint())
+                .size(16.0)
+                .color(Color32::from_gray(140)),
         );
         // 兩種錯誤都要顯示：影片畫面初始化失敗時，開檔錯誤也不能被蓋掉
         for msg in [self.fatal.as_deref(), self.player.state.last_error.as_deref()]
@@ -3058,21 +3126,30 @@ impl VitascopeApp {
                 .map_or((false, false), |l| (l.prev().is_some(), l.next().is_some()));
             if ui
                 .add_enabled(has_prev, icon_button("⏮"))
-                .on_hover_text(crate::tr!("上一個檔案（PgUp）", "Previous file (PgUp)"))
+                .on_hover_text(
+                    self.keymap
+                        .labeled(crate::tr!("上一個檔案", "Previous file"), Command::PrevFile),
+                )
                 .clicked()
             {
                 self.run(ui.ctx(), Action::PrevFile);
             }
             if ui
                 .add_enabled(loaded, icon_button(play_icon))
-                .on_hover_text(crate::tr!("播放 / 暫停（空白鍵）", "Play / pause (Space)"))
+                .on_hover_text(
+                    self.keymap
+                        .labeled(crate::tr!("播放 / 暫停", "Play / pause"), Command::TogglePause),
+                )
                 .clicked()
             {
                 self.run(ui.ctx(), Action::TogglePause);
             }
             if ui
                 .add_enabled(has_next, icon_button("⏭"))
-                .on_hover_text(crate::tr!("下一個檔案（PgDn）", "Next file (PgDn)"))
+                .on_hover_text(
+                    self.keymap
+                        .labeled(crate::tr!("下一個檔案", "Next file"), Command::NextFile),
+                )
                 .clicked()
             {
                 self.run(ui.ctx(), Action::NextFile);
@@ -3111,9 +3188,9 @@ impl VitascopeApp {
                 );
                 let needed = galley.size().x + ui.spacing().item_spacing.x;
                 if ui.available_width() >= self.right_controls_width + needed {
-                    ui.label(galley).on_hover_text(crate::tr!(
-                        "播放速度（C 加快、X 減慢、Z 恢復正常）",
-                        "Playback speed (C faster, X slower, Z normal)"
+                    ui.label(galley).on_hover_text(crate::keymap::paren(
+                        crate::tr!("播放速度", "Playback speed"),
+                        &self.keymap.speed_keys(),
                     ));
                 }
             }
@@ -3121,21 +3198,30 @@ impl VitascopeApp {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
                     .add(icon_button("⛶"))
-                    .on_hover_text(crate::tr!("全螢幕（F / Enter）", "Fullscreen (F / Enter)"))
+                    .on_hover_text(
+                        self.keymap
+                            .labeled_all(crate::tr!("全螢幕", "Fullscreen"), Command::Fullscreen),
+                    )
                     .clicked()
                 {
                     self.run(ui.ctx(), Action::ToggleFullscreen);
                 }
                 if ui
                     .add(icon_button("🗁"))
-                    .on_hover_text(crate::tf!("開啟檔案（{OPEN_SHORTCUT}）", "Open file ({OPEN_SHORTCUT})"))
+                    .on_hover_text(
+                        self.keymap
+                            .labeled(crate::tr!("開啟檔案", "Open file"), Command::OpenFile),
+                    )
                     .clicked()
                 {
                     self.run(ui.ctx(), Action::Open);
                 }
                 if ui
                     .add(icon_button("ℹ"))
-                    .on_hover_text(crate::tr!("關於影戲（F1）", "About VitaScope (F1)"))
+                    .on_hover_text(
+                        self.keymap
+                            .labeled(crate::tr!("關於影戲", "About VitaScope"), Command::About),
+                    )
                     .clicked()
                 {
                     self.run(ui.ctx(), Action::About);
@@ -3143,7 +3229,10 @@ impl VitascopeApp {
                 let list_button = egui::Button::selectable(self.settings.show_playlist, "☰").min_size(vec2(28.0, 22.0));
                 if ui
                     .add(list_button)
-                    .on_hover_text(crate::tr!("播放清單（F6）", "Playlist (F6)"))
+                    .on_hover_text(
+                        self.keymap
+                            .labeled(crate::tr!("播放清單", "Playlist"), Command::Playlist),
+                    )
                     .clicked()
                 {
                     self.run(ui.ctx(), Action::TogglePlaylist);
@@ -3172,7 +3261,10 @@ impl VitascopeApp {
         let response = ui
             .add_enabled_ui(!spdif, |ui| ui.add_sized([70.0, 20.0], slider))
             .inner
-            .on_hover_text(crate::tf!("音量 {:.0}%（↑ ↓）", "Volume {:.0}% (↑ ↓)", total))
+            .on_hover_text(crate::keymap::paren(
+                &crate::tf!("音量 {:.0}%", "Volume {:.0}%", total),
+                &self.keymap.volume_keys(),
+            ))
             .on_disabled_hover_text(sound::spdif_volume_hover());
         if response.changed() || response.drag_stopped() {
             // 拖曳中先即時調整，放開（或點一下）時改寫濾鏡鏈（超過 100% 時）
@@ -3189,7 +3281,7 @@ impl VitascopeApp {
         };
         if ui
             .add_enabled(!spdif, icon_button(icon))
-            .on_hover_text(crate::tr!("靜音（M）", "Mute (M)"))
+            .on_hover_text(self.keymap.labeled(crate::tr!("靜音", "Mute"), Command::ToggleMute))
             .on_disabled_hover_text(sound::spdif_volume_hover())
             .clicked()
         {
@@ -3202,6 +3294,7 @@ impl VitascopeApp {
         let st = &self.player.state;
         let has_video = st.loaded && st.has_video();
         let g = self.geometry.clone();
+        let keys = &self.keymap;
         let mut action = None;
         ui.add_enabled_ui(has_video, |ui| {
             // 英文是 View：新的「畫質」子選單叫 Picture
@@ -3220,11 +3313,11 @@ impl VitascopeApp {
                                 action = Some(Action::SetAspect(Some(i)));
                             }
                         }
-                        ui.separator();
-                        ui.weak(crate::tf!(
-                            "A 或 {ASPECT_SHORTCUT} 依序切換",
-                            "A or {ASPECT_SHORTCUT} cycles"
-                        ));
+                        let aspect = keys.any_of(Command::AspectCycle);
+                        if !aspect.is_empty() {
+                            ui.separator();
+                            ui.weak(crate::tf!("{aspect} 依序切換", "{aspect} cycles"));
+                        }
                     },
                 );
                 ui.menu_button(crate::tf!("裁切（{}）", "Crop ({})", g.crop_label()), |ui| {
@@ -3252,36 +3345,39 @@ impl VitascopeApp {
                     {
                         action = Some(Action::ToggleFill);
                     }
-                    ui.weak(crate::tf!("{CROP_SHORTCUT} 依序切換", "{CROP_SHORTCUT} cycles"));
+                    let crop = keys.any_of(Command::CropCycle);
+                    if !crop.is_empty() {
+                        ui.weak(crate::tf!("{crop} 依序切換", "{crop} cycles"));
+                    }
                 });
                 ui.separator();
-                if menu_item(ui, true, crate::tr!("放大", "Zoom in"), "9") {
+                if menu_item(ui, true, crate::tr!("放大", "Zoom in"), &keys.hint(Command::ZoomIn)) {
                     action = Some(Action::Zoom(ZOOM_STEP));
                 }
-                if menu_item(ui, true, crate::tr!("縮小", "Zoom out"), "1") {
+                if menu_item(ui, true, crate::tr!("縮小", "Zoom out"), &keys.hint(Command::ZoomOut)) {
                     action = Some(Action::Zoom(-ZOOM_STEP));
                 }
                 if menu_item(
                     ui,
                     true,
                     &crate::tf!("重設縮放（{:.0}%）", "Reset zoom ({:.0}%)", g.zoom_percent()),
-                    "5",
+                    &keys.hint(Command::ZoomReset),
                 ) {
                     action = Some(Action::ZoomReset);
                 }
                 ui.menu_button(crate::tr!("移動畫面", "Move picture"), |ui| {
-                    for (label, key, dx, dy) in [
-                        (crate::tr!("左移", "Left"), "←", -PAN_STEP, 0.0),
-                        (crate::tr!("右移", "Right"), "→", PAN_STEP, 0.0),
-                        (crate::tr!("上移", "Up"), "↑", 0.0, -PAN_STEP),
-                        (crate::tr!("下移", "Down"), "↓", 0.0, PAN_STEP),
+                    for (label, cmd, dx, dy) in [
+                        (crate::tr!("左移", "Left"), Command::PanLeft, -PAN_STEP, 0.0),
+                        (crate::tr!("右移", "Right"), Command::PanRight, PAN_STEP, 0.0),
+                        (crate::tr!("上移", "Up"), Command::PanUp, 0.0, -PAN_STEP),
+                        (crate::tr!("下移", "Down"), Command::PanDown, 0.0, PAN_STEP),
                     ] {
-                        if menu_item(ui, true, label, &format!("{ALT_KEY}+{key}")) {
+                        if menu_item(ui, true, label, &keys.hint(cmd)) {
                             action = Some(Action::Pan(dx, dy));
                         }
                     }
                     ui.separator();
-                    if menu_item(ui, true, crate::tr!("置中", "Center"), PAN_CENTER_SHORTCUT) {
+                    if menu_item(ui, true, crate::tr!("置中", "Center"), &keys.hint(Command::PanCenter)) {
                         action = Some(Action::PanCenter);
                     }
                 });
@@ -3297,17 +3393,20 @@ impl VitascopeApp {
                             action = Some(Action::SetRotate(deg));
                         }
                     }
-                    ui.separator();
-                    ui.weak(crate::tf!("{ALT_KEY}+K 依序旋轉", "{ALT_KEY}+K rotates"));
+                    let rotate = keys.any_of(Command::Rotate);
+                    if !rotate.is_empty() {
+                        ui.separator();
+                        ui.weak(crate::tf!("{rotate} 依序旋轉", "{rotate} rotates"));
+                    }
                 });
                 let hflip =
                     egui::Button::selectable(g.hflip, crate::tr!("左右翻轉（鏡像）", "Flip horizontally (mirror)"))
-                        .shortcut_text(FLIP_H_SHORTCUT);
+                        .shortcut_text(keys.hint(Command::FlipH));
                 if ui.add(hflip).clicked() {
                     action = Some(Action::Flip(true));
                 }
                 let vflip = egui::Button::selectable(g.vflip, crate::tr!("上下翻轉", "Flip vertically"))
-                    .shortcut_text(FLIP_V_SHORTCUT);
+                    .shortcut_text(keys.hint(Command::FlipV));
                 if ui.add(vflip).clicked() {
                     action = Some(Action::Flip(false));
                 }
@@ -3316,7 +3415,7 @@ impl VitascopeApp {
                     ui,
                     !g.is_default(),
                     crate::tr!("重設畫面", "Reset picture"),
-                    &format!("{ALT_KEY}+Backspace"),
+                    &keys.hint(Command::ResetView),
                 ) {
                     action = Some(Action::ResetView);
                 }
@@ -3749,6 +3848,8 @@ impl eframe::App for VitascopeApp {
             }
         }
         self.lift_subtitles(overlay_height);
+        // 這一幀畫的對話框自己記下來（下一幀的 handle_keys 看）
+        self.modal_open = false;
         self.about_window(&ctx);
         self.subtitle_style_window(&ctx);
         self.settings_window(&ctx);
@@ -3855,6 +3956,13 @@ fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
     }
 }
 
+impl VitascopeApp {
+    /// 指令的選單項目：右側的按鍵說明從快捷鍵對照表來（沒有指定按鍵就不寫）
+    fn cmd_item(&self, ui: &mut egui::Ui, enabled: bool, text: &str, cmd: Command) -> bool {
+        menu_item(ui, enabled, text, &self.keymap.hint(cmd))
+    }
+}
+
 /// 選單項目：文字 + 右側的快捷鍵說明，回傳是否被點選
 fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bool {
     let mut button = egui::Button::new(text);
@@ -3863,31 +3971,6 @@ fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bo
     }
     ui.add_enabled(enabled, button).clicked()
 }
-
-/// 畫面相關的快捷鍵說明（macOS 的按鍵名稱不一樣）
-const ALT_KEY: &str = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
-const CROP_SHORTCUT: &str = if cfg!(target_os = "macos") {
-    "Control+Q"
-} else {
-    "Ctrl+Q"
-};
-const ASPECT_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+F6" } else { "Ctrl+F6" };
-const FLIP_H_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+Z" } else { "Ctrl+Z" };
-const FLIP_V_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+P" } else { "Ctrl+P" };
-const PAN_CENTER_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+5" } else { "Ctrl+5" };
-const ON_TOP_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+T" } else { "Ctrl+T" };
-
-/// 跳章節的快捷鍵說明
-const CHAPTER_SHORTCUT: &str = if cfg!(target_os = "macos") {
-    "Cmd+PgUp / PgDn"
-} else {
-    "Ctrl+PgUp / PgDn"
-};
-
-/// 開檔快捷鍵的說明文字（macOS 用 Command 鍵）
-const OPEN_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
-/// macOS 的 Ctrl+F1 是系統的「鍵盤操作」快捷鍵，用 Cmd+I（QuickTime 的「影片檢閱器」）
-const INFO_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+I" } else { "Ctrl+F1" };
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.viewport().fullscreen.unwrap_or(false))
