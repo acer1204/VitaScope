@@ -594,10 +594,10 @@ fn splitmix64(mut x: u64) -> u64 {
 #[serde(default)]
 pub struct ToneSettings {
     pub curve: ToneCurve,
-    /// 目標亮度（nits，100…1000）；None = 自動
+    /// 目標亮度（nits，100…203）；None = 自動（203）。只對 HDR 影片送出（見 `mpv_options`）
     pub target_peak: Option<u32>,
     pub gamut: Gamut,
-    /// 依畫面動態調整亮度（hdr-compute-peak；macOS 不顯示）
+    /// 依畫面動態調整亮度（hdr-compute-peak）。畫面輸出的 OpenGL 不支援時介面不顯示（見 `EngineCaps::compute_peak`）
     pub compute_peak: bool,
 }
 
@@ -614,18 +614,40 @@ impl Default for ToneSettings {
 }
 
 impl ToneSettings {
+    /// 「自動」的目標亮度（nits）：畫面輸出不知道螢幕的規格，當成 SDR 螢幕，
+    /// 峰值 = 1.0 × MP_REF_WHITE = 203（BT.2408 的 SDR 參考白）
+    pub const AUTO_PEAK: u32 = 203;
     pub const MIN_PEAK: u32 = 100;
-    pub const MAX_PEAK: u32 = 1000;
-    /// 選單上的目標亮度（nits）：一般 SDR 螢幕、BT.2408 的參考白、常見的 HDR 電視
-    pub const PEAK_PRESETS: [u32; 4] = [100, 203, 400, 1000];
+    /// 最大就是「自動」的 203：vo_gpu 的目標亮度超過 203 時當成 HDR 螢幕（pass_color_map 的 dst_range
+    /// 變成轉換函數的標稱峰值 1.0），203 以上到目標亮度之間的亮部直接裁成白色，不是壓縮；
+    /// 1000 nits 時對 1000 nits 以下的母帶完全不做色調映射。VitaScope 輸出的是 SDR，這些值都是錯的
+    pub const MAX_PEAK: u32 = Self::AUTO_PEAK;
+    /// 選單上的目標亮度（nits；「自動」= 203 另外列）。數字越小 HDR 畫面越亮、亮部壓縮得越多
+    pub const PEAK_PRESETS: [u32; 2] = [100, 150];
 }
 
-/// 目標亮度的名稱：「自動」「400 nits」
+/// 目標亮度的名稱：「自動」「150 nits」（提示、選單的標題）
 pub fn peak_label(peak: Option<u32>) -> String {
     match peak {
         None => crate::tr!("自動", "Auto").to_owned(),
         Some(nits) => format!("{nits} nits"),
     }
+}
+
+/// 選單項目上的目標亮度：「自動」註明是 203 nits
+pub fn peak_menu_label(peak: Option<u32>) -> String {
+    match peak {
+        None => crate::tf!("自動（{} nits）", "Auto ({} nits)", ToneSettings::AUTO_PEAK),
+        p => peak_label(p),
+    }
+}
+
+/// 目標亮度的說明（選單、設定頁的滑鼠提示）
+pub fn peak_hover() -> &'static str {
+    crate::tr!(
+        "數字越小，HDR 畫面越亮、亮部壓縮得越多。自動 = 203 nits（BT.2408 的 SDR 參考白）。只對 HDR 影片有作用",
+        "Lower values make HDR video brighter and compress highlights more. Auto = 203 nits (the BT.2408 SDR reference white). Only affects HDR video"
+    )
 }
 
 /// 色調映射曲線（只列 vo_gpu 支援的）。不列 gamma：vo_gpu 的 gamma 曲線著色器對純量用了 .x，
@@ -679,24 +701,24 @@ impl ToneCurve {
     }
 }
 
-/// 色域對應
+/// 色域對應（只列 vo_gpu 支援、而且畫面不一樣的：vo_gpu 的 auto 跟 desaturate 是同一段程式）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Gamut {
+    /// 開發版存過的「desaturate」讀成自動（畫面完全一樣）
     #[default]
+    #[serde(alias = "desaturate")]
     Auto,
     Clip,
-    Desaturate,
 }
 
 impl Gamut {
-    pub const ALL: [Gamut; 3] = [Gamut::Auto, Gamut::Clip, Gamut::Desaturate];
+    pub const ALL: [Gamut; 2] = [Gamut::Auto, Gamut::Clip];
 
     pub fn mpv(self) -> &'static str {
         match self {
             Gamut::Auto => "auto",
             Gamut::Clip => "clip",
-            Gamut::Desaturate => "desaturate",
         }
     }
 
@@ -704,7 +726,6 @@ impl Gamut {
         match self {
             Gamut::Auto => crate::tr!("自動", "Auto"),
             Gamut::Clip => crate::tr!("裁切", "Clip"),
-            Gamut::Desaturate => crate::tr!("降低飽和度", "Desaturate"),
         }
     }
 }
@@ -735,12 +756,18 @@ const HIGH_ANTIRING: &str = "0.6";
 /// 畫質設定 → mpv 選項。每次都回傳 `MANAGED` 的全部選項（套用時只送有變的，見 `Player::apply_picture`），
 /// 但使用者用 VITASCOPE_MPV_OPTS 指定的（`overrides`）不列。
 /// 軟體繪圖的簡化流程（`caps.dumb`）照樣對應：畫面輸出會忽略去色帶、縮放、HDR 這些選項，沒有害處，
-/// 而且設定跟 mpv 的值永遠一致（介面上這些項目停用，改不了）
+/// 而且設定跟 mpv 的值永遠一致（介面上這些項目停用，改不了）。
+///
+/// `video_hdr`：目前的影片是 HDR（`State::video_hdr`）。不是 HDR（SDR、沒有影片、還不知道）時目標亮度一律送 auto：
+/// mpv 把 SDR 影片當成 203 nits，目標亮度 100 會把 SDR 影片也做色調映射（變亮、變平），
+/// 超過 203 會改用 gamma 2.2 輸出（對比變了）；只有 auto（= 203）不動 SDR 影片、字幕和 OSD。
+/// 曲線不用管：只有影片比目標亮時才做色調映射，目標是 auto 時 SDR 影片不會經過曲線
 pub fn mpv_options(
     v: &VideoSettings,
     caps: &EngineCaps,
     defaults: &PictureDefaults,
     overrides: &HashSet<String>,
+    video_hdr: bool,
 ) -> Vec<(&'static str, String)> {
     // 關閉去色帶時參數用 mpv 的預設值（= 中等）：預設設定跟 mpv 原本的值完全一樣
     let deband = v.deband.deband();
@@ -776,7 +803,9 @@ pub fn mpv_options(
         ("tone-mapping", t.curve.mpv().to_owned()),
         (
             "target-peak",
-            t.target_peak.map_or_else(|| "auto".to_owned(), |p| p.to_string()),
+            t.target_peak
+                .filter(|_| video_hdr)
+                .map_or_else(|| "auto".to_owned(), |p| p.to_string()),
         ),
         ("gamut-mapping-mode", t.gamut.mpv().to_owned()),
         (
@@ -851,10 +880,10 @@ mod tests {
         );
         assert_eq!(ToneCurve::ALL.map(ToneCurve::mpv)[1], "bt.2390");
         assert_eq!(serde_json::to_value(ToneCurve::Bt2390).unwrap(), "bt2390");
-        assert_eq!(
-            [Gamut::Auto, Gamut::Clip, Gamut::Desaturate].map(Gamut::mpv),
-            ["auto", "clip", "desaturate"]
-        );
+        assert_eq!(Gamut::ALL.map(Gamut::mpv), ["auto", "clip"]);
+        // 開發版存過的「desaturate」（vo_gpu 跟 auto 是同一段程式）讀成自動；存檔寫 auto
+        assert_eq!(serde_json::from_str::<Gamut>(r#""desaturate""#).unwrap(), Gamut::Auto);
+        assert_eq!(serde_json::to_value(Gamut::Auto).unwrap(), "auto");
         assert_eq!(Strength::Off.deband(), None);
         // 中等 = mpv 的預設值
         assert_eq!(
@@ -978,7 +1007,12 @@ mod tests {
     }
 
     fn opts(v: &VideoSettings) -> Vec<(&'static str, String)> {
-        mpv_options(v, &caps(), &PictureDefaults::default(), &HashSet::new())
+        opts_for(v, true)
+    }
+
+    /// `video_hdr`：目前的影片是不是 HDR
+    fn opts_for(v: &VideoSettings, video_hdr: bool) -> Vec<(&'static str, String)> {
+        mpv_options(v, &caps(), &PictureDefaults::default(), &HashSet::new(), video_hdr)
     }
 
     /// 選項清單 → 名稱 → 值
@@ -1020,13 +1054,14 @@ mod tests {
             &old,
             &PictureDefaults::default(),
             &HashSet::new(),
+            false,
         );
         assert_eq!(get(&o, "deinterlace"), "no");
         let on = VideoSettings {
             deinterlace: Deinterlace::On,
             ..VideoSettings::default()
         };
-        let o = mpv_options(&on, &old, &PictureDefaults::default(), &HashSet::new());
+        let o = mpv_options(&on, &old, &PictureDefaults::default(), &HashSet::new(), false);
         assert_eq!(get(&o, "deinterlace"), "yes", "開啟照樣是開啟");
         assert_eq!(get(&opts(&on), "deinterlace"), "yes");
         let off = VideoSettings {
@@ -1046,7 +1081,7 @@ mod tests {
             scale_antiring: "0.100000".into(),
         };
         let scalers = |v: &VideoSettings| -> [String; 4] {
-            let o = mpv_options(v, &caps(), &defaults, &HashSet::new());
+            let o = mpv_options(v, &caps(), &defaults, &HashSet::new(), false);
             assert!(o.iter().map(|(k, _)| *k).eq(MANAGED), "{o:?}");
             ["scale", "dscale", "cscale", "scale-antiring"].map(|k| get(&o, k).to_owned())
         };
@@ -1131,11 +1166,11 @@ mod tests {
         assert_eq!(
             tone(ToneSettings {
                 curve: ToneCurve::Hable,
-                target_peak: Some(400),
-                gamut: Gamut::Desaturate,
+                target_peak: Some(150),
+                gamut: Gamut::Clip,
                 compute_peak: false,
             }),
-            ["hable", "400", "desaturate", "no"]
+            ["hable", "150", "clip", "no"]
         );
         for c in ToneCurve::ALL {
             let t = ToneSettings {
@@ -1152,7 +1187,77 @@ mod tests {
             assert_eq!(tone(t)[2], g.mpv());
         }
         assert_eq!(peak_label(None), "自動");
-        assert_eq!(peak_label(Some(203)), "203 nits");
+        assert_eq!(peak_label(Some(150)), "150 nits");
+        assert_eq!(peak_menu_label(None), "自動（203 nits）");
+        assert_eq!(peak_menu_label(Some(100)), "100 nits");
+        // 說明的三點：越小越亮、自動 = 203、只對 HDR 影片
+        let zh = peak_hover();
+        assert!(
+            zh.contains("數字越小，HDR 畫面越亮") && zh.contains("自動 = 203 nits") && zh.contains("只對 HDR 影片")
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let (en, en_hover) = (peak_menu_label(None), peak_hover());
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(en, "Auto (203 nits)");
+        assert!(
+            en_hover.contains("Auto = 203 nits (the BT.2408 SDR reference white)"),
+            "{en_hover}"
+        );
+        assert!(en_hover.contains("Only affects HDR video"), "{en_hover}");
+        assert!(!en_hover.contains("  "), "{en_hover}");
+    }
+
+    #[test]
+    fn target_peak_only_for_hdr_video() {
+        // SDR、沒有影片、還不知道的影片：不管設定是多少都送 auto（目標亮度 100 會把 SDR 影片也做色調映射）
+        let peak = |target_peak, video_hdr| {
+            let v = VideoSettings {
+                tone: ToneSettings {
+                    target_peak,
+                    ..ToneSettings::default()
+                },
+                ..VideoSettings::default()
+            };
+            get(&opts_for(&v, video_hdr), "target-peak").to_owned()
+        };
+        for p in [None, Some(100), Some(150), Some(203)] {
+            assert_eq!(peak(p, false), "auto", "{p:?}");
+        }
+        // HDR 影片：送設定的值
+        assert_eq!(peak(None, true), "auto");
+        assert_eq!(peak(Some(100), true), "100");
+        assert_eq!(peak(Some(150), true), "150");
+        // 其他 HDR 選項不看影片（只有目標比影片暗時才做色調映射，auto 時 SDR 影片不經過曲線）
+        let v = VideoSettings {
+            tone: ToneSettings {
+                curve: ToneCurve::Hable,
+                target_peak: Some(100),
+                gamut: Gamut::Clip,
+                compute_peak: false,
+            },
+            ..VideoSettings::default()
+        };
+        let (sdr, hdr) = (opts_for(&v, false), opts_for(&v, true));
+        for name in ["tone-mapping", "gamut-mapping-mode", "hdr-compute-peak"] {
+            assert_eq!(get(&sdr, name), get(&hdr, name), "{name}");
+        }
+        // 每次都是完整的一組
+        assert!(sdr.iter().map(|(k, _)| *k).eq(MANAGED));
+    }
+
+    #[test]
+    fn peak_presets_stay_within_what_vo_gpu_can_show() {
+        // 超過 203 nits 時 vo_gpu 把亮部直接裁成白色（當成 HDR 螢幕）：選單上的值、範圍都不能超過
+        assert_eq!(ToneSettings::MAX_PEAK, 203);
+        assert_eq!(ToneSettings::AUTO_PEAK, ToneSettings::MAX_PEAK);
+        assert!(
+            ToneSettings::PEAK_PRESETS
+                .iter()
+                .all(|p| (ToneSettings::MIN_PEAK..=ToneSettings::MAX_PEAK).contains(p))
+        );
+        // 「自動」就是 203，不另外列一個 203
+        assert!(!ToneSettings::PEAK_PRESETS.contains(&ToneSettings::AUTO_PEAK));
+        assert_eq!(ToneSettings::PEAK_PRESETS, [100, 150]);
     }
 
     #[test]
@@ -1164,7 +1269,7 @@ mod tests {
             quality: Quality::High,
             ..VideoSettings::default()
         };
-        let o = mpv_options(&v, &caps(), &PictureDefaults::default(), &overrides);
+        let o = mpv_options(&v, &caps(), &PictureDefaults::default(), &overrides, false);
         let names: Vec<&str> = o.iter().map(|(k, _)| *k).collect();
         let expected: Vec<&str> = MANAGED
             .into_iter()
@@ -1172,6 +1277,20 @@ mod tests {
             .collect();
         assert_eq!(names, expected);
         assert_eq!(get(&o, "scale-antiring"), "0.6", "同一組的其他選項照送");
+        // 使用者指定的目標亮度：HDR、SDR 影片都不送（不會被改成 auto）
+        let overrides: HashSet<String> = ["target-peak".to_owned()].into();
+        let hdr_peak = VideoSettings {
+            tone: ToneSettings {
+                target_peak: Some(100),
+                ..ToneSettings::default()
+            },
+            ..VideoSettings::default()
+        };
+        for video_hdr in [false, true] {
+            let o = mpv_options(&hdr_peak, &caps(), &PictureDefaults::default(), &overrides, video_hdr);
+            assert!(o.iter().all(|(k, _)| *k != "target-peak"), "{o:?}");
+            assert_eq!(o.len(), MANAGED.len() - 1);
+        }
     }
 
     #[test]
@@ -1183,11 +1302,13 @@ mod tests {
             deband: Strength::Strong,
             ..VideoSettings::default()
         };
-        let plain = mpv_options(&v, &caps(), &PictureDefaults::default(), &HashSet::new());
-        assert_eq!(
-            mpv_options(&v, &dumb, &PictureDefaults::default(), &HashSet::new()),
-            plain
-        );
+        for video_hdr in [false, true] {
+            let plain = mpv_options(&v, &caps(), &PictureDefaults::default(), &HashSet::new(), video_hdr);
+            assert_eq!(
+                mpv_options(&v, &dumb, &PictureDefaults::default(), &HashSet::new(), video_hdr),
+                plain
+            );
+        }
     }
 
     #[test]

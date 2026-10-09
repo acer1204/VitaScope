@@ -5,7 +5,10 @@ use super::quality::{dumb_hover, follow_quality, scaler_choice};
 use super::sound::{auto_device_label, leveling_hover, volume_max_hover, volume_max_label};
 use super::{Action, VitascopeApp};
 use crate::pacing::{Plan, SmoothMode};
-use crate::picture::{ChromaScaler, Downscaler, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_label};
+use crate::picture::{
+    ChromaScaler, Downscaler, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover, peak_label,
+    peak_menu_label,
+};
 use crate::sound::{EqPreset, Leveling, VOLUME_MAX_CHOICES};
 use crate::{tf, tr};
 use eframe::egui;
@@ -186,14 +189,18 @@ impl VitascopeApp {
             ui.separator();
             let peak = tf!("目標亮度（{}）", "Target brightness ({})", peak_label(tone.target_peak));
             submenu(ui, peak, self.video_disabled(false, "target-peak"), |ui| {
+                // 「自動」= 203 nits；超過 203 vo_gpu 會裁切亮部，所以只列比它小的
                 for p in std::iter::once(None).chain(ToneSettings::PEAK_PRESETS.map(Some)) {
-                    if ui.selectable_label(tone.target_peak == p, peak_label(p)).clicked() {
+                    let r = ui
+                        .selectable_label(tone.target_peak == p, peak_menu_label(p))
+                        .on_hover_text(peak_hover());
+                    if r.clicked() {
                         action = Some(Action::SetTargetPeak(p));
                     }
                 }
             });
-            // macOS 的畫面輸出不支援（hdr-compute-peak 要 compute shader）
-            if !self.caps.macos {
+            // 動態峰值偵測要畫面輸出的 OpenGL 有 GLSL 4.20 + compute shader：不能用時不顯示
+            if self.caps.compute_peak {
                 let mut on = tone.compute_peak;
                 let r = ui
                     .add_enabled(

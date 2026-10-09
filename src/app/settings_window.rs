@@ -6,7 +6,9 @@ use super::sound::auto_device_label;
 use super::{Action, VitascopeApp};
 use crate::i18n::{self, Lang};
 use crate::pacing::{Plan, SmoothMode};
-use crate::picture::{ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler};
+use crate::picture::{
+    ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover,
+};
 use crate::sound::{AUTO_DEVICE, AudioDevice, SPDIF_CODECS, spdif_label};
 use crate::{tf, tr};
 use eframe::egui::{self, Id, pos2, vec2};
@@ -511,18 +513,21 @@ impl VitascopeApp {
                     *action = Some(Action::SetTone(c));
                 }
                 ui.end_row();
-                let name = ui.label(tr!("目標亮度", "Target brightness"));
+                let name = ui
+                    .label(tr!("目標亮度", "Target brightness"))
+                    .on_hover_text(peak_hover());
                 let locked = self.video_locked("target-peak");
                 ui.horizontal(|ui| {
                     let mut auto = tone.target_peak.is_none();
                     let r = ui
                         .add_enabled(!locked, egui::Checkbox::new(&mut auto, tr!("自動", "Auto")))
+                        .on_hover_text(peak_hover())
                         .on_disabled_hover_text(adjust_locked_hover());
                     if r.changed() {
-                        // 取消自動時從 SDR 的參考白（203 nits）開始
-                        *action = Some(Action::SetTargetPeak((!auto).then_some(DEFAULT_PEAK)));
+                        // 取消自動時從自動的值（203 nits，SDR 的參考白）開始：畫面不會突然變
+                        *action = Some(Action::SetTargetPeak((!auto).then_some(ToneSettings::AUTO_PEAK)));
                     }
-                    let mut nits = tone.target_peak.unwrap_or(DEFAULT_PEAK);
+                    let mut nits = tone.target_peak.unwrap_or(ToneSettings::AUTO_PEAK);
                     let mut r = ui
                         .add_enabled(
                             !locked && !auto,
@@ -531,6 +536,7 @@ impl VitascopeApp {
                                 .speed(5.0)
                                 .suffix(" nits"),
                         )
+                        .on_hover_text(peak_hover())
                         .labelled_by(name.id);
                     if locked {
                         r = r.on_disabled_hover_text(adjust_locked_hover());
@@ -557,8 +563,9 @@ impl VitascopeApp {
                 }
                 ui.end_row();
             });
-        // macOS 的畫面輸出不支援動態峰值偵測（要 compute shader）
-        if !self.caps.macos {
+        // 動態峰值偵測要畫面輸出的 OpenGL 有 GLSL 4.20 + compute shader（看驅動：NVIDIA 的 Windows 驅動給 3.3、macOS 是 4.1，都沒有）：
+        // 不能用時不顯示（停用的話是一個說不清楚的死選項）
+        if self.caps.compute_peak {
             let mut on = tone.compute_peak;
             let r = ui
                 .add_enabled(
@@ -819,9 +826,6 @@ impl VitascopeApp {
         changed
     }
 }
-
-/// HDR 目標亮度取消「自動」時的起始值（nits；BT.2408 的 SDR 參考白）
-const DEFAULT_PEAK: u32 = 203;
 
 /// 快捷鍵一覽（唯讀）
 /// 快捷鍵說明裡的 Ctrl（macOS 是 ⌘）

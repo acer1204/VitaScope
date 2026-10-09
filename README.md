@@ -135,7 +135,9 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] 像素著色器（GLSL）：用自己的 .glsl 檔案（例如 Anime4K、FSRCNNX；影戲不附）組成「組合」，在右鍵選單「畫質 ▸ 像素著色器」切換，
   「設定 → 畫質」新增、排序、改名；換檔案時沿用。PotPlayer / MPC 的 .hlsl 不能用（加入時會說明）；套用後畫不出來（例如編譯失敗）
   會自動改回之前用的組合（剛啟動時、或改了使用中組合的檔案時改成不使用）。截圖存的是原始畫面，不含像素著色器與影像調整
-- [x] HDR → SDR 色調映射選項：曲線（BT.2390、Hable、Mobius、Reinhard…）、目標亮度、色域對應、動態峰值偵測（macOS 不支援）。
+- [x] HDR → SDR 色調映射選項：曲線（BT.2390、Hable、Mobius、Reinhard…）、目標亮度（100–203 nits，只影響 HDR 影片）、
+  色域對應（自動 / 裁切）、動態峰值偵測（顯示卡驅動的 OpenGL 要有 GLSL 4.20 與 compute shader 才顯示；NVIDIA 顯示卡的 Windows、macOS 目前沒有）。
+  杜比視界 Profile 5 顏色無法正確顯示，開檔時提示。
   軟體繪圖（虛擬機的 llvmpipe 之類）不支援去色帶、銳化與縮放演算法，選單上會停用；HDR 色調映射照常
 - [x] 音訊輸出裝置：在右鍵選單「音效 ▸ 輸出裝置」或「設定 → 音效」選擇（存下的裝置拔掉時暫時用預設裝置，插回來自動切回去）；
   獨佔模式（Windows、macOS；Linux 用 PipeWire 時）
@@ -280,8 +282,8 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/instance.rs` | 單一執行個體：同時啟動好幾個程式，檔案都送到同一個視窗；第一個關掉後由下一個接手 |
 | `tests/mediainfo.rs`、`tests/thumbs.rs` | 媒體資訊、進度條預覽縮圖 |
 | `tests/hwdec.rs` | 硬體解碼確實走 GPU，Hi10P 自動退回軟解 |
-| `tests/picture.rs` | 畫質選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項、去交錯「自動」只處理交錯的影片；像素著色器的清單換檔照舊、翻轉不帶到下一個檔案 |
-| `tests/picture_shot.rs` | 影像調整的截圖檢查：亮度 +50 時畫面確實變亮；HDR10 影片在每種色調映射曲線下都不是黑的；反相的像素著色器確實畫在畫面上、壞掉的自動還原（會開視窗，預設不跑） |
+| `tests/picture.rs` | 畫質選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項、去交錯「自動」只處理交錯的影片、目標亮度只對 HDR 影片送；像素著色器的清單換檔照舊、翻轉不帶到下一個檔案 |
+| `tests/picture_shot.rs` | 影像調整的截圖檢查：亮度 +50 時畫面確實變亮；HDR10 影片在每種色調映射曲線下都不是黑的、目標亮度 100 nits 比自動亮；SDR 影片的畫面不受目標亮度影響（逐像素比較）；反相的像素著色器確實畫在畫面上、壞掉的自動還原（會開視窗，預設不跑） |
 | `tests/sound.rs` | 音效選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項；AC-3、E-AC-3、DTS、TrueHD 實際直通；等化器、夜間模式、音量放大、轉成立體聲用 `ao=pcm` 寫出 WAV 實際量測；等化器與音量放大在跳轉後照樣有效 |
 | `tests/async_opts.rs` | 非同步設定 mpv 選項（回覆依種類分派、先後順序、失敗時的處理）、偵測播放引擎的功能、L3 加的播放狀態 |
 | `tests/engine_build.rs` | 播放引擎的建置內容：用到的解碼器、分離器、協定、濾鏡都在，L3 元件（DASH、片段輸出、轉 GIF、音訊濾鏡）實際可用 |
@@ -295,10 +297,20 @@ vitascope 影片.mp4 --shot 截圖.png [--shot-delay 秒] [--fullscreen]
 ```
 
 影像調整與 HDR 的截圖檢查（亮度 +50 要比沒有調整亮，一般流程與軟體繪圖的簡化流程各比一次；HDR10 影片每種色調映射曲線各截一次、
-簡化流程的目標亮度要有作用；反相的像素著色器要讓畫面變亮、編譯不過的要自動還原；每次會在螢幕上開視窗約 5 秒）：
+目標亮度 100 nits 要比自動亮、SDR 影片的畫面不受目標亮度影響；反相的像素著色器要讓畫面變亮、編譯不過的要自動還原；
+每次會在螢幕上開視窗約 5 秒）：
 
 ```bash
 cargo test --test picture_shot -- --ignored --nocapture --test-threads=1
+```
+
+手邊有真正的 HDR 影片（HDR10、HLG、杜比視界…，不放進專案）時，把資料夾設成 `VITASCOPE_HDR_SAMPLES`，
+`tests/ui.rs` 的 `real_hdr_clips` 檢查媒體資訊的動態範圍與杜比視界 Profile 5 的提示，
+`tests/picture_shot.rs` 的 `real_hdr10_clip_target_peak` 比較目標亮度 100 nits 與自動的畫面（檔名見測試裡的清單）：
+
+```bash
+VITASCOPE_HDR_SAMPLES=~/hdr cargo test --test ui -- --ignored --nocapture real_hdr_clips
+VITASCOPE_HDR_SAMPLES=~/hdr cargo test --test picture_shot -- --ignored --nocapture real_hdr10_clip_target_peak
 ```
 
 排查顯示或播放問題時可以用這些環境變數：

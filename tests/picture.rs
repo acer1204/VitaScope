@@ -89,7 +89,7 @@ fn every_ui_value() -> Vec<(&'static str, String)> {
             deint_auto: true,
             ..EngineCaps::default()
         };
-        for (name, value) in picture::mpv_options(&v, &caps, &defaults, &HashSet::new()) {
+        for (name, value) in picture::mpv_options(&v, &caps, &defaults, &HashSet::new(), false) {
             if ["scale", "dscale", "cscale", "scale-antiring"].contains(&name) {
                 add(name, &value);
             }
@@ -155,7 +155,7 @@ fn default_settings_match_engine_defaults() {
     let mut p = player_with(&[]);
     let caps = p.probe_caps();
     let defaults = p.picture_defaults();
-    let opts = picture::mpv_options(&VideoSettings::default(), &caps, &defaults, &HashSet::new());
+    let opts = picture::mpv_options(&VideoSettings::default(), &caps, &defaults, &HashSet::new(), false);
     let sent = p.apply_picture(&opts, true);
     for (name, _, result) in &sent {
         assert!(result.is_ok(), "{name}：{result:?}");
@@ -179,7 +179,7 @@ fn apply_picture_sends_only_what_changed() {
     let caps = p.probe_caps();
     let defaults = p.picture_defaults();
     let overrides = p.user_overrides().clone();
-    let opts = |v: &VideoSettings| picture::mpv_options(v, &caps, &defaults, &overrides);
+    let opts = |v: &VideoSettings| picture::mpv_options(v, &caps, &defaults, &overrides, false);
     let mut v = VideoSettings::default();
     let first = p.apply_picture(&opts(&v), true);
     assert_eq!(first.len(), MANAGED.len() - 1, "使用者指定的 scale 不送");
@@ -292,7 +292,7 @@ fn options_set_by_a_profile_are_left_alone() {
     let caps = p.probe_caps();
     let defaults = p.picture_defaults();
     let overrides = p.user_overrides().clone();
-    let opts = picture::mpv_options(&VideoSettings::default(), &caps, &defaults, &overrides);
+    let opts = picture::mpv_options(&VideoSettings::default(), &caps, &defaults, &overrides, false);
     p.apply_picture(&opts, true);
     for (name, value) in &changed {
         assert_eq!(&p.get_string(name).unwrap(), value, "{name} 不能被啟動時的設定蓋掉");
@@ -319,7 +319,7 @@ fn deinterlace_auto_engages_on_interlaced() {
         return;
     };
     let defaults = p.picture_defaults();
-    let opts = picture::mpv_options(&VideoSettings::default(), &caps, &defaults, &HashSet::new());
+    let opts = picture::mpv_options(&VideoSettings::default(), &caps, &defaults, &HashSet::new(), false);
     p.apply_picture(&opts, true);
     assert_eq!(p.get_string("deinterlace").unwrap(), "auto");
     p.open(&interlaced).unwrap();
@@ -358,6 +358,52 @@ fn video_hdr_follows_the_file() {
     p.stop().unwrap();
     p.wait_state(TIMEOUT, |s| !s.loaded && !s.video_hdr)
         .unwrap_or_else(|e| panic!("關檔後歸零：{e}"));
+}
+
+/// 目標亮度只對 HDR 影片送設定的值（介面每一輪看 `video_hdr` 重新算，見 app 的 `hdr_tick`）：
+/// HDR10 → 100、SDR → auto、HLG → 100。讀回 mpv 的 target-peak
+#[test]
+fn target_peak_follows_video_hdr() {
+    let mut p = player_with(&[]);
+    let caps = p.probe_caps();
+    let defaults = p.picture_defaults();
+    let v = VideoSettings {
+        tone: ToneSettings {
+            target_peak: Some(100),
+            ..ToneSettings::default()
+        },
+        ..VideoSettings::default()
+    };
+    // 啟動時（還沒有影片）：auto
+    let opts = picture::mpv_options(&v, &caps, &defaults, &HashSet::new(), p.state.video_hdr);
+    p.apply_picture(&opts, true);
+    assert_eq!(p.get_string("target-peak").unwrap(), "auto");
+    for (rel, hdr, peak) in [
+        ("general/mkv_hevc10_hdr10.mkv", true, "100"),
+        ("common/mp4_h264_aac.mp4", false, "auto"),
+        ("general/mkv_hevc10_hlg.mkv", true, "100"),
+    ] {
+        p.open(&sample(rel)).unwrap();
+        p.wait_for(TIMEOUT, |e| *e == PlayerEvent::StartFile).unwrap();
+        p.wait_state(TIMEOUT, |s| s.loaded && s.video_hdr == hdr)
+            .unwrap_or_else(|e| panic!("{rel} 的 HDR 應該是 {hdr}：{e}"));
+        // 播放中跟介面一樣非同步送（只送有變的：就是目標亮度），等回覆
+        let opts = picture::mpv_options(&v, &caps, &defaults, &HashSet::new(), p.state.video_hdr);
+        let sent = p.apply_picture(&opts, false);
+        let names: Vec<&str> = sent.iter().map(|(n, _, _)| *n).collect();
+        assert_eq!(names, ["target-peak"], "{rel}");
+        let Ok(Some(id)) = sent[0].2 else {
+            panic!("{rel}：{sent:?}")
+        };
+        match p.wait_for(
+            TIMEOUT,
+            |e| matches!(e, PlayerEvent::CommandReply { id: r, .. } if *r == id),
+        ) {
+            Ok(PlayerEvent::CommandReply { error, .. }) => assert_eq!(error, None, "{rel}"),
+            other => panic!("{rel}：等不到回覆 {other:?}"),
+        }
+        assert_eq!(p.get_string("target-peak").unwrap(), peak, "{rel}");
+    }
 }
 
 // ───────────── 像素著色器（glsl-shaders） ─────────────

@@ -6,6 +6,7 @@ use super::{VitascopeApp, mpv_opts_override};
 use crate::picture::{
     self, ChromaScaler, Deinterlace, Downscaler, Gamut, Quality, Strength, ToneCurve, Upscaler, VideoSettings,
 };
+use crate::player::TrackKind;
 use crate::{tf, tr};
 use eframe::egui;
 
@@ -76,14 +77,54 @@ impl VitascopeApp {
         self.apply_shaders(true, Some(None));
     }
 
-    /// 目前的設定對應的 mpv 選項（VITASCOPE_MPV_OPTS 指定的不列）
+    /// 目前的設定對應的 mpv 選項（VITASCOPE_MPV_OPTS 指定的不列）。目標亮度只對 HDR 影片送設定的值，
+    /// 看的是 `picture_hdr`（`hdr_tick` 跟著播放器的狀態更新；啟動時還沒有影片，是 false = auto）
     fn video_options(&self) -> Vec<(&'static str, String)> {
         picture::mpv_options(
             &self.settings.video,
             &self.caps,
             &self.picture_defaults,
             self.player.user_overrides(),
+            self.picture_hdr,
         )
+    }
+
+    /// 每一輪處理完播放器的事件之後：影片是不是 HDR 變了（換檔、拿到第一個影格的參數、換影片軌）就重新套用
+    /// （只送有變的，實際上就是目標亮度）；杜比視界 Profile 5 的影片每個檔案提示一次
+    pub(super) fn hdr_tick(&mut self) {
+        let hdr = self.player.state.video_hdr;
+        if hdr != self.picture_hdr {
+            self.picture_hdr = hdr;
+            self.apply_video();
+        }
+        self.dolby_vision_notice();
+    }
+
+    /// 杜比視界 Profile 5 沒有相容的基礎層，畫面輸出（vo_gpu）不會套用杜比視界的轉換，顏色是錯的（偏紫、偏綠）：
+    /// 提示一次。換檔（`file_gen` 變了）之後重新算。
+    /// 開檔時已經有別的提示（續播位置、字幕載入失敗、影像調整中…）時先等它消失再提示，不蓋掉
+    fn dolby_vision_notice(&mut self) {
+        let st = &self.player.state;
+        if !st.loaded || self.dv_notice_gen == Some(self.file_gen) {
+            return;
+        }
+        if self
+            .osd
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() <= super::OSD_DURATION)
+        {
+            return;
+        }
+        let p5 = st
+            .selected(TrackKind::Video)
+            .is_some_and(|t| t.dolby_vision_profile == Some(5));
+        if p5 {
+            self.dv_notice_gen = Some(self.file_gen);
+            self.osd(tr!(
+                "杜比視界 Profile 5：目前無法正確顯示顏色",
+                "Dolby Vision profile 5: colors can't be shown correctly yet"
+            ));
+        }
     }
 
     /// 設定改了之後：非同步送出有變的選項（畫面輸出的選項同步設定要等畫面輸出執行緒，會卡住介面）
@@ -221,6 +262,7 @@ impl VitascopeApp {
         self.osd(tf!("HDR 色調映射：{}", "HDR tone mapping: {}", c.label()));
     }
 
+    /// 目標亮度（None = 自動）；限制在 100…203（見 `ToneSettings::MAX_PEAK`）
     pub(super) fn set_target_peak(&mut self, peak: Option<u32>) {
         let peak = peak.map(|p| p.clamp(picture::ToneSettings::MIN_PEAK, picture::ToneSettings::MAX_PEAK));
         self.change_video(|v| v.tone.target_peak = peak);

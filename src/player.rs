@@ -109,6 +109,9 @@ pub struct Track {
     pub channels: Option<i64>,
     #[serde(default, rename = "demux-samplerate")]
     pub samplerate: Option<i64>,
+    /// 杜比視界的 profile（只有主版本：8.1、8.4 都是 8）；不是杜比視界時 None
+    #[serde(default)]
+    pub dolby_vision_profile: Option<i64>,
 }
 
 impl Track {
@@ -395,6 +398,10 @@ pub struct EngineCaps {
     /// 播放中改 audio-spdif 馬上生效（mpv 0.41 起會重新開啟音訊解碼器；
     /// 系統的 libmpv 0.37–0.40 要到下一個檔案才生效）
     pub spdif_live: bool,
+    /// 畫面輸出的 OpenGL 能做 HDR 動態峰值偵測（hdr-compute-peak 要 GLSL 4.20 + compute shader + SSBO，
+    /// 見 `video::GlInfo::compute_peak`）。看的是介面的 GL context，不是引擎：`probe_caps` 一律 false，
+    /// 介面建立時依 GL context 設定（介面測試沒有 GL context，也是 false）
+    pub compute_peak: bool,
 }
 
 /// mpv 的版本（`mpv-version`：「mpv 0.37.0」「mpv v0.41.0-1102-g6c092d978」）→（主版本, 次版本）；看不懂時 None
@@ -653,6 +660,8 @@ pub struct Player {
     watching_devices: bool,
     /// 測試用的假裝置清單：有的話不讀 mpv 的（見 `set_fake_audio_devices`）
     fake_devices: bool,
+    /// 測試用：影片軌一律當成這個杜比視界 profile（見 `set_fake_dolby_vision`）
+    fake_dolby_vision: Option<i64>,
     /// 像素著色器：使用者的組合（app 給的；VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時是使用者原本的清單，不改）
     shader_user: Vec<String>,
     /// 翻轉用的著色器（左右、上下）；每個檔案各自的，開新檔時拿掉
@@ -764,6 +773,7 @@ impl Player {
             options_applied: HashMap::new(),
             watching_devices: false,
             fake_devices: false,
+            fake_dolby_vision: None,
             shaders_applied: Some(shader_base.clone()),
             shader_user: shader_base,
             shader_flip: [None, None],
@@ -942,6 +952,21 @@ impl Player {
         self.state.audio_devices = Some(list);
     }
 
+    /// 測試用：之後每個檔案的影片軌都當成杜比視界 `profile`（產生不了杜比視界的樣本；None = 照 mpv 的）
+    #[doc(hidden)]
+    pub fn set_fake_dolby_vision(&mut self, profile: Option<i64>) {
+        self.fake_dolby_vision = profile;
+        self.apply_fake_dolby_vision();
+    }
+
+    fn apply_fake_dolby_vision(&mut self) {
+        if let Some(p) = self.fake_dolby_vision {
+            for t in self.state.tracks.iter_mut().filter(|t| t.kind == TrackKind::Video) {
+                t.dolby_vision_profile = Some(p);
+            }
+        }
+    }
+
     // ───────────── 像素著色器（glsl-shaders） ─────────────
 
     /// mpv 目前的 glsl-shaders（每一項；直接問 mpv）
@@ -1039,6 +1064,7 @@ impl Player {
             dumb: self.mpv.get_string("gpu-dumb-mode").is_ok_and(|v| v == "yes"),
             macos: cfg!(target_os = "macos"),
             spdif_live: spdif_live(&self.mpv.get_string("mpv-version").unwrap_or_default()),
+            compute_peak: false,
         }
     }
 
@@ -1762,6 +1788,7 @@ impl Player {
                     .as_str()
                     .and_then(|j| serde_json::from_str(j).ok())
                     .unwrap_or_default();
+                self.apply_fake_dolby_vision();
             }
             "media-title" => s.title = value.as_str().map(str::to_owned),
             "path" => s.path = value.as_str().map(str::to_owned),
@@ -1820,6 +1847,7 @@ impl Player {
             && let Ok(tracks) = serde_json::from_str(&json)
         {
             self.state.tracks = tracks;
+            self.apply_fake_dolby_vision();
         }
     }
 

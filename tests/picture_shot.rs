@@ -175,33 +175,175 @@ fn hdr_is_not_black_under_any_tone_curve() {
     }
 }
 
-/// 軟體繪圖的簡化流程也做色調映射（所以選單上 HDR 的選項不停用）：目標亮度 100 跟 1000 nits 的畫面要不一樣
-#[test]
-#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
-fn hdr_target_peak_applies_in_dumb_mode() {
+/// 設定檔：HDR 目標亮度（None = 自動）
+fn peak_settings(peak: Option<u32>) -> String {
+    match peak {
+        Some(p) => format!(r#"{{"video": {{"tone": {{"target_peak": {p}}}}}}}"#),
+        None => "{}".to_owned(),
+    }
+}
+
+/// 記錄裡這次的 GL context 能不能做動態峰值偵測：「OpenGL 3.3 · GLSL 3.30；HDR 動態峰值偵測：不能用…」。
+/// 引擎功能的記錄（`compute_peak: …`）要跟它一樣（建立 App 時讀 GL context 的結果真的進了 `caps`），
+/// GLSL 4.20 以下、OpenGL ES 一定不能用（mpv 關掉 compute shader）
+fn gl_compute_peak(log: &str) -> bool {
+    let line = log
+        .lines()
+        .find(|l| l.contains("HDR 動態峰值偵測："))
+        .unwrap_or_else(|| panic!("沒有記下 GL context 能不能做動態峰值偵測\n{log}"));
+    let can = line.contains("動態峰值偵測：可以用");
+    let caps = log
+        .lines()
+        .find(|l| l.contains("播放引擎功能："))
+        .unwrap_or_else(|| panic!("沒有引擎功能的記錄\n{log}"));
+    assert!(
+        caps.contains(&format!("compute_peak: {can}")),
+        "引擎功能跟 GL context 的結果不一樣：\n{line}\n{caps}"
+    );
+    let glsl = line
+        .split("GLSL ")
+        .nth(1)
+        .map_or(0, vitascope::video::parse_glsl_version);
+    if line.contains("OpenGL ES") || glsl < 420 {
+        assert!(!can, "GLSL 4.20 以下、OpenGL ES 不能用：{line}");
+    }
+    eprintln!("{line}");
+    can
+}
+
+/// 不會動的測試畫面：testsrc2 只播 1 秒，截圖時（3 秒）停在最後一格，兩次截圖的影像完全一樣，才能逐像素比較
+///（這個 FFmpeg 沒有 loop 濾鏡）
+const STILL: &str = "av://lavfi:testsrc2=size=640x360:rate=30:duration=1";
+
+/// HDR 影片：目標亮度 100 nits 比自動（203 nits）亮（數字越小，HDR 畫面越亮）。
+/// 色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程（Linux CI 的 llvmpipe）也一樣
+fn hdr_peak_100_is_brighter(label: &str, mpv_opts: &str) {
+    // 產生的 HDR10 樣本（mkv_hevc10_hdr10）幾乎都是 1000 nits 以上的亮部，100 跟 203 都壓到最亮、看不出差別
+    //（RTX 3090 實測中央平均 141.7 / 141.5）；這個樣本的亮度大多在 203 nits 以下
     let media =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated/general/mkv_hevc10_hdr10.mkv");
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated/general/mkv_hevc10_hdr10_mid.mkv");
     assert!(
         media.exists(),
         "找不到樣本 {}，請先執行：python scripts/gen_samples.py",
         media.display()
     );
     let media = media.to_string_lossy();
-    let shot_peak = |peak: u32| {
-        let settings = format!(r#"{{"video": {{"tone": {{"target_peak": {peak}}}}}}}"#);
-        let (luma, log) = shot(&format!("hdr-dumb-{peak}"), &settings, "gpu-dumb-mode=yes", &media);
-        assert!(property_set(&log, "target-peak", &peak.to_string()), "{peak}：\n{log}");
+    let shot_peak = |peak: Option<u32>| {
+        let tag = peak.map_or("auto".to_owned(), |p| p.to_string());
+        let (luma, log) = shot(&format!("hdr-{label}-{tag}"), &peak_settings(peak), mpv_opts, &media);
+        // 知道是 HDR 之後才送設定的目標亮度（開檔前是 auto）
+        assert!(property_set(&log, "target-peak", &tag), "{tag}：\n{log}");
         let errors = render_errors(&log);
-        assert!(errors.is_empty(), "{peak}：畫面輸出出錯\n{}", errors.join("\n"));
+        assert!(errors.is_empty(), "{tag}：畫面輸出出錯\n{}", errors.join("\n"));
+        gl_compute_peak(&log);
         luma
     };
-    let (low, high) = (shot_peak(100), shot_peak(1000));
-    // 實測簡化流程：RTX 3090 141.3 → 161.6（一般流程 142.2 → 162.1）；Linux 的 llvmpipe 94.0 → 162.2，
-    // 系統的 libmpv 0.37 94.0 → 117.1
+    let (low, auto) = (shot_peak(Some(100)), shot_peak(None));
+    // 實測（100 nits / 自動）：RTX 3090 114.9 / 101.3、簡化流程 114.0 / 100.4；
+    // Linux 的 llvmpipe（本專案建置的引擎、系統的 libmpv 0.37 都是）108.5 / 87.2
     assert!(
-        (high - low).abs() > 8.0,
-        "簡化流程的目標亮度沒有作用（100 nits {low:.1}、1000 nits {high:.1}）"
+        low > auto + 6.0,
+        "{label}：目標亮度 100 nits 應該比自動（203 nits）亮（100 nits {low:.1}、自動 {auto:.1}）"
     );
+}
+
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn hdr_target_peak_100_is_brighter_than_auto() {
+    hdr_peak_100_is_brighter("gpu", "");
+}
+
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn hdr_target_peak_applies_in_dumb_mode() {
+    hdr_peak_100_is_brighter("dumb", "gpu-dumb-mode=yes");
+}
+
+/// 截圖檔案（`shot` 存的）→（寬, 高, RGBA）
+fn read_png(path: &Path) -> (usize, usize, Vec<u8>) {
+    let decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()));
+    let mut reader = decoder.read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!(info.color_type, png::ColorType::Rgba, "{}", path.display());
+    buf.truncate(info.buffer_size());
+    (info.width as usize, info.height as usize, buf)
+}
+
+/// 兩張截圖中央一半（影片畫面；不含控制列的時間）每個像素每個顏色的（平均差, 最大差）
+fn center_diff(a: &Path, b: &Path) -> (f64, u8) {
+    let (w, h, pa) = read_png(a);
+    let (w2, h2, pb) = read_png(b);
+    assert_eq!((w, h), (w2, h2), "兩張截圖大小不一樣");
+    let (mut sum, mut max, mut n) = (0u64, 0u8, 0u64);
+    for y in h / 4..h * 3 / 4 {
+        for x in w / 4..w * 3 / 4 {
+            let i = (y * w + x) * 4;
+            for c in 0..3 {
+                let d = pa[i + c].abs_diff(pb[i + c]);
+                sum += u64::from(d);
+                max = max.max(d);
+                n += 1;
+            }
+        }
+    }
+    (sum as f64 / n as f64, max)
+}
+
+/// `shot` 存的截圖
+fn shot_png(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("vitascope-picture-shot")
+        .join(name)
+        .join("shot.png")
+}
+
+/// SDR 影片：目標亮度設成 100 跟自動的畫面一模一樣（目標亮度只對 HDR 影片送；
+/// 以前會送給 SDR 影片，mpv 把 SDR 當成 203 nits，100 nits 時 SDR 影片也被色調映射、變亮變平）
+fn sdr_ignores_target_peak(label: &str, mpv_opts: &str) {
+    let auto = format!("sdr-{label}-auto");
+    let low = format!("sdr-{label}-100");
+    let (luma_auto, _) = shot(&auto, &peak_settings(None), mpv_opts, STILL);
+    let (luma_low, log) = shot(&low, &peak_settings(Some(100)), mpv_opts, STILL);
+    let (mean, max) = center_diff(&shot_png(&auto), &shot_png(&low));
+    eprintln!("{label}：SDR 自動 {luma_auto:.1}、100 nits {luma_low:.1}；逐像素平均差 {mean:.3}、最大差 {max}");
+    assert!(
+        mean < 0.5 && max <= 3,
+        "{label}：SDR 影片的畫面不能因為目標亮度改變（平均差 {mean:.3}、最大差 {max}）"
+    );
+    assert!(!property_set(&log, "target-peak", "100"), "SDR 影片不能送 100\n{log}");
+}
+
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn sdr_video_ignores_the_target_peak() {
+    sdr_ignores_target_peak("gpu", "");
+}
+
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒）；在開發機或 CI 的虛擬螢幕上跑"]
+fn sdr_video_ignores_the_target_peak_in_dumb_mode() {
+    sdr_ignores_target_peak("dumb", "gpu-dumb-mode=yes");
+}
+
+/// 真正的 HDR10 影片（不放進專案：VITASCOPE_HDR_SAMPLES=資料夾，裡面要有 hdr10_hevc_1080p.mp4）：
+/// 目標亮度 100 比自動亮；記下這台電腦的 OpenGL 能不能做動態峰值偵測
+#[test]
+#[ignore = "要真正的 HDR 影片：VITASCOPE_HDR_SAMPLES=資料夾；會在螢幕上開視窗（約 10 秒）"]
+fn real_hdr10_clip_target_peak() {
+    let Some(dir) = std::env::var_os("VITASCOPE_HDR_SAMPLES").map(std::path::PathBuf::from) else {
+        eprintln!("略過：沒有設定 VITASCOPE_HDR_SAMPLES");
+        return;
+    };
+    let media = dir.join("hdr10_hevc_1080p.mp4");
+    assert!(media.exists(), "找不到 {}", media.display());
+    let media = media.to_string_lossy();
+    let (low, log) = shot("real-hdr10-100", &peak_settings(Some(100)), "", &media);
+    let (auto, _) = shot("real-hdr10-auto", &peak_settings(None), "", &media);
+    gl_compute_peak(&log);
+    eprintln!("hdr10_hevc_1080p.mp4：目標亮度 100 nits {low:.1}、自動 {auto:.1}");
+    assert!(property_set(&log, "target-peak", "100"), "{log}");
+    assert!(low > auto, "100 nits 應該比自動亮（{low:.1}、{auto:.1}）");
 }
 
 /// 單色的測試畫面：testsrc2 左上角深色的一小塊放大成整個畫面（這個 FFmpeg 只有 testsrc2，沒有 color）。

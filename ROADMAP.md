@@ -336,13 +336,31 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   編譯不過的著色器記下錯誤（`error C1503: undefined variable`）後自動還原，截圖時 16.9 跟沒有著色器一樣；
   簡化流程（RTX 3090 指定 gpu-dumb-mode、Linux 的 llvmpipe）不送著色器，畫面不變、也不會誤判成壞掉）
   - [ ] 手動確認：Anime4K、FSRCNNX 在 NVIDIA（以及有機會的話 AMD、Intel）顯示卡與 macOS 上實際的效果與速度
-- [x] HDR → SDR 色調映射選項：曲線、目標亮度（自動或 100–1000 nits）、色域對應、動態峰值偵測（macOS 不顯示）。
+- [x] HDR → SDR 色調映射選項：曲線、目標亮度（自動 = 203，或 100–203 nits，只對 HDR 影片送）、色域對應（自動 / 裁切）、
+  動態峰值偵測（畫面輸出的 OpenGL 支援時才顯示）；杜比視界 Profile 5 開檔時提示、媒體資訊註明顏色無法正確顯示。
   vo_gpu 的 gamma 曲線不列：它的著色器在 OpenGL 3.3 編譯不過，畫面變成一片藍。
-  色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以這些選項在簡化流程照常可以用
-  （自動：每條曲線、色域、目標亮度 mpv 都接受；kittest 選單與設定頁；截圖檢查 `tests/picture_shot.rs`：HDR10 樣本在每條曲線下
-  mpv 收到設定的曲線、畫面輸出沒有錯誤，中央平均亮度 RTX 3090 137–142、Linux 的 llvmpipe 72.6–100.1；
-  簡化流程的目標亮度 100 → 1000 nits：RTX 3090 141.3 → 161.6、llvmpipe 94.0 → 162.2、系統的 libmpv 0.37 94.0 → 117.1）
-  - [ ] 手動確認：真正的 HDR 影片在各曲線、目標亮度下的觀感
+  色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以這些選項在簡化流程照常可以用。
+  第十四批修正（對照 mpv 原始碼與真正的 HDR 影片，見第 7 節）：目標亮度超過 203 會把亮部裁成白色，上限改成 203、
+  選單只列自動（203）/ 100 / 150，存過 400、1000 的設定讀成 203；SDR 影片（含還不知道、沒有影片）一律送 auto；
+  「降低飽和度」跟自動是同一段程式，拿掉（存過的讀成自動）；動態峰值偵測改看 GL context（GLSL 4.20 + compute shader + SSBO）
+  （自動：每條曲線、色域、目標亮度 mpv 都接受；目標亮度跟著影片換（HDR10 → 100、SDR → auto、HLG → 100，讀回 mpv 的值）；
+  kittest 選單、設定頁、動態峰值偵測依能力顯示、HDR 播放中從選單或設定頁改目標亮度馬上送到 mpv、
+  杜比視界 Profile 5 每個檔案提示一次（續播位置之類的提示先顯示完才提示）；
+  截圖檢查 `tests/picture_shot.rs`：HDR10 樣本在每條曲線下 mpv 收到設定的曲線、畫面輸出沒有錯誤，
+  中央平均亮度 RTX 3090 137–142、Linux 的 llvmpipe 72.6–100.1；
+  亮度在 203 nits 以下的 HDR10 樣本（`mkv_hevc10_hdr10_mid`）目標亮度 100 比自動亮：RTX 3090 114.9 / 101.3、簡化流程 114.0 / 100.4、
+  Linux 的 llvmpipe（本專案建置的引擎、系統的 libmpv 0.37 一樣）108.5 / 87.2
+  （原本的 HDR10 樣本幾乎都是 1000 nits 以上的亮部，141.7 / 141.5 看不出差別）；
+  SDR 畫面在目標亮度 100 跟自動逐像素一樣（RTX 3090、llvmpipe 的兩種引擎都是；修正前 100 nits 會把 SDR 也做色調映射：129.7 → 132.6）。
+  真正的 HDR 影片（不放進專案，`VITASCOPE_HDR_SAMPLES`）：HEVC HDR10、AV1 HDR10、杜比視界 Profile 5 / 8.1 / 8.4、AV1 HLG、
+  VP9 HDR10+ 都開得起來，媒體資訊依序是 HDR10、HDR10、Dolby Vision（Profile 5，顏色無法正確顯示）、Dolby Vision（Profile 8）×2、
+  HLG、HDR10（這個 VP9 影片每一格 HDR10+ 的 average_maxrgb 都是 0，libplacebo 當成沒有 HDR10+；
+  用 x265 的 `dhdr10-info` 產生的 HEVC HDR10+ 是 HDR10+）；Profile 5 有提示；HEVC HDR10 的中央平均亮度 100 nits 106.0、
+  自動 93.8；這台 RTX 3090 的 GL context 是 OpenGL 3.3 · GLSL 3.30，動態峰值偵測不顯示；
+  Linux 的 llvmpipe 是 OpenGL 4.5 · GLSL 4.50，可以用。截圖檢查確認引擎功能的 `compute_peak` 跟 GL context 的結果一樣）
+  - [ ] 手動確認：真正的 HDR 影片在各曲線、目標亮度下的觀感，Windows 的 HDR 關閉、開啟各看一次
+  - [ ] 之後：向 eframe / glutin 要 OpenGL 4.3 以上的 core context，NVIDIA 顯示卡的 Windows 上動態峰值偵測才能用
+    （eframe 0.36 用預設的 context 設定，NVIDIA 給 3.3 core；mpv 對 GLSL 4.20 以下關掉 compute shader）
 
 音訊
 - [x] 選擇音訊輸出裝置：右鍵選單「音效 ▸ 輸出裝置」、「設定 → 音效」；預設裝置（跟隨系統）＋ 目前輸出方式的裝置
@@ -529,7 +547,7 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 |---|---|---|
 | R1 | macOS 打包 libmpv 及其相依 dylib 最麻煩 | 已解決：改用本專案建置的單一 `libmpv.2.dylib`（只依賴 macOS 內建的函式庫），打包後實際執行檢查 |
 | R2 | macOS 已將 OpenGL 標為棄用 | 目前仍可正常使用（IINA 也是用 OpenGL 接 mpv），持續觀察 |
-| R3 | 部分 HDR / Dolby Vision 功能只有 mpv 的 gpu-next 渲染器支援，嵌入式 render API 是否支援要看 mpv 版本；egui 也還沒有 HDR 輸出 | L3 前先驗證；必要時 HDR 直通模式改用 mpv 原生視窗 |
+| R3 | 部分 HDR / Dolby Vision 功能只有 mpv 的 gpu-next 渲染器支援，嵌入式 render API 是否支援要看 mpv 版本；egui 也還沒有 HDR 輸出 | 已確認（第十四批）：render API 用的是舊的 vo_gpu，引擎建置的 libplacebo 關掉了 OpenGL，gpu-next 根本不能用。vo_gpu 不套用杜比視界的 RPU：Profile 8.1 / 8.4 照 HDR10 / HLG 的基礎層播放沒問題，Profile 5 沒有相容的基礎層，顏色是錯的（偏紫、偏綠），目前開檔時提示。要正確顯示 Profile 5，路線是讓引擎的 libplacebo 開 OpenGL、render API 改用 gpu-next；HDR 直通仍需要另外的輸出方式（mpv 原生視窗或 D3D11） |
 | R4 | Wayland 不支援把 mpv 嵌進子視窗（`wid`） | 本來就採用 render API，不受影響 |
 | R5 | 上次的視窗位置在已拔掉的螢幕上時，視窗可能開在看不到的地方 | 已解決：建立視窗前直接問作業系統有哪些螢幕（Windows、macOS、X11；`src/screens.rs`），上次的標題列不在任何螢幕上就交給系統擺放（eframe 在建立視窗前拿不到螢幕清單，winit 也不讓程式先查）。視窗配合影片後超出螢幕的情況另外處理（v0.2.0） |
 | R6 | 全螢幕時字幕上移只對文字字幕（SRT 等）有效，ASS 字幕有自己的版面 | 觀察實際使用情況再決定是否處理 |
@@ -672,6 +690,19 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   不過換檔時 mpv 沿用同一個輸出（gapless-audio 預設 weak，格式一樣就不重開），預設裝置的清單變了也不會自己重開：
   不處理的話之後的檔案一直沒有聲音，所以改用 null 之後換檔、裝置清單變了時送 `ao-reload` 再試真正的裝置。
   重開之後觀察到的 `current-ao` 可能還是重開前的 null（值一樣不會再通知），等一下直接問 mpv 再決定要不要提示。
+- **vo_gpu 的 target-peak 超過 203 = 假裝輸出到 HDR 螢幕**：輸出的特性不知道時 mpv 當成 SDR，峰值 203 nits（MP_REF_WHITE）。
+  目標亮度超過 203 時 `pass_color_map` 把它當成 HDR 輸出，最後的縮放用轉換函數的標稱峰值（gamma 2.2 是 1.0），
+  203 以上到目標亮度之間的亮部直接裁成白色，不是壓縮。輸出 SDR 的播放器目標亮度只能 ≤ 203。
+- **target-peak 也會改到 SDR 影片**：mpv 把 SDR 影片當成 203 nits，目標 100 時 SDR 影片也被色調映射、變亮變平，
+  超過 203 時輸出改用 gamma 2.2；字幕、OSD 也走同一條路。只有 auto 不動 SDR，所以目標亮度只對 HDR 影片送。
+- **hdr-compute-peak 要 GLSL 4.20**：mpv 對 GLSL 4.20 以下關掉 compute shader（有些驅動在舊版也宣稱支援），
+  eframe 要的是 3.3 core，驅動可以給更新的：NVIDIA 的 Windows 驅動就給 3.3、macOS 是 4.1，動態峰值偵測從來沒有作用過
+  （記錄裡的「Disabling HDR peak computation」）；AMD、Intel、Mesa 常給 4.6，所以要在執行時看 context，不能寫死平台。
+- **HDR10+ 的平均亮度是 0 就當成沒有**：libplacebo（`pl_hdr_metadata_contains`）要 average_maxrgb 不是 0 才算 HDR10+，
+  mpv 的 `video-params` 才有 scene-max-*。有些 HDR10+ 範例影片每一格都是 0，看起來是 HDR10；不是引擎拿不到。
+- **HDR 的標記不一定在容器層**：只標在 HEVC 位元流裡的 HDR，ffprobe 的串流資訊（容器層）寫 unknown，mpv 解出影格後才知道是 PQ；
+  杜比視界 Profile 5 的串流層 transfer 也是 unknown。y4m、沒有標記的原始影像沒有色彩資訊。判斷 HDR 要看 mpv 的 `video-params`，
+  不是容器或 ffprobe。另外 `video-params` 是濾鏡之前的參數，用 `vf=format=gamma=pq` 改標記不會讓它變成 HDR。
 - **產生的正弦波 WAV 可能被當成 MPEG-TS**：48 kHz 的 1 kHz 浮點正弦波每 192 位元組重複一次，剛好是 M2TS 的封包長度，
   FFmpeg 的偵測給 MPEG-TS 滿分、開不起來。測試指定 `demuxer-lavf-format=wav`。本專案建置的引擎也沒有 FFmpeg 的 `sine` 來源，
   測試用的聲音都在測試裡產生。

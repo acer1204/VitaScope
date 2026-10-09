@@ -134,6 +134,91 @@ impl GpuTimer {
     }
 }
 
+/// 畫面輸出用的 OpenGL（mpv 的 render API 跟 egui 共用同一個 context）：版本與動態峰值偵測要的功能
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GlInfo {
+    pub major: u32,
+    pub minor: u32,
+    /// OpenGL ES
+    pub es: bool,
+    /// GLSL 的版本 × 100（「3.30」→ 330）；讀不到時 0
+    pub glsl: u32,
+    /// GL_ARB_compute_shader、GL_ARB_shader_image_load_store、GL_ARB_shader_storage_buffer_object
+    pub compute_shader: bool,
+    pub image_load_store: bool,
+    pub ssbo: bool,
+}
+
+impl GlInfo {
+    /// 讀目前的 GL context。必須在 GL context 生效時呼叫
+    ///
+    /// # Safety
+    /// `gl` 的 context 是 current
+    pub unsafe fn read(gl: &glow::Context) -> Self {
+        let v = gl.version();
+        let glsl = unsafe { gl.get_parameter_string(glow::SHADING_LANGUAGE_VERSION) };
+        let ext = gl.supported_extensions();
+        Self {
+            major: v.major,
+            minor: v.minor,
+            es: v.is_embedded,
+            glsl: parse_glsl_version(&glsl),
+            compute_shader: ext.contains("GL_ARB_compute_shader"),
+            image_load_store: ext.contains("GL_ARB_shader_image_load_store"),
+            ssbo: ext.contains("GL_ARB_shader_storage_buffer_object"),
+        }
+    }
+
+    /// mpv 的動態峰值偵測（hdr-compute-peak）在這個 context 上能不能用。跟 mpv 的條件一樣：
+    /// 桌面 GL（ES 不能寫入貼圖，ra_gl.c 直接關掉 compute）、GLSL 4.20 以上（ra_gl.c 對 GLSL < 420 關掉 compute，
+    /// 有些驅動在舊版 GLSL 也宣稱有 compute shader）、compute shader + 寫入貼圖（DispatchCompute、BindImageTexture）
+    /// 加 SSBO（video.c 的 have_compute_peak）。GL 4.3 起三項都是核心功能，舊版要有對應的 ARB 擴充功能。
+    /// eframe 預設要的是 GL 3.3 core，驅動可以給更新的版本：NVIDIA 的 Windows 驅動就給 3.3（GLSL 3.30），不能用
+    /// （mpv 記「Disabling HDR peak computation」）；有些驅動（AMD、Intel、Linux 的 Mesa）會給 4.6，就能用
+    pub fn compute_peak(&self) -> bool {
+        if self.es || self.glsl < 420 {
+            return false;
+        }
+        let core = (self.major, self.minor);
+        let compute = core >= (4, 3) || self.compute_shader;
+        let image = core >= (4, 2) || self.image_load_store;
+        let ssbo = core >= (4, 3) || self.ssbo;
+        compute && image && ssbo
+    }
+
+    /// 「OpenGL 3.3 · GLSL 3.30」（除錯記錄用）
+    pub fn describe(&self) -> String {
+        let es = if self.es { " ES" } else { "" };
+        format!(
+            "OpenGL{es} {}.{} · GLSL {}.{:02}",
+            self.major,
+            self.minor,
+            self.glsl / 100,
+            self.glsl % 100
+        )
+    }
+}
+
+/// GL_SHADING_LANGUAGE_VERSION 的文字 → 版本 × 100：「3.30 NVIDIA via Cg compiler」→ 330、
+/// 「OpenGL ES GLSL ES 3.20」→ 320。跟 mpv 一樣是主版本 × 100 + 次版本的數字（common.c 的 `sscanf("%d.%d")`），
+/// 次版本不補 0：「4.6」→ 406，mpv 也當成低於 420、關掉 compute。看不懂時 0
+pub fn parse_glsl_version(text: &str) -> u32 {
+    let Some(start) = text.find(|c: char| c.is_ascii_digit()) else {
+        return 0;
+    };
+    let rest = &text[start..];
+    let mut parts = rest.split('.');
+    let major: Option<u32> = parts.next().and_then(|m| m.parse().ok());
+    let minor: String = parts
+        .next()
+        .map(|m| m.chars().take_while(char::is_ascii_digit).collect())
+        .unwrap_or_default();
+    let (Some(major), Ok(minor)) = (major, minor.parse::<u32>()) else {
+        return 0;
+    };
+    major * 100 + minor
+}
+
 struct Target {
     fbo: glow::Framebuffer,
     tex: glow::Texture,
@@ -677,5 +762,75 @@ unsafe fn create_quad(gl: &glow::Context) -> Result<Quad, String> {
         // core profile 畫東西一定要綁一個 VAO，即使不用頂點資料
         let vao = gl.create_vertex_array()?;
         Ok(Quad { program, vao })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gl(major: u32, minor: u32, glsl: u32) -> GlInfo {
+        GlInfo {
+            major,
+            minor,
+            glsl,
+            ..GlInfo::default()
+        }
+    }
+
+    #[test]
+    fn compute_peak_needs_glsl_420_and_compute() {
+        // eframe 預設的 3.3 core（這台 RTX 3090 實測）、macOS 的 4.1：不能用
+        assert!(!gl(3, 3, 330).compute_peak());
+        assert!(!gl(4, 1, 410).compute_peak());
+        // 4.3 起 compute shader、SSBO 都是核心功能（Linux Mesa 要 core 時可能給 4.6）
+        assert!(gl(4, 3, 430).compute_peak());
+        assert!(gl(4, 6, 460).compute_peak());
+        // OpenGL ES 3.2：有 compute shader 但不能寫入貼圖，mpv 直接關掉
+        let es = GlInfo {
+            es: true,
+            compute_shader: true,
+            image_load_store: true,
+            ssbo: true,
+            ..gl(3, 2, 320)
+        };
+        assert!(!es.compute_peak());
+        // 3.3 加上三個擴充功能，但 GLSL 還是 3.30：mpv 對 GLSL < 420 關掉 compute
+        let ext = GlInfo {
+            compute_shader: true,
+            image_load_store: true,
+            ssbo: true,
+            ..gl(3, 3, 330)
+        };
+        assert!(!ext.compute_peak());
+        // 4.2（GLSL 4.20，寫入貼圖是核心功能）：要有 compute shader 與 SSBO 的擴充功能
+        assert!(!gl(4, 2, 420).compute_peak());
+        let only_compute = GlInfo {
+            compute_shader: true,
+            ..gl(4, 2, 420)
+        };
+        assert!(!only_compute.compute_peak(), "還缺 SSBO");
+        let both = GlInfo {
+            ssbo: true,
+            ..only_compute.clone()
+        };
+        assert!(both.compute_peak());
+        // GLSL 讀不到（0）：當成不能用
+        assert!(!gl(4, 6, 0).compute_peak());
+    }
+
+    #[test]
+    fn glsl_version_text() {
+        assert_eq!(parse_glsl_version("3.30 NVIDIA via Cg compiler"), 330);
+        assert_eq!(parse_glsl_version("4.60 NVIDIA"), 460);
+        assert_eq!(parse_glsl_version("4.10"), 410);
+        // mpv 的算法：次版本不補 0，「4.6」是 406（低於 420，不能用）
+        assert_eq!(parse_glsl_version("4.6"), 406);
+        assert!(!gl(4, 6, parse_glsl_version("4.6")).compute_peak());
+        assert_eq!(parse_glsl_version("OpenGL ES GLSL ES 3.20"), 320);
+        assert_eq!(parse_glsl_version("4.50 - Build 31.0.101.2111"), 450);
+        assert_eq!(parse_glsl_version(""), 0);
+        assert_eq!(parse_glsl_version("unknown"), 0);
+        assert_eq!(gl(3, 3, 330).describe(), "OpenGL 3.3 · GLSL 3.30");
     }
 }

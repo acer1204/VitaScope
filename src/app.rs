@@ -341,6 +341,12 @@ pub struct VitascopeApp {
     panel_tab: control_panel::PanelTab,
     /// 改去交錯時的提示（顯示的時間）：「目前」的狀態要等 mpv 換好濾鏡，提示還在時跟著更新
     deint_osd: Option<Instant>,
+    /// 送畫質選項時看的「影片是 HDR」：跟播放器的狀態不一樣了就重新套用（目標亮度只對 HDR 影片送）
+    picture_hdr: bool,
+    /// 已經提示過「杜比視界 Profile 5」的檔案（`file_gen`）：每個檔案只提示一次
+    dv_notice_gen: Option<u64>,
+    /// 畫面輸出的 OpenGL 能不能做 HDR 動態峰值偵測（建立 App 時看 GL context；`probe_caps` 問的是 mpv，不知道這個）
+    gl_compute_peak: bool,
     /// 換了像素著色器之後，看它能不能用（畫不出來就還原）
     shader_watch: crate::picture::shader::ShaderApply,
     /// 著色器檔案的檢查結果（設定頁顯示說明或問題）；設定視窗關掉時清掉，下次打開重新檢查
@@ -444,6 +450,9 @@ pub struct Launch {
     pub platform: Option<Box<dyn PlatformProbe>>,
     /// 環境變數 VITASCOPE_PACING（啟動時讀一次；自動測試預設沒有）
     pub pacing: crate::pacing::Overrides,
+    /// 測試用：當成建立 App 時看到的 GL context 能／不能做 HDR 動態峰值偵測（介面測試沒有 GL context）；None = 看 GL context
+    #[doc(hidden)]
+    pub gl_compute_peak: Option<bool>,
 }
 
 impl VitascopeApp {
@@ -457,22 +466,40 @@ impl VitascopeApp {
         let _ = player.set_mute(settings.muted);
         player.apply_sub_style(&settings.subtitle);
 
+        // 畫面輸出的 OpenGL 能不能做 HDR 動態峰值偵測（mpv 跟介面用同一個 GL context）
+        let mut compute_peak = false;
         if let Some(gl) = &cc.gl {
             use eframe::glow::HasContext;
             // SAFETY: 建立 App 時 GL context 是 current
-            let (renderer, version) = unsafe {
+            let (renderer, version, info) = unsafe {
                 (
                     gl.get_parameter_string(glow::RENDERER),
                     gl.get_parameter_string(glow::VERSION),
+                    crate::video::GlInfo::read(gl),
                 )
             };
             eprintln!("[vitascope] OpenGL：{renderer}（{version}）");
+            compute_peak = info.compute_peak();
+            if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+                eprintln!(
+                    "[vitascope] {}；HDR 動態峰值偵測：{}",
+                    info.describe(),
+                    if compute_peak {
+                        "可以用"
+                    } else {
+                        "不能用（要 GLSL 4.20 以上、compute shader 與 SSBO）"
+                    }
+                );
+            }
             // Mesa 的軟體繪圖（llvmpipe 等，常見於虛擬機、沒有顯示卡驅動的電腦）上，
             // mpv 完整的繪圖流程畫出來是全黑的；改用簡化流程（少了高品質縮放等效果，但看得到畫面）
             if is_mesa_software_renderer(&renderer) && !mpv_opts_override(&player, "gpu-dumb-mode") {
                 eprintln!("[vitascope] 偵測到軟體繪圖，mpv 改用簡化的繪圖流程");
                 let _ = player.mpv().set_property("gpu-dumb-mode", "yes");
             }
+        }
+        if let Some(fake) = launch.gl_compute_peak {
+            compute_peak = fake;
         }
         let (video, fatal) = match &cc.get_proc_address {
             Some(gpa) => match VideoView::new(
@@ -604,6 +631,9 @@ impl VitascopeApp {
             panel_open: false,
             panel_tab: control_panel::PanelTab::default(),
             deint_osd: None,
+            picture_hdr: false,
+            dv_notice_gen: None,
+            gl_compute_peak: compute_peak,
             shader_watch: Default::default(),
             shader_info: HashMap::new(),
             shader_failures: HashMap::new(),
@@ -720,6 +750,8 @@ impl VitascopeApp {
     /// （流暢播放打開而且已經查得到更新率時、畫質、音效）
     fn apply_startup(&mut self) {
         self.caps = self.player.probe_caps();
+        // 軟體繪圖的簡化流程不做動態峰值偵測（llvmpipe 的 GL 4.5 雖然有 compute shader）
+        self.caps.compute_peak = self.gl_compute_peak && !self.caps.dumb;
         self.picture_defaults = self.player.picture_defaults();
         if std::env::var_os("VITASCOPE_DEBUG").is_some() {
             eprintln!(
@@ -2258,6 +2290,13 @@ impl VitascopeApp {
         self.keep_on_screen(ctx, size);
     }
 
+    /// 測試用：當成畫面輸出的 OpenGL 能／不能做 HDR 動態峰值偵測（介面測試沒有 GL context，一律是不能）
+    #[doc(hidden)]
+    pub fn set_gl_compute_peak(&mut self, supported: bool) {
+        self.gl_compute_peak = supported;
+        self.caps.compute_peak = supported && !self.caps.dumb;
+    }
+
     /// 測試用：直接設定檢查更新的結果（不連網）
     #[doc(hidden)]
     pub fn set_update_status(&mut self, status: UpdateStatus) {
@@ -3550,6 +3589,8 @@ impl eframe::App for VitascopeApp {
         for ev in self.player.poll() {
             self.on_player_event(ev);
         }
+        // 影片是不是 HDR 變了（換檔、拿到第一個影格的參數、換影片軌）：同一輪就重新送目標亮度
+        self.hdr_tick();
         self.shader_tick();
         self.sound_tick();
         // 視窗出現之後才有螢幕可查

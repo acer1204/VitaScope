@@ -301,15 +301,18 @@ pub fn chroma(pixfmt: &str) -> Option<&'static str> {
     }
 }
 
-/// 動態範圍：HDR10 / HDR10+ / Dolby Vision / HLG / SDR
+/// 動態範圍：HDR10 / HDR10+ / Dolby Vision（Profile 8）/ HLG / SDR
 pub fn dynamic_range(vp: &VideoParams, video: Option<&TrackInfo>) -> String {
     let wide = vp.primaries.as_deref() == Some("bt.2020");
+    let profile = video.and_then(|v| v.dolby_vision_profile);
+    // 杜比視界：PQ（profile 5、8.1）或 HLG（8.4）的基礎層。8.4 的 HLG 照樣列在色彩空間裡
+    if profile.is_some() && matches!(vp.gamma.as_deref(), Some("pq" | "hlg")) {
+        return dolby_vision_label(profile);
+    }
     match vp.gamma.as_deref() {
         Some("pq") => {
-            let dolby = video.is_some_and(|v| v.dolby_vision_profile.is_some())
-                || vp.colormatrix.as_deref() == Some("dolbyvision");
-            if dolby {
-                "Dolby Vision".to_owned()
+            if vp.colormatrix.as_deref() == Some("dolbyvision") {
+                dolby_vision_label(None)
             } else if vp.scene_max_r.is_some() {
                 "HDR10+".to_owned()
             } else {
@@ -319,6 +322,20 @@ pub fn dynamic_range(vp: &VideoParams, video: Option<&TrackInfo>) -> String {
         Some("hlg") => "HLG".to_owned(),
         _ if wide => crate::tr!("SDR（廣色域）", "SDR (wide gamut)").to_owned(),
         _ => "SDR".to_owned(),
+    }
+}
+
+/// 杜比視界加上 profile（mpv 只給主版本：8.1、8.4 都是 8）。Profile 5 沒有相容的基礎層，
+/// 畫面輸出（vo_gpu）不會套用杜比視界的轉換，顏色是錯的：註明
+fn dolby_vision_label(profile: Option<i64>) -> String {
+    match profile {
+        Some(5) => crate::tr!(
+            "Dolby Vision（Profile 5，顏色無法正確顯示）",
+            "Dolby Vision (profile 5, colors can't be shown correctly)"
+        )
+        .to_owned(),
+        Some(p) => crate::tf!("Dolby Vision（Profile {p}）", "Dolby Vision (profile {p})"),
+        None => "Dolby Vision".to_owned(),
     }
 }
 
@@ -711,16 +728,42 @@ mod tests {
             ..pq.clone()
         };
         assert_eq!(dynamic_range(&plus, None), "HDR10+");
-        let dv = TrackInfo {
-            dolby_vision_profile: Some(8),
+        let dv = |p| TrackInfo {
+            dolby_vision_profile: Some(p),
             ..Default::default()
         };
-        assert_eq!(dynamic_range(&pq, Some(&dv)), "Dolby Vision");
+        // 8.1（PQ 的基礎層）：mpv 只給主版本
+        assert_eq!(dynamic_range(&pq, Some(&dv(8))), "Dolby Vision（Profile 8）");
+        // Profile 5：顏色是錯的，註明
+        assert_eq!(
+            dynamic_range(&pq, Some(&dv(5))),
+            "Dolby Vision（Profile 5，顏色無法正確顯示）"
+        );
+        // 只有 colormatrix 看得出來（沒有 profile）
+        let dv_matrix = VideoParams {
+            colormatrix: Some("dolbyvision".into()),
+            ..pq.clone()
+        };
+        assert_eq!(dynamic_range(&dv_matrix, None), "Dolby Vision");
         let hlg = VideoParams {
             gamma: Some("hlg".into()),
             ..Default::default()
         };
         assert_eq!(dynamic_range(&hlg, None), "HLG");
+        // 8.4（HLG 的基礎層）
+        assert_eq!(dynamic_range(&hlg, Some(&dv(8))), "Dolby Vision（Profile 8）");
+        // 有 profile 但影像參數不是 HDR（還沒解出第一格、或只是軌道資訊）：不當成杜比視界
+        assert_eq!(dynamic_range(&VideoParams::default(), Some(&dv(5))), "SDR");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let en = [dynamic_range(&pq, Some(&dv(5))), dynamic_range(&pq, Some(&dv(8)))];
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(
+            en,
+            [
+                "Dolby Vision (profile 5, colors can't be shown correctly)",
+                "Dolby Vision (profile 8)"
+            ]
+        );
         let wide = VideoParams {
             primaries: Some("bt.2020".into()),
             gamma: Some("bt.1886".into()),

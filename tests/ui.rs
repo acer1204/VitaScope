@@ -4083,22 +4083,36 @@ fn video_menu_items() {
     assert_eq!(h.state().osd_text(), Some("HDR 色調映射：Hable"));
     wait_prop(&mut h, "tone-mapping", "hable");
     assert_eq!(saved_video(&path)["tone"]["curve"], "hable");
-    // 目標亮度
-    pick_picture_item(&mut h, &["HDR 色調映射", "目標亮度（自動）"], "400 nits");
-    assert_eq!(h.state().osd_text(), Some("HDR 目標亮度：400 nits"));
-    wait_prop(&mut h, "target-peak", "400");
-    assert_eq!(saved_video(&path)["tone"]["target_peak"], 400);
-    // 依畫面動態調整亮度（macOS 不顯示）
-    if cfg!(target_os = "macos") {
-        open_picture_menu(&mut h);
-        hover_menu_item(&mut h, "HDR 色調映射");
-        assert!(h.query_by_label("依畫面動態調整亮度").is_none());
-    } else {
-        pick_picture_item(&mut h, &["HDR 色調映射"], "依畫面動態調整亮度");
-        assert_eq!(h.state().osd_text(), Some("依畫面動態調整亮度：關"));
-        wait_prop(&mut h, "hdr-compute-peak", "no");
-        assert_eq!(saved_video(&path)["tone"]["compute_peak"], false);
+    // 目標亮度：「自動」註明是 203 nits，只列 203 以下的值（超過 203 時 vo_gpu 把亮部裁成白色）
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "HDR 色調映射");
+    hover_menu_item(&mut h, "目標亮度（自動）");
+    for label in ["自動（203 nits）", "100 nits", "150 nits"] {
+        h.get_by_label(label);
     }
+    for label in ["203 nits", "400 nits", "1000 nits"] {
+        assert!(h.query_by_label(label).is_none(), "{label} 不能列");
+    }
+    h.get_by_label("150 nits").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("HDR 目標亮度：150 nits"));
+    assert_eq!(h.state().settings().video.tone.target_peak, Some(150));
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 150);
+    // SDR 影片：mpv 的目標亮度維持 auto（不然 SDR 影片也會被色調映射）
+    h.run_steps(10);
+    assert_eq!(prop(&h, "target-peak"), "auto");
+    // 依畫面動態調整亮度：介面測試沒有 GL context = 畫面輸出不支援，不顯示
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "HDR 色調映射");
+    assert!(h.query_by_label("依畫面動態調整亮度").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 支援的 GL：顯示，可以關掉
+    h.state_mut().set_gl_compute_peak(true);
+    pick_picture_item(&mut h, &["HDR 色調映射"], "依畫面動態調整亮度");
+    assert_eq!(h.state().osd_text(), Some("依畫面動態調整亮度：關"));
+    wait_prop(&mut h, "hdr-compute-peak", "no");
+    assert_eq!(saved_video(&path)["tone"]["compute_peak"], false);
     h.key_press(egui::Key::Escape);
     h.run_steps(2);
     // 換檔之後照舊（這些選項不是每個檔案各自的）
@@ -4109,10 +4123,370 @@ fn video_menu_items() {
         ("deband", "yes"),
         ("sharpen", "0.250000"),
         ("tone-mapping", "hable"),
-        ("target-peak", "400"),
+        ("target-peak", "auto"),
     ] {
         assert_eq!(prop(&h, name), value, "{name}");
     }
+}
+
+// 目標亮度只對 HDR 影片送：啟動時（還沒開檔）auto、HDR10 影片是設定的值、換成 SDR 影片變回 auto、再換回 HDR 又是設定的值。
+// 看的是 mpv 的 target-peak（不是播放器記下的值）
+#[test]
+fn target_peak_follows_the_video_dynamic_range() {
+    let dir = TempDir::new("hdr-peak");
+    let path = dir.0.join("settings.json");
+    std::fs::write(
+        &path,
+        r#"{"auto_next": false, "video": {"tone": {"target_peak": 100}}}"#,
+    )
+    .unwrap();
+    let settings = Settings::load_from(path);
+    assert_eq!(settings.video.tone.target_peak, Some(100));
+    let mut h = harness_with(None, settings);
+    h.run_steps(3);
+    assert_eq!(prop(&h, "target-peak"), "auto", "還沒有影片");
+    for (file, hdr, peak) in [
+        ("general/mkv_hevc10_hdr10.mkv", true, "100"),
+        ("common/mp4_h264_aac.mp4", false, "auto"),
+        ("general/mkv_hevc10_hlg.mkv", true, "100"),
+        ("common/mkv_multitrack.mkv", false, "auto"),
+        ("general/mkv_hevc10_hdr10.mkv", true, "100"),
+    ] {
+        let name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+        drop_file(&mut h, sample(file));
+        step_until(&mut h, &format!("{name} 的 HDR = {hdr}"), |s| {
+            playing(s, &name) && s.video_hdr == hdr
+        });
+        wait_prop(&mut h, "target-peak", peak);
+    }
+    // 關檔之後（沒有影片）回到 auto
+    h.state().player().stop().unwrap();
+    step_until(&mut h, "關檔", |s| !s.loaded && !s.video_hdr);
+    wait_prop(&mut h, "target-peak", "auto");
+}
+
+// VITASCOPE_MPV_OPTS 指定了 target-peak：HDR、SDR 影片都不改它
+#[test]
+fn user_target_peak_is_left_alone() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.tone.target_peak = Some(100);
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![("target-peak".into(), "180".into())],
+            ..Options::headless()
+        },
+        Launch::default(),
+        settings,
+    );
+    for (file, hdr) in [
+        ("general/mkv_hevc10_hdr10.mkv", true),
+        ("common/mp4_h264_aac.mp4", false),
+    ] {
+        let name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+        drop_file(&mut h, sample(file));
+        step_until(&mut h, &format!("{name} 的 HDR = {hdr}"), |s| {
+            playing(s, &name) && s.video_hdr == hdr
+        });
+        h.run_steps(10);
+        assert_eq!(prop(&h, "target-peak"), "180", "{name}");
+    }
+}
+
+// 動態峰值偵測只在畫面輸出的 OpenGL 支援時出現（GLSL 4.20 + compute shader）：選單、設定頁都一樣
+#[test]
+fn compute_peak_checkbox_follows_the_gl_capability() {
+    let (_dir, path, mut h) = video_settings_harness("compute-peak", "general/mkv_hevc10_hdr10.mkv");
+    assert!(!h.state().engine_caps().compute_peak, "介面測試沒有 GL context");
+    let shown = |h: &mut Harness<'_, VitascopeApp>| {
+        open_picture_menu(h);
+        hover_menu_item(h, "HDR 色調映射");
+        h.get_by_label("Hable");
+        let menu = h.query_by_label("依畫面動態調整亮度").is_some();
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        h.key_press(egui::Key::F5);
+        h.run_steps(2);
+        h.get_by_label("畫質").click();
+        h.run_steps(2);
+        h.get_by_label("HDR → SDR");
+        let page = h.query_by_label("動態峰值偵測").is_some();
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        (menu, page)
+    };
+    assert_eq!(shown(&mut h), (false, false), "不支援：不顯示");
+    // 不顯示時設定照舊（預設開），mpv 照樣收到 auto：換到支援的 GL 上自動生效
+    assert_eq!(prop(&h, "hdr-compute-peak"), "auto");
+    h.state_mut().set_gl_compute_peak(true);
+    assert_eq!(shown(&mut h), (true, true), "支援：選單、設定頁都有");
+    // 設定頁也能改
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    click_in_view(&mut h, "動態峰值偵測");
+    wait_prop(&mut h, "hdr-compute-peak", "no");
+    assert_eq!(saved_video(&path)["tone"]["compute_peak"], false);
+}
+
+// 建立 App 時看到的 GL context 能力要進到引擎功能（啟動時 probe_caps 一律 false，之後才填上 GL 的結果）：
+// 不用 set_gl_compute_peak，一啟動選單就有「依畫面動態調整亮度」
+#[test]
+fn gl_capability_at_startup_reaches_engine_caps() {
+    for supported in [true, false] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        let mut h = harness_launch(
+            Launch {
+                files: vec![sample("general/mkv_hevc10_hdr10.mkv")],
+                gl_compute_peak: Some(supported),
+                ..Default::default()
+            },
+            settings,
+        );
+        assert_eq!(
+            h.state().engine_caps().compute_peak,
+            supported,
+            "啟動後馬上就是 GL 的結果"
+        );
+        settle(&mut h, "mkv_hevc10_hdr10.mkv");
+        open_picture_menu(&mut h);
+        hover_menu_item(&mut h, "HDR 色調映射");
+        h.get_by_label("Hable");
+        assert_eq!(
+            h.query_by_label("依畫面動態調整亮度").is_some(),
+            supported,
+            "GL context {}",
+            if supported { "支援" } else { "不支援" }
+        );
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+}
+
+// 杜比視界 Profile 5（顏色無法正確顯示）：每個檔案提示一次，換檔之後再提示
+#[test]
+fn dolby_vision_profile_5_notice_once_per_file() {
+    const NOTICE: &str = "杜比視界 Profile 5：目前無法正確顯示顏色";
+    let mut player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    // 產生不了杜比視界的樣本：把影片軌當成 profile 5
+    player.set_fake_dolby_vision(Some(5));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with_player(player, Launch::default(), settings);
+    h.step();
+    assert_ne!(h.state().osd_text(), Some(NOTICE), "還沒有檔案");
+    drop_file(&mut h, sample("general/mkv_hevc10_hdr10.mkv"));
+    step_until_app(&mut h, "提示杜比視界 Profile 5", |app| {
+        app.osd_text() == Some(NOTICE)
+    });
+    // 換成別的提示之後，同一個檔案不會再提示
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    assert_ne!(h.state().osd_text(), Some(NOTICE));
+    for _ in 0..30 {
+        h.step();
+        assert_ne!(h.state().osd_text(), Some(NOTICE), "同一個檔案只提示一次");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 下一個檔案：再提示一次
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until_app(&mut h, "下一個檔案再提示", |app| {
+        playing(&app.player().state, "mp4_h264_aac.mp4") && app.osd_text() == Some(NOTICE)
+    });
+}
+
+// 真正的 HDR 影片（不放進專案：設定 VITASCOPE_HDR_SAMPLES 指到放影片的資料夾才跑）：媒體資訊的動態範圍、
+// 杜比視界 Profile 5 的提示、目標亮度只對 HDR 送。沒有的檔案略過
+#[test]
+#[ignore = "要真正的 HDR 影片：VITASCOPE_HDR_SAMPLES=資料夾"]
+fn real_hdr_clips() {
+    let Some(dir) = std::env::var_os("VITASCOPE_HDR_SAMPLES").map(PathBuf::from) else {
+        eprintln!("略過：沒有設定 VITASCOPE_HDR_SAMPLES");
+        return;
+    };
+    const P5: &str = "杜比視界 Profile 5：目前無法正確顯示顏色";
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.video.tone.target_peak = Some(100);
+    let mut h = harness_with(None, settings);
+    h.step();
+    let mut tested = 0;
+    for (file, range, notice) in [
+        ("hdr10_hevc_1080p.mp4", "HDR10", false),
+        ("hdr10_av1_1080p.mp4", "HDR10", false),
+        ("dv_p5_1080p.mp4", "Dolby Vision（Profile 5，顏色無法正確顯示）", true),
+        ("dv_p81_1080p.mp4", "Dolby Vision（Profile 8）", false),
+        ("dv_p84_1080p.mp4", "Dolby Vision（Profile 8）", false),
+        ("hlg_av1_1080p50.mp4", "HLG", false),
+        // 這個 HDR10+ 影片每一格的 average_maxrgb 都是 0（ffprobe -show_frames）：libplacebo 把平均是 0 的
+        // HDR10+ 當成沒有（pl_hdr_metadata_contains），mpv 的 video-params 就沒有 scene-max-*，看起來是 HDR10。
+        // 引擎本身拿得到 HDR10+（mpv 把 WebM 的 BlockAdditional 轉成封包的 side data），見下一個
+        ("hdr10plus_vp9.webm", "HDR10", false),
+        // 用 x265 的 dhdr10-info 自己產生的 HEVC HDR10+（average_maxrgb 不是 0）
+        ("hdr10plus_hevc_x265.mkv", "HDR10+", false),
+    ] {
+        let path = dir.join(file);
+        if !path.exists() {
+            eprintln!("略過：沒有 {}", path.display());
+            continue;
+        }
+        tested += 1;
+        // 先換掉上一個檔案的提示（提示顯示 1.5 秒，開下一個檔案時可能還在）
+        if h.state().player().state.loaded {
+            h.key_press(egui::Key::Space);
+            h.run_steps(2);
+        }
+        drop_file(&mut h, path);
+        step_until(&mut h, &format!("{file} 是 HDR"), |s| playing(s, file) && s.video_hdr);
+        // HDR 影片：送設定的目標亮度
+        wait_prop(&mut h, "target-peak", "100");
+        // 影像參數（HDR10+ 的動態中繼資料）要等解出影格。對了之後再看 2 秒都不變
+        //（HDR10 的不能過一下又變成 HDR10+）
+        let mut got = String::new();
+        let mut since: Option<Instant> = None;
+        let start = Instant::now();
+        while start.elapsed() < TIMEOUT && since.is_none_or(|t| t.elapsed() < Duration::from_secs(2)) {
+            let info = vitascope::mediainfo::read(h.state().player(), None);
+            if let Some(vp) = &info.vparams {
+                got = vitascope::mediainfo::dynamic_range(vp, info.video.as_ref());
+                if since.is_some() {
+                    assert_eq!(got, range, "{file}：動態範圍變了");
+                } else if got == range {
+                    since = Some(Instant::now());
+                }
+            }
+            h.step();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        eprintln!("{file}：{got}");
+        assert_eq!(got, range, "{file}");
+        if notice {
+            step_until_app(&mut h, "提示杜比視界 Profile 5", |app| app.osd_text() == Some(P5));
+        } else {
+            assert_ne!(h.state().osd_text(), Some(P5), "{file}");
+        }
+    }
+    assert!(tested > 0, "{} 裡沒有任何 HDR 影片", dir.display());
+    // 換成 SDR 影片：目標亮度回到 auto
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "SDR 影片", |s| playing(s, "mp4_h264_aac.mp4") && !s.video_hdr);
+    wait_prop(&mut h, "target-peak", "auto");
+}
+
+// 不是杜比視界 Profile 5（profile 8、一般 HDR10）：不提示
+#[test]
+fn other_dolby_vision_profiles_have_no_notice() {
+    let mut player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    player.set_fake_dolby_vision(Some(8));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with_player(player, Launch::default(), settings);
+    // 每一格都看（提示只顯示 1.5 秒：等開始播放之後才看的話，慢的電腦上可能已經消失了）
+    let no_notice = |h: &Harness<'_, VitascopeApp>| {
+        assert!(
+            !h.state().osd_text().is_some_and(|t| t.contains("杜比視界")),
+            "{:?}",
+            h.state().osd_text()
+        );
+    };
+    drop_file(&mut h, sample("general/mkv_hevc10_hdr10.mkv"));
+    let start = Instant::now();
+    loop {
+        no_notice(&h);
+        let s = &h.state().player().state;
+        if playing(s, "mkv_hevc10_hdr10.mkv") && s.video_size.is_some() && s.time_pos > 0.0 {
+            break;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：開始播放");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    for _ in 0..30 {
+        h.step();
+        no_notice(&h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+// 杜比視界 Profile 5 的提示不蓋掉開檔時比較要緊的提示（續播位置）：等那個提示消失才出現
+#[test]
+fn dolby_vision_notice_waits_for_the_resume_message() {
+    const NOTICE: &str = "杜比視界 Profile 5：目前無法正確顯示顏色";
+    let mut player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    player.set_fake_dolby_vision(Some(5));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let long = sample("common/mp4_long.mp4");
+    let launch = Launch {
+        files: vec![long.clone()],
+        ..Default::default()
+    };
+    let mut h = harness_with_player(player, launch, settings);
+    step_until_app(&mut h, "沒有續播時直接提示", |app| {
+        app.osd_text() == Some(NOTICE)
+    });
+    step_until(&mut h, "開始播放", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until_app(&mut h, "下一個檔案提示", |app| {
+        playing(&app.player().state, "mp4_h264_aac.mp4") && app.osd_text() == Some(NOTICE)
+    });
+    step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+    // 回到上次的位置：先看到續播的提示，消失之後才提示杜比視界
+    drop_file(&mut h, long);
+    step_until_app(&mut h, "續播的提示", |app| {
+        app.osd_text().is_some_and(|t| t.contains("繼續播放（Home 從頭播放）"))
+    });
+    step_until_app(&mut h, "續播的提示消失後提示杜比視界", |app| {
+        app.osd_text() == Some(NOTICE)
+    });
+}
+
+// HDR 影片播放中改目標亮度：選單、設定頁（打字時馬上生效）、勾回自動都直接送到 mpv
+#[test]
+fn target_peak_changes_reach_mpv_during_hdr_playback() {
+    let (_dir, path, mut h) = video_settings_harness("peak-hdr", "general/mkv_hevc10_hdr10.mkv");
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    wait_prop(&mut h, "target-peak", "auto");
+    open_picture_menu(&mut h);
+    hover_menu_item(&mut h, "HDR 色調映射");
+    hover_menu_item(&mut h, "目標亮度（自動）");
+    h.get_by_label("100 nits").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "target-peak", "100");
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 100);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("畫質").click();
+    h.run_steps(2);
+    type_peak(&mut h, "150");
+    wait_prop(&mut h, "target-peak", "150");
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 100, "還在打字，先不存");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 150);
+    click_in_view(&mut h, "自動");
+    wait_prop(&mut h, "target-peak", "auto");
+    assert_eq!(h.state().settings().video.tone.target_peak, None);
+    assert!(saved_video(&path)["tone"]["target_peak"].is_null());
 }
 
 // 「目前的影片不是 HDR」只在 SDR 影片時出現：HDR10 影片時選單、設定頁都沒有，換成 SDR 影片後設定頁跟著顯示
@@ -4228,12 +4602,15 @@ fn dumb_mode_greys_out_gpu_only_items() {
         },
         Launch {
             files: vec![sample("common/mkv_multitrack.mkv")],
+            // GL 有 compute shader（像 llvmpipe 的 4.5）：簡化流程照樣不做動態峰值偵測
+            gl_compute_peak: Some(true),
             ..Default::default()
         },
         settings,
     );
     settle(&mut h, "mkv_multitrack.mkv");
     assert!(h.state().engine_caps().dumb);
+    assert!(!h.state().engine_caps().compute_peak, "簡化流程不做動態峰值偵測");
     assert!(
         h.state().player().shader_list().unwrap().is_empty(),
         "簡化流程不送著色器"
@@ -4257,6 +4634,7 @@ fn dumb_mode_greys_out_gpu_only_items() {
     hover_menu_item(&mut h, "HDR 色調映射");
     assert!(!h.get_by_label("Hable").accesskit_node().is_disabled());
     assert!(!h.get_by_label_contains("目標亮度").accesskit_node().is_disabled());
+    assert!(h.query_by_label("依畫面動態調整亮度").is_none());
     h.get_by_label_contains("去色帶").hover();
     h.run_steps(3);
     h.get_by_label("軟體繪圖模式不支援");
@@ -4302,6 +4680,17 @@ fn click_in_view(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     h.get_by_label(label).scroll_to_me();
     h.run_steps(15);
     h.get_by_label(label).click();
+    h.run_steps(2);
+}
+
+/// 設定頁「HDR → SDR」的目標亮度數值欄：點進去、打字（還沒按 Enter）
+fn type_peak(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    h.query_all_by_label("目標亮度")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+        .unwrap()
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text(text.into()));
     h.run_steps(2);
 }
 
@@ -4453,7 +4842,7 @@ fn picture_page_processing_sections() {
     h.run_steps(2);
     wait_prop(&mut h, "dscale", "catmull_rom");
     assert_eq!(saved_video(&path)["dscale"], "catmull_rom");
-    // HDR：曲線、目標亮度（取消自動 → 203 nits，可以拖）
+    // HDR：曲線、目標亮度（取消自動 → 203 nits，可以拖，最多 203）
     combo_in_view(&mut h, "曲線");
     h.run_steps(2);
     h.get_by_label("BT.2390").click();
@@ -4469,36 +4858,35 @@ fn picture_page_processing_sections() {
     assert!(peak(&h), "自動時不能拖");
     click_in_view(&mut h, "自動");
     h.run_steps(2);
-    wait_prop(&mut h, "target-peak", "203");
+    assert_eq!(h.state().settings().video.tone.target_peak, Some(203));
     assert_eq!(saved_video(&path)["tone"]["target_peak"], 203);
     assert!(!peak(&h), "取消自動之後可以拖");
-    // 數值欄打字：馬上套用，按 Enter（離開欄位）才存檔
-    h.query_all_by_label("目標亮度")
-        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
-        .unwrap()
-        .focus();
-    h.run_steps(2);
-    h.event(egui::Event::Text("500".into()));
-    h.run_steps(2);
-    wait_prop(&mut h, "target-peak", "500");
-    assert_eq!(h.state().settings().video.tone.target_peak, Some(500));
+    // 這是 SDR 影片：mpv 的目標亮度維持 auto
+    h.run_steps(10);
+    assert_eq!(prop(&h, "target-peak"), "auto");
+    // 數值欄打字：馬上生效，按 Enter（離開欄位）才存檔
+    type_peak(&mut h, "150");
+    assert_eq!(h.state().settings().video.tone.target_peak, Some(150));
     assert_eq!(saved_video(&path)["tone"]["target_peak"], 203, "還在打字，先不存");
     h.key_press(egui::Key::Enter);
     h.run_steps(2);
-    assert_eq!(saved_video(&path)["tone"]["target_peak"], 500);
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 150);
+    // 超過 203 拉回 203
+    type_peak(&mut h, "500");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().video.tone.target_peak, Some(203));
+    assert_eq!(saved_video(&path)["tone"]["target_peak"], 203);
+    // 色域對應：自動、裁切兩個（「降低飽和度」在 vo_gpu 跟自動是同一段程式，拿掉了）
     combo_in_view(&mut h, "色域對應");
     h.run_steps(2);
-    h.get_by_label("降低飽和度").click();
+    assert!(h.query_by_label("降低飽和度").is_none());
+    h.get_by_label("裁切").click();
     h.run_steps(2);
-    wait_prop(&mut h, "gamut-mapping-mode", "desaturate");
-    assert_eq!(saved_video(&path)["tone"]["gamut"], "desaturate");
-    if cfg!(target_os = "macos") {
-        assert!(h.query_by_label("動態峰值偵測").is_none());
-    } else {
-        click_in_view(&mut h, "動態峰值偵測");
-        h.run_steps(2);
-        wait_prop(&mut h, "hdr-compute-peak", "no");
-    }
+    wait_prop(&mut h, "gamut-mapping-mode", "clip");
+    assert_eq!(saved_video(&path)["tone"]["gamut"], "clip");
+    // 動態峰值偵測：介面測試沒有 GL context（畫面輸出不支援），不顯示
+    assert!(h.query_by_label("動態峰值偵測").is_none());
     // 去交錯（引擎支援自動時三個都有；不支援時「自動」當成關閉，所以選開啟）
     let caps = *h.state().engine_caps();
     click_in_view(&mut h, "開啟");

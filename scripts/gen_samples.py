@@ -272,6 +272,13 @@ def samples() -> list[Sample]:
                                                 "-x265-params", HLG_PARAMS, "-color_primaries", "bt2020",
                                                 "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc"], AAC,
           "hevc", "aac", expect={"gamma": "hlg", "primaries": "bt.2020"}, note="HLG"),
+        # 上面的 HDR10 是彩條直接當成 PQ，幾乎都是 1000 nits 以上的亮部，目標亮度 100 跟 203 都壓到最亮、看不出差別；
+        # 這個把亮度、飽和度都壓低（大多在 SDR 參考白 203 nits 以下），tests/picture_shot.rs 用來比較目標亮度
+        S("mkv_hevc10_hdr10_mid", "general", "mkv", ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+                                                      "-x265-params", HDR10_PARAMS, "-color_primaries", "bt2020",
+                                                      "-color_trc", "smpte2084", "-colorspace", "bt2020nc"], None,
+          "hevc", vf="lutyuv=y=16+(val-16)*0.6:u=128+(val-128)*0.4:v=128+(val-128)*0.4", expect={"gamma": "pq", "primaries": "bt.2020"},
+          note="HDR10，亮度大多在 203 nits 以下"),
         S("mp4_h264_120fps", "general", "mp4", X264, AAC, "h264", "aac", rate="120", note="高幀率"),
         S("audio_mp3", "general", "mp3", None, MP3, None, "mp3"),
         S("audio_aac", "general", "m4a", None, AAC, None, "aac"),

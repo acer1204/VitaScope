@@ -242,6 +242,7 @@ impl Settings {
     pub fn sanitized(mut self) -> Self {
         let v = &mut self.video;
         v.adjust = v.adjust.clamped();
+        // 開發版存得下 400、1000 nits（超過 203 時 vo_gpu 裁切亮部）：所有讀檔都經過這裡，一起拉回 100…203
         v.tone.target_peak = v.tone.target_peak.map(|p| {
             p.clamp(
                 crate::picture::ToneSettings::MIN_PEAK,
@@ -806,7 +807,7 @@ mod tests {
             (s.video.adjust.brightness, s.video.adjust.gamma, s.video.adjust.hue),
             (100, -100, 7)
         );
-        assert_eq!(s.video.tone.target_peak, Some(1000));
+        assert_eq!(s.video.tone.target_peak, Some(203), "最多 203（vo_gpu 超過就裁切）");
         assert_eq!(&s.audio.eq.gains[..3], &[12.0, -12.0, 3.5]);
         assert_eq!(s.audio.eq.gains[9], -12.0);
         assert_eq!(s.audio.volume_max, 150);
@@ -832,6 +833,68 @@ mod tests {
         let loaded = Settings::load_from(path);
         assert_eq!(loaded.volume, 100.0);
         assert_eq!(loaded.video.adjust.contrast, -100);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn target_peak_above_203_loads_as_203() {
+        // 開發版（批次 5 起）存得下 400、1000 nits，超過 203 時 vo_gpu 把亮部裁成白色：讀檔時拉回 203
+        let dir = temp_dir("peak-clamp");
+        let path = dir.join("settings.json");
+        for (saved, loaded) in [(400, 203), (1000, 203), (203, 203), (150, 150), (100, 100), (50, 100)] {
+            std::fs::write(
+                &path,
+                format!(r#"{{"volume": 70.0, "video": {{"tone": {{"target_peak": {saved}, "curve": "hable"}}}}}}"#),
+            )
+            .unwrap();
+            let s = Settings::load_from(path.clone());
+            assert_eq!(s.video.tone.target_peak, Some(loaded), "存的是 {saved}");
+            assert_eq!(
+                s.video.tone.curve,
+                crate::picture::ToneCurve::Hable,
+                "同一組的其他項目照讀"
+            );
+            assert_eq!(s.volume, 70.0);
+        }
+        // 一項讀不懂、走逐項讀取時也一樣會拉回（整理在所有讀檔方式之後）
+        std::fs::write(
+            &path,
+            r#"{"video": {"deband": "ultra", "tone": {"target_peak": 1000}}}"#,
+        )
+        .unwrap();
+        assert_eq!(Settings::load_from(path.clone()).video.tone.target_peak, Some(203));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gamut_desaturate_loads_as_auto_and_keeps_the_rest() {
+        // 「降低飽和度」拿掉了（vo_gpu 跟自動是同一段程式）：開發版存的值讀成自動，畫質的其他設定不能跟著不見
+        use crate::picture::{Gamut, Quality, Strength, ToneCurve};
+        let dir = temp_dir("gamut-desaturate");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"volume": 55.0, "video": {"deband": "strong", "quality": "high", "sharpen": "light",
+                "tone": {"gamut": "desaturate", "curve": "mobius", "target_peak": 150, "compute_peak": false}}}"#,
+        )
+        .unwrap();
+        let mut s = Settings::load_from(path.clone());
+        assert_eq!(s.video.tone.gamut, Gamut::Auto);
+        assert_eq!(s.video.tone.curve, ToneCurve::Mobius);
+        assert_eq!(s.video.tone.target_peak, Some(150));
+        assert!(!s.video.tone.compute_peak);
+        assert_eq!(s.video.deband, Strength::Strong);
+        assert_eq!(s.video.sharpen, Strength::Light);
+        assert_eq!(s.video.quality, Quality::High);
+        assert_eq!(s.volume, 55.0);
+        // 存檔寫的是新的名稱
+        s.video.tone.gamut = Gamut::Clip;
+        s.save().unwrap();
+        s.video.tone.gamut = Gamut::Auto;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("desaturate"), "{text}");
+        assert_eq!(Settings::load_from(path).video.tone.gamut, Gamut::Auto);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
