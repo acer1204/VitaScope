@@ -6,7 +6,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 > 名稱取自 1896 年第一台在戲院成功商業放映的放映機 Vitascope。
 > 「影戲」是清末民初對電影的稱呼。姊妹作是看圖軟體 [Zoetrope 走馬燈](https://github.com/acer1204/Zoetrope)。
 
-目前進度：**L1 基本播放、L2 日常主力已完成**（v0.2.0），接下來是 L3 進階調校；做到哪裡見下方的[功能清單](#功能清單)，完整規劃見 [ROADMAP.md](ROADMAP.md)。
+目前進度：**L1 基本播放、L2 日常主力已完成**（v0.2.0），L3 進階調校進行中（流暢播放、畫質與音效的調校已在 v0.3.0 發佈）；做到哪裡見下方的[功能清單](#功能清單)，完整規劃見 [ROADMAP.md](ROADMAP.md)。
 
 ## 下載
 
@@ -26,7 +26,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   Windows 不允許程式自己設成預設播放器：到「設定 → 應用程式 → 預設應用程式」選影戲，或在影戲的「設定 → 系統」按「選擇預設播放器…」。
 - **macOS**：沒有經過 Apple 公證，第一次開啟會被擋下。請到「系統設定」→「隱私權與安全性」，在下方按「仍要打開」；
   也可以在終端機執行 `xattr -dr com.apple.quarantine /Applications/VitaScope.app`。
-- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2 與 libxkbcommon-x11（一般桌面都有；AppImage 已內含）。
+- **Linux**：需要 glibc 2.39 以上（例如 Ubuntu 24.04、Debian 13 以後、目前的 Fedora）；tar.gz 另外需要 libmpv.so.2（mpv 0.37 以上）與 libxkbcommon-x11（一般桌面都有；AppImage 已內含）。
   AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）與 OpenSSL 3（libssl3，桌面系統都有）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
@@ -119,14 +119,38 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] 安裝程式：Windows 安裝檔（不需要系統管理員）、macOS `.dmg`、Linux AppImage
 - [x] 「通用」格式三平台全數通過自動測試
 
-### L3 進階調校（未開始）
+### L3 進階調校（進行中）
 
-- [ ] 影像調整：亮度、對比、飽和度、色相、Gamma
-- [ ] 去交錯、去色帶
-- [ ] 縮放演算法選擇
-- [ ] GLSL 著色器（Anime4K、FSRCNNX、銳化）
-- [ ] HDR → SDR 色調映射選項
-- [ ] 選擇音訊輸出裝置、等化器、音量正規化 / 夜間模式、聲道混音、音量超過 100%、音訊直通
+- [x] **流暢播放**：依視窗所在螢幕的實際更新率（例如 119.88 Hz）微調播放速度，每格影像顯示的次數固定，
+  平移畫面不會忽快忽慢；使用電池時自動暫停。在「設定 → 播放」或右鍵選單「畫質」打開（目前預設關閉）。
+  Wayland 偵測不到螢幕更新率，維持一般播放
+- [x] 一般播放時畫面輸出不再卡住介面（以前介面每秒只更新 24 次左右，跟著影片的格率）
+- [x] 影像調整：亮度、對比、飽和度、色相、Gamma（W/E、R/T、Y/U、I/O 加減，Q 還原；Alt（Option）+ G 控制面板有滑桿）。
+  換檔案時沿用，預設不記到下次開啟（控制面板或「設定 → 畫質」可以勾「下次開啟時沿用這些調整」）；
+  截圖（Ctrl（⌘）+ E）存的是原始畫面，不含影像調整
+- [x] 去交錯、去色帶、銳化：去交錯預設「自動」（只處理電視錄影、DVD 之類的交錯式影片），右鍵選單會顯示目前有沒有在去交錯；
+  去色帶、銳化各有輕微 / 中等 / 強。在右鍵選單「畫質」、控制面板與「設定 → 畫質」切換，設定會記住。
+  Linux tar.gz 用的系統 libmpv 較舊時（例如 Ubuntu 24.04 的 0.37）沒有「自動」、預設關閉，也看不到目前有沒有在去交錯
+- [x] 縮放演算法選擇：快速 / 標準（mpv 預設）/ 高品質（放大用 ewa_lanczossharp），放大、縮小、色度也可以個別指定
+- [x] 像素著色器（GLSL）：用自己的 .glsl 檔案（例如 Anime4K、FSRCNNX；影戲不附）組成「組合」，在右鍵選單「畫質 ▸ 像素著色器」切換，
+  「設定 → 畫質」新增、排序、改名；換檔案時沿用。PotPlayer / MPC 的 .hlsl 不能用（加入時會說明）；套用後畫不出來（例如編譯失敗）
+  會自動改回之前用的組合（剛啟動時、或改了使用中組合的檔案時改成不使用）。截圖存的是原始畫面，不含像素著色器與影像調整
+- [x] HDR → SDR 色調映射選項：曲線（BT.2390、Hable、Mobius、Reinhard…）、目標亮度（100–203 nits，只影響 HDR 影片）、
+  色域對應（自動 / 裁切）、動態峰值偵測（顯示卡驅動的 OpenGL 要有 GLSL 4.20 與 compute shader 才顯示；NVIDIA 顯示卡的 Windows、macOS 目前沒有）。
+  杜比視界 Profile 5 顏色無法正確顯示，開檔時提示。
+  軟體繪圖（虛擬機的 llvmpipe 之類）不支援去色帶、銳化與縮放演算法，選單上會停用；HDR 色調映射照常
+- [x] 音訊輸出裝置：在右鍵選單「音效 ▸ 輸出裝置」或「設定 → 音效」選擇（存下的裝置拔掉時暫時用預設裝置，插回來自動切回去）；
+  獨佔模式（Windows、macOS；Linux 用 PipeWire 時）
+- [x] 十段等化器（平坦、重低音、人聲、古典、搖滾、流行、爵士、電子、高音加強、自訂；自動防止破音）：右鍵選單「音效」、
+  控制面板（Alt（Option）+ G）的「音效」分頁有十段滑桿，邊聽邊調
+- [x] 音量平衡：夜間模式（小聲變大、大聲變小）、人聲平衡、音量平均（右鍵選單「音效 ▸ 音量平衡」）
+- [x] 聲道混音：多聲道轉成立體聲（5.1／7.1 → 2.0，可以選「混音時避免破音」）
+- [x] 音量放大超過 100%：「音效 ▸ 音量上限」130 / 150 / 200%，超過 100% 經過限幅器、不會爆音（開啟時音量最多從 100% 開始）
+- [x] 音訊直通：AC-3、E-AC-3、DTS、DTS-HD、TrueHD 不解碼，經 HDMI、光纖送到擴大機（「設定 → 音效」選格式）；
+  直通中音量、靜音由擴大機處理、不能變速（開始直通時改回 1×；改回正常速度可以），音量鍵、靜音鍵、變速鍵會提示，
+  等化器、音量平衡、限幅器也不經過。
+  Windows、macOS 直通時會獨佔這個裝置（其他程式暫時沒有聲音），DTS-HD、TrueHD 需要 HDMI 支援 HBR；
+  Linux 要選 HDMI / S/PDIF（IEC958）的裝置。Linux tar.gz 用的系統 libmpv 0.40 以前，播放中切換要到下一個檔案才生效
 - [ ] 自訂快捷鍵
 - [ ] 書籤
 - [ ] 開啟網址（HTTP、HLS、DASH）、網站影片（yt-dlp）
@@ -162,10 +186,10 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | ↑ / ↓ | 音量 ±5 |
 | M | 靜音 |
 | F、Enter、雙擊畫面 | 全螢幕 |
-| Esc | 離開全螢幕 |
+| Esc | 離開全螢幕（控制面板、設定、媒體資訊開著時先關掉它們） |
 | Ctrl（macOS：⌘）+ O | 開啟檔案 |
 | F1 | 關於 / 檢查更新 |
-| F5 | 設定（介面語言、硬體解碼、跳轉秒數、截圖資料夾…） |
+| F5 | 設定（介面語言、硬體解碼、跳轉秒數、畫質、音效、截圖資料夾…） |
 | 單擊畫面 | 播放 / 暫停 |
 | PgUp / PgDn | 上一個 / 下一個檔案（同資料夾的影片，依檔名排序；播完自動接下一個） |
 | Ctrl（macOS：⌘）+ PgUp / PgDn | 上一章 / 下一章 |
@@ -180,6 +204,9 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | Alt（Option）+ K | 順時針旋轉 90° |
 | Ctrl（⌘）+ Z / P | 左右翻轉 / 上下翻轉 |
 | Alt（Option）+ Backspace | 畫面調整全部還原 |
+| W / E、R / T、Y / U、I / O | 亮度、對比、飽和度、色相 −1 / +1（按住連續調整） |
+| Q | 影像調整（亮度、對比…）全部還原 |
+| Alt（macOS：Option）+ G | 控制面板：「畫質」分頁（影像調整、去交錯、去色帶、銳化）、「音效」分頁（十段等化器、音量平衡、轉成立體聲、音量上限） |
 | Ctrl（⌘）+ T | 視窗置頂 |
 | F6 | 播放清單（清單開著時 Delete 移除選取的項目；macOS 也可以用 Backspace） |
 | Ctrl + F1（macOS：⌘ + I），或 Ctrl + I | 媒體資訊 |
@@ -191,7 +218,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | 在畫面上按右鍵 | 選單：最近開啟的檔案、播放速度、章節、音軌、字幕… |
 
 字幕選單另有「第二字幕」「字幕延遲」「字幕編碼」「載入字幕檔…」「字幕外觀…」；音軌選單有「音訊延遲」「載入音軌檔…」。
-右鍵選單的「畫面」有畫面比例、裁切、縮放、移動、旋轉、翻轉與重設；「擷取畫面」可以另存新檔、選擇含不含字幕、開啟或變更截圖資料夾。
+右鍵選單的「畫面」有畫面比例、裁切、縮放、移動、旋轉、翻轉與重設；「畫質」有影像調整（控制面板）、去交錯、去色帶、銳化、
+縮放演算法、像素著色器、HDR 色調映射與流暢播放；「音效」有等化器、音量平衡、轉成立體聲、音量上限、輸出裝置（含獨佔模式）與音訊直通；「擷取畫面」可以另存新檔、選擇含不含字幕、開啟或變更截圖資料夾。
 播放清單開著時，拖放進來的檔案會加到清單最後；清單上可以按右鍵複製路徑。
 
 ## 支援格式
@@ -254,6 +282,13 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/instance.rs` | 單一執行個體：同時啟動好幾個程式，檔案都送到同一個視窗；第一個關掉後由下一個接手 |
 | `tests/mediainfo.rs`、`tests/thumbs.rs` | 媒體資訊、進度條預覽縮圖 |
 | `tests/hwdec.rs` | 硬體解碼確實走 GPU，Hi10P 自動退回軟解 |
+| `tests/picture.rs` | 畫質選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項、去交錯「自動」只處理交錯的影片、目標亮度只對 HDR 影片送；像素著色器的清單換檔照舊、翻轉不帶到下一個檔案 |
+| `tests/picture_shot.rs` | 影像調整的截圖檢查：亮度 +50 時畫面確實變亮；HDR10 影片在每種色調映射曲線下都不是黑的、目標亮度 100 nits 比自動亮；SDR 影片的畫面不受目標亮度影響（逐像素比較）；反相的像素著色器確實畫在畫面上、壞掉的自動還原（會開視窗，預設不跑） |
+| `tests/sound.rs` | 音效選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項；AC-3、E-AC-3、DTS、TrueHD 實際直通；等化器、夜間模式、音量放大、轉成立體聲用 `ao=pcm` 寫出 WAV 實際量測；等化器與音量放大在跳轉後照樣有效 |
+| `tests/async_opts.rs` | 非同步設定 mpv 選項（回覆依種類分派、先後順序、失敗時的處理）、偵測播放引擎的功能、L3 加的播放狀態 |
+| `tests/engine_build.rs` | 播放引擎的建置內容：用到的解碼器、分離器、協定、濾鏡都在，L3 元件（DASH、片段輸出、轉 GIF、音訊濾鏡）實際可用 |
+| `tests/pacing.rs` | 流暢播放在播放引擎這一層的行為（`vo-null-fps` 當假的螢幕更新率） |
+| `tests/pacing_window.rs` | 流暢播放與畫面輸出節奏的實機量測（會開全螢幕視窗，預設不跑；見下方） |
 
 影片畫面的渲染可以用自動截圖驗證：
 
@@ -261,12 +296,41 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 vitascope 影片.mp4 --shot 截圖.png [--shot-delay 秒] [--fullscreen]
 ```
 
-排查顯示或播放問題時可以用兩個環境變數：
+影像調整與 HDR 的截圖檢查（亮度 +50 要比沒有調整亮，一般流程與軟體繪圖的簡化流程各比一次；HDR10 影片每種色調映射曲線各截一次、
+目標亮度 100 nits 要比自動亮、SDR 影片的畫面不受目標亮度影響；反相的像素著色器要讓畫面變亮、編譯不過的要自動還原；
+每次會在螢幕上開視窗約 5 秒）：
+
+```bash
+cargo test --test picture_shot -- --ignored --nocapture --test-threads=1
+```
+
+手邊有真正的 HDR 影片（HDR10、HLG、杜比視界…，不放進專案）時，把資料夾設成 `VITASCOPE_HDR_SAMPLES`，
+`tests/ui.rs` 的 `real_hdr_clips` 檢查媒體資訊的動態範圍與杜比視界 Profile 5 的提示，
+`tests/picture_shot.rs` 的 `real_hdr10_clip_target_peak` 比較目標亮度 100 nits 與自動的畫面（檔名見測試裡的清單）：
+
+```bash
+VITASCOPE_HDR_SAMPLES=~/hdr cargo test --test ui -- --ignored --nocapture real_hdr_clips
+VITASCOPE_HDR_SAMPLES=~/hdr cargo test --test picture_shot -- --ignored --nocapture real_hdr10_clip_target_peak
+```
+
+排查顯示或播放問題時可以用這些環境變數：
 
 | 環境變數 | 作用 |
 |---|---|
-| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v` |
-| `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"` |
+| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v`。`VITASCOPE_DEBUG=pacing` 另外印出流暢播放的決定（螢幕更新率、電源、套用的設定），並每 10 秒印一次畫面輸出的統計（render 花的時間、等影格的時間、每格重繪幾次、交出影格比預定時間早或晚多少、顯示卡什麼時候畫完影格）、每秒印一次影像與聲音差多少（avsync） |
+| `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"`；指定了 `video-sync` 或 `display-fps-override` 時流暢播放不會去改它們 |
+| `VITASCOPE_PACING=off` | 流暢播放完全不動作（跟沒有這個功能時一樣） |
+| `VITASCOPE_PACING=block` | 畫面輸出照以前的做法：每格在介面的執行緒上等到影格的預定時間（可以跟 `off` 一起用，以逗號隔開） |
+| `VITASCOPE_PACING=resync` | 流暢播放中介面停頓過之後，不等 mpv 自己追上，一律暫時改用一般播放追上聲音（實機測試這條路用） |
+
+流暢播放的實機量測（全螢幕播 1080p、4K 10-bit 平移影片，從 mpv 的記錄算每格顯示幾次螢幕更新；每次會在螢幕上開視窗約 15 秒，
+一般播放的比較（介面閒著、一直重畫、一直重畫又播 4K，以前與現在的畫面輸出各三次）共 18 次）：
+
+```bash
+python scripts/gen_samples.py --tier pacing
+cargo test --test pacing_window -- --ignored --nocapture --test-threads=1
+python scripts/pacing_stats.py <暫存資料夾>/vitascope-pacing-window/display
+```
 
 Windows 的發佈版沒有主控台視窗，要把輸出存到檔案才看得到。請在「命令提示字元」（cmd）執行：
 
@@ -300,11 +364,17 @@ src/
 ├─ main.rs       進入點、命令列參數（`vitascope [檔案…] [--fullscreen] [--new-window] [--version]`；
 │                另有開發用的 `--shot`、解除安裝程式用的 `--unregister-associations`）
 ├─ app.rs        播放器視窗：控制列、快捷鍵、全螢幕、OSD
-├─ app/          視窗的各個部分：播放清單面板、設定視窗、媒體資訊、擷取畫面、進度條預覽縮圖
+├─ app/          視窗的各個部分：播放清單面板、設定視窗、媒體資訊、擷取畫面、進度條預覽縮圖、
+│                控制面板、「畫質」「音效」選單、像素著色器、流暢播放
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
 ├─ player.rs     播放器核心：mpv 屬性與事件 → Rust 狀態（介面和測試共用）
 ├─ mpv/          libmpv 的安全包裝（client API、render API：OpenGL 與軟體繪圖）
 ├─ geometry.rs   畫面調整：長寬比、裁切、縮放、旋轉、翻轉
+├─ picture.rs    畫質：影像調整、去交錯、去色帶、銳化、縮放演算法、HDR 色調映射 → mpv 選項；picture/shader.rs 像素著色器組合
+├─ sound.rs      音效：輸出裝置、獨佔模式、轉成立體聲、音訊直通、等化器與音量平衡的濾鏡鏈、音量放大
+├─ pacing.rs     流暢播放的決策（螢幕更新率、電源…）、畫面輸出取影格的時機
+├─ screens.rs    螢幕清單、精確的更新率（Windows、macOS、X11）、遠端桌面
+├─ power.rs      接著電源還是用電池（使用電池時暫停流暢播放）
 ├─ subs.rs       外掛字幕：尋找、編碼偵測、繁簡判斷
 ├─ playlist.rs   播放清單：同資料夾的檔案、自然排序、編輯
 ├─ m3u.rs        播放清單檔（.m3u / .m3u8）的讀寫、下次開啟時還原

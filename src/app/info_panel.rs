@@ -37,15 +37,28 @@ impl VitascopeApp {
         }
         let stale = lang_changed || self.info_cache.as_ref().is_none_or(|c| c.read_at.elapsed() >= REFRESH);
         if stale {
+            // 輸出裝置播放中也會換（選單、設定頁、拔掉 / 插回來）：已經在觀察裝置清單時不用再列舉，每次都重讀
+            if self.audio_device.is_some() && self.player.state.audio_devices.is_some() {
+                self.audio_device = mediainfo::audio_device_name(&self.player);
+            }
+            let live = mediainfo::read_live(&self.player);
+            // 「使用中」的說明（每格幾次更新、影片快多少）也用這次讀到的數字
+            self.set_sync_numbers(&live);
             self.info_cache = Some(InfoCache {
                 info: mediainfo::read(&self.player, self.audio_device.clone()),
-                live: mediainfo::read_live(&self.player),
+                live,
                 read_at: Instant::now(),
                 lang,
             });
         }
         let cache = self.info_cache.as_ref().expect("剛讀過");
-        mediainfo::sections(&cache.info, &cache.live)
+        let mut sections = mediainfo::sections(&cache.info, &cache.live);
+        // 螢幕更新率、電源、流暢播放的狀態（跟著每一幀更新，不用快取），加上 mpv 的顯示同步數字（每秒讀一次）
+        let mut smooth = self.pacing_status().info_lines();
+        smooth.extend(mediainfo::sync_lines(&cache.live));
+        smooth.extend(self.render_line());
+        sections.push((crate::tr!("播放流暢度", "Smoothness"), smooth));
+        sections
     }
 
     /// 畫在影片畫面的左上角（不接收滑鼠，點下去還是暫停 / 播放）

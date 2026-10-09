@@ -4,7 +4,7 @@
 //! 每一列是同一個能點也能拖的元件（`Ui::dnd_drag_source` 一按下就算開始拖，點擊會被吃掉）；
 //! 放下的位置看滑鼠在第幾列之間（列與列的空隙也算），拖到上下邊緣會自動捲動。
 
-use super::{ACCENT, VitascopeApp, file_name, icon_button};
+use super::{ACCENT, DialogKind, Pick, VitascopeApp, file_name, icon_button};
 use crate::formats;
 use crate::m3u;
 use crate::playlist::Playlist;
@@ -372,21 +372,16 @@ impl VitascopeApp {
         if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
             dialog = dialog.set_directory(dir);
         }
-        if let Some(mut files) = dialog.pick_files() {
-            crate::playlist::sort_by_name(&mut files);
-            self.add_to_playlist(files);
-        }
+        self.show_dialog(DialogKind::PlaylistAddFiles, Pick::Files, dialog);
+    }
+
+    fn add_folder_dialog(&mut self) {
+        let dialog = self.file_dialog().set_title(crate::tr!("加入資料夾", "Add folder"));
+        self.show_dialog(DialogKind::PlaylistAddFolder, Pick::Folder, dialog);
     }
 
     /// 加入資料夾：裡面的影音檔依檔名排序（網路磁碟上的大資料夾要掃一陣子，在背景掃）
-    fn add_folder_dialog(&mut self) {
-        let Some(dir) = self
-            .file_dialog()
-            .set_title(crate::tr!("加入資料夾", "Add folder"))
-            .pick_folder()
-        else {
-            return;
-        };
+    pub(super) fn add_folder(&mut self, dir: PathBuf) {
         let (tx, rx) = mpsc::channel();
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
@@ -416,14 +411,11 @@ impl VitascopeApp {
     }
 
     fn open_playlist_dialog(&mut self) {
-        if let Some(path) = self
+        let dialog = self
             .file_dialog()
             .set_title(crate::tr!("開啟播放清單檔", "Open playlist file"))
-            .add_filter(crate::tr!("播放清單", "Playlist"), formats::PLAYLIST)
-            .pick_file()
-        {
-            self.open_playlist_file(&path);
-        }
+            .add_filter(crate::tr!("播放清單", "Playlist"), formats::PLAYLIST);
+        self.show_dialog(DialogKind::PlaylistOpen, Pick::File, dialog);
     }
 
     /// 開啟播放清單檔：換成檔案裡的清單，從第一個開始播
@@ -464,15 +456,6 @@ impl VitascopeApp {
 
     fn save_playlist_dialog(&mut self) {
         let Some(list) = &self.playlist else { return };
-        let entries: Vec<m3u::Entry> = list
-            .items()
-            .iter()
-            .map(|p| m3u::Entry {
-                path: p.clone(),
-                title: None,
-                duration: None,
-            })
-            .collect();
         // 第一個篩選條件的副檔名是預設的（Windows）
         let mut dialog = self
             .file_dialog()
@@ -483,7 +466,21 @@ impl VitascopeApp {
         if let Some(dir) = list.items().first().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
         }
-        let Some(mut path) = dialog.save_file() else { return };
+        self.show_dialog(DialogKind::PlaylistSave, Pick::Save, dialog);
+    }
+
+    /// 播放清單存到 `path`（存檔對話框選好的；存的是那時清單裡的）
+    pub(super) fn save_playlist(&mut self, mut path: PathBuf) {
+        let Some(list) = &self.playlist else { return };
+        let entries: Vec<m3u::Entry> = list
+            .items()
+            .iter()
+            .map(|p| m3u::Entry {
+                path: p.clone(),
+                title: None,
+                duration: None,
+            })
+            .collect();
         // macOS / Linux 的對話框不會自己補副檔名
         if !formats::is_playlist(&path) {
             path.set_extension("m3u8");

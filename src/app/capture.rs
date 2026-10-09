@@ -1,6 +1,6 @@
 //! 擷取畫面（Ctrl+E 存檔、Ctrl+C 複製到剪貼簿、右鍵選單「擷取畫面」）。截圖的處理見 `screenshot.rs`。
 
-use super::{Action, VitascopeApp, file_name, menu_item};
+use super::{Action, DialogKind, Pick, VitascopeApp, file_name, menu_item};
 use crate::screenshot::{self, Done, Fixup, Target};
 use eframe::egui;
 use std::path::PathBuf;
@@ -8,6 +8,12 @@ use std::sync::mpsc;
 
 /// 截圖用的非同步指令編號從這裡開始（跟其他非同步指令分開）
 const SHOT_ID_BASE: u64 = 1 << 40;
+
+/// 第 n 張截圖的指令編號：流水號只用低 40 位元，編號一定在 [1<<40, 1<<41) 之間，
+/// 不會跑進設定選項用的那一段（`player::ASYNC_BASE` = 1<<44 起算）
+fn shot_id(n: u64) -> u64 {
+    SHOT_ID_BASE | (n & (SHOT_ID_BASE - 1))
+}
 
 /// 截圖相關的狀態
 pub(super) struct Capture {
@@ -119,7 +125,7 @@ impl VitascopeApp {
         let tmp = match &target {
             Target::File { tmp, .. } | Target::Clipboard { tmp } => tmp.to_string_lossy().into_owned(),
         };
-        let id = SHOT_ID_BASE + n;
+        let id = shot_id(n);
         let wanted = self.settings.screenshot_subtitles;
         let subtitles = fix.keeps_subtitles(wanted);
         match self.player.screenshot_to_file(id, &tmp, subtitles) {
@@ -189,43 +195,51 @@ impl VitascopeApp {
         if !st.loaded || !st.has_video() {
             return;
         }
-        // 對話框開著時 mpv 照樣在播：先暫停，存的才是選「另存新檔」時的畫面（檔名的時間也一樣）
-        let was_playing = !st.paused;
-        if was_playing {
-            let _ = self.player.set_pause(true);
+        // 已經開著別的對話框（Linux 的對話框不一定擋得住主視窗）：不開
+        let kind = DialogKind::ScreenshotSaveAs;
+        if self.refuse_second_dialog(kind) {
+            return;
         }
+        // 對話框開著時 mpv 照樣在播：先暫停，存的才是選「另存新檔」時的畫面（檔名的時間也一樣）。
+        // 所以這個對話框照樣在介面的執行緒上開（開著時本來就暫停）
+        let was_playing = self.pause_for_dialog();
         let time = self.player.get_f64("time-pos").unwrap_or(self.player.state.time_pos);
         let name = screenshot::file_name(self.player.state.path.as_deref().unwrap_or_default(), time);
-        let chosen = self
+        let dialog = self
             .file_dialog()
             .set_title(crate::tr!("另存截圖", "Save screenshot as"))
             .add_filter(crate::tr!("PNG 圖片", "PNG image"), &["png"])
             .set_directory(self.screenshot_dir())
-            .set_file_name(&name)
-            .save_file();
-        if let Some(mut path) = chosen {
-            if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
-                path.set_extension("png");
-            }
-            // mpv 收到指令時就取下畫面（之後才在背景編碼），接著繼續播沒關係
-            self.take_screenshot(ShotDest::File(path));
+            .set_file_name(&name);
+        let chosen = self.dialog_runner(kind, Pick::Save, dialog)();
+        if let Some(paths) = chosen.filter(|p| !p.is_empty()) {
+            self.on_dialog_result(kind, paths);
         }
-        if was_playing {
-            let _ = self.player.set_pause(false);
+        self.resume_after_dialog(was_playing);
+    }
+
+    /// 截圖存到 `path`（另存新檔對話框選好的；沒有 .png 就補上）
+    pub(super) fn save_screenshot_as(&mut self, mut path: PathBuf) {
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+            path.set_extension("png");
         }
+        // mpv 收到指令時就取下畫面（之後才在背景編碼），接著繼續播沒關係
+        self.take_screenshot(ShotDest::File(path));
     }
 
     pub(super) fn choose_screenshot_dir(&mut self) {
-        if let Some(dir) = self
+        let dialog = self
             .file_dialog()
             .set_title(crate::tr!("選擇截圖資料夾", "Choose the screenshot folder"))
-            .set_directory(self.screenshot_dir())
-            .pick_folder()
-        {
-            self.osd(crate::tf!("截圖資料夾：{}", "Screenshot folder: {}", dir.display()));
-            self.settings.screenshot_dir = Some(dir);
-            self.save_settings();
-        }
+            .set_directory(self.screenshot_dir());
+        self.show_dialog(DialogKind::ScreenshotDir, Pick::Folder, dialog);
+    }
+
+    /// 截圖資料夾改成 `dir`（資料夾對話框選好的）
+    pub(super) fn set_screenshot_dir(&mut self, dir: PathBuf) {
+        self.osd(crate::tf!("截圖資料夾：{}", "Screenshot folder: {}", dir.display()));
+        self.settings.screenshot_dir = Some(dir);
+        self.save_settings();
     }
 
     /// 右鍵選單「擷取畫面」
@@ -279,3 +293,24 @@ impl VitascopeApp {
 /// 截圖的快捷鍵說明
 pub(super) const SHOT_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+E" } else { "Ctrl+E" };
 pub(super) const COPY_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
+
+#[cfg(test)]
+mod tests {
+    use super::{SHOT_ID_BASE, shot_id};
+    use crate::player::{ASYNC_BASE, AsyncKey, async_key};
+
+    #[test]
+    fn screenshot_ids_never_look_like_option_replies() {
+        for n in [1, 2, 1000, (1 << 40) - 1, 1 << 40, (1 << 44) + 7, u64::MAX] {
+            let id = shot_id(n);
+            assert!((SHOT_ID_BASE..SHOT_ID_BASE << 1).contains(&id), "{n:#x} → {id:#x}");
+            assert!(id < ASYNC_BASE);
+            assert_eq!(async_key(id), None, "{n:#x} → {id:#x}");
+        }
+        // 平常的編號跟以前一樣
+        assert_eq!(shot_id(3), SHOT_ID_BASE + 3);
+        // 反過來：設定選項的編號（一定 ≥ ASYNC_BASE）也不在截圖那一段
+        const { assert!(ASYNC_BASE >= SHOT_ID_BASE << 1) };
+        assert!(AsyncKey::ALL.iter().all(|k| (*k as u64) < 1 << 20));
+    }
+}

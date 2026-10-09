@@ -43,13 +43,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      # libmpv（播放引擎）+ FFmpeg（產生測試樣本）
+      # libmpv（播放引擎）+ FFmpeg（產生測試樣本）+ 截圖檢查用的虛擬螢幕
       - name: 安裝 libmpv 與 FFmpeg（Linux）
         if: runner.os == 'Linux'
         # 套件伺服器偶爾卡住，預設要等 6 小時才會逾時
         timeout-minutes: 10
         run: |
           sudo apt-get update
+          sudo apt-get install -y xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1
           if [ "$VITASCOPE_LIBMPV" = vendor ]; then
             bash scripts/fetch-libmpv.sh
             sudo apt-get install -y ffmpeg   # 也帶進 libva2、libpulse0
@@ -84,6 +85,13 @@ jobs:
         # 播放引擎卡住時（例如 DASH 分離器無限循環）測試程式會一直等，不要拖到整個工作逾時
         timeout-minutes: 30
         run: cargo test --all-targets -- --nocapture
+
+      # 真的開視窗截圖：亮度 +50 時畫面要比較亮（系統的 libmpv、本專案建置的各跑一次；
+      # llvmpipe 會自動改用軟體繪圖的簡化流程，兩種流程都比）
+      - name: 影像調整的截圖檢查（Linux，虛擬螢幕）
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: xvfb-run -a -s "-screen 0 1280x800x24" cargo test --test picture_shot -- --ignored --nocapture --test-threads=1
 
       - name: 建置發佈版
         run: cargo build --release

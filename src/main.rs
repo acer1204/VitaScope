@@ -68,7 +68,21 @@ fn parse_args() -> (Launch, bool) {
             _ => launch.files.push(PathBuf::from(arg)),
         }
     }
-    launch.autoshot = shot.map(|p| AutoShot::new(p, Duration::from_secs_f64(delay)));
+    // 流暢播放的實機測試：VITASCOPE_TEST_MINIMIZE=3,6 截圖前縮到最小再還原；
+    // VITASCOPE_TEST_BUSY_UI=1 介面一直重畫（模擬滑鼠在視窗上移動）；VITASCOPE_TEST_STALL=3,10 第 3 秒讓介面停 10 秒
+    //（像開著檔案對話框）。只跟 --shot 一起用
+    let minimize = std::env::var("VITASCOPE_TEST_MINIMIZE").unwrap_or_default();
+    let busy_ui = std::env::var_os("VITASCOPE_TEST_BUSY_UI").is_some_and(|v| v == "1");
+    launch.autoshot = shot.map(|p| {
+        AutoShot::new(p, Duration::from_secs_f64(delay))
+            .minimize_at(vitascope::autoshot::parse_minimize(&minimize))
+            .busy_ui(busy_ui)
+            .stall_at(vitascope::autoshot::parse_stall(
+                &std::env::var("VITASCOPE_TEST_STALL").unwrap_or_default(),
+            ))
+    });
+    // 流暢播放出問題時回到以前的做法：VITASCOPE_PACING=off（只在啟動時讀一次）
+    launch.pacing = vitascope::pacing::Overrides::from_env();
     // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
     if launch.autoshot.is_none() {
         launch.history = History::load();
@@ -130,10 +144,17 @@ fn main() -> eframe::Result {
         }
     }
     let wake = egui_ctx.clone();
+    let pace = !launch.pacing.block;
     let player = match Player::new(Options {
         wakeup: Some(Box::new(move || {
             if let Some(ctx) = wake.get() {
-                ctx.request_repaint();
+                if pace {
+                    // 只要一輪（`request_repaint()` 每次畫兩輪）：一般播放時 mpv 每格都有事件（播放位置），
+                    // 第二輪只是再看一次還沒到時間的影格。延遲不是 0 就只畫一輪，扣掉 predicted_dt 後還是馬上畫
+                    ctx.request_repaint_after_for(std::time::Duration::from_nanos(1), egui::ViewportId::ROOT);
+                } else {
+                    ctx.request_repaint();
+                }
             }
         })),
         hwdec: if settings.hwdec { "auto-safe" } else { "no" }.into(),
@@ -178,6 +199,11 @@ fn main() -> eframe::Result {
         viewport,
         // mpv 的 render API 只支援 OpenGL
         renderer: eframe::Renderer::Glow,
+        // 顯示器同步靠 swap 等垂直同步；不能關
+        glow_options: eframe::egui_glow::GlowConfiguration {
+            vsync: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

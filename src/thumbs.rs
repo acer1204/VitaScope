@@ -354,7 +354,7 @@ fn dec_params(mpv: &Mpv) -> Option<(i64, i64, i64)> {
 /// 緩衝區（RGBX）→ 縮圖（RGBA、不透明、轉正）
 fn to_thumb(file: u64, bucket: u32, (w, h): (usize, usize), rotate: i64, buf: &[u8]) -> Thumb {
     let mut rgba = buf[..w * h * 4].to_vec();
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         p[3] = 255;
     }
     let img = crate::screenshot::Image { w, h, rgba }.fixed(crate::screenshot::Fixup {

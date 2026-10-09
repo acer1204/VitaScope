@@ -1,6 +1,6 @@
 [package]
 name = "vitascope"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "影戲 — 跨平台影片播放器：libmpv 引擎 + egui 介面"
 authors = ["acer1204"]
@@ -40,15 +40,20 @@ ureq = "3"
 # Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
 [target.'cfg(windows)'.dependencies]
 # 單一執行個體：具名管道、使用者 SID（只讓同一個使用者連線）、把前景交給已開啟的視窗
+# 流暢播放：螢幕的精確更新率（QueryDisplayConfig）、電源（GetSystemPowerStatus）
 windows-sys = { version = "0.61", features = [
+    "Win32_Devices_Display",
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
+    "Win32_System_Performance",
     "Win32_System_Pipes",
+    "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
@@ -68,16 +73,25 @@ x11-dl = "2.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-# 啟動時查有哪些螢幕（NSScreen）
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSScreen"] }
+# 啟動時查有哪些螢幕（NSScreen）；視窗所在螢幕的編號（NSView → NSWindow → NSScreen.deviceDescription）
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSGraphics",
+    "NSResponder",
+    "NSScreen",
+    "NSView",
+    "NSWindow",
+] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSAppleEventDescriptor",
     "NSAppleEventManager",
+    "NSDictionary",
     "NSEnumerator",
     "NSNotification",
     "NSString",
     "NSURL",
+    "NSValue",
 ] }
 
 [profile.release]

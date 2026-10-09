@@ -1,7 +1,15 @@
 //! 設定視窗（F5、右鍵選單「設定…」）：改了馬上生效、馬上存檔。
 
+use super::control_panel::adjust_locked_hover;
+use super::quality::{combo, dumb_hover, scaler_choice};
+use super::sound::auto_device_label;
 use super::{Action, VitascopeApp};
 use crate::i18n::{self, Lang};
+use crate::pacing::{Plan, SmoothMode};
+use crate::picture::{
+    ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover,
+};
+use crate::sound::{AUTO_DEVICE, AudioDevice, SPDIF_CODECS, spdif_label};
 use crate::{tf, tr};
 use eframe::egui::{self, Id, pos2, vec2};
 
@@ -11,6 +19,10 @@ pub(super) enum Page {
     #[default]
     General,
     Playback,
+    /// 畫質（影像調整、去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR）
+    Picture,
+    /// 音效（輸出裝置、獨佔模式、轉成立體聲、音訊直通）
+    Sound,
     Subtitles,
     Screenshot,
     System,
@@ -18,9 +30,11 @@ pub(super) enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 6] = [
+    const ALL: [Page; 8] = [
         Page::General,
         Page::Playback,
+        Page::Picture,
+        Page::Sound,
         Page::Subtitles,
         Page::Screenshot,
         Page::System,
@@ -31,6 +45,8 @@ impl Page {
         match self {
             Page::General => tr!("一般", "General"),
             Page::Playback => tr!("播放", "Playback"),
+            Page::Picture => tr!("畫質", "Video quality"),
+            Page::Sound => tr!("音效", "Sound"),
             Page::Subtitles => tr!("字幕", "Subtitles"),
             Page::Screenshot => tr!("截圖", "Screenshots"),
             Page::System => tr!("系統", "System"),
@@ -42,6 +58,8 @@ impl Page {
 impl VitascopeApp {
     pub(super) fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.settings_open {
+            // 下次打開時重新檢查著色器檔案（可能換過內容）
+            self.shader_info.clear();
             return;
         }
         let mut open = true;
@@ -72,6 +90,8 @@ impl VitascopeApp {
                             match self.settings_page {
                                 Page::General => changed |= self.general_page(ui, &mut action),
                                 Page::Playback => changed |= self.playback_page(ui),
+                                Page::Picture => self.picture_page(ui, &mut action),
+                                Page::Sound => self.sound_page(ui, &mut action),
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
                                 Page::System => changed |= self.system_page(ui),
@@ -266,7 +286,488 @@ impl VitascopeApp {
                 );
                 ui.end_row();
             });
+        ui.add_space(10.0);
+        self.smooth_section(ui);
         changed
+    }
+
+    /// 播放頁的「流暢播放」：兩個勾選對應三種設定
+    /// （「流暢播放」沒勾 = 關；「使用電池時暫停」勾 = 開但用電池時暫停、沒勾 = 一直開）。改了馬上生效、存檔
+    fn smooth_section(&mut self, ui: &mut egui::Ui) {
+        self.read_sync_numbers();
+        let mode = self.settings.smooth;
+        let locked = self.pacing_status().plan == Some(Plan::Untouched);
+        let (mut on, mut pause) = (mode != SmoothMode::Off, mode != SmoothMode::Always);
+        let mut toggled = false;
+        ui.add_enabled_ui(!locked, |ui| {
+            toggled |= ui
+                .checkbox(
+                    &mut on,
+                    tr!(
+                        "流暢播放（對齊螢幕更新率）",
+                        "Smooth playback (match the screen's refresh rate)"
+                    ),
+                )
+                .on_hover_text(super::tuning_menu::smooth_hover())
+                .on_disabled_hover_text(super::tuning_menu::smooth_locked_hover())
+                .changed();
+            ui.indent("smooth_battery", |ui| {
+                ui.add_enabled_ui(on, |ui| {
+                    toggled |= ui
+                        .checkbox(
+                            &mut pause,
+                            tr!("使用電池時暫停（省電）", "Pause on battery (saves power)"),
+                        )
+                        .changed();
+                });
+            });
+        });
+        ui.indent("smooth_status", |ui| {
+            ui.weak(self.pacing_status().describe());
+        });
+        if toggled {
+            self.set_smooth(match (on, pause) {
+                (false, _) => SmoothMode::Off,
+                (true, true) => SmoothMode::Auto,
+                (true, false) => SmoothMode::Always,
+            });
+        }
+    }
+
+    /// 畫質頁：影像調整（滑桿在控制面板裡），去交錯、去色帶、銳化、縮放演算法、像素著色器、HDR
+    fn picture_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        ui.strong(tr!("影像調整", "Image adjustments"));
+        ui.label(tf!(
+            "亮度、對比、飽和度、色相、Gamma：{}",
+            "Brightness, contrast, saturation, hue, gamma: {}",
+            self.adjust_summary()
+        ));
+        ui.add_space(4.0);
+        if ui.button(tr!("影像調整…", "Image adjustments…")).clicked() {
+            *action = Some(Action::ShowAdjustments);
+        }
+        let mut keep = self.settings.video.keep_adjust;
+        if ui
+            .checkbox(&mut keep, super::control_panel::keep_adjust_label())
+            .on_hover_text(tr!(
+                "沒勾的話，調整只在這次執行有效（換檔案時會沿用），下次開啟影戲時從 0 開始",
+                "If unticked, adjustments last only until VitaScope closes (they carry over to the next file) \
+                 and start from 0 next time"
+            ))
+            .changed()
+        {
+            self.set_keep_adjust(keep);
+        }
+        self.processing_sections(ui, action);
+    }
+
+    /// 畫質頁的去交錯、去色帶／銳化、縮放演算法、像素著色器、HDR → SDR（選了馬上套用、存檔）
+    fn processing_sections(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        let v = self.settings.video.clone();
+        let dumb = self.caps.dumb;
+        ui.add_space(12.0);
+        ui.strong(tr!("去交錯", "Deinterlacing"));
+        let deint = self.deint_effective();
+        let deint_locked = self.video_locked("deinterlace");
+        ui.horizontal(|ui| {
+            for d in self.deint_choices() {
+                let r = ui
+                    .add_enabled(!deint_locked, egui::RadioButton::new(deint == d, d.menu_label()))
+                    .on_disabled_hover_text(adjust_locked_hover());
+                if r.clicked() && deint != d {
+                    *action = Some(Action::SetDeinterlace(d));
+                }
+            }
+        });
+        if let Some(now) = self.deint_status() {
+            ui.weak(tf!("目前：{now}", "Now: {now}"));
+        }
+        ui.weak(tr!(
+            "電視錄影、DVD 之類的交錯式影片才需要；自動 = 只處理交錯的影片",
+            "Needed for interlaced video such as TV recordings and DVDs; Auto handles only interlaced video"
+        ));
+
+        ui.add_space(12.0);
+        ui.strong(tr!("去色帶／銳化", "Debanding / sharpening"));
+        egui::Grid::new("settings_deband_sharpen")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                if let Some(s) = combo(
+                    ui,
+                    tr!("去色帶", "Debanding"),
+                    "settings_deband",
+                    v.deband,
+                    &Strength::ALL,
+                    Strength::label,
+                    self.video_disabled(true, "deband"),
+                ) {
+                    *action = Some(Action::SetDeband(s));
+                }
+                ui.end_row();
+                if let Some(s) = combo(
+                    ui,
+                    tr!("銳化", "Sharpening"),
+                    "settings_sharpen",
+                    v.sharpen,
+                    &Strength::ALL,
+                    Strength::label,
+                    self.video_disabled(true, "sharpen"),
+                ) {
+                    *action = Some(Action::SetSharpen(s));
+                }
+                ui.end_row();
+            });
+
+        ui.add_space(12.0);
+        ui.strong(tr!("縮放演算法", "Scaling"));
+        ui.add_enabled_ui(!dumb, |ui| {
+            ui.horizontal(|ui| {
+                for q in Quality::ALL {
+                    if ui.selectable_label(v.quality == q, q.menu_label()).clicked() && v.quality != q {
+                        *action = Some(Action::SetQuality(q));
+                    }
+                }
+            });
+            egui::CollapsingHeader::new(tr!("進階", "Advanced"))
+                .id_salt("settings_scalers")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("settings_scalers_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            let ups: Vec<Option<Upscaler>> =
+                                std::iter::once(None).chain(Upscaler::ALL.map(Some)).collect();
+                            if let Some(s) = combo(
+                                ui,
+                                tr!("放大", "Upscaling"),
+                                "settings_scale",
+                                v.scale,
+                                &ups,
+                                |s| scaler_choice(s.map(Upscaler::label)),
+                                self.video_disabled(true, "scale"),
+                            ) {
+                                *action = Some(Action::SetUpscaler(s));
+                            }
+                            ui.end_row();
+                            let downs: Vec<Option<Downscaler>> =
+                                std::iter::once(None).chain(Downscaler::ALL.map(Some)).collect();
+                            if let Some(s) = combo(
+                                ui,
+                                tr!("縮小", "Downscaling"),
+                                "settings_dscale",
+                                v.dscale,
+                                &downs,
+                                |s| scaler_choice(s.map(Downscaler::label)),
+                                self.video_disabled(true, "dscale"),
+                            ) {
+                                *action = Some(Action::SetDownscaler(s));
+                            }
+                            ui.end_row();
+                            let chromas: Vec<Option<ChromaScaler>> =
+                                std::iter::once(None).chain(ChromaScaler::ALL.map(Some)).collect();
+                            if let Some(s) = combo(
+                                ui,
+                                tr!("色度", "Chroma"),
+                                "settings_cscale",
+                                v.cscale,
+                                &chromas,
+                                |s| scaler_choice(s.map(ChromaScaler::label)),
+                                self.video_disabled(true, "cscale"),
+                            ) {
+                                *action = Some(Action::SetChromaScaler(s));
+                            }
+                            ui.end_row();
+                        });
+                });
+        })
+        .response
+        .on_disabled_hover_text(dumb_hover());
+        if dumb {
+            ui.weak(dumb_hover());
+        }
+
+        self.shader_section(ui, action);
+
+        // HDR：色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以不看 dumb
+        ui.add_space(12.0);
+        ui.strong("HDR → SDR");
+        let tone = v.tone;
+        // 拖曳、打字時馬上生效，放開滑鼠或離開欄位時才存檔（跟播放頁一樣）
+        let commit =
+            |r: &egui::Response| r.drag_stopped() || r.lost_focus() || (r.changed() && !r.dragged() && !r.has_focus());
+        egui::Grid::new("settings_hdr")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                if let Some(c) = combo(
+                    ui,
+                    tr!("曲線", "Curve"),
+                    "settings_tone",
+                    tone.curve,
+                    &ToneCurve::ALL,
+                    ToneCurve::label,
+                    self.video_disabled(false, "tone-mapping"),
+                ) {
+                    *action = Some(Action::SetTone(c));
+                }
+                ui.end_row();
+                let name = ui
+                    .label(tr!("目標亮度", "Target brightness"))
+                    .on_hover_text(peak_hover());
+                let locked = self.video_locked("target-peak");
+                ui.horizontal(|ui| {
+                    let mut auto = tone.target_peak.is_none();
+                    let r = ui
+                        .add_enabled(!locked, egui::Checkbox::new(&mut auto, tr!("自動", "Auto")))
+                        .on_hover_text(peak_hover())
+                        .on_disabled_hover_text(adjust_locked_hover());
+                    if r.changed() {
+                        // 取消自動時從自動的值（203 nits，SDR 的參考白）開始：畫面不會突然變
+                        *action = Some(Action::SetTargetPeak((!auto).then_some(ToneSettings::AUTO_PEAK)));
+                    }
+                    let mut nits = tone.target_peak.unwrap_or(ToneSettings::AUTO_PEAK);
+                    let mut r = ui
+                        .add_enabled(
+                            !locked && !auto,
+                            egui::DragValue::new(&mut nits)
+                                .range(ToneSettings::MIN_PEAK..=ToneSettings::MAX_PEAK)
+                                .speed(5.0)
+                                .suffix(" nits"),
+                        )
+                        .on_hover_text(peak_hover())
+                        .labelled_by(name.id);
+                    if locked {
+                        r = r.on_disabled_hover_text(adjust_locked_hover());
+                    }
+                    if r.changed() && !auto {
+                        self.settings.video.tone.target_peak = Some(nits);
+                        self.apply_video();
+                    }
+                    if commit(&r) && !auto {
+                        self.save_settings();
+                    }
+                });
+                ui.end_row();
+                if let Some(g) = combo(
+                    ui,
+                    tr!("色域對應", "Gamut mapping"),
+                    "settings_gamut",
+                    tone.gamut,
+                    &Gamut::ALL,
+                    Gamut::label,
+                    self.video_disabled(false, "gamut-mapping-mode"),
+                ) {
+                    *action = Some(Action::SetGamut(g));
+                }
+                ui.end_row();
+            });
+        // 動態峰值偵測要畫面輸出的 OpenGL 有 GLSL 4.20 + compute shader（看驅動：NVIDIA 的 Windows 驅動給 3.3、macOS 是 4.1，都沒有）：
+        // 不能用時不顯示（停用的話是一個說不清楚的死選項）
+        if self.caps.compute_peak {
+            let mut on = tone.compute_peak;
+            let r = ui
+                .add_enabled(
+                    !self.video_locked("hdr-compute-peak"),
+                    egui::Checkbox::new(&mut on, tr!("動態峰值偵測", "Dynamic peak detection")),
+                )
+                .on_hover_text(tr!(
+                    "依每個畫面的實際亮度調整色調映射，亮暗變化大的影片比較自然",
+                    "Adapts the tone mapping to the actual brightness of each scene"
+                ))
+                .on_disabled_hover_text(adjust_locked_hover());
+            if r.changed() {
+                *action = Some(Action::SetComputePeak(on));
+            }
+        }
+        if self.video_not_hdr() {
+            ui.weak(tr!("目前的影片不是 HDR", "The current video isn't HDR"));
+        }
+    }
+
+    /// 音效頁：輸出裝置、獨佔模式、等化器、音量平衡、音量上限、轉成立體聲、音訊直通（選了馬上套用、存檔）
+    fn sound_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+        let a = self.settings.audio.clone();
+        ui.strong(tr!("輸出裝置", "Output device"));
+        let devices = self.device_choices();
+        let saved = a.device.clone().filter(|d| d != AUTO_DEVICE);
+        // 下拉選單的文字：存下的裝置（拔掉了就註明）或預設裝置
+        let current = match &saved {
+            None => auto_device_label().to_owned(),
+            Some(name) => {
+                let label = devices
+                    .iter()
+                    .find(|d| &d.name == name)
+                    .map(|d| d.label().to_owned())
+                    .or_else(|| a.device_label.clone())
+                    .unwrap_or_else(|| name.clone());
+                if self.device_missing() {
+                    tf!(
+                        "{label}（找不到，暫用預設裝置）",
+                        "{label} (not found; using the default)"
+                    )
+                } else {
+                    label
+                }
+            }
+        };
+        let mut chosen: Option<Option<AudioDevice>> = None;
+        let disabled = self.sound_disabled("audio-device");
+        ui.horizontal(|ui| {
+            let name = ui.label(tr!("裝置", "Device"));
+            let r = ui
+                .add_enabled_ui(disabled.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("settings_audio_device")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(saved.is_none(), auto_device_label()).clicked() && saved.is_some() {
+                                chosen = Some(None);
+                            }
+                            for d in &devices {
+                                let on = saved.as_deref() == Some(d.name.as_str());
+                                if ui.selectable_label(on, d.label()).on_hover_text(&d.name).clicked() && !on {
+                                    chosen = Some(Some(d.clone()));
+                                }
+                            }
+                        })
+                        .response
+                })
+                .inner
+                .labelled_by(name.id);
+            if let Some(why) = disabled {
+                r.on_disabled_hover_text(why);
+            }
+        });
+        if let Some(d) = chosen {
+            self.select_audio_device(d.as_ref());
+        }
+        if self.exclusive_shown() {
+            let mut on = a.exclusive;
+            let r = ui
+                .add_enabled(
+                    !self.sound_locked("audio-exclusive"),
+                    egui::Checkbox::new(&mut on, tr!("獨佔模式", "Exclusive mode")),
+                )
+                .on_hover_text(super::tuning_menu::exclusive_hover())
+                .on_disabled_hover_text(adjust_locked_hover());
+            if r.changed() {
+                *action = Some(Action::ToggleExclusive);
+            }
+        }
+
+        ui.add_space(12.0);
+        ui.strong(tr!("等化器", "Equalizer"));
+        ui.horizontal(|ui| {
+            ui.label(self.eq_summary());
+            // 十段滑桿在控制面板（不擋住畫面，邊聽邊調）
+            if ui.button(tr!("等化器…", "Equalizer…")).clicked() {
+                *action = Some(Action::ShowEqualizer);
+            }
+        });
+        if let Some(why) = self.eq_disabled() {
+            ui.weak(why);
+        }
+
+        ui.add_space(12.0);
+        ui.strong(tr!("音量", "Volume"));
+        ui.horizontal(|ui| {
+            if let Some(m) = self.leveling_combo(ui, "settings_leveling") {
+                *action = Some(Action::SetLeveling(m));
+            }
+        });
+        ui.horizontal(|ui| {
+            if let Some(v) = self.volume_max_combo(ui, "settings_volume_max") {
+                *action = Some(Action::SetVolumeMax(v));
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.strong(tr!("聲道", "Channels"));
+        let mut downmix = a.downmix;
+        let disabled = self.downmix_disabled();
+        let r = ui
+            .add_enabled(
+                disabled.is_none(),
+                egui::Checkbox::new(
+                    &mut downmix,
+                    tr!(
+                        "多聲道轉成立體聲（5.1／7.1 → 2.0）",
+                        "Downmix to stereo (5.1/7.1 → 2.0)"
+                    ),
+                ),
+            )
+            .on_hover_text(super::tuning_menu::downmix_hover())
+            .on_disabled_hover_text(disabled.unwrap_or_default());
+        if r.changed() {
+            *action = Some(Action::ToggleDownmix);
+        }
+        ui.indent("settings_normalize_downmix", |ui| {
+            let mut on = a.normalize_downmix;
+            let locked = self.sound_locked("audio-normalize-downmix");
+            let r = ui
+                .add_enabled(
+                    a.downmix && !locked && disabled.is_none(),
+                    egui::Checkbox::new(&mut on, tr!("混音時避免破音", "Avoid clipping when downmixing")),
+                )
+                .on_hover_text(tr!(
+                    "混音時先把音量降低一些，大聲的地方不會破音（整體會小聲一點）",
+                    "Lowers the level while mixing so loud parts don't clip (overall a little quieter)"
+                ));
+            let r = match (locked, disabled) {
+                (true, _) => r.on_disabled_hover_text(adjust_locked_hover()),
+                (false, Some(why)) => r.on_disabled_hover_text(why),
+                (false, None) => r,
+            };
+            if r.changed() {
+                self.set_normalize_downmix(on);
+            }
+        });
+
+        ui.add_space(12.0);
+        ui.strong(tr!("音訊直通", "Passthrough"));
+        let p = a.passthrough;
+        let locked = self.sound_locked("audio-spdif");
+        let mut on = p.enabled;
+        let r = ui
+            .add_enabled(!locked, egui::Checkbox::new(&mut on, tr!("啟用", "Enable")))
+            .on_hover_text(super::tuning_menu::passthrough_hover())
+            .on_disabled_hover_text(adjust_locked_hover());
+        if r.changed() {
+            *action = Some(Action::TogglePassthrough);
+        }
+        let mut codecs = p;
+        ui.indent("settings_spdif_codecs", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for c in SPDIF_CODECS {
+                    let mut ticked = codecs.codec(c);
+                    let r = ui.add_enabled(p.enabled && !locked, egui::Checkbox::new(&mut ticked, spdif_label(c)));
+                    let r = if locked {
+                        r.on_disabled_hover_text(adjust_locked_hover())
+                    } else {
+                        r
+                    };
+                    if r.changed() {
+                        codecs.set_codec(c, ticked);
+                    }
+                }
+            });
+            if let Some(f) = self.spdif_active() {
+                ui.weak(tf!("使用中：{}", "Active: {}", spdif_label(f)));
+            }
+            ui.weak(if cfg!(any(windows, target_os = "macos")) {
+                tr!(
+                    "直通時會獨佔這個裝置，其他程式暫時沒有聲音；TrueHD／DTS-HD 需要 HDMI 支援 HBR",
+                    "Passthrough takes over the device, so other apps go silent meanwhile; \
+                     TrueHD and DTS-HD need HDMI with HBR support"
+                )
+            } else {
+                tr!("需要 HDMI／IEC958 裝置", "Needs an HDMI or IEC958 (S/PDIF) device")
+            });
+        });
+        if codecs != p {
+            self.set_passthrough_codecs(codecs);
+        }
     }
 
     fn subtitles_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
@@ -377,6 +878,18 @@ fn shortcuts_page(ui: &mut egui::Ui) {
             tr!("左右 / 上下翻轉", "Flip horizontally / vertically"),
         ),
         (format!("{alt} + Backspace"), tr!("畫面調整還原", "Reset the picture")),
+        ("W / E".to_owned(), tr!("亮度 - / +", "Brightness - / +")),
+        ("R / T".to_owned(), tr!("對比 - / +", "Contrast - / +")),
+        ("Y / U".to_owned(), tr!("飽和度 - / +", "Saturation - / +")),
+        ("I / O".to_owned(), tr!("色相 - / +", "Hue - / +")),
+        ("Q".to_owned(), tr!("影像調整還原", "Reset image adjustments")),
+        (
+            format!("{alt} + G"),
+            tr!(
+                "控制面板（影像調整、等化器）",
+                "Control panel (image adjustments, equalizer)"
+            ),
+        ),
         (format!("{cmd} + T"), tr!("視窗置頂", "Always on top")),
         ("F6".to_owned(), tr!("播放清單", "Playlist")),
         (

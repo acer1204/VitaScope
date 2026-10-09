@@ -5,11 +5,14 @@
   samples/generated/<tier>/<id>.<ext>   外掛字幕放在影片旁邊、同檔名
   samples/generated/manifest.json       測試程式（tests/formats.rs）讀這份清單比對預期結果
   samples/generated/general/dash_h264_aac/manifest.mpd   本機的 DASH（不在 manifest.json；tests/engine_build.rs 用）
+  samples/generated/pacing/pan_23976.mkv  流暢播放的實機測試（tests/pacing_window.rs）；只有 --tier pacing 才產生
+  samples/generated/pacing/pan_4k10.mkv   同上，4K 10-bit（軟體解碼、GPU 畫一格比較久）
 
 用法：
   python scripts/gen_samples.py                 # 產生全部等級
   python scripts/gen_samples.py --tier common   # 只產生「常見」
   python scripts/gen_samples.py --force         # 已存在也重新產生
+  python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p、4K 平移影片（約 20 MB + 50 MB，CI 不需要）
 
 需要 FFmpeg 7.1 以上的 full build（VVC 樣本需要 libvvenc）。
 FFmpeg 無法編碼的格式（VC-1、RV40、PGS、Dolby Vision…）請把公開樣本放到 samples/external/。
@@ -269,6 +272,13 @@ def samples() -> list[Sample]:
                                                 "-x265-params", HLG_PARAMS, "-color_primaries", "bt2020",
                                                 "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc"], AAC,
           "hevc", "aac", expect={"gamma": "hlg", "primaries": "bt.2020"}, note="HLG"),
+        # 上面的 HDR10 是彩條直接當成 PQ，幾乎都是 1000 nits 以上的亮部，目標亮度 100 跟 203 都壓到最亮、看不出差別；
+        # 這個把亮度、飽和度都壓低（大多在 SDR 參考白 203 nits 以下），tests/picture_shot.rs 用來比較目標亮度
+        S("mkv_hevc10_hdr10_mid", "general", "mkv", ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+                                                      "-x265-params", HDR10_PARAMS, "-color_primaries", "bt2020",
+                                                      "-color_trc", "smpte2084", "-colorspace", "bt2020nc"], None,
+          "hevc", vf="lutyuv=y=16+(val-16)*0.6:u=128+(val-128)*0.4:v=128+(val-128)*0.4", expect={"gamma": "pq", "primaries": "bt.2020"},
+          note="HDR10，亮度大多在 203 nits 以下"),
         S("mp4_h264_120fps", "general", "mp4", X264, AAC, "h264", "aac", rate="120", note="高幀率"),
         S("audio_mp3", "general", "mp3", None, MP3, None, "mp3"),
         S("audio_aac", "general", "m4a", None, AAC, None, "aac"),
@@ -560,6 +570,49 @@ def generate_dash(force: bool) -> str | None:
     return None
 
 
+# ───────────── 流暢播放（實機測試用，不在 manifest.json）─────────────
+# 1920×1080、23.976 fps、20 秒：每格往左平移 16 像素，左上角是影格編號。
+# 卡頓（某一格多停一次更新）在平移的畫面上最明顯；tests/pacing_window.rs 用 mpv 的記錄算每格顯示幾次更新
+PACING = OUT / "pacing" / "pan_23976.mkv"
+# 同上，3840×2160 10-bit H.264、16 秒：顯示卡不能硬體解碼（軟體解碼，render 要上傳大貼圖），
+# GPU 畫一格比較久；比較畫面輸出挑時間取影格時 GPU 來不來得及（tests/pacing_window.rs）
+PACING_4K = OUT / "pacing" / "pan_4k10.mkv"
+
+
+def generate_pacing(force: bool) -> str | None:
+    err = generate_pan(PACING, 1920, 1080, 20, ["-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"], force)
+    if err:
+        return err
+    return generate_pan(PACING_4K, 3840, 2160, 16, ["-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p10le"],
+                        force)
+
+
+def generate_pan(out: Path, w: int, h: int, secs: int, enc: list[str], force: bool) -> str | None:
+    if out.exists() and not force:
+        print(f"  略過  pacing  {out.stem}（已存在）")
+        return None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pan = rf"crop={w}:{h}:x='mod(n*{w // 120}\,{w})':y=0"
+    font = find_font()
+    cwd = None
+    if font is not None:
+        # 在字型的資料夾裡執行、只給檔名：Windows 路徑的「C:」在濾鏡參數裡要跳脫
+        cwd = font.parent
+        pan += (f",drawtext=fontfile={font.name}:text='%{{frame_num}}':fontsize={h // 9}:fontcolor=white"
+                ":box=1:boxcolor=black@0.7:boxborderw=16:x=60:y=60")
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "lavfi", "-i", f"testsrc2=size={2 * w}x{h}:rate=24000/1001:duration={secs}",
+                        "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={secs}",
+                        "-map", "0:v", "-map", "1:a", "-vf", pan,
+                        "-c:v", "libx264", *enc, "-g", "48",
+                        *AAC, str(out)],
+                       cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"ffmpeg exit {r.returncode}"
+    print(f"  完成  pacing  {out.stem}")
+    return None
+
+
 def manifest_entry(s: Sample) -> dict:
     e = {
         "id": s.id,
@@ -585,13 +638,19 @@ def main() -> int:
         stream.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=(*TIERS, "all"), default="all")
+    ap.add_argument("--tier", choices=(*TIERS, "all", "pacing"), default="all")
     ap.add_argument("--force", action="store_true", help="已存在的樣本也重新產生")
     args = ap.parse_args()
 
     if shutil.which("ffmpeg") is None:
         print("找不到 ffmpeg，請先安裝並加入 PATH", file=sys.stderr)
         return 1
+    if args.tier == "pacing":
+        err = generate_pacing(args.force)
+        if err:
+            print(f"  失敗  pacing: {err}")
+            return 2
+        return 0
 
     all_samples = samples()
     todo = [s for s in all_samples if args.tier in ("all", s.tier)]

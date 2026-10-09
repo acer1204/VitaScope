@@ -109,6 +109,19 @@ pub struct LiveStats {
     pub vo_drops: Option<i64>,
     pub decoder_drops: Option<i64>,
     pub avsync: Option<f64>,
+    /// 顯示同步（流暢播放）。mpv 的 display-sync-active 播放中不會更新，用播放器狀態裡的
+    pub display_sync_active: bool,
+    /// mpv 用來同步的更新率（display-fps-override 或查到的）、mpv 量到的更新率
+    pub display_fps: Option<f64>,
+    pub estimated_display_fps: Option<f64>,
+    /// 每格影像顯示幾次螢幕更新、更新間隔的抖動（相對值）
+    pub vsync_ratio: Option<f64>,
+    pub vsync_jitter: Option<f64>,
+    /// 影片速度的修正倍數（1.001 = 快 0.1%）
+    pub video_speed_correction: Option<f64>,
+    /// 顯示時間跟預定的差太多的影格、晚了的影格
+    pub mistimed_frame_count: Option<i64>,
+    pub vo_delayed_frame_count: Option<i64>,
 }
 
 fn lenient_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -157,18 +170,16 @@ pub fn read(player: &Player, audio_device: Option<String>) -> MediaInfo {
 }
 
 /// 音訊裝置的名稱。查裝置清單第一次要十幾毫秒，面板打開時查一次就好
+///（已經在觀察清單時直接用觀察到的，不再查）
 pub fn audio_device_name(player: &Player) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Device {
-        name: String,
-        #[serde(default)]
-        description: String,
-    }
     let current = player.get_string("audio-device").ok()?;
-    if current == "auto" {
+    if current == crate::sound::AUTO_DEVICE {
         return Some(crate::tr!("預設裝置", "Default device").to_owned());
     }
-    let list: Vec<Device> = json(player, "audio-device-list").unwrap_or_default();
+    let list = match &player.state.audio_devices {
+        Some(list) => list.clone(),
+        None => crate::sound::parse_devices(&player.get_string("audio-device-list").unwrap_or_default()),
+    };
     Some(
         list.into_iter()
             .find(|d| d.name == current && !d.description.is_empty())
@@ -186,7 +197,58 @@ pub fn read_live(player: &Player) -> LiveStats {
         vo_drops: int("frame-drop-count"),
         decoder_drops: int("decoder-frame-drop-count"),
         avsync: float("avsync"),
+        display_sync_active: player.state.display_sync_active,
+        display_fps: float("display-fps"),
+        estimated_display_fps: float("estimated-display-fps"),
+        vsync_ratio: float("vsync-ratio"),
+        vsync_jitter: float("vsync-jitter"),
+        video_speed_correction: float("video-speed-correction"),
+        mistimed_frame_count: int("mistimed-frame-count"),
+        vo_delayed_frame_count: int("vo-delayed-frame-count"),
     }
+}
+
+/// 媒體資訊面板「播放流暢度」裡 mpv 回報的顯示同步數字，例如
+/// 「顯示同步：開 · 120.000 Hz（量到 119.998 Hz）」「每格 5.000 次更新 · 影片快 0.10% · 抖動 0.034」「錯時 0 · 延遲 0」
+pub fn sync_lines(live: &LiveStats) -> Vec<String> {
+    let hz = |v: Option<f64>| v.filter(|v| *v > 0.0).map(|v| format!("{v:.3} Hz"));
+    let mut first = if live.display_sync_active {
+        crate::tr!("顯示同步：開", "Display sync: on").to_owned()
+    } else {
+        crate::tr!("顯示同步：關", "Display sync: off").to_owned()
+    };
+    if let Some(fps) = hz(live.display_fps) {
+        first += &format!(" · {fps}");
+    }
+    if let Some(est) = hz(live.estimated_display_fps) {
+        first += &crate::tf!("（量到 {est}）", " (measured {est})");
+    }
+    let mut lines = vec![first];
+    if !live.display_sync_active {
+        return lines;
+    }
+    let mut timing = Vec::new();
+    if let Some(r) = live.vsync_ratio {
+        timing.push(crate::tf!("每格 {r:.3} 次更新", "{r:.3} refreshes per frame"));
+    }
+    if let Some(c) = live.video_speed_correction {
+        let pct = (c - 1.0) * 100.0;
+        timing.push(crate::tf!("影片速度 {pct:+.2}%", "video speed {pct:+.2}%"));
+    }
+    if let Some(j) = live.vsync_jitter {
+        timing.push(crate::tf!("抖動 {j:.3}", "jitter {j:.3}"));
+    }
+    if !timing.is_empty() {
+        lines.push(timing.join(" · "));
+    }
+    let n = |v: Option<i64>| v.map_or("-".to_owned(), |v| v.to_string());
+    lines.push(crate::tf!(
+        "錯時 {} · 延遲 {}",
+        "Mistimed {} · delayed {}",
+        n(live.mistimed_frame_count),
+        n(live.vo_delayed_frame_count)
+    ));
+    lines
 }
 
 // ───────────── 顯示 ─────────────
@@ -239,15 +301,18 @@ pub fn chroma(pixfmt: &str) -> Option<&'static str> {
     }
 }
 
-/// 動態範圍：HDR10 / HDR10+ / Dolby Vision / HLG / SDR
+/// 動態範圍：HDR10 / HDR10+ / Dolby Vision（Profile 8）/ HLG / SDR
 pub fn dynamic_range(vp: &VideoParams, video: Option<&TrackInfo>) -> String {
     let wide = vp.primaries.as_deref() == Some("bt.2020");
+    let profile = video.and_then(|v| v.dolby_vision_profile);
+    // 杜比視界：PQ（profile 5、8.1）或 HLG（8.4）的基礎層。8.4 的 HLG 照樣列在色彩空間裡
+    if profile.is_some() && matches!(vp.gamma.as_deref(), Some("pq" | "hlg")) {
+        return dolby_vision_label(profile);
+    }
     match vp.gamma.as_deref() {
         Some("pq") => {
-            let dolby = video.is_some_and(|v| v.dolby_vision_profile.is_some())
-                || vp.colormatrix.as_deref() == Some("dolbyvision");
-            if dolby {
-                "Dolby Vision".to_owned()
+            if vp.colormatrix.as_deref() == Some("dolbyvision") {
+                dolby_vision_label(None)
             } else if vp.scene_max_r.is_some() {
                 "HDR10+".to_owned()
             } else {
@@ -257,6 +322,20 @@ pub fn dynamic_range(vp: &VideoParams, video: Option<&TrackInfo>) -> String {
         Some("hlg") => "HLG".to_owned(),
         _ if wide => crate::tr!("SDR（廣色域）", "SDR (wide gamut)").to_owned(),
         _ => "SDR".to_owned(),
+    }
+}
+
+/// 杜比視界加上 profile（mpv 只給主版本：8.1、8.4 都是 8）。Profile 5 沒有相容的基礎層，
+/// 畫面輸出（vo_gpu）不會套用杜比視界的轉換，顏色是錯的：註明
+fn dolby_vision_label(profile: Option<i64>) -> String {
+    match profile {
+        Some(5) => crate::tr!(
+            "Dolby Vision（Profile 5，顏色無法正確顯示）",
+            "Dolby Vision (profile 5, colors can't be shown correctly)"
+        )
+        .to_owned(),
+        Some(p) => crate::tf!("Dolby Vision（Profile {p}）", "Dolby Vision (profile {p})"),
+        None => "Dolby Vision".to_owned(),
     }
 }
 
@@ -649,16 +728,42 @@ mod tests {
             ..pq.clone()
         };
         assert_eq!(dynamic_range(&plus, None), "HDR10+");
-        let dv = TrackInfo {
-            dolby_vision_profile: Some(8),
+        let dv = |p| TrackInfo {
+            dolby_vision_profile: Some(p),
             ..Default::default()
         };
-        assert_eq!(dynamic_range(&pq, Some(&dv)), "Dolby Vision");
+        // 8.1（PQ 的基礎層）：mpv 只給主版本
+        assert_eq!(dynamic_range(&pq, Some(&dv(8))), "Dolby Vision（Profile 8）");
+        // Profile 5：顏色是錯的，註明
+        assert_eq!(
+            dynamic_range(&pq, Some(&dv(5))),
+            "Dolby Vision（Profile 5，顏色無法正確顯示）"
+        );
+        // 只有 colormatrix 看得出來（沒有 profile）
+        let dv_matrix = VideoParams {
+            colormatrix: Some("dolbyvision".into()),
+            ..pq.clone()
+        };
+        assert_eq!(dynamic_range(&dv_matrix, None), "Dolby Vision");
         let hlg = VideoParams {
             gamma: Some("hlg".into()),
             ..Default::default()
         };
         assert_eq!(dynamic_range(&hlg, None), "HLG");
+        // 8.4（HLG 的基礎層）
+        assert_eq!(dynamic_range(&hlg, Some(&dv(8))), "Dolby Vision（Profile 8）");
+        // 有 profile 但影像參數不是 HDR（還沒解出第一格、或只是軌道資訊）：不當成杜比視界
+        assert_eq!(dynamic_range(&VideoParams::default(), Some(&dv(5))), "SDR");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let en = [dynamic_range(&pq, Some(&dv(5))), dynamic_range(&pq, Some(&dv(8)))];
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(
+            en,
+            [
+                "Dolby Vision (profile 5, colors can't be shown correctly)",
+                "Dolby Vision (profile 8)"
+            ]
+        );
         let wide = VideoParams {
             primaries: Some("bt.2020".into()),
             gamma: Some("bt.1886".into()),
@@ -696,6 +801,45 @@ mod tests {
         .unwrap();
         assert_eq!(vp.par, None);
         assert_eq!(vp.real_pixelformat(), Some("p010"));
+    }
+
+    #[test]
+    fn display_sync_lines() {
+        let off = LiveStats {
+            estimated_display_fps: Some(119.9981),
+            ..Default::default()
+        };
+        assert_eq!(sync_lines(&off), vec!["顯示同步：關（量到 119.998 Hz）".to_owned()]);
+        let on = LiveStats {
+            display_sync_active: true,
+            display_fps: Some(120.0),
+            estimated_display_fps: Some(119.9981),
+            vsync_ratio: Some(5.0),
+            vsync_jitter: Some(0.0342),
+            video_speed_correction: Some(1.001),
+            mistimed_frame_count: Some(0),
+            vo_delayed_frame_count: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            sync_lines(&on),
+            vec![
+                "顯示同步：開 · 120.000 Hz（量到 119.998 Hz）".to_owned(),
+                "每格 5.000 次更新 · 影片速度 +0.10% · 抖動 0.034".to_owned(),
+                "錯時 0 · 延遲 2".to_owned(),
+            ]
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let en = sync_lines(&on);
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(
+            en,
+            vec![
+                "Display sync: on · 120.000 Hz (measured 119.998 Hz)".to_owned(),
+                "5.000 refreshes per frame · video speed +0.10% · jitter 0.034".to_owned(),
+                "Mistimed 0 · delayed 2".to_owned(),
+            ]
+        );
     }
 
     #[test]

@@ -3,8 +3,9 @@
 目標：跨平台（Windows / macOS / Linux）、功能看齊 PotPlayer 的影片播放器。
 先做出能用的基本版，再依等級逐步補完；每完成一項就測一項。
 
-**目前進度（2026-10-07）**：L1、L2 完成（v0.2.0）。Windows 本機、macOS / Linux（GitHub Actions）自動測試通過；
-另用實際影片庫（約 1.4 萬部）抽樣 626 個檔案實測，全部能播放。下一步是 L3 進階調校。
+**目前進度（2026-10-09）**：L1、L2 完成（v0.2.0）。Windows 本機、macOS / Linux（GitHub Actions）自動測試通過；
+另用實際影片庫（約 1.4 萬部）抽樣 626 個檔案實測，全部能播放。L3 進階調校進行中：第一批（流暢播放、畫面輸出不卡住介面、
+影像與音訊的調校）已完成並在 v0.3.0 發佈，還需要人實際確認的項目列在各項底下的「手動確認」。
 
 ---
 
@@ -280,18 +281,149 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 **目標：PotPlayer 進階使用者常用的功能。**
 
 影像
-- [ ] 影像調整：亮度、對比、飽和度、色相、Gamma
-- [ ] 去交錯（自動 / 強制）、去色帶（deband）
-- [ ] 縮放演算法選擇（bilinear、spline36、ewa_lanczos…）
-- [ ] GLSL 著色器載入與切換（Anime4K、FSRCNNX、銳化）
-- [ ] HDR → SDR 色調映射選項（演算法、目標峰值亮度）
+- [x] 流暢播放：依螢幕的實際更新率同步影像（mpv display-resample + 精確更新率；使用電池、視窗縮小、
+  swap 沒等垂直同步、畫面跟不上時自動改回一般播放；電源只在「使用電池時暫停」時查，Linux 播放中在背景執行緒讀 sysfs、啟動時直接讀一次；
+  介面停頓 0.3 秒以上之後確認影像跟上聲音，0.5 秒後還差 50 ms 以上就暫時改用一般播放追上，`VITASCOPE_PACING=resync` 一律這樣做）
+  （自動；實機 120 Hz 電視 240/240 格都是 5 次更新；介面停 8 秒之後 1 秒內 avsync 在 10 ms 內、之後每格 5 次更新。
+  目前預設關閉，在 60 Hz 螢幕上量過之後再改成預設打開）
+  - [ ] 手動確認：60 Hz 螢幕的實機節奏（量過之後才改成預設打開）
+  - [ ] 手動確認：G-SYNC / FreeSync（VRR）、顯示卡驅動強制關閉垂直同步時改回一般播放並提示
+  - [ ] 手動確認：拖曳、改大小視窗不會誤判「跟不上」「沒等垂直同步」
+  - [ ] 手動確認：瀏覽器最大化蓋住播放器 30 秒不會誤判「沒等垂直同步」（Windows 不回報被蓋住）
+  - [ ] 手動確認：多螢幕（不同更新率）之間拖曳、在系統設定改更新率
+  - [ ] 手動確認：縮到最小（含 Win+D）播 1 分鐘再還原，聲音照常、畫面接得上；筆電拔掉、插回電源時暫停與恢復
+  - [ ] 手動確認：macOS 的 ProMotion 螢幕與外接螢幕、X11 多螢幕、Wayland 上的狀態顯示（偵測不到更新率）
+  - [ ] 手動確認：播放中打開每一種檔案對話框（開啟影片、載入字幕／音軌、播放清單的加入檔案／加入資料夾／開啟／儲存、
+    變更截圖資料夾、像素著色器的加入檔案），Windows、Linux 上影片照樣播放、macOS 暫停；Windows 上主視窗按不到；
+    Linux 的對話框不一定擋住主視窗（沒有 portal 時用 zenity，可能躲在主視窗後面），再按一次開檔不會開第二個、提示「檔案對話框已經開著」；
+    開著時影片播完換到下一個，選好的字幕／音軌不會加到新的影片上；選好檔案之後字幕跟對白同步（流暢播放開、關都試）
+- [x] 畫面輸出不再卡住介面：一般播放時離影格的預定時間大約一次螢幕更新（多 2 ms 的餘裕）才取影格（再讓 mpv 等到預定時間），
+  介面的執行緒每格只等這麼久（自動；實機 120 Hz 電視上每格的等待從約 39 ms 降到平均約 3.5～6 ms、最久約 11 ms，
+  介面一直重畫時每秒畫 120 次（以前 24 次）；交出影格的時間跟以前差不到 1 ms，
+  顯示卡畫完影格的時間（GL 的 timestamp query）也跟以前差不多：介面一直重畫又播 4K 10-bit 軟體解碼時本來會晚好幾毫秒，
+  量到來不及就自動提早一點取（最多 10 ms），
+  每格 5 次更新的比例跟以前差不多（介面閒著、一直重畫、一直重畫又播 4K 10-bit 三種情況，各量三次比平均；
+  10 秒的量測每次差好幾個百分點，三次平均的差也在 ±4 個百分點之內上下）。
+  `VITASCOPE_PACING=block` 可以改回以前的做法）
+  - [ ] 手動確認：一般播放時滑鼠移過進度條、開選單，介面跟著螢幕更新率反應（不再只有每秒 24 次）
+- [x] 影像調整：亮度、對比、飽和度、色相、Gamma（mpv 的畫面輸出選項，不用 FFmpeg 的 eq 濾鏡；W/E、R/T、Y/U、I/O、Q 還原，
+  Alt+G 控制面板、右鍵選單「畫質」、「設定 → 畫質」；換檔案時沿用，勾「下次開啟時沿用這些調整」才存檔）
+  （自動 kittest：按鍵、滑桿、選單、跨檔案沿用與存檔；截圖亮度檢查 `tests/picture_shot.rs`：亮度 +50 時畫面中央的平均亮度
+  一般流程 125.0 → 197.0、軟體繪圖的簡化流程 125.9 → 198.2；Linux 的 llvmpipe（自動改用簡化流程）129.3 → 196.0，
+  Linux 的 CI（系統的 libmpv 與本專案建置的）每次都跑）
+  - [ ] 手動確認：各項調整在實際影片上的效果（特別是色相、Gamma）、按住按鍵連續調整的反應
+- [x] 去交錯（自動 / 開啟 / 關閉，預設自動）、去色帶（deband）、銳化：右鍵選單「畫質」、控制面板、「設定 → 畫質」，整個程式共用、存檔；
+  選單與提示顯示目前的狀態（mpv 的 deinterlace-active：已去交錯 / 逐行影片）；引擎沒有 deinterlace=auto 時（系統的 libmpv 0.37）
+  不列「自動」、當成關閉
+  （自動：`tests/picture.rs` 每個值 mpv 都接受、預設設定只有 deinterlace 跟 mpv 不同、交錯的 TS 自動去交錯而逐行的不會；
+  kittest 選單、控制面板、設定頁、軟體繪圖時停用、VITASCOPE_MPV_OPTS 指定的不改；
+  實機（RTX 3090）：nvdec 解交錯的 MPEG-2 時 bwdif_cuda 建不起來，mpv 改用 hwdownload + bwdif，照樣去交錯，記錄不當成錯誤）
+  - [ ] 手動確認：1080i 電視錄影去交錯的效果、去色帶在有色帶的影片上的效果
+- [x] 縮放演算法選擇：快速（bilinear）/ 標準（引擎的預設值）/ 高品質（ewa_lanczossharp、抗振鈴 0.6），放大、縮小、色度可以個別指定
+  （自動：每個演算法 mpv 都接受、三種畫質的完整選項與個別指定優先的單元測試、kittest 選單與設定頁）
+  - [ ] 手動確認：各演算法放大 480p 影片的銳利度
+- [x] GLSL 著色器載入與切換：使用者自己的 .glsl 組成「組合」（不附任何著色器），右鍵選單「畫質 ▸ 像素著色器」切換、
+  「設定 → 畫質」新增 / 刪除 / 改名、檔案排序（↑ ↓ ✕）；整個程式共用、存檔，換檔照舊。glsl-shaders 由影戲管理：
+  清單 = 組合 + 翻轉的著色器，一次換掉整個清單（change-list set）；翻轉在開新檔之前同步拿掉（新檔案第一格就不翻轉），
+  開檔前的同步設定被還沒執行的非同步翻轉蓋掉時，開始播新檔時再送一次。加入檔案時檢查：.hlsl / .fx 之類不是 mpv 格式的、
+  二進位檔、超過 2 MB、macOS 的 COMPUTE 著色器、路徑有清單分隔字元或不是 UTF-8 的都不收；找不到的檔案略過並提示，組合照舊。
+  套用後第一次畫出影格起 3 秒或 30 格內畫面輸出有著色器的錯誤就改回之前用的組合並提示（上一個還沒確認能用就又換了時，
+  改回最後一個確定能用的；剛啟動時、改了使用中組合的檔案時改成不使用）。軟體繪圖不跑著色器（選單停用），
+  VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時不改（翻轉照樣接在後面；glsl-shader-opts 不算）
+  （自動：`picture::shader` 單元測試（檢查檔案、組清單、分隔字元、還原的狀態機）；`tests/picture.rs` 清單換兩次檔照舊、
+  翻轉換檔就拿掉、翻轉還沒執行就換檔也不會帶到新檔案、使用者指定的不改；kittest 選單、設定頁的組合編輯、.hlsl 被拒絕、
+  畫不出來時還原到確定能用的組合（存檔、提示、設定頁標出來）、軟體繪圖停用、英文介面；截圖檢查 `tests/picture_shot.rs`（RTX 3090）：反相的著色器讓中央平均亮度 16.9 → 238.4，
+  編譯不過的著色器記下錯誤（`error C1503: undefined variable`）後自動還原，截圖時 16.9 跟沒有著色器一樣；
+  簡化流程（RTX 3090 指定 gpu-dumb-mode、Linux 的 llvmpipe）不送著色器，畫面不變、也不會誤判成壞掉）
+  - [ ] 手動確認：Anime4K、FSRCNNX 在 NVIDIA（以及有機會的話 AMD、Intel）顯示卡與 macOS 上實際的效果與速度
+- [x] HDR → SDR 色調映射選項：曲線、目標亮度（自動 = 203，或 100–203 nits，只對 HDR 影片送）、色域對應（自動 / 裁切）、
+  動態峰值偵測（畫面輸出的 OpenGL 支援時才顯示）；杜比視界 Profile 5 開檔時提示、媒體資訊註明顏色無法正確顯示。
+  vo_gpu 的 gamma 曲線不列：它的著色器在 OpenGL 3.3 編譯不過，畫面變成一片藍。
+  色調映射在最後輸出到螢幕時做，軟體繪圖的簡化流程也有，所以這些選項在簡化流程照常可以用。
+  第十四批修正（對照 mpv 原始碼與真正的 HDR 影片，見第 7 節）：目標亮度超過 203 會把亮部裁成白色，上限改成 203、
+  選單只列自動（203）/ 100 / 150，存過 400、1000 的設定讀成 203；SDR 影片（含還不知道、沒有影片）一律送 auto；
+  「降低飽和度」跟自動是同一段程式，拿掉（存過的讀成自動）；動態峰值偵測改看 GL context（GLSL 4.20 + compute shader + SSBO）
+  （自動：每條曲線、色域、目標亮度 mpv 都接受；目標亮度跟著影片換（HDR10 → 100、SDR → auto、HLG → 100，讀回 mpv 的值）；
+  kittest 選單、設定頁、動態峰值偵測依能力顯示、HDR 播放中從選單或設定頁改目標亮度馬上送到 mpv、
+  杜比視界 Profile 5 每個檔案提示一次（續播位置之類的提示先顯示完才提示）；
+  截圖檢查 `tests/picture_shot.rs`：HDR10 樣本在每條曲線下 mpv 收到設定的曲線、畫面輸出沒有錯誤，
+  中央平均亮度 RTX 3090 137–142、Linux 的 llvmpipe 72.6–100.1；
+  亮度在 203 nits 以下的 HDR10 樣本（`mkv_hevc10_hdr10_mid`）目標亮度 100 比自動亮：RTX 3090 114.9 / 101.3、簡化流程 114.0 / 100.4、
+  Linux 的 llvmpipe（本專案建置的引擎、系統的 libmpv 0.37 一樣）108.5 / 87.2
+  （原本的 HDR10 樣本幾乎都是 1000 nits 以上的亮部，141.7 / 141.5 看不出差別）；
+  SDR 畫面在目標亮度 100 跟自動逐像素一樣（RTX 3090、llvmpipe 的兩種引擎都是；修正前 100 nits 會把 SDR 也做色調映射：129.7 → 132.6）。
+  真正的 HDR 影片（不放進專案，`VITASCOPE_HDR_SAMPLES`）：HEVC HDR10、AV1 HDR10、杜比視界 Profile 5 / 8.1 / 8.4、AV1 HLG、
+  VP9 HDR10+ 都開得起來，媒體資訊依序是 HDR10、HDR10、Dolby Vision（Profile 5，顏色無法正確顯示）、Dolby Vision（Profile 8）×2、
+  HLG、HDR10（這個 VP9 影片每一格 HDR10+ 的 average_maxrgb 都是 0，libplacebo 當成沒有 HDR10+；
+  用 x265 的 `dhdr10-info` 產生的 HEVC HDR10+ 是 HDR10+）；Profile 5 有提示；HEVC HDR10 的中央平均亮度 100 nits 106.0、
+  自動 93.8；這台 RTX 3090 的 GL context 是 OpenGL 3.3 · GLSL 3.30，動態峰值偵測不顯示；
+  Linux 的 llvmpipe 是 OpenGL 4.5 · GLSL 4.50，可以用。截圖檢查確認引擎功能的 `compute_peak` 跟 GL context 的結果一樣）
+  - [ ] 手動確認：真正的 HDR 影片在各曲線、目標亮度下的觀感，Windows 的 HDR 關閉、開啟各看一次
+  - [ ] 之後：向 eframe / glutin 要 OpenGL 4.3 以上的 core context，NVIDIA 顯示卡的 Windows 上動態峰值偵測才能用
+    （eframe 0.36 用預設的 context 設定，NVIDIA 給 3.3 core；mpv 對 GLSL 4.20 以下關掉 compute shader）
 
 音訊
-- [ ] 選擇音訊輸出裝置
-- [ ] 等化器
-- [ ] 音量正規化、動態範圍壓縮（夜間模式）
-- [ ] 聲道混音（5.1 → 2.0）、音量放大超過 100%
-- [ ] 音訊直通（AC-3 / DTS / TrueHD 經 HDMI、S/PDIF 送到擴大機）
+- [x] 選擇音訊輸出裝置：右鍵選單「音效 ▸ 輸出裝置」、「設定 → 音效」；預設裝置（跟隨系統）＋ 目前輸出方式的裝置
+  （macOS 只列 coreaudio）。存了指定的裝置時啟動時同步讀一次裝置清單，不在就暫時用預設裝置並提示（設定照舊）；
+  其他時候第一個畫面出來之後才開始觀察清單（列舉裝置可能很慢），清單變了就重新對照：裝置插回來自動切回去、播放中拔掉改用預設裝置
+  （音訊輸出開不起來時 mpv 改用 null 輸出繼續播放（audio-fallback-to-null，純音樂檔也不會停）並提示一次，
+  之後換裝置、獨佔模式時照新的設定重開，換檔、裝置清單變了時也重開再試一次；音軌被關掉的話（例如 VITASCOPE_MPV_OPTS 改回 mpv 原本的做法），
+  換裝置、獨佔模式、轉成立體聲之後把原本的音軌選回來）。
+  獨佔模式（audio-exclusive）在 Windows、macOS 顯示，Linux 只在 PipeWire 時顯示；多聲道轉成立體聲（audio-channels=stereo，
+  ☑ 混音時避免破音 = audio-normalize-downmix，只在轉成立體聲時開，沒轉時跟 mpv 原本一樣）。
+  VITASCOPE_MPV_OPTS（含 include=、profile= 間接）指定的音效選項不改、介面上停用
+  （自動：`sound` 單元測試（wasapi、coreaudio、PipeWire 的裝置清單、對照存下的裝置）；`tests/sound.rs` 每個值 mpv 都接受、
+  預設設定跟 mpv 原本的值一樣、只送有變的；kittest 選單、設定頁、找不到裝置時改用預設裝置、插回來切回去、拔掉後選回被關掉的音軌（假的裝置清單，CI 沒有音訊裝置也能跑）、
+  轉成立體聲之後選回被關掉的音軌、強制用不存在的裝置時改用 null 照樣播放並提示、換檔與裝置清單變了時重開再試（`tests/sound.rs` 對照：不改用 null 時純音樂檔直接結束）、
+  媒體資訊跟著換裝置、直通中不能轉立體聲、
+  轉成立體聲、使用者指定的不改、英文介面）
+  - [ ] 手動確認：實際切換喇叭／HDMI 電視、播放中拔插 USB DAC、獨佔模式時其他程式沒有聲音
+- [x] 等化器：十段（31 Hz–16 kHz，每段 −12…+12 dB、0.5 dB 一格），預設平坦、重低音、人聲、古典、搖滾、流行、爵士、電子、
+  高音加強與自訂；右鍵選單「音效」（等化器… / ☑ 等化器 / 等化器預設 ▸）、控制面板的「音效」分頁（十段滑桿、還原、
+  ☑ 自動防止破音 = 前級降低最高那一段的量）、「設定 → 音效」。影戲自己的 af 濾鏡鏈：
+  `@vs-eq:lavfi=[aformat=sample_rates=44100|48000|…,equalizer@b1…b10]`（先換取樣率：32 kHz、22.05 kHz 時 16 kHz 那一段在
+  Nyquist 上會不穩定）、`@vs-limit:lavfi=[alimiter@lim=level_in=放大×前級:limit=0.98:level=0:…:latency=1]`。
+  af 的字串是唯一的依據：結構改變時整條重設，拖滑桿時先送 af-command 馬上聽得到，放開滑桿、音量鍵停下來 300 毫秒之後改寫字串
+  （af-command 的值跳轉後就被字串蓋掉）。引擎沒有 equalizer / aformat / alimiter 時停用；音訊直通時停用，
+  開檔前、選音軌前、播放中打開直通時、重新開啟音訊輸出（換裝置、獨佔模式、轉成立體聲）前先清空 af，直通結束送 af "" 再送整條；
+  輸出不支援直通（mpv 改回 PCM）時，確定解碼出來的是 PCM 之後設回濾鏡鏈。VITASCOPE_MPV_OPTS 指定了 af 時不改、停用
+  （自動：`sound` 單元測試（每種組合的 af 字串、af-command、前級、預設值、延遲改寫的狀態機）；`tests/sound.rs` 每種濾鏡鏈都能播、
+  每一段的 af-command 都成功、32 kHz / 22.05 kHz 沒有濾鏡被停用；ao=pcm 寫出 WAV 用 Goertzel 量測：b6（1 kHz）+12 dB →
+  1 kHz +12.00 dB、b1 +12 dB → 1 kHz +0.01 dB、自動防止破音 → −0.00 dB；af-command +12 dB 之後改寫字串、跳轉 → +12.00 dB，
+  只送 af-command 的話跳轉後 −0.00 dB（引擎的行為，所以要改寫字串）；直通前清空、直通後恢復沒有濾鏡被停用；
+  kittest 選單、控制面板拖滑桿變成自訂、拖曳中只送 af-command、放開才存檔與改寫、設定頁、直通中停用、啟動時同步設定、
+  換成會直通的音軌之前先清空、ao=null 只接受 float 時（直通開不起來）設回濾鏡鏈、之後轉成立體聲之前又先清空、
+  預測不到的直通（VITASCOPE_MPV_OPTS 指定 audio-spdif）開始之後清空、結束之後設回、沒開檔時不送 af-command 直接改寫、
+  使用者指定的 af 不改、英文介面）
+  - [ ] 手動確認：實際聽各個預設，調整預設的值
+- [x] 音量正規化、動態範圍壓縮（夜間模式）：「音效 ▸ 音量平衡」關閉 / 夜間模式（acompressor：−18 dB 以上 4:1、整體 +6 dB）/
+  人聲平衡（speechnorm；只讓說話的音量一致，不會把對白拉到音效上面，所以不叫「對白加強」）/ 音量平均（dynaudnorm）。
+  loudnorm 不提供（要 3 秒的前瞻、不能即時調整）。各種模式依引擎有沒有那個濾鏡停用，濾鏡鏈後面一定接限幅器
+  （自動：ao=pcm 量測：0.5 秒大聲（0.9）、1.5 秒小聲（0.02）輪流的 1 kHz，夜間模式讓大聲與小聲段落的差 33.1 dB → 20.8 dB、
+  峰值 0.980；三種模式的 af-command 都成功；kittest 選單、控制面板、設定頁）
+  - [ ] 手動確認：實際影片的夜間模式、人聲平衡聽感
+- [x] 聲道混音（5.1 → 2.0）：見上面「選擇音訊輸出裝置」的多聲道轉成立體聲（自動：kittest、`tests/sound.rs` 的 audio-channels、
+  audio-normalize-downmix；ao=pcm 量測：只有中央聲道（0.3）的 5.1 → 左 0.212、右 0.212）
+  - [ ] 手動確認：實際 5.1 影片轉立體聲的對白清晰度
+- [x] 音量放大超過 100%：「音效 ▸ 音量上限」100 / 130 / 150 / 200%（設定頁也有）。超過 100% 時 mpv 的音量停在 100，
+  多的部分在限幅器的輸入增益放大（三次方，跟 mpv 自己的音量曲線一樣，100% 接得上），不會爆音；引擎沒有 alimiter、
+  或使用者指定了 af 時改用 mpv 自己的音量（volume-max，可能破音）。↑ ↓、滾輪、控制列的音量滑桿（範圍到音量上限）都可以超過 100%，
+  提示「音量 150%（放大）」；存檔存總音量，但開啟時最多從 100% 開始
+  （自動：ao=pcm 量測：−3 dBFS 的 1 kHz 在 200% 時峰值 0.9800、RMS +2.82 dB；level_in ×2 改寫字串、跳轉後 +6.02 dB；
+  `tests/sound.rs` 總音量 150 = mpv 100 + 放大 50、沒有限幅器時 volume-max 提高；kittest 上限 150% 時 ↑ 到 150%、
+  停下來後 af 的 level_in = 3.375、調低上限時音量跟著拉下來、存下 150% 的音量啟動時是 100%、使用者指定 af 時用 mpv 自己的音量）
+  - [ ] 手動確認：150% / 200% 在筆電喇叭、耳機上的聽感（限幅器的失真）
+- [x] 音訊直通（AC-3 / DTS / TrueHD 經 HDMI、S/PDIF 送到擴大機）：右鍵選單「音效 ▸ 音訊直通」、「設定 → 音效」勾選格式
+  （AC-3、E-AC-3、DTS 預設勾，DTS-HD、TrueHD 要 HDMI 支援 HBR 預設不勾）→ audio-spdif。直通中選單註明「（使用中：AC-3）」，
+  開始時提示；音量鍵、滾輪、音量滑桿、靜音（M、按鈕）與變速（C／X、選單的速度）不動作並提示（直通的資料不能調音量、
+  不能重新取樣，mpv 的靜音也只是軟體音量；改回正常速度可以，存下的靜音不動），開始直通時靜音或 0% 在提示裡註明，
+  速度不是 1× 就改回 1×（不然 mpv 丟掉、重複整個封包）；「載入音軌檔…」跟選單換音軌一樣先預測直通、清空濾鏡鏈；
+  流暢播放改用略過或重複影格對齊螢幕（display-vdrop）。mpv 0.41 起播放中切換馬上生效；Linux tar.gz 用的系統 libmpv 0.40 以前
+  要到下一個檔案才生效（提示「下一個檔案開始生效」）
+  （自動：ao=null 也接受直通，`tests/sound.rs` AC-3、E-AC-3、DTS、TrueHD 樣本實際直通（audio-out-params 是 spdif-*），
+  跟 `predict_spdif` 的預測一致，播放中關掉、再打開也會切換（系統的 libmpv 0.37 重新開檔後切換）；kittest 選單、設定頁的格式、直通中擋音量、
+  靜音與變速、1.5× 開始直通時改回 1×、載入 AC-3 音軌檔時濾鏡鏈先清空）
+  - [ ] 手動確認：接 AV 擴大機／電視實際直通 AC-3、DTS、TrueHD（擴大機顯示格式）、直通時其他程式沒有聲音
 
 功能
 - [ ] 自訂快捷鍵（提供 PotPlayer 風格的預設組）
@@ -367,10 +499,14 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | 測試 | 數量 | 平台 |
 |---|---|---|
 | 格式矩陣 `tests/formats.rs` | 98 個樣本（常見 35、通用 37、罕見 26；CI 上 Linux、macOS 的 FFmpeg 少幾個編碼器，產生的樣本比較少） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 99 | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 171 | Windows、macOS、Linux |
 | 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
 | 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式、強制結束主視窗） | 6 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 3 + 97（其中 1 個需要網路，預設略過） | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` + 單元測試 | 4 + 248（smoke 在 Linux 多 1 個：執行檔引用的 libmpv 函式；其中 2 個預設略過：1 個需要網路、1 個只印出 Windows 偵測更新率的各種方法；單元測試有些只在特定平台編譯，數字是 Windows 的） | Windows、macOS、Linux |
+| 畫質 `tests/picture.rs`、音效 `tests/sound.rs`、非同步設定與引擎功能 `tests/async_opts.rs`、流暢播放 `tests/pacing.rs` | 10、14、8、2 | Windows、macOS、Linux |
+| 播放引擎的建置內容 `tests/engine_build.rs` | 7（舊的引擎、系統的 libmpv 略過 L3 元件的部分） | Windows、macOS、Linux |
+| 截圖檢查 `tests/picture_shot.rs`（會開視窗） | 6 + 2 個不開視窗的輔助測試 | Windows 本機（RTX 3090）、Linux 的 CI（虛擬螢幕）、macOS 的 libmpv 建置流程 |
+| 實機節奏 `tests/pacing_window.rs`（會開全螢幕視窗，手動跑） | 4 + 1 個不開視窗的輔助測試 | Windows 本機（RTX 3090 + 120 Hz 電視） |
 | 硬體解碼 `tests/hwdec.rs`（需要 GPU） | 8 種編碼 | RTX 3090 通過 |
 
 ### 4.5 真實影片庫普查（`examples/media_survey.rs`）
@@ -411,12 +547,19 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 |---|---|---|
 | R1 | macOS 打包 libmpv 及其相依 dylib 最麻煩 | 已解決：改用本專案建置的單一 `libmpv.2.dylib`（只依賴 macOS 內建的函式庫），打包後實際執行檢查 |
 | R2 | macOS 已將 OpenGL 標為棄用 | 目前仍可正常使用（IINA 也是用 OpenGL 接 mpv），持續觀察 |
-| R3 | 部分 HDR / Dolby Vision 功能只有 mpv 的 gpu-next 渲染器支援，嵌入式 render API 是否支援要看 mpv 版本；egui 也還沒有 HDR 輸出 | L3 前先驗證；必要時 HDR 直通模式改用 mpv 原生視窗 |
+| R3 | 部分 HDR / Dolby Vision 功能只有 mpv 的 gpu-next 渲染器支援，嵌入式 render API 是否支援要看 mpv 版本；egui 也還沒有 HDR 輸出 | 已確認（第十四批）：render API 用的是舊的 vo_gpu，引擎建置的 libplacebo 關掉了 OpenGL，gpu-next 根本不能用。vo_gpu 不套用杜比視界的 RPU：Profile 8.1 / 8.4 照 HDR10 / HLG 的基礎層播放沒問題，Profile 5 沒有相容的基礎層，顏色是錯的（偏紫、偏綠），目前開檔時提示。要正確顯示 Profile 5，路線是讓引擎的 libplacebo 開 OpenGL、render API 改用 gpu-next；HDR 直通仍需要另外的輸出方式（mpv 原生視窗或 D3D11） |
 | R4 | Wayland 不支援把 mpv 嵌進子視窗（`wid`） | 本來就採用 render API，不受影響 |
 | R5 | 上次的視窗位置在已拔掉的螢幕上時，視窗可能開在看不到的地方 | 已解決：建立視窗前直接問作業系統有哪些螢幕（Windows、macOS、X11；`src/screens.rs`），上次的標題列不在任何螢幕上就交給系統擺放（eframe 在建立視窗前拿不到螢幕清單，winit 也不讓程式先查）。視窗配合影片後超出螢幕的情況另外處理（v0.2.0） |
 | R6 | 全螢幕時字幕上移只對文字字幕（SRT 等）有效，ASS 字幕有自己的版面 | 觀察實際使用情況再決定是否處理 |
 | R7 | macOS 的最低需求降到 macOS 11，但只在 GitHub 的 macOS 15 / 26 虛擬機測過，沒有在 11–14 的實機上跑過 | 建置時檢查每個目的檔的最低版本都是 11.0、記錄用到的較新 API（weak imports）；有使用者回報再處理 |
 | R8 | AppImage 的 PulseAudio、libva 用系統的，系統沒有時換成只有函式名稱的替身（音訊改走 ALSA、硬體解碼改用軟體解碼） | CI 在沒有這兩個函式庫的 Debian 13 容器實際播放，並強制走到替身的進入點 |
+| R9 | Wayland 不讓程式知道視窗在哪個螢幕、更新率多少；XWayland 的 RandR 更新率也只是合成器給的近似值 | 流暢播放在 Wayland 上維持一般播放（狀態顯示「偵測不到更新率」）；有可靠的介面（例如 wp_presentation）再加 |
+| R10 | macOS 的 ProMotion（可變更新率）螢幕：回報 120 Hz，OpenGL 的 swap 可能只跑到 60 Hz | 防呆偵測到只跑到一半更新率時改用一半；沒有實機測過，列入手動確認 |
+| R11 | 視窗縮到最小時 mpv 的影格沒人取（eframe 不畫隱藏的視窗），原本打算縮小時在背景把到時間的影格交給 mpv（排空影格） | 刻意不做：縮小再還原的實機測試（`pacing_window` 的 minimize_and_restore、`--shot` 縮小時的播放位置）位置都正確，聲音照常、畫面接得上。之後有問題再做；`VITASCOPE_PACING=no-drain` 目前只是保留的名稱 |
+| R12 | NVIDIA 硬體解碼的零複製（CUDA 與 OpenGL 共用貼圖）：mpv 重複用解碼的畫面時，可能跟還在畫的上一格撞在一起，大場景切換時偶爾閃一下方塊（使用者回報過一次，還不能穩定重現） | 能重現時先比較關掉硬體解碼、`hwdec=nvdec-copy`、`opengl-glfinish=yes`；要修的話在取新影格前等上一次 render 的 GL fence（`glClientWaitSync`，平常幾微秒），或在自建的 libmpv 改 `hwdec_cuda_gl.c` 每格 map / unmap |
+| R13 | 等化器預設、夜間模式、人聲平衡、音量平均的參數是照一般播放器的值和耳朵調的，沒有客觀標準 | ao=pcm 的量測只確認濾鏡有作用、不會破音；實際聽感列入手動確認，依回饋調整 |
+| R14 | mpv 的 `tone-mapping=gamma` 著色器在 OpenGL 上編譯不過（對純量做 swizzle），畫面變成整片藍 | HDR 曲線不列 Gamma；之後可以在自建的 libmpv 加修正檔再開放 |
+| R15 | 音訊直通在檔案一開始就被輸出拒絕時，這個引擎改回 PCM 之後會停住，跳轉一下才繼續播（第十批測試時發現，見第 7 節） | 測試用 `ao-null-format=float` 模擬並確認濾鏡鏈會設回；停住的部分要在引擎裡查，實機（擴大機、電視）確認時一起看 |
 
 ## 7. 開發中學到的事
 
@@ -488,6 +631,7 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **Git Bash 會把 `/D…` 之類的參數當成路徑轉換掉**：Inno Setup 的 ISCC 要在 PowerShell 或 cmd 執行。
 - **好幾個視窗共用一個設定檔時，關閉的那個不能把整份舊設定寫回去**：存檔時只寫這個視窗上次讀檔或存檔之後改過的設定，
   其他的保留檔案裡現在的值。新版寫的、這版讀不懂的設定也要保留（只有讀不懂的那一項用預設值）。
+  清單也一樣：整個陣列當成一個值的話，另一個視窗新增的像素著色器組合會不見；組合依編號合併，等化器的增益逐格合併。
 - **解除安裝時程式還開著，執行檔刪不掉，關閉時還會把設定寫回去**：程式啟動時建立一個具名 mutex，
   安裝程式用 `AppMutex` 先請使用者關掉。
 - **檔案關聯只認「登錄的那一個執行檔」**：同一台電腦上有安裝版、免安裝版、開發中的建置時，啟動時不能誰都去搶；
@@ -507,3 +651,58 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   要多跑幾幀確認最後的狀態。
 - **macOS 連結器的 LC_UUID 是對 strip 之前的內容算的**：那部分偶爾不固定，兩次建置就只差在 UUID。
   strip 之後用最終內容重新計算 UUID 再簽章。
+- **mpv 的 `af-command` 只是暫時的**：跳轉、換音軌、換格式時 mpv 用 `af` 的字串重建 lavfi 濾鏡，即時改的值就沒了
+  （等化器拖到 +12 dB、跳轉之後又回到 0）。即時調整之後一定要改寫字串；mpv 重設 `af` 時參數沒變的濾鏡會留著，只有改到的那一段重建。
+  `af` 讀回來的寫法跟設定的不一樣（`lavfi=graph=%長度%…`），不能拿來比對送過什麼。
+- **直通開不起來時 mpv 改回 PCM，判斷要看解碼的格式**：只看 `audio-out-params` 不夠，換檔時 mpv 沿用上一個檔案的音訊輸出
+  （`gapless-audio` 預設 weak），新檔案的聲音出來之前輸出還是上一個檔案的 PCM；要看 `audio-params/format`（解碼器送進濾鏡鏈的格式，
+  直通時是 `spdif-ac3`）。另外這個引擎在檔案一開始就改回 PCM 時會停住（core-idle，沒有濾鏡鏈也一樣），跳轉一下才繼續播
+  （測試用 `ao-null-format=float` 模擬，見 `passthrough_refused_restores_the_eq_chain`）。
+- **同步的檔案對話框會讓 eframe 整個停住**：rfd 的 `FileDialog` 在介面的執行緒上開，開著時一幀都不畫，
+  mpv 照樣播聲音、影像停在那裡（mpv 每 200 ms 記一次 `not being called or stuck`），從 v0.1 就是這樣。
+  Windows、Linux 改在背景執行緒開（rfd 的 `FileDialog` 本身可以送到別的執行緒，擁有者照樣是主視窗，Windows 上主視窗照樣按不到），
+  結果用 channel 送回來；macOS 的 NSOpenPanel 一定要在主執行緒，開著時先暫停。同時只開一個（Linux 的 portal 對話框不一定擋得住主視窗，
+  rfd 改用 zenity 時完全沒有擁有者）。開著時影片照樣播，可能已經換了檔案：字幕、音軌要記下開對話框時是哪個檔案。
+- **依螢幕同步時介面停住，mpv 自己會略過晚了的影格追上**：display-resample 也會在差 20 ms 以上時略過影格
+  （`handle_display_sync_frame` 的 `drop_repeat`），實測停 0.3～10 秒之後，1080p 約 0.15 秒、4K 軟體解碼 1 秒內就追上，剩 15 ms 左右再由聲音的速度慢慢修正。
+  `VITASCOPE_DEBUG=pacing` 10 秒一次的 avsync 平均會把停住剛結束時讀到的那一筆（好幾秒）算進去，看起來像要十幾秒才追上；
+  要看每秒的值（現在每秒印一筆）。保險起見（較舊的 mpv、解碼跟不上）停過之後 0.5 秒還差 50 ms 以上才暫時改用一般播放追上。
+- **libmpv 預設的 BLOCK_FOR_TARGET_TIME 會卡住介面**：`mpv_render_context_render` 在介面的執行緒上等到影格的預定時間，
+  每格約 39 ms，介面每秒只能更新 24 次左右。改成影格快到時間（大約一次螢幕更新內）才取，再讓 mpv 精準等待。
+- **egui 的 `request_repaint_after` 會扣掉 `predicted_dt`**（eframe 沒有設定，固定 1/60 秒）：要等 38 ms 會提早約 17 ms 醒來，
+  接著幾輪都是馬上重畫，一格影像畫了好幾輪。排喚醒時間要把 `predicted_dt` 加回去。
+- **vo_libmpv 沒有回報螢幕更新率**（沒有 `VOCTRL_GET_DISPLAY_FPS`）：嵌在程式裡的 mpv 永遠不會依螢幕同步，
+  要自己偵測更新率，用 `display-fps-override` 告訴它，再設 `video-sync=display-resample`。
+- **`target_time` 的單位是奈秒**：render.h 的註解寫微秒，已經過時（libmpv 0.37 起都是 `mp_time_ns`）。
+  也不能在執行時猜單位：mpv 的時鐘從程式啟動算起，剛啟動時奈秒的數值很小，看起來像微秒。
+- **`display-sync-active` 播放中不會更新**：要知道有沒有在依螢幕同步，改看 `mistimed-frame-count` 有沒有值。
+- **同步的 `set_property` 會插隊到還沒執行的非同步指令前面**（同步呼叫直接鎖住核心，非同步的是排隊）；非同步指令彼此之間照順序。
+  同一個選項同時用兩種方式設定時，要想清楚最後是誰。
+- **字串清單選項設成 `""` 會變成有一個空項目的清單 `[""]`**，不是空清單；要清空用 `change-list <選項> clr ""`。
+- **Windows：觀察 `audio-device-list` 要讓程式一直有多執行緒 COM（MTA）**：mpv 在自己的執行緒初始化 MTA、關閉時拆掉，
+  那是程式裡唯一的 MTA 時，系統的裝置通知還在用，關閉播放器時存取違規。啟動時先 `CoIncrementMTAUsage`，不再減回去。
+- **Linux 直接連結新版 libmpv 才有的函式，舊的 libmpv 在程式開始之前就被載入器擋掉**：Rust 預設 `-z now`（完整 RELRO），
+  `mpv_get_time_ns`（0.37 起）找不到時連 `--version` 都跑不了，`Mpv::new` 的版本檢查沒機會說明。Linux 改成執行時用
+  `dlsym(RTLD_DEFAULT, …)` 找；`tests/smoke.rs` 在 Linux 用 `nm -D --undefined-only` 確認執行檔不直接需要 client API 2.0 之後的函式。
+- **音訊輸出開不起來時 mpv 把音軌關掉，之後改裝置、獨佔模式也不會重開**（`reload_audio_output` 沒有輸出就直接返回），
+  純音樂檔還會整個停止。開 `audio-fallback-to-null` 改用 null 輸出繼續播放，輸出一直在，改選項時 mpv 照新的設定重開；
+  `current-ao` 變成 null（ao 不是自己指定 null）就是開不起來改用的，提示使用者。直通開不起來時 mpv 不用 null（先改回 PCM）。
+  不過換檔時 mpv 沿用同一個輸出（gapless-audio 預設 weak，格式一樣就不重開），預設裝置的清單變了也不會自己重開：
+  不處理的話之後的檔案一直沒有聲音，所以改用 null 之後換檔、裝置清單變了時送 `ao-reload` 再試真正的裝置。
+  重開之後觀察到的 `current-ao` 可能還是重開前的 null（值一樣不會再通知），等一下直接問 mpv 再決定要不要提示。
+- **vo_gpu 的 target-peak 超過 203 = 假裝輸出到 HDR 螢幕**：輸出的特性不知道時 mpv 當成 SDR，峰值 203 nits（MP_REF_WHITE）。
+  目標亮度超過 203 時 `pass_color_map` 把它當成 HDR 輸出，最後的縮放用轉換函數的標稱峰值（gamma 2.2 是 1.0），
+  203 以上到目標亮度之間的亮部直接裁成白色，不是壓縮。輸出 SDR 的播放器目標亮度只能 ≤ 203。
+- **target-peak 也會改到 SDR 影片**：mpv 把 SDR 影片當成 203 nits，目標 100 時 SDR 影片也被色調映射、變亮變平，
+  超過 203 時輸出改用 gamma 2.2；字幕、OSD 也走同一條路。只有 auto 不動 SDR，所以目標亮度只對 HDR 影片送。
+- **hdr-compute-peak 要 GLSL 4.20**：mpv 對 GLSL 4.20 以下關掉 compute shader（有些驅動在舊版也宣稱支援），
+  eframe 要的是 3.3 core，驅動可以給更新的：NVIDIA 的 Windows 驅動就給 3.3、macOS 是 4.1，動態峰值偵測從來沒有作用過
+  （記錄裡的「Disabling HDR peak computation」）；AMD、Intel、Mesa 常給 4.6，所以要在執行時看 context，不能寫死平台。
+- **HDR10+ 的平均亮度是 0 就當成沒有**：libplacebo（`pl_hdr_metadata_contains`）要 average_maxrgb 不是 0 才算 HDR10+，
+  mpv 的 `video-params` 才有 scene-max-*。有些 HDR10+ 範例影片每一格都是 0，看起來是 HDR10；不是引擎拿不到。
+- **HDR 的標記不一定在容器層**：只標在 HEVC 位元流裡的 HDR，ffprobe 的串流資訊（容器層）寫 unknown，mpv 解出影格後才知道是 PQ；
+  杜比視界 Profile 5 的串流層 transfer 也是 unknown。y4m、沒有標記的原始影像沒有色彩資訊。判斷 HDR 要看 mpv 的 `video-params`，
+  不是容器或 ffprobe。另外 `video-params` 是濾鏡之前的參數，用 `vf=format=gamma=pq` 改標記不會讓它變成 HDR。
+- **產生的正弦波 WAV 可能被當成 MPEG-TS**：48 kHz 的 1 kHz 浮點正弦波每 192 位元組重複一次，剛好是 M2TS 的封包長度，
+  FFmpeg 的偵測給 MPEG-TS 滿分、開不起來。測試指定 `demuxer-lavf-format=wav`。本專案建置的引擎也沒有 FFmpeg 的 `sine` 來源，
+  測試用的聲音都在測試裡產生。

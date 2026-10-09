@@ -210,6 +210,37 @@ type Callback = Box<dyn Fn() + Send + Sync + 'static>;
 /// 只在有 Lua 的 libmpv 才有的選項（影戲都是把它們關掉）
 const SCRIPT_OPTIONS: &[&str] = &["osc", "ytdl", "load-scripts", "load-stats-overlay"];
 
+/// `mpv_get_time_ns` 的型別（client.h）
+#[cfg(all(unix, not(target_os = "macos")))]
+type GetTimeNs = unsafe extern "C" fn(*mut sys::mpv_handle) -> i64;
+
+/// Linux：執行時才找 `mpv_get_time_ns`（libmpv 0.37 起才有）。Linux 版用系統的 libmpv，
+/// 直接連結的話舊的 libmpv 在程式開始之前就被系統的載入器擋掉（undefined symbol），
+/// `Mpv::new` 的版本檢查沒機會說明要更新 mpv。Windows、macOS 附帶自己的引擎，照常連結
+#[cfg(all(unix, not(target_os = "macos")))]
+fn get_time_ns() -> Option<GetTimeNs> {
+    static FOUND: std::sync::OnceLock<Option<GetTimeNs>> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        // SAFETY: RTLD_DEFAULT 在已經載入的程式庫（包括連結的 libmpv）裡找，名稱是 NUL 結尾的常數
+        let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"mpv_get_time_ns".as_ptr()) };
+        // SAFETY: 找到的就是 client.h 宣告的這個函式
+        (!found.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, GetTimeNs>(found) })
+    })
+}
+
+/// 找得到 `mpv_get_time_ns`（Linux 執行時才找；其他平台直接連結，一定有）。測試用
+#[doc(hidden)]
+pub fn has_time_ns() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        get_time_ns().is_some()
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        true
+    }
+}
+
 pub struct Mpv {
     handle: NonNull<sys::mpv_handle>,
     wakeup: Option<Box<Callback>>,
@@ -224,12 +255,13 @@ impl Mpv {
     /// 只能在初始化前設定的選項（例如 `vo`、`config`）要放這裡。
     pub fn new(options: &[(&str, &str)]) -> Result<Self> {
         let api = unsafe { sys::mpv_client_api_version() } as u64;
-        if api >> 16 != 2 {
+        // 2.2（mpv 0.37）起才有 mpv_get_time_ns（畫面輸出挑時間取影格要用）
+        if api >> 16 != 2 || api & 0xffff < 2 {
             return Err(Error::new(
                 sys::mpv_error_MPV_ERROR_UNSUPPORTED,
                 crate::tf!(
-                    "libmpv client API {}.{} 不相容（需要 2.x）",
-                    "libmpv client API {}.{} is not compatible (2.x required)",
+                    "libmpv client API {}.{} 不相容（需要 2.2 以上的 2.x，也就是 mpv 0.37 以上）",
+                    "libmpv client API {}.{} is not compatible (2.2 or a newer 2.x required, i.e. mpv 0.37 or newer)",
                     api >> 16,
                     api & 0xffff
                 ),
@@ -262,6 +294,29 @@ impl Mpv {
 
     pub(crate) fn raw(&self) -> *mut sys::mpv_handle {
         self.handle.as_ptr()
+    }
+
+    /// mpv 內部的時鐘（奈秒，跟 render API 的影格預定時間同一個基準）。
+    /// 任何時候、在畫面輸出的執行緒上都能呼叫（client.h：safe from render threads）；libmpv 0.37 起才有
+    pub fn time_ns(&self) -> i64 {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            match get_time_ns() {
+                // SAFETY: 跟 client.h 的宣告一樣的函式，handle 有效
+                Some(f) => unsafe { f(self.raw()) },
+                // 不會發生（`new` 已經擋掉 0.37 以前的 libmpv）：用微秒的時鐘，同一個基準
+                None => self.time_us().saturating_mul(1000),
+            }
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            unsafe { sys::mpv_get_time_ns(self.raw()) }
+        }
+    }
+
+    /// 同 `time_ns`，單位是微秒
+    pub fn time_us(&self) -> i64 {
+        unsafe { sys::mpv_get_time_us(self.raw()) }
     }
 
     /// 執行指令，例如 `["loadfile", path]`、`["seek", "10", "relative"]`。
@@ -298,6 +353,48 @@ impl Mpv {
     /// 以字串讀取屬性。Node 型別（`track-list`、`metadata`…）會拿到 JSON。
     pub fn get_string(&self, name: &str) -> Result<String> {
         self.get_property::<String>(name)
+    }
+
+    /// 讀字串清單（`glsl-shaders` 之類）的每一項。用 Node 讀：讀成字串時分隔字元各版本不同
+    /// （0.37 是逗號、新版的路徑清單是平台的路徑分隔字元），路徑裡也可能有逗號
+    pub fn get_string_list(&self, name: &str) -> Result<Vec<String>> {
+        let n = cstring(name);
+        // SAFETY: mpv_node 是純資料（全 0 = MPV_FORMAT_NONE）；成功時 mpv 填好內容，讀完用 mpv_free_node_contents 釋放
+        let mut node: sys::mpv_node = unsafe { std::mem::zeroed() };
+        let code = unsafe {
+            sys::mpv_get_property(
+                self.raw(),
+                n.as_ptr(),
+                sys::mpv_format_MPV_FORMAT_NODE,
+                &mut node as *mut sys::mpv_node as *mut c_void,
+            )
+        };
+        check(code, || crate::tf!("讀取屬性 {name}", "reading property {name}"))?;
+        // SAFETY: format 決定 union 裡哪一個欄位有效；陣列的 values 有 num 個
+        let list = unsafe {
+            match node.format {
+                sys::mpv_format_MPV_FORMAT_NODE_ARRAY if !node.u.list.is_null() => {
+                    let l = &*node.u.list;
+                    let values: &[sys::mpv_node] = if l.num > 0 && !l.values.is_null() {
+                        std::slice::from_raw_parts(l.values, l.num as usize)
+                    } else {
+                        &[]
+                    };
+                    Ok(values
+                        .iter()
+                        .filter(|v| v.format == sys::mpv_format_MPV_FORMAT_STRING && !v.u.string.is_null())
+                        .map(|v| CStr::from_ptr(v.u.string).to_string_lossy().into_owned())
+                        .collect())
+                }
+                sys::mpv_format_MPV_FORMAT_NONE => Ok(Vec::new()),
+                _ => Err(Error::new(
+                    sys::mpv_error_MPV_ERROR_PROPERTY_FORMAT,
+                    crate::tf!("{name} 不是字串清單", "{name} is not a string list"),
+                )),
+            }
+        };
+        unsafe { sys::mpv_free_node_contents(&mut node) };
+        list
     }
 
     pub fn observe(&self, id: u64, name: &str, format: Format) -> Result<()> {
