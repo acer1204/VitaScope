@@ -444,7 +444,6 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 
 - [ ] 腳本：支援 mpv 的 Lua / JavaScript 腳本（直接使用 mpv 生態系的現成腳本）
 - [ ] 自家外掛 API
-- [ ] 補幀：mpv interpolation（平滑運動）、VapourSynth（SVP、RIFE）
 - [ ] 串流錄製（邊看邊存，不重新編碼）
 - [ ] DVD / 藍光：ISO 或資料夾，依標題播放（不含光碟選單）。藍光要在 libmpv 加上 libbluray（LGPL）；
   DVD 要 libdvdnav / libdvdread（GPL-2.0-or-later，libmpv 會變成 GPL，跟影戲本身相容，但要另外決定）
@@ -456,6 +455,43 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   目前影片畫面經 OpenGL 畫進 egui（8 位元 SDR，HDR 影片由 mpv 色調映射成 SDR），需要另外讓 mpv 用 D3D11 輸出（⚠ 見風險 R3）
 - [ ] 3D、360° 影片
 - [ ] 自動更新
+
+### L9 未來評估
+
+**目標：記下評估過、但要等外部條件成熟才決定做不做的項目。** 條件成熟時重新評估，決定要做就移到對應的等級。
+
+- [ ] 補幀：把 23.976 fps 的動畫即時補到 59.94 / 119.88 fps（類似以前的 AMD Fluid Motion），AMD、NVIDIA 都要能用。
+  **重新評估的時機：FFmpeg 下一個正式版（9.1 或之後）發佈、內含 `fruc_vulkan` 時。**
+
+#### 補幀的評估紀錄（2026-10-09）
+
+現況：
+- AMD：Fluid Motion（影片）只支援 GCN 世代（2014–2019），RDNA 起沒有，不是哪一版驅動拿掉的。現在給影片用的是 AMF 的 FRC
+  （Adrenalin 23.12.1 起，只有 AMD、只能補成 2 倍）：Bluesky FRC、PowerDVD 24、VLC 3.0.22 起、FFmpeg 9.0 的 `frc_amf`、
+  mpv 的 `vf=amf_frc` 都是用它。AFMF 是遊戲用的（全螢幕、關垂直同步、原始幀率 60 以上，只有 2 倍）。
+- NVIDIA：沒有給 RTX 30 的影片補幀。Smooth Motion 只支援 RTX 40/50 的遊戲；DLSS 補幀要遊戲的深度與運動向量；
+  RTX Video 只有放大與 HDR；VFX SDK 的 Video Frame Generation 只支援 Ada／Blackwell。
+  FFmpeg master 在 2026-08 加入 `fruc_vulkan`（LGPL，用顯示卡的光流硬體 VK_NV_optical_flow，RTX 30 起，可以補到任意幀率，
+  沒有場景切換偵測，有使用者回報動畫比真人影片差一點），mpv master 2026-09 起支援；FFmpeg 9.0.2 沒有。
+- 跨廠牌的現成方案：SVP 4 Pro（US$24.99，RIFE 用 TensorRT 或 ncnn/Vulkan，傳統的 svpflow 任何顯示卡都能用）、
+  mpv + VapourSynth + RIFE（免費；VapourSynth R80 起不再載入 API3 外掛，例如 vs-mlrt，要用 R79 或整合包）、
+  Lossless Scaling（US$6.99，擷取整個視窗，字幕與介面也會被補幀，延遲不會對齊聲音）、電視的 MEMC。
+- mpv 的 `interpolation`／tscale 只是混合前後兩格，不是運動補償；24p 在 120 Hz（每格 5 次）上幾乎沒有作用。
+- 倍率：120 Hz 的螢幕要補成 2.5 倍（59.94）或 5 倍（119.88）；2 倍（47.95）會變成 2、3 次交替，一樣頓挫。
+- 效能：RTX 3090 跑 1080p 的 RIFE，補到 60 輕鬆、補到 120 勉強（要 TensorRT 加輕量模型）；Radeon 890M 這類內顯跑不了即時的 1080p RIFE。
+
+影戲可以走的路（工作量是一個熟悉引擎建置的人的估計）：
+
+| 做法 | 工作量 | 支援 | 備註 |
+|---|---|---|---|
+| 引擎打開 VapourSynth，使用者自備 SVP／RIFE | 2～3 週 | AMD、NVIDIA、Intel | 建置只要標頭檔，執行時才載入 VSScript，安裝檔幾乎不變大；硬體解碼要 copy-back；每次跳轉重新載入腳本 |
+| `frc_amf`（FFmpeg 9.0.2 已有） | 1～2 週 | AMD（Windows），只能 2 倍 | 120 Hz 上會頓挫；890M 支不支援未確認 |
+| `fruc_vulkan` | 3～5 週，等 FFmpeg 新版 | NVIDIA RTX 30 起 | 引擎要打開 Vulkan；影戲是 OpenGL，要在濾鏡鏈裡 CUDA → Vulkan → CUDA，沒有人試過 |
+| 內建 RIFE（ncnn + Vulkan，程式與模型都是 MIT） | 只做 Windows 7～10 週、三平台 12～18 週，零複製另加 4～8 週 | 全部 | 要放在 mpv 的濾鏡鏈裡（字幕才不會變形）；一拍二／一拍三、換場景另外處理；TensorRT 的授權不能跟影戲一起散布 |
+| 自己訓練模型 | 不建議 | — | 動畫訓練資料沒有授權，品質只能靠人眼判斷 |
+
+重新評估時先做：用現成、含 `fruc_vulkan` 或 VapourSynth + RIFE 的 mpv，在 RTX 3090 與 890M 上實測動畫 1～3 天
+（快速平移、換場景、字幕），觀感可以接受再投入。
 
 ---
 
