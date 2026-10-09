@@ -790,6 +790,12 @@ impl VitascopeApp {
         &self.player
     }
 
+    /// 測試用：改動介面記下的播放狀態（例如模擬還沒更新的 time-pos）
+    #[doc(hidden)]
+    pub fn player_mut(&mut self) -> &mut Player {
+        &mut self.player
+    }
+
     /// 播放紀錄（介面測試用）
     pub fn history(&self) -> &History {
         &self.history

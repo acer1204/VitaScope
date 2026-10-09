@@ -9807,20 +9807,21 @@ fn bookmark_steps_add_up_when_pressed_quickly() {
     step_until(&mut h, "回到第一個書籤", |s| (s.time_pos - 10.0).abs() < 0.05);
 }
 
-/// 不是精準跳轉（沒有記下目標）時，P 也是問 mpv 按下那一刻的 time-pos，不是介面上一幀看到的狀態
+/// 不是精準跳轉（沒有記下目標）時，P 也是問 mpv 按下那一刻的 time-pos，不是介面記下的狀態。
+/// 介面的狀態故意改成錯的（暫停中 mpv 不會再送 time-pos，下一幀也不會被蓋掉）：書籤要在 mpv 真正的位置。
+/// 不靠「跳轉做完了、介面還沒看到」這種時間差，慢的機器上結果一樣
 #[test]
-fn bookmark_time_comes_from_mpv_after_a_keyframe_seek() {
+fn bookmark_time_comes_from_mpv_not_the_ui_state() {
     let mut h = paused_long();
     paused_at(&mut h, 10.0);
-    // 離上一次跳轉超過 0.3 秒：mpv 不會延後這一次
-    wait_real(&mut h, 0.4);
-    // 關鍵影格跳轉（落在 60 秒或之前最近的關鍵影格），跟 P 同一幀處理
-    h.state().player().seek_to(60.0, false).unwrap();
+    // 離上一次精準跳轉超過 0.35 秒：不再用跳轉的目標，改問 mpv
+    wait_real(&mut h, 0.5);
+    h.state_mut().player_mut().state.time_pos = 123.0;
     h.key_press(egui::Key::P);
     h.step();
     let times = mark_times(&h);
     assert_eq!(times.len(), 1, "{times:?}");
-    assert!(times[0] > 40.0, "書籤要在跳轉後的位置：{times:?}");
+    assert!((times[0] - 10.0).abs() < 0.05, "書籤要在 mpv 的位置：{times:?}");
 }
 
 #[test]
