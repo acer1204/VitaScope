@@ -103,6 +103,8 @@ pub struct Palette {
     pub accent: Color32,
     /// 進度條上的 A-B 重播區段（半透明疊在進度條上）、只設了起點時的那條線
     pub ab: Color32,
+    /// 進度條上方的書籤標記（小三角形）
+    pub bookmark: Color32,
     /// 有問題的檔案、錯誤訊息
     pub problem: Color32,
     /// 次要的小字（例如「關於」的授權說明）
@@ -119,6 +121,7 @@ impl Palette {
         tick: Color32::from_gray(24),
         accent: Color32::from_rgb(0x4f, 0x9d, 0xff),
         ab: Color32::from_rgb(0xff, 0xc1, 0x07),
+        bookmark: Color32::from_rgb(0x66, 0xbb, 0x6a),
         problem: Color32::from_rgb(0xff, 0x8a, 0x80),
         faint: Color32::from_gray(150),
     };
@@ -134,6 +137,8 @@ impl Palette {
             accent: Color32::from_rgb(0x1a, 0x6f, 0xd8),
             // 原本的琥珀色（#FFC107）跟淺灰的進度條底差不多亮，淺色主題看不出區段：換深一點的琥珀色
             ab: Color32::from_rgb(0xa6, 0x6f, 0x00),
+            // 淺底上原本的綠色太淡：深一點的綠
+            bookmark: Color32::from_rgb(0x2e, 0x7d, 0x32),
             problem: Color32::from_rgb(0xc6, 0x28, 0x28),
             faint: Color32::from_gray(110),
         }
@@ -258,6 +263,11 @@ mod tests {
             assert!(over.abs_diff(luma(p.track)) >= 40, "{p:?}");
         }
         assert!(luma(light.problem) < 110 && luma(light.accent) < 130, "{light:?}");
+        // 書籤標記畫在控制列的底上：深色是亮的綠、淺色是深的綠，跟底色看得出差別
+        assert_eq!(dark.bookmark, Color32::from_rgb(0x66, 0xbb, 0x6a));
+        for p in [dark, light] {
+            assert!(luma(p.panel).abs_diff(luma(p.bookmark)) >= 80, "{p:?}");
+        }
         assert!(luma(light.faint) < luma(light.panel) - 100);
         assert!(luma(dark.faint) > luma(dark.panel) + 100);
     }

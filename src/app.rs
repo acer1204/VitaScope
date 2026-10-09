@@ -1,5 +1,6 @@
 //! 播放器視窗：影片畫面、控制列、快捷鍵、全螢幕。
 
+mod bookmarks_panel;
 mod capture;
 mod control_panel;
 mod dialogs;
@@ -15,6 +16,7 @@ mod sound;
 mod tuning_menu;
 
 use crate::autoshot::AutoShot;
+use crate::bookmarks::Bookmarks;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
@@ -190,6 +192,10 @@ enum Action {
     SetTheme(ThemeChoice),
     /// 外觀：深色 ↔ 淺色（跟隨系統時換成跟現在看到的相反）
     CycleTheme,
+    /// 書籤：在目前的位置新增（P）、上一個（-1）/ 下一個（+1）、跳到某個書籤（編號）
+    BookmarkAdd,
+    BookmarkStep(i32),
+    BookmarkJump(u64),
 }
 
 /// Esc 會關掉的視窗，依這個順序一次關一個（之後的批次把自己的視窗加進來：匯出、線上搜尋字幕…）
@@ -263,6 +269,8 @@ pub struct VitascopeApp {
     engine_lgpl: bool,
     /// 最近開啟的檔案、續播位置
     history: History,
+    /// 每個檔案的書籤（背景執行緒存檔）
+    bookmarks: Bookmarks,
     /// 同資料夾的播放清單（開網址時沒有）
     playlist: Option<Playlist>,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
@@ -492,6 +500,8 @@ pub struct Launch {
     pub autoshot: Option<AutoShot>,
     /// 播放紀錄；預設只放在記憶體（自動測試用），播放器用 `History::load()`
     pub history: History,
+    /// 書籤；預設只放在記憶體（自動測試、`--shot` 不碰使用者的檔案），播放器用 `Bookmarks::load()`
+    pub bookmarks: Bookmarks,
     /// 上次手動整理的播放清單（沒有指定要開的檔案時還原）
     pub playlist: Option<Playlist>,
     /// 手動整理的播放清單要存起來（預設不存：自動測試不能動到使用者的檔案）
@@ -606,6 +616,10 @@ impl VitascopeApp {
         };
 
         let keymap = Keymap::build(&settings.keys, Platform::current());
+        let mut bookmarks = launch.bookmarks;
+        // 存檔失敗的回覆要叫醒介面（顯示提示）
+        let ctx = cc.egui_ctx.clone();
+        bookmarks.set_wake(Arc::new(move || ctx.request_repaint()));
         let mut app = Self {
             player,
             video,
@@ -632,6 +646,7 @@ impl VitascopeApp {
             engine_versions: String::new(),
             engine_lgpl: false,
             history: launch.history,
+            bookmarks,
             playlist: launch.playlist.clone(),
             was_eof: false,
             wheel: 0.0,
@@ -1474,6 +1489,9 @@ impl VitascopeApp {
                 });
             }
             Action::LoadAudio if loaded => self.load_file_dialog(false),
+            Action::BookmarkAdd => self.add_bookmark(),
+            Action::BookmarkStep(dir) if loaded => self.step_bookmark(dir),
+            Action::BookmarkJump(id) if loaded => self.jump_bookmark(id),
             Action::Restart if loaded && st.seekable => {
                 let _ = self.player.seek_to(0.0, true);
                 // 播完停在最後一格（暫停中）時也要開始播
@@ -2004,6 +2022,8 @@ impl VitascopeApp {
         let Ok(path) = self.player.get_string("path") else {
             return;
         };
+        // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到
+        self.bookmarks.refresh(&path);
         if let Some((video, subs)) = self.pending_subs.take()
             && crate::playlist::same_file(&video, Path::new(&path))
         {
@@ -2352,6 +2372,9 @@ impl VitascopeApp {
             Command::ToggleSmooth => Action::ToggleSmooth,
             Command::ScreenshotAs => Action::ScreenshotAs,
             Command::LoadSubtitle => Action::LoadSubtitle,
+            Command::BookmarkAdd => Action::BookmarkAdd,
+            Command::BookmarkPrev => Action::BookmarkStep(-1),
+            Command::BookmarkNext => Action::BookmarkStep(1),
         }
     }
 
@@ -3234,6 +3257,9 @@ impl VitascopeApp {
                 }
             });
         }
+        if let Some(a) = self.bookmarks_menu(ui) {
+            action = Some(a);
+        }
         ui.separator();
         self.track_menu(ui, TrackKind::Audio, crate::tr!("音軌", "Audio"));
         self.track_menu(ui, TrackKind::Sub, crate::tr!("字幕", "Subtitles"));
@@ -3871,6 +3897,7 @@ impl VitascopeApp {
     }
 
     fn progress_bar(&mut self, ui: &mut egui::Ui) {
+        let marks = self.current_marks().to_vec();
         let st = &self.player.state;
         let duration = st.duration.unwrap_or(0.0);
         let can_seek = st.loaded && st.seekable && duration > 0.0;
@@ -3882,6 +3909,8 @@ impl VitascopeApp {
         response.widget_info(|| egui::WidgetInfo::slider(can_seek, st.time_pos, crate::tr!("進度", "Progress")));
 
         let time_at = |x: f32| ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64 * duration;
+        // 書籤在進度條上的位置（超過片長的畫在最後面）
+        let mark_x = |t: f64| rect.left() + rect.width() * (t / duration).clamp(0.0, 1.0) as f32;
         // 拖曳只對開始拖的那個檔案有效：拖到結尾、換到下一個檔案後，不要繼續把新檔案也拖到結尾
         if response.drag_started() {
             self.drag_gen = Some(self.file_gen);
@@ -3902,6 +3931,11 @@ impl VitascopeApp {
                     self.seek_released = false;
                 }
                 if (response.drag_stopped() && drag_is_ours) || response.clicked() {
+                    // 點在書籤標記附近：精準跳到書籤的時間（拖曳放開的位置照舊）
+                    let t = match bookmarks_panel::mark_near(&marks, p.x, mark_x) {
+                        Some(m) if response.clicked() => m.time,
+                        _ => t,
+                    };
                     let _ = self.player.seek_to(t, true);
                     if std::mem::take(&mut self.resume_after_drag) {
                         let _ = self.player.set_pause(false);
@@ -3956,6 +3990,8 @@ impl VitascopeApp {
                     Stroke::new(2.0, palette.tick),
                 );
             }
+            // 書籤：進度條上方的小三角形
+            bookmarks_panel::paint_markers(painter, rect, bar, marks.iter().map(|m| x_of(m.time)), palette.bookmark);
         }
         if active {
             painter.circle(
@@ -3968,10 +4004,17 @@ impl VitascopeApp {
 
         // 滑鼠停在進度條上：顯示該位置的時間
         if can_seek && let Some(hover) = response.hover_pos() {
-            let t = time_at(hover.x);
-            let label = match st.chapter_at(t) {
-                Some(i) => format!("{} · {}", fmt_time(t), chapter_label(&st.chapters, i)),
-                None => fmt_time(t),
+            // 停在書籤標記附近：顯示書籤（點下去也是跳到它）。拖曳中不換：放開時跳到的是滑鼠的位置，
+            // 時間、預覽畫面要跟它一樣
+            let dragging = response.dragged() || response.drag_stopped();
+            let near = (!dragging)
+                .then(|| bookmarks_panel::mark_near(&marks, hover.x, mark_x))
+                .flatten();
+            let t = near.map_or_else(|| time_at(hover.x), |m| m.time);
+            let label = match (near, st.chapter_at(t)) {
+                (Some(m), _) => bookmarks_panel::hover_label(m),
+                (None, Some(i)) => format!("{} · {}", fmt_time(t), chapter_label(&st.chapters, i)),
+                (None, None) => fmt_time(t),
             };
             let layer = egui::LayerId::new(egui::Order::Tooltip, Id::new("seek_hover"));
             let p = ui.ctx().layer_painter(layer);
@@ -4009,6 +4052,7 @@ impl eframe::App for VitascopeApp {
             self.pacing_tick(ctx);
         }
         self.poll_playlist_scan();
+        self.poll_bookmarks();
         self.poll_screenshots(ctx);
         self.poll_previews(ctx);
         self.poll_folder_add();
@@ -4147,6 +4191,10 @@ impl eframe::App for VitascopeApp {
         self.remember_position();
         self.save_settings();
         self.persist_playlist();
+        // 剛加的書籤還在背景存檔：等它寫完（最多兩秒），結束程式時背景執行緒會直接被停掉
+        if !self.bookmarks.flush(Duration::from_secs(2)) {
+            eprintln!("[vitascope] 書籤還沒存完就結束了");
+        }
         // 之後啟動的程式自己當主視窗
         if let Some(p) = &mut self.instance {
             p.shutdown();

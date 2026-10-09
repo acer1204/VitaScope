@@ -302,10 +302,11 @@ pub enum Group {
     Quality,
     Window,
     Files,
+    Bookmarks,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [
+    pub const ALL: [Group; 8] = [
         Group::Playback,
         Group::Sound,
         Group::Subtitles,
@@ -313,6 +314,7 @@ impl Group {
         Group::Quality,
         Group::Window,
         Group::Files,
+        Group::Bookmarks,
     ];
 
     pub fn label(self) -> &'static str {
@@ -325,6 +327,7 @@ impl Group {
             Group::Quality => crate::tr!("畫質", "Video quality"),
             Group::Window => crate::tr!("視窗", "Window"),
             Group::Files => crate::tr!("檔案與截圖", "Files and screenshots"),
+            Group::Bookmarks => crate::tr!("書籤", "Bookmarks"),
         }
     }
 }
@@ -439,6 +442,9 @@ commands! {
     CopyFrame => "copy-frame", Files, once, ("擷取畫面（剪貼簿）", "Copy frame");
     ScreenshotAs => "screenshot-as", Files, once, ("另存截圖…", "Save screenshot as…");
     LoadSubtitle => "load-subtitle", Files, once, ("載入字幕檔…", "Load subtitle file…");
+    BookmarkAdd => "bookmark-add", Bookmarks, once, ("新增書籤", "Add bookmark");
+    BookmarkPrev => "bookmark-prev", Bookmarks, once, ("上一個書籤", "Previous bookmark");
+    BookmarkNext => "bookmark-next", Bookmarks, once, ("下一個書籤", "Next bookmark");
 }
 
 impl Command {
@@ -488,6 +494,7 @@ fn vitascope_preset(platform: Platform) -> Vec<(Command, Chord)> {
     const N: Mods = Mods::NONE;
     const CMD: Mods = Mods::CMD;
     const ALT: Mods = Mods::ALT;
+    const SHIFT: Mods = Mods::SHIFT;
     let mut list = vec![
         (C::TogglePause, Chord::new(N, Key::Space)),
         (C::Restart, Chord::new(N, Key::Home)),
@@ -505,6 +512,11 @@ fn vitascope_preset(platform: Platform) -> Vec<(Command, Chord)> {
         (C::NextFile, Chord::new(N, Key::PageDown)),
         (C::PrevChapter, Chord::new(CMD, Key::PageUp)),
         (C::NextChapter, Chord::new(CMD, Key::PageDown)),
+        // 書籤：檔案、章節、書籤用同一組鍵、不同的修飾鍵。以前 Shift+PgUp / PgDn 是換檔（多按的 Shift 不影響），
+        // 現在修飾鍵多的優先，變成跳書籤
+        (C::BookmarkPrev, Chord::new(SHIFT, Key::PageUp)),
+        (C::BookmarkNext, Chord::new(SHIFT, Key::PageDown)),
+        (C::BookmarkAdd, Chord::new(N, Key::P)),
         (C::VolumeUp, Chord::new(N, Key::ArrowUp)),
         (C::VolumeDown, Chord::new(N, Key::ArrowDown)),
         (C::ToggleMute, Chord::new(N, Key::M)),
@@ -1199,6 +1211,19 @@ impl Keymap {
         }
     }
 
+    /// 這個檔案沒有書籤時按了上一個 / 下一個：「這個檔案還沒有書籤（按 P 新增）」
+    pub fn no_bookmarks_osd(&self) -> String {
+        let key = self.hint(Command::BookmarkAdd);
+        if key.is_empty() {
+            crate::tr!("這個檔案還沒有書籤", "No bookmarks in this file yet").to_owned()
+        } else {
+            crate::tf!(
+                "這個檔案還沒有書籤（按 {key} 新增）",
+                "No bookmarks in this file yet (press {key} to add one)"
+            )
+        }
+    }
+
     /// 起始畫面：「把影片拖放到這裡，或按 Ctrl+O 開啟檔案」
     pub fn drop_hint(&self) -> String {
         let key = self.hint(Command::OpenFile);
@@ -1336,6 +1361,10 @@ mod tests {
         "toggle-smooth",
         "screenshot-as",
         "load-subtitle",
+        // B1
+        "bookmark-add",
+        "bookmark-prev",
+        "bookmark-next",
     ];
 
     #[test]
@@ -1464,7 +1493,10 @@ mod tests {
                 | C::FillWindow
                 | C::ToggleSmooth
                 | C::ScreenshotAs
-                | C::LoadSubtitle => false,
+                | C::LoadSubtitle
+                | C::BookmarkAdd
+                | C::BookmarkPrev
+                | C::BookmarkNext => false,
             };
             assert_eq!(c.repeatable(), expected, "{c:?}");
         }
@@ -1819,13 +1851,25 @@ mod tests {
             .collect()
     }
 
+    /// v0.3.0 之後刻意改的按鍵（批次二 B1）：P 新增書籤（以前沒有作用）；Shift+PgUp / PgDn 上一個 / 下一個書籤
+    /// （以前多按的 Shift 不影響，是換檔）。Ctrl+P、Ctrl+Shift+PgUp 之類有 Ctrl 的照舊
+    fn changed_after_v030(mods: Modifiers, key: Key) -> Option<Option<Command>> {
+        let no_ctrl = !mods.ctrl && !mods.command && !mods.mac_cmd;
+        match key {
+            Key::P if no_ctrl => Some(Some(Command::BookmarkAdd)),
+            Key::PageUp if no_ctrl && mods.shift => Some(Some(Command::BookmarkPrev)),
+            Key::PageDown if no_ctrl && mods.shift => Some(Some(Command::BookmarkNext)),
+            _ => None,
+        }
+    }
+
     #[test]
     fn preset_matches_the_old_hard_coded_keys_exactly() {
         for p in Platform::ALL {
             let map = keymap(p);
             for &key in Key::ALL {
                 for mods in combos(p) {
-                    let old = old_lookup(mods, key);
+                    let old = changed_after_v030(mods, key).unwrap_or_else(|| old_lookup(mods, key));
                     let new = map.lookup(key, mods);
                     // Windows、Linux 的 egui-winit 一律送 command = ctrl。只按其中一個（介面測試的
                     // `Modifiers::COMMAND`、`Modifiers::CTRL`）時舊版分得出兩者，新版都當成 Ctrl：
@@ -2401,5 +2445,55 @@ mod tests {
         assert!(all.custom.is_empty());
         // 一項一項還原只動按鍵
         assert_eq!(keys.reset_command(Command::Stop).mouse, keys.mouse);
+    }
+
+    #[test]
+    fn bookmark_keys_in_both_presets() {
+        set_lang(Lang::ZhTw);
+        for preset in KeyPreset::ALL {
+            for p in Platform::ALL {
+                let map = Keymap::build(
+                    &KeySettings {
+                        preset,
+                        ..Default::default()
+                    },
+                    p,
+                );
+                let cmd = if p == Platform::Mac {
+                    Modifiers::MAC_CMD | Modifiers::COMMAND
+                } else {
+                    Modifiers::COMMAND
+                };
+                // 檔案、章節、書籤：同一組鍵，修飾鍵多的優先
+                assert_eq!(map.lookup(Key::PageUp, Modifiers::NONE), Some(Command::PrevFile));
+                assert_eq!(map.lookup(Key::PageUp, cmd), Some(Command::PrevChapter));
+                assert_eq!(map.lookup(Key::PageUp, Modifiers::SHIFT), Some(Command::BookmarkPrev));
+                assert_eq!(map.lookup(Key::PageDown, Modifiers::SHIFT), Some(Command::BookmarkNext));
+                assert_eq!(
+                    map.lookup(Key::PageDown, cmd | Modifiers::SHIFT),
+                    Some(Command::NextChapter),
+                    "{preset:?} {p:?}"
+                );
+                assert_eq!(map.lookup(Key::P, Modifiers::NONE), Some(Command::BookmarkAdd));
+                assert_eq!(map.lookup(Key::P, cmd), Some(Command::FlipV), "Ctrl+P 照舊是上下翻轉");
+                assert_eq!(
+                    map.pair(Command::BookmarkPrev, Command::BookmarkNext),
+                    "Shift+PgUp / PgDn"
+                );
+                assert_eq!(map.no_bookmarks_osd(), "這個檔案還沒有書籤（按 P 新增）");
+            }
+        }
+        // 改了按鍵：提示跟著改；沒有按鍵時括號整個不寫
+        let map = Keymap::build(&custom(&[("bookmark-add", &["B"])]), Platform::Windows);
+        assert_eq!(map.no_bookmarks_osd(), "這個檔案還沒有書籤（按 B 新增）");
+        let map = Keymap::build(&custom(&[("bookmark-add", &[])]), Platform::Windows);
+        assert_eq!(map.no_bookmarks_osd(), "這個檔案還沒有書籤");
+        set_lang(Lang::En);
+        assert_eq!(
+            keymap(Platform::Windows).no_bookmarks_osd(),
+            "No bookmarks in this file yet (press P to add one)"
+        );
+        assert_eq!(Group::Bookmarks.label(), "Bookmarks");
+        set_lang(Lang::ZhTw);
     }
 }

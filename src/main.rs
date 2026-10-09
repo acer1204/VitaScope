@@ -83,9 +83,10 @@ fn parse_args() -> (Launch, bool) {
     });
     // 流暢播放出問題時回到以前的做法：VITASCOPE_PACING=off（只在啟動時讀一次）
     launch.pacing = vitascope::pacing::Overrides::from_env();
-    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
+    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、書籤、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
     if launch.autoshot.is_none() {
         launch.history = History::load();
+        launch.bookmarks = vitascope::bookmarks::Bookmarks::load();
         launch.persist_playlist = true;
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
         if launch.files.is_empty() {

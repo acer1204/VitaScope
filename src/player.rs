@@ -674,7 +674,13 @@ pub struct Player {
     boost_pct: f64,
     /// ao 選項本來就有 null（headless、VITASCOPE_MPV_OPTS 指定）：用 null 輸出不是開不起來改用的
     ao_null_wanted: bool,
+    /// 最近一次精準跳轉的目標和送出的時間（見 `position_now`）；其他跳轉、換檔時清掉
+    exact_seek: std::sync::Mutex<Option<(f64, Instant)>>,
 }
+
+/// 送出精準跳轉後這麼久（秒）以內，`position_now` 用跳轉的目標：上一次跳轉 0.3 秒內，
+/// mpv 會等上一次的畫面出來才做下一次（playloop.c `execute_queued_seek`），這段時間 time-pos 還是舊的位置
+const SEEK_PENDING: f64 = 0.35;
 
 impl Player {
     pub fn new(opts: Options) -> mpv::Result<Self> {
@@ -780,6 +786,7 @@ impl Player {
             shaders_inflight: HashSet::new(),
             boost_pct: 0.0,
             ao_null_wanted,
+            exact_seek: std::sync::Mutex::new(None),
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -1144,6 +1151,7 @@ impl Player {
     pub fn toggle_pause(&self) -> mpv::Result<()> {
         // 播完停在最後一格時按播放 = 從頭開始
         if self.state.eof && self.state.paused {
+            self.note_seek(None);
             self.mpv.command(&["seek", "0", "absolute"])?;
         }
         self.mpv.command(&["cycle", "pause"])
@@ -1157,15 +1165,40 @@ impl Player {
             && let Some(duration) = self.state.duration
             && self.state.time_pos + seconds >= duration
         {
+            self.note_seek(None);
             return self.mpv.command(&["seek", "100", "absolute-percent+exact"]);
         }
+        self.note_seek(None);
         self.mpv.command(&["seek", &format!("{seconds}"), "relative"])
     }
 
     /// 跳到絕對時間（秒）。`exact` = 精準到影格（較慢）；拖曳進度條時用關鍵影格比較順
     pub fn seek_to(&self, seconds: f64, exact: bool) -> mpv::Result<()> {
         let mode = if exact { "absolute+exact" } else { "absolute+keyframes" };
+        // 關鍵影格跳轉落在哪裡要等 mpv 做了才知道：不記目標
+        self.note_seek(exact.then_some(seconds));
         self.mpv.command(&["seek", &format!("{seconds}"), mode])
+    }
+
+    /// 記下（或清掉）最近一次精準跳轉的目標
+    fn note_seek(&self, target: Option<f64>) {
+        if let Ok(mut slot) = self.exact_seek.lock() {
+            *slot = target.map(|t| (t, Instant::now()));
+        }
+    }
+
+    /// 目前的位置（秒），按下按鍵的那一刻用（新增書籤、上一個 / 下一個書籤）：
+    /// - 直接問 mpv 的 time-pos：屬性通知可能還沒到，介面看到的狀態可能還是跳轉前的。
+    /// - 剛送出精準跳轉（[`SEEK_PENDING`] 秒內）時用跳轉的目標：連續跳轉時 mpv 可能還沒開始做這一次，
+    ///   time-pos 還是上一次的位置（連按「下一個書籤」會一直跳到同一個）
+    pub fn position_now(&self) -> f64 {
+        let pending = self.exact_seek.lock().ok().and_then(|slot| *slot);
+        if let Some((t, at)) = pending
+            && at.elapsed().as_secs_f64() < SEEK_PENDING
+        {
+            return t;
+        }
+        self.get_f64("time-pos").unwrap_or(self.state.time_pos)
     }
 
     pub fn set_volume(&self, volume: f64) -> mpv::Result<()> {
@@ -1219,6 +1252,7 @@ impl Player {
 
     /// 逐格前進 / 後退（會暫停播放）
     pub fn frame_step(&self, forward: bool) -> mpv::Result<()> {
+        self.note_seek(None);
         self.mpv
             .command(&[if forward { "frame-step" } else { "frame-back-step" }])
     }
@@ -1256,11 +1290,13 @@ impl Player {
 
     /// 跳到前 / 後幾個章節
     pub fn add_chapter(&self, delta: i64) -> mpv::Result<()> {
+        self.note_seek(None);
         self.mpv.command(&["add", "chapter", &delta.to_string()])
     }
 
     /// 跳到第 `index` 個章節（從 0 開始）
     pub fn seek_chapter(&self, index: usize) -> mpv::Result<()> {
+        self.note_seek(None);
         self.mpv.set_property("chapter", index as i64)
     }
 
@@ -1725,6 +1761,8 @@ impl Player {
                 None
             }
             Event::StartFile => {
+                // 上一個檔案的跳轉目標不算這個檔案的位置
+                self.note_seek(None);
                 self.state.loading = true;
                 self.state.loaded = false;
                 self.state.last_error = None;

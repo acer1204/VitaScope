@@ -8,6 +8,7 @@
 pub mod app;
 pub mod assoc;
 pub mod autoshot;
+pub mod bookmarks;
 pub mod fonts;
 pub mod formats;
 pub mod geometry;

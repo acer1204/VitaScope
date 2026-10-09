@@ -1460,6 +1460,16 @@ fn hover_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
         });
         h.run_steps(2);
     }
+    // 捲動有動畫：等項目停下來再移過去（不然滑鼠停在動畫途中的位置，項目捲走後就不在它上面了）
+    let mut last = h.get_by_label_contains(label).rect();
+    for _ in 0..30 {
+        h.step();
+        let now = h.get_by_label_contains(label).rect();
+        if now == last {
+            break;
+        }
+        last = now;
+    }
     // 捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：先移到要點的項目上，等子選單關掉
     h.get_by_label_contains(label).hover();
     h.run_steps(3);
@@ -3472,6 +3482,16 @@ fn open_exact_submenu(h: &mut Harness<'_, VitascopeApp>, label: &str) {
             phase: egui::TouchPhase::Move,
         });
         h.run_steps(2);
+    }
+    // 等捲動的動畫停下來（同 `hover_menu_item`）
+    let mut last = h.get_by_label(label).rect();
+    for _ in 0..30 {
+        h.step();
+        let now = h.get_by_label(label).rect();
+        if now == last {
+            break;
+        }
+        last = now;
     }
     h.get_by_label(label).hover();
     h.run_steps(3);
@@ -9557,4 +9577,589 @@ fn save_as_screenshot_waits_for_the_open_dialog() {
     assert_eq!(h.state().dialog_pending(), Some(DialogKind::Open));
     req.reply.send(None).unwrap();
     step_until_app(&mut h, "取消", |app| app.dialog_pending().is_none());
+}
+
+// ───────────── 書籤 ─────────────
+
+/// 目前檔案的書籤時間
+fn mark_times(h: &Harness<'_, VitascopeApp>) -> Vec<f64> {
+    let app = h.state();
+    let key = app.player().state.path.clone().unwrap_or_default();
+    app.bookmarks().marks(&key).iter().map(|m| m.time).collect()
+}
+
+/// 暫停中精準跳到 `t`，等畫面跟上
+fn paused_at(h: &mut Harness<'_, VitascopeApp>, t: f64) {
+    h.state().player().seek_to(t, true).unwrap();
+    step_until(h, "跳到指定的時間", |s| {
+        s.paused && (s.time_pos - t).abs() < 0.05
+    });
+    h.run_steps(3);
+}
+
+/// 開 90 秒的樣本、暫停
+fn paused_long() -> Harness<'static, VitascopeApp> {
+    let mut h = opened(sample("common/mp4_long.mp4"));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h
+}
+
+#[test]
+fn bookmark_key_adds_and_says_why_not() {
+    // 沒有開檔：提示先開影片
+    let mut h = harness(None);
+    h.run_steps(2);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("請先開啟影片"));
+    let mut h = paused_long();
+    // 還沒有書籤：上一個 / 下一個說明怎麼加（按鍵從對照表來）；不會換檔
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("這個檔案還沒有書籤（按 P 新增）"));
+    assert!(
+        playing(&h.state().player().state, "mp4_long.mp4"),
+        "Shift+PgDn 不是下一個檔案"
+    );
+    paused_at(&mut h, 12.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("新增書籤 00:12"));
+    assert_eq!(mark_times(&h), [12.0]);
+    // 同一個位置（0.5 秒內）不重複加
+    paused_at(&mut h, 12.3);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("00:12 已經有書籤"));
+    assert_eq!(mark_times(&h), [12.0]);
+    assert!(h.state().player().state.paused, "加書籤不影響暫停");
+}
+
+/// 書籤的時間是按下 P 那一刻 mpv 的時間（不是介面看到的狀態：跳轉剛送出時還是跳轉前的），
+/// 上一個 / 下一個書籤精準跳到那一格
+#[test]
+fn bookmark_jump_is_exact() {
+    let mut h = paused_long();
+    for target in [3.2, 7.9] {
+        // 跳轉送出後馬上按 P，同一幀處理（不等介面看到新的位置）。兩次跳轉不到 0.3 秒：
+        // mpv 可能還沒開始做這一次（等上一次的畫面），書籤照樣在這次的目標
+        h.state().player().seek_to(target, true).unwrap();
+        h.key_press(egui::Key::P);
+        h.step();
+        let times = mark_times(&h);
+        assert!(
+            times.iter().any(|t| (t - target).abs() < 0.05),
+            "書籤要在 {target}：{times:?}"
+        );
+    }
+    assert_eq!(mark_times(&h).len(), 2);
+    paused_at(&mut h, 0.0);
+    for (key, want, osd) in [
+        (egui::Key::PageDown, 3.2, "書籤 1/2：00:03"),
+        (egui::Key::PageDown, 7.9, "書籤 2/2：00:08"),
+        (egui::Key::PageUp, 3.2, "書籤 1/2：00:03"),
+    ] {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, key);
+        step_until(&mut h, osd, |s| (s.time_pos - want).abs() < 0.05);
+        assert_eq!(h.state().osd_text(), Some(osd));
+        // 跳轉途中的畫面時間可能先到、之後才真的停在那一格：多跑幾幀再確認
+        wait_real(&mut h, 0.3);
+        let s = &h.state().player().state;
+        assert!(
+            (s.time_pos - want).abs() < 0.05 && s.paused,
+            "停在 {want}：{}",
+            s.time_pos
+        );
+    }
+    // 前面、後面沒有了
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("前面沒有書籤"));
+    paused_at(&mut h, 7.9);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("後面沒有書籤"));
+    assert!((h.state().player().state.time_pos - 7.9).abs() < 0.05);
+}
+
+/// 進度條上這個顏色的小三角形（書籤標記）的中心 x
+fn marker_xs(h: &Harness<'_, VitascopeApp>) -> Vec<f32> {
+    fn walk(shape: &egui::Shape, color: egui::Color32, out: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Path(p) if p.fill == color && p.points.len() == 3 => {
+                out.push(p.points.iter().map(|q| q.x).sum::<f32>() / 3.0);
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, color, out)),
+            _ => {}
+        }
+    }
+    let color = h.state().palette().bookmark;
+    let mut out = Vec::new();
+    for c in &h.output().shapes {
+        walk(&c.shape, color, &mut out);
+    }
+    out
+}
+
+#[test]
+fn bookmark_marker_shows_its_name_and_click_snaps() {
+    let mut h = paused_long();
+    assert!(marker_xs(&h).is_empty());
+    paused_at(&mut h, 30.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    paused_at(&mut h, 60.0);
+    let bar = h.get_by_label("進度").rect();
+    let x = bar.left() + bar.width() * (30.0 / 90.0);
+    let xs = marker_xs(&h);
+    assert_eq!(xs.len(), 1, "畫一個標記");
+    assert!((xs[0] - x).abs() < 1.0, "標記在 30 秒的位置：{} / {x}", xs[0]);
+    // 停在標記附近：時間換成書籤
+    let near = egui::pos2(x + 3.0, bar.center().y);
+    h.event(egui::Event::PointerMoved(near));
+    h.run_steps(2);
+    assert!(painted(&h, "00:30 · 書籤"), "停在標記上顯示書籤");
+    // 點標記旁邊 3 點：精準跳到書籤的時間（不是點的位置）
+    h.event(left_button(near, true));
+    h.event(left_button(near, false));
+    h.step();
+    step_until(&mut h, "跳到書籤", |s| (s.time_pos - 30.0).abs() < 0.05);
+    wait_real(&mut h, 0.3);
+    assert!((h.state().player().state.time_pos - 30.0).abs() < 0.05);
+    // 離標記遠一點：照點的位置跳，時間照舊顯示
+    let far = egui::pos2(x + 40.0, bar.center().y);
+    h.event(egui::Event::PointerMoved(far));
+    h.run_steps(2);
+    assert!(!painted(&h, "00:30 · 書籤"));
+    h.event(left_button(far, true));
+    h.event(left_button(far, false));
+    h.step();
+    let want = 90.0 * f64::from((far.x - bar.left()) / bar.width());
+    step_until(&mut h, "照點的位置跳", |s| (s.time_pos - want).abs() < 0.3);
+    assert!((h.state().player().state.time_pos - 30.0).abs() > 1.0);
+    // 拖曳經過標記：放開時跳到的是滑鼠的位置，時間也照滑鼠的位置顯示（不換成書籤）
+    wait_real(&mut h, 0.4);
+    let close = egui::pos2(x + 4.0, bar.center().y);
+    h.event(left_button(far, true));
+    h.step();
+    for i in 1..=10 {
+        h.event(egui::Event::PointerMoved(far.lerp(close, i as f32 / 10.0)));
+        h.step();
+    }
+    h.run_steps(2);
+    assert!(!painted(&h, "00:30 · 書籤"), "拖曳中不換成書籤");
+    let pointer = 90.0 * f64::from((close.x - bar.left()) / bar.width());
+    assert!(painted(&h, &vitascope::app::fmt_time(pointer)), "顯示滑鼠位置的時間");
+    h.event(left_button(close, false));
+    h.step();
+    step_until(&mut h, "放開：跳到滑鼠的位置", |s| {
+        (s.time_pos - pointer).abs() < 0.1
+    });
+    // 放開後滑鼠還停在標記附近：又顯示書籤
+    h.run_steps(2);
+    assert!(painted(&h, "00:30 · 書籤"));
+}
+
+/// 連按「下一個書籤」：每按一次前進一個（上一次的跳轉 mpv 還沒做時，從它的目標往後找）
+#[test]
+fn bookmark_steps_add_up_when_pressed_quickly() {
+    let mut h = paused_long();
+    for t in [10.0, 20.0, 30.0, 40.0] {
+        paused_at(&mut h, t);
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+    }
+    assert_eq!(mark_times(&h), [10.0, 20.0, 30.0, 40.0]);
+    paused_at(&mut h, 0.0);
+    for _ in 0..3 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+        h.step();
+    }
+    assert_eq!(h.state().osd_text(), Some("書籤 3/4：00:30"));
+    step_until(&mut h, "停在第三個書籤", |s| (s.time_pos - 30.0).abs() < 0.05);
+    wait_real(&mut h, 0.4);
+    let s = &h.state().player().state;
+    assert!((s.time_pos - 30.0).abs() < 0.05 && s.paused, "{}", s.time_pos);
+    // 往回連按兩次：回到第一個
+    for _ in 0..2 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+        h.step();
+    }
+    assert_eq!(h.state().osd_text(), Some("書籤 1/4：00:10"));
+    step_until(&mut h, "回到第一個書籤", |s| (s.time_pos - 10.0).abs() < 0.05);
+}
+
+/// 不是精準跳轉（沒有記下目標）時，P 也是問 mpv 按下那一刻的 time-pos，不是介面上一幀看到的狀態
+#[test]
+fn bookmark_time_comes_from_mpv_after_a_keyframe_seek() {
+    let mut h = paused_long();
+    paused_at(&mut h, 10.0);
+    // 離上一次跳轉超過 0.3 秒：mpv 不會延後這一次
+    wait_real(&mut h, 0.4);
+    // 關鍵影格跳轉（落在 60 秒或之前最近的關鍵影格），跟 P 同一幀處理
+    h.state().player().seek_to(60.0, false).unwrap();
+    h.key_press(egui::Key::P);
+    h.step();
+    let times = mark_times(&h);
+    assert_eq!(times.len(), 1, "{times:?}");
+    assert!(times[0] > 40.0, "書籤要在跳轉後的位置：{times:?}");
+}
+
+#[test]
+fn bookmarks_context_submenu_adds_and_jumps() {
+    let mut h = paused_long();
+    // 沒有書籤：子選單說還沒有，寫出上一個 / 下一個的按鍵
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label("這個檔案還沒有書籤");
+    h.get_by_label("上一個 / 下一個書籤：Shift+PgUp / PgDn");
+    let first = h.state().player().state.time_pos;
+    h.get_by_label("新增書籤 P").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some(format!("新增書籤 {}", vitascope::app::fmt_time(first)).as_str())
+    );
+    assert_eq!(mark_times(&h).len(), 1);
+    let first = mark_times(&h)[0];
+    paused_at(&mut h, 45.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    paused_at(&mut h, 70.0);
+    // 子選單列出書籤（時間），點了跳過去
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label("00:45").click();
+    h.run_steps(2);
+    step_until(&mut h, "跳到 45 秒", |s| (s.time_pos - 45.0).abs() < 0.05);
+    assert_eq!(h.state().osd_text(), Some("書籤 2/2：00:45"));
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label(&vitascope::app::fmt_time(first)).click();
+    h.run_steps(2);
+    step_until(&mut h, "跳到第一個", |s| (s.time_pos - first).abs() < 0.05);
+    assert!(h.state().player().state.paused);
+}
+
+#[test]
+fn bookmark_menu_without_a_file_is_disabled() {
+    let mut h = harness(None);
+    h.run_steps(2);
+    // 起始畫面中間是提示文字：在影片畫面的角落按右鍵
+    let corner = h.get_by_label("影片畫面").rect().left_top() + egui::vec2(20.0, 20.0);
+    h.event(egui::Event::PointerMoved(corner));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: corner,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+    hover_menu_item(&mut h, "書籤 ⏵");
+    assert!(
+        h.get_by_label("新增書籤 P").accesskit_node().is_disabled(),
+        "沒有開檔不能加"
+    );
+    assert!(h.query_by_label("這個檔案還沒有書籤").is_none());
+}
+
+#[test]
+fn unseekable_sources_cannot_be_bookmarked() {
+    // 經過 FFmpeg 的 file 協定、告訴它不能跳轉（像直播、不支援 Range 的伺服器）
+    let url = format!("lavf://file:{}", sample("common/mp4_long.mp4").display());
+    for (lang, cant_add, cant_jump, video, menu, add) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            "這個檔案不能跳轉，無法加書籤",
+            "這個檔案不能跳轉",
+            "影片畫面",
+            "書籤 ⏵",
+            "新增書籤 P",
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            "This file isn't seekable, so it can't be bookmarked",
+            "This file isn't seekable",
+            "Video",
+            "Bookmarks ⏵",
+            "Add bookmark P",
+        ),
+    ] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let opts = Options {
+            keep_open: true,
+            extra: vec![("stream-lavf-o".into(), "seekable=0".into())],
+            ..Options::headless()
+        };
+        // 之前（例如能跳轉時）加的書籤：跳不過去
+        let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+        bookmarks.add(&url, 50.0).unwrap();
+        let launch = Launch {
+            files: vec![PathBuf::from(&url)],
+            bookmarks,
+            ..Default::default()
+        };
+        let mut h = harness_launch_with(opts, launch, settings);
+        step_until(&mut h, "載入完成", |s| s.loaded && s.duration.is_some());
+        h.run_steps(3);
+        assert!(!h.state().player().state.seekable, "這個來源不能跳轉");
+        assert_eq!(mark_times(&h), [50.0]);
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+        assert_eq!(h.state().osd_text(), Some(cant_add));
+        assert_eq!(mark_times(&h), [50.0]);
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+        h.run_steps(2);
+        assert_eq!(h.state().osd_text(), Some(cant_jump));
+        h.get_by_label(video).click_secondary();
+        h.run_steps(2);
+        hover_menu_item(&mut h, menu);
+        let node = h.get_by_label(add);
+        assert!(node.accesskit_node().is_disabled());
+        node.hover();
+        h.run_steps(3);
+        assert!(h.query_by_label(cant_add).is_some(), "停在上面說明為什麼不能加");
+    }
+}
+
+#[test]
+fn bookmarks_are_saved_to_their_file() {
+    let dir = TempDir::new("bookmarks");
+    let store = dir.0.join("bookmarks.json");
+    let video = dir.clip("影片.mp4");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let launch = Launch {
+        files: vec![video.clone()],
+        bookmarks: vitascope::bookmarks::Bookmarks::load_from(store.clone()),
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    settle(&mut h, "影片.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    paused_at(&mut h, 1.5);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    let key = h.state().player().state.path.clone().unwrap();
+    assert!(h.state().bookmarks().flush(TIMEOUT), "背景存檔");
+    let saved = vitascope::bookmarks::Bookmarks::load_from(store);
+    let marks = saved.marks(&key);
+    assert_eq!(marks.len(), 1);
+    assert!((marks[0].time - 1.5).abs() < 0.05);
+    let file = saved.file(&key).unwrap();
+    assert_eq!(file.path, key, "存的是完整路徑");
+    assert_eq!(file.size, Some(std::fs::metadata(&video).unwrap().len()));
+}
+
+#[test]
+fn bookmarks_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings.clone());
+    h.run_steps(2);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Open a video first"));
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "pause", |s| s.paused);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("No bookmarks in this file yet (press P to add one)")
+    );
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Bookmarks ⏵");
+    h.get_by_label("No bookmarks in this file yet");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    paused_at(&mut h, 20.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Bookmark added at 00:20"));
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("There's already a bookmark at 00:20"));
+    paused_at(&mut h, 50.0);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("No more bookmarks after this point"));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    step_until(&mut h, "back to 20 s", |s| (s.time_pos - 20.0).abs() < 0.05);
+    assert_eq!(h.state().osd_text(), Some("Bookmark 1/1: 00:20"));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("No bookmarks before this point"));
+    paused_at(&mut h, 50.0);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Bookmarks ⏵");
+    h.get_by_label("Add bookmark P");
+    h.get_by_label("Previous / next bookmark: Shift+PgUp / PgDn");
+    h.get_by_label("00:20");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 進度條上的標記
+    let bar = h.get_by_label("Progress").rect();
+    let x = bar.left() + bar.width() * (20.0 / 90.0);
+    h.event(egui::Event::PointerMoved(egui::pos2(x, bar.center().y)));
+    h.run_steps(2);
+    assert!(painted(&h, "00:20 · Bookmark"));
+}
+
+/// 存檔失敗：使用者加書籤時提示一次，記憶體裡照樣保留；之後開檔時的讀回（順便重試）失敗不再提示
+#[test]
+fn bookmark_save_failure_is_shown_for_the_users_own_change_only() {
+    for (lang, failed) in [
+        (vitascope::i18n::Lang::ZhTw, "無法儲存書籤："),
+        (vitascope::i18n::Lang::En, "Couldn't save bookmarks: "),
+    ] {
+        let dir = TempDir::new(&format!("bookmark-save-fails-{}", failed.len()));
+        // 存檔的資料夾其實是一個檔案：寫不進去
+        let blocked = dir.0.join("blocked");
+        std::fs::write(&blocked, "不是資料夾").unwrap();
+        let a = dir.clip("a.mp4");
+        dir.clip("b.mp4");
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let launch = Launch {
+            files: vec![a],
+            bookmarks: vitascope::bookmarks::Bookmarks::load_from(blocked.join("bookmarks.json")),
+            ..Default::default()
+        };
+        let mut h = harness_launch(launch, settings);
+        settle(&mut h, "a.mp4");
+        step_until_app(&mut h, "掃描到兩個檔案", |app| playlist_len(app) == 2);
+        h.key_press(egui::Key::P);
+        step_until_app(&mut h, "存檔失敗的提示", |app| {
+            app.osd_text().is_some_and(|t| t.starts_with(failed))
+        });
+        assert_eq!(mark_times(&h).len(), 1, "記憶體裡照樣保留");
+        step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+        // 換到下一個檔案：讀回 b 的書籤時順便重試存檔（還是失敗），使用者這次沒有動書籤，不提示
+        h.key_press(egui::Key::PageDown);
+        step_until(&mut h, "換到 b", |s| playing(s, "b.mp4"));
+        assert!(h.state().bookmarks().flush(TIMEOUT));
+        h.run_steps(3);
+        assert!(
+            !h.state().osd_text().is_some_and(|t| t.starts_with(failed)),
+            "{:?}",
+            h.state().osd_text()
+        );
+    }
+}
+
+/// 選單只列出目前位置附近的 20 個書籤，標出目前的那一個，多的寫總數
+#[test]
+fn bookmark_submenu_lists_twenty_around_the_current_mark() {
+    // 開檔時會換成絕對路徑（Windows 上斜線也會統一）：書籤的代號跟著用
+    let long = vitascope::playlist::absolute(&sample("common/mp4_long.mp4"));
+    let key = long.to_string_lossy().into_owned();
+    for (lang, video, menu, total) in [
+        (vitascope::i18n::Lang::ZhTw, "影片畫面", "書籤 ⏵", "共 25 個書籤"),
+        (vitascope::i18n::Lang::En, "Video", "Bookmarks ⏵", "25 bookmarks in all"),
+    ] {
+        let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+        for i in 1..=25 {
+            bookmarks.add(&key, 3.0 * f64::from(i)).unwrap();
+        }
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let launch = Launch {
+            files: vec![long.clone()],
+            bookmarks,
+            ..Default::default()
+        };
+        let mut h = harness_launch(launch, settings);
+        settle(&mut h, "mp4_long.mp4");
+        h.key_press(egui::Key::Space);
+        step_until(&mut h, "暫停", |s| s.paused);
+        assert_eq!(mark_times(&h).len(), 25);
+        // 40 秒：目前的書籤是 39 秒那個（第 13 個），列出第 3 到第 22 個（9 秒到 66 秒）
+        paused_at(&mut h, 40.0);
+        h.get_by_label(video).click_secondary();
+        h.run_steps(2);
+        hover_menu_item(&mut h, menu);
+        h.get_by_label(total);
+        for (label, listed) in [("00:06", false), ("00:09", true), ("01:06", true), ("01:09", false)] {
+            assert_eq!(h.query_by_label(label).is_some(), listed, "{label}");
+        }
+        assert_eq!(
+            h.get_by_label("00:39").accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::True),
+            "目前的書籤"
+        );
+        assert_eq!(
+            h.get_by_label("00:42").accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::False)
+        );
+    }
+}
+
+/// 一個檔案的書籤滿了（1000 個）：說滿了，不加
+#[test]
+fn full_bookmark_list_says_so() {
+    let dir = TempDir::new("bookmarks-full");
+    let clip = dir.clip("影片.mp4");
+    let key = clip.to_string_lossy().into_owned();
+    for (lang, full) in [
+        (vitascope::i18n::Lang::ZhTw, "這個檔案的書籤已經滿了（1000 個）"),
+        (vitascope::i18n::Lang::En, "This file already has 1000 bookmarks"),
+    ] {
+        let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+        for i in 0..vitascope::bookmarks::MAX_MARKS {
+            bookmarks.add(&key, 100.0 + i as f64).unwrap();
+        }
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let launch = Launch {
+            files: vec![clip.clone()],
+            bookmarks,
+            ..Default::default()
+        };
+        let mut h = harness_launch(launch, settings);
+        settle(&mut h, "影片.mp4");
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+        assert_eq!(h.state().osd_text(), Some(full));
+        assert_eq!(mark_times(&h).len(), vitascope::bookmarks::MAX_MARKS);
+    }
+}
+
+/// 開檔時讀回磁碟上這個檔案的書籤：同時開著的另一個視窗加的也看得到
+#[test]
+fn bookmarks_from_another_window_show_up_when_the_file_opens() {
+    let dir = TempDir::new("bookmarks-other-window");
+    let store = dir.0.join("bookmarks.json");
+    let video = dir.clip("影片.mp4");
+    let ours = vitascope::bookmarks::Bookmarks::load_from(store.clone());
+    // 這邊讀完書籤檔之後，另一個視窗加了一個
+    let mut other = vitascope::bookmarks::Bookmarks::load_from(store);
+    other.add(&video.to_string_lossy(), 2.0).unwrap();
+    assert!(other.flush(TIMEOUT));
+    assert!(ours.marks(&video.to_string_lossy()).is_empty());
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let launch = Launch {
+        files: vec![video],
+        bookmarks: ours,
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    settle(&mut h, "影片.mp4");
+    step_until_app(&mut h, "讀回另一個視窗加的書籤", |app| {
+        let key = app.player().state.path.clone().unwrap_or_default();
+        app.bookmarks().marks(&key).len() == 1
+    });
+    assert_eq!(mark_times(&h), [2.0]);
 }
