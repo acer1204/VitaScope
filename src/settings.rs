@@ -595,6 +595,10 @@ mod tests {
         assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
+        assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
+        assert_eq!(s.keys.mouse.double_click, "fullscreen", "雙擊畫面預設全螢幕");
+        assert!(s.keys.mouse.middle.is_empty() && s.keys.mouse.back.is_empty() && s.keys.mouse.forward.is_empty());
+        assert_eq!(s.keys.mouse.wheel, crate::keymap::WheelMode::Volume, "滾輪預設調音量");
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -639,6 +643,7 @@ mod tests {
         assert_eq!(s.smooth, SmoothMode::default());
         assert_eq!(s.theme, ThemeChoice::Dark, "升級後外觀不變");
         assert_eq!(s.keys, KeySettings::default(), "升級後快捷鍵不變");
+        assert_eq!(s.keys.mouse, crate::keymap::MouseSettings::default(), "升級後滑鼠不變");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -689,6 +694,51 @@ mod tests {
         let back = Settings::load_from(path);
         assert_eq!(back.keys.custom["stop"], ["S"]);
         assert_eq!(back.keys.custom["restart"], ["Backspace"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mouse_settings_load_leniently_and_merge() {
+        use crate::keymap::{MouseSettings, WheelMode};
+        // 只寫了快捷鍵（A3 的設定檔）：滑鼠是預設值
+        let s = lenient(r#"{"keys": {"preset": "potplayer", "custom": {"stop": ["S"]}}}"#);
+        assert_eq!(s.keys.mouse, MouseSettings::default());
+        // 一項讀不懂（新版的滾輪動作、不是字串）：只有那一項用預設值，其他照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "keys": {"custom": {"stop": ["S"]},
+                "mouse": {"wheel": "zoom-2030", "middle": "toggle-mute", "back": 3, "forward": "future-cmd"}}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert_eq!(s.keys.custom["stop"], ["S"]);
+        assert_eq!(s.keys.mouse.wheel, WheelMode::Volume);
+        assert_eq!(s.keys.mouse.middle, "toggle-mute");
+        assert_eq!(s.keys.mouse.back, "");
+        assert_eq!(s.keys.mouse.forward, "future-cmd", "認不得的指令照樣保留");
+        assert_eq!(s.keys.mouse.click, "toggle-pause");
+        // 存檔、讀回來
+        let dir = temp_dir("mouse");
+        let path = dir.join("settings.json");
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.keys.mouse.middle = "toggle-mute".into();
+        a.keys.mouse.click = String::new();
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""wheel": "volume""#), "{text}");
+        // 另一個視窗改了滾輪：兩個視窗改的都留下
+        b.keys.mouse.wheel = WheelMode::Seek;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.keys.mouse.middle, "toggle-mute");
+        assert_eq!(back.keys.mouse.click, "");
+        assert_eq!(back.keys.mouse.wheel, WheelMode::Seek);
+        // 「還原成預設組…」：滑鼠回到預設，存檔後不會從檔案回來
+        a.keys = a.keys.reset_all();
+        a.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.keys.mouse.middle, "");
+        assert_eq!(back.keys.mouse.click, "toggle-pause");
+        assert_eq!(back.keys.mouse.wheel, WheelMode::Seek, "A 沒改過滾輪：留著 B 改的");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

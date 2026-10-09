@@ -5501,6 +5501,285 @@ fn menus_show_the_keys_of_new_commands() {
     h.get_by_label(&format!("{cmd}+← / → 跳轉"));
 }
 
+// ───────────── 滑鼠按鍵（設定 → 快捷鍵 → 滑鼠） ─────────────
+
+/// 在影片畫面中間按一下滑鼠的 `button`（按下、放開在同一幀）
+fn click_video_with(h: &mut Harness<'_, VitascopeApp>, button: egui::PointerButton) {
+    h.get_by_label("影片畫面").click_button(button);
+    h.step();
+}
+
+/// 在影片畫面上捲動滾輪 `lines` 格（往上為正）
+fn wheel_video(h: &mut Harness<'_, VitascopeApp>, lines: f32) {
+    h.get_by_label("影片畫面").hover();
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, lines),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+#[test]
+fn mouse_middle_side_buttons_and_wheel_bindings() {
+    use vitascope::keymap::WheelMode;
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.click = String::new();
+    settings.keys.mouse.middle = "toggle-mute".into();
+    settings.keys.mouse.back = "speed-down".into();
+    settings.keys.mouse.forward = "speed-up".into();
+    settings.keys.mouse.wheel = WheelMode::Seek;
+    // 不用預設的 5 秒：確定每格跳的是「跳轉秒數」
+    settings.seek_short = 3.0;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    // 單擊 = 不動作：不會繼續播放
+    click_video_with(&mut h, egui::PointerButton::Primary);
+    h.run_steps(3);
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "單擊不動作");
+    // 中鍵 = 靜音
+    click_video_with(&mut h, egui::PointerButton::Middle);
+    step_until(&mut h, "中鍵靜音", |s| s.muted);
+    // 側鍵：下一頁加快、上一頁減慢
+    click_video_with(&mut h, egui::PointerButton::Extra2);
+    step_until(&mut h, "側鍵（下一頁）加快", |s| close_to(s.speed, 1.1));
+    click_video_with(&mut h, egui::PointerButton::Extra1);
+    step_until(&mut h, "側鍵（上一頁）減慢", |s| close_to(s.speed, 1.0));
+    // 滾輪 = 跳轉：往上一格前進 3 秒（跳轉秒數），音量不變。
+    // 相對跳轉會落在關鍵影格上（這個檔案只有 0 秒、10.4 秒兩個），跳了幾秒看 OSD，位置只看方向
+    let t0 = h.state().player().state.time_pos;
+    wheel_video(&mut h, 2.0);
+    let osd = h.state().osd_text().unwrap_or_default();
+    assert!(osd.starts_with("▶▶ 前進 6 秒"), "往上兩格 × 3 秒：{osd}");
+    step_until(&mut h, "滾輪往上：往前跳", |s| s.time_pos > t0 + 1.0);
+    wait_real(&mut h, 0.3);
+    let t1 = h.state().player().state.time_pos;
+    wheel_video(&mut h, -1.0);
+    let osd = h.state().osd_text().unwrap_or_default();
+    assert!(osd.starts_with("◀◀ 後退 3 秒"), "往下一格 × 3 秒：{osd}");
+    step_until(&mut h, "往下一格：往回跳", |s| s.time_pos < t1 - 1.0);
+    assert_eq!(h.state().player().state.volume, 100.0, "滾輪不再調音量");
+    // 滾輪 = 不動作
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.wheel = WheelMode::None;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t0 = h.state().player().state.time_pos;
+    let osd0 = h.state().osd_text().map(str::to_owned);
+    // 先往上（音量已經是 100%，跳轉會跳到 10.4 秒），再往下（音量會變 90%）
+    for lines in [2.0, -2.0] {
+        wheel_video(&mut h, lines);
+        let osd = h.state().osd_text().map(str::to_owned);
+        assert!(
+            osd.is_none() || osd == osd0,
+            "滾輪 {lines} 格不顯示跳轉 / 音量：{osd:?}"
+        );
+        h.run_steps(3);
+        wait_real(&mut h, 0.3);
+        let st = &h.state().player().state;
+        assert_eq!(st.volume, 100.0, "滾輪 {lines} 格不調音量");
+        assert!(
+            (st.time_pos - t0).abs() < 0.05,
+            "滾輪 {lines} 格不跳轉：{t0} → {}",
+            st.time_pos
+        );
+    }
+}
+
+/// 預設：雙擊畫面只切換全螢幕（第一下單擊已經暫停了，雙擊時切回來）
+#[test]
+fn double_click_on_the_video_goes_fullscreen_without_pausing() {
+    let mut h = playing_multitrack();
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    assert_eq!(h.state().osd_text(), None, "不顯示暫停 / 播放");
+    wait_real(&mut h, 0.4);
+    assert!(!h.state().player().state.paused, "雙擊不暫停");
+}
+
+/// 單擊 = 靜音：雙擊時也要把第一下的靜音切回來，結果只有全螢幕改變
+#[test]
+fn double_click_undoes_a_mute_click() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.click = "toggle-mute".into();
+    let mut h = playing_multitrack_with(settings);
+    click_video_with(&mut h, egui::PointerButton::Primary);
+    step_until(&mut h, "單擊靜音", |s| s.muted);
+    h.run_steps(3);
+    assert!(!h.state().player().state.paused, "單擊不暫停");
+    // 靜音中雙擊：還是靜音，切換全螢幕
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    assert_eq!(h.state().osd_text(), None, "不顯示靜音 / 取消靜音");
+    wait_real(&mut h, 0.4);
+    let st = &h.state().player().state;
+    assert!(st.muted, "雙擊不改變靜音");
+    assert!(!st.paused);
+}
+
+/// 單擊 = 靜音、雙擊 = 不動作：點兩下是靜音再取消靜音（第二下照第一下之前的值設回去）
+#[test]
+fn double_click_bound_to_nothing_with_a_mute_click_mutes_and_unmutes() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.click = "toggle-mute".into();
+    settings.keys.mouse.double_click = String::new();
+    let mut h = playing_multitrack_with(settings);
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "{cmds:?}"
+    );
+    assert_eq!(h.state().osd_text(), Some("取消靜音"), "第二下取消靜音");
+    h.run_steps(3);
+    wait_real(&mut h, 0.4);
+    let st = &h.state().player().state;
+    assert!(!st.muted, "靜音再取消靜音");
+    assert!(!st.paused);
+    // 再點一下：照常靜音
+    click_video_with(&mut h, egui::PointerButton::Primary);
+    step_until(&mut h, "第三下靜音", |s| s.muted);
+}
+
+/// 雙擊 = 不動作：點兩下就是單擊兩下（暫停再播放），不切換全螢幕
+#[test]
+fn double_click_bound_to_nothing_is_two_clicks() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.double_click = String::new();
+    let mut h = playing_multitrack_with(settings);
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "{cmds:?}"
+    );
+    assert!(h.state().osd_text().is_some(), "第二下照樣是單擊（顯示播放 / 暫停）");
+    wait_real(&mut h, 0.4);
+    assert!(!h.state().player().state.paused, "暫停又播放");
+}
+
+/// 設定頁的滑鼠區：改中鍵、滾輪馬上生效、存檔；「還原成預設組…」連滑鼠一起還原
+#[test]
+fn mouse_settings_page_changes_and_resets() {
+    use vitascope::keymap::{MouseSettings, WheelMode};
+    let dir = TempDir::new("mouse-page");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    shortcuts_page(&mut h, "快捷鍵", "滑鼠");
+    // 只剩滑鼠的設定（搜尋「滑鼠」）；預設是單擊播放／暫停、雙擊全螢幕、滾輪音量
+    assert!(h.query_by_label("播放／暫停").is_none(), "鍵盤的指令不在搜尋結果裡");
+    for (label, value) in [
+        ("單擊畫面", "播放／暫停"),
+        ("雙擊畫面", "全螢幕"),
+        ("中鍵", "不動作"),
+        ("側鍵（上一頁）", "不動作"),
+        ("側鍵（下一頁）", "不動作"),
+        ("在畫面上捲動滾輪", "音量"),
+    ] {
+        let combo = combo_box(&h, label);
+        assert_eq!(combo.accesskit_node().value().as_deref(), Some(value), "{label}");
+    }
+    // 中鍵改成靜音（任何指令都可以選，清單很長，要捲到看得到）
+    combo_in_view(&mut h, "中鍵");
+    h.get_by_label("靜音").scroll_to_me();
+    h.run_steps(3);
+    h.get_by_label("靜音").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse.middle, "toggle-mute");
+    assert_eq!(combo_box(&h, "中鍵").accesskit_node().value().as_deref(), Some("靜音"));
+    // 單擊只能選開關：清單裡沒有全螢幕
+    combo_in_view(&mut h, "單擊畫面");
+    assert!(h.query_by_label("全螢幕").is_none(), "單擊不能選全螢幕");
+    h.get_by_label("不動作").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse.click, "");
+    // 滾輪改成跳轉
+    combo_in_view(&mut h, "在畫面上捲動滾輪");
+    h.get_by_label("跳轉（每格 5 秒）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse.wheel, WheelMode::Seek);
+    // 馬上存檔
+    let saved = Settings::load_from(path.clone()).keys.mouse;
+    assert_eq!(saved.middle, "toggle-mute");
+    assert_eq!(saved.click, "");
+    assert_eq!(saved.wheel, WheelMode::Seek);
+    // 關掉設定，馬上生效：中鍵靜音
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    click_video_with(&mut h, egui::PointerButton::Middle);
+    step_until(&mut h, "中鍵靜音", |s| s.muted);
+    // 還原成預設組：滑鼠也還原（對話框寫明）
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("還原成預設組…").scroll_to_me();
+    h.run_steps(5);
+    h.get_by_label("還原成預設組…").click();
+    h.run_steps(2);
+    h.get_by_label("把所有快捷鍵還原成「影戲」的預設值？");
+    h.get_by_label("滑鼠的設定也一起還原。");
+    h.get_by_label("還原").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse, MouseSettings::default());
+    assert_eq!(Settings::load_from(path).keys.mouse, MouseSettings::default());
+    // 固定的按鍵清單不再寫單擊、雙擊、滾輪（可以改了）
+    assert!(h.query_by_label("切換全螢幕").is_none());
+}
+
+#[test]
+fn mouse_settings_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    settings.keys.mouse.forward = "future-command-2030".into();
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "Shortcuts", "mouse");
+    h.get_by_label("Mouse");
+    for (label, value) in [
+        ("Click on the video", "Play / pause"),
+        ("Double-click on the video", "Fullscreen"),
+        ("Middle button", "Do nothing"),
+        ("Back button", "Do nothing"),
+        // 新版的指令：照原樣寫出來，不會被改掉
+        ("Forward button", "future-command-2030"),
+        ("Wheel over the video", "Volume"),
+    ] {
+        let combo = combo_box(&h, label);
+        assert_eq!(combo.accesskit_node().value().as_deref(), Some(value), "{label}");
+    }
+    combo_in_view(&mut h, "Wheel over the video");
+    h.get_by_label("Seek (5 s per notch)");
+    h.get_by_label("Do nothing").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().keys.mouse.wheel,
+        vitascope::keymap::WheelMode::None
+    );
+    assert_eq!(h.state().settings().keys.mouse.forward, "future-command-2030");
+    // 捲回最上面（選滾輪時捲到下面了）再按「還原成預設組…」
+    h.get_by_label("Reset to the preset…").scroll_to_me();
+    h.run_steps(5);
+    h.get_by_label("Reset to the preset…").click();
+    h.run_steps(2);
+    h.get_by_label("Mouse settings are reset too.");
+}
+
 // ───────────── 畫質：去交錯、去色帶、銳化、縮放演算法、HDR ─────────────
 
 /// 右鍵選單「畫質」→ 一層層的子選單（`path`，標籤的一部分）→ 點 `item`（完整標籤）

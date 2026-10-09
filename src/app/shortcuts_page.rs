@@ -4,9 +4,12 @@
 //!   錄的時候其他快捷鍵都停用（`handle_keys` 最前面先交給 [`VitascopeApp::capture_key`]）。
 //! - 系統保留的按鍵（Ctrl+V…）不能指定；已經用在別的指令時問要不要改到這裡。
 //! - 改了馬上生效、存檔；自己改過的指令標「•」，可以一項一項還原，或「還原成預設組…」全部還原。
+//! - 底下是滑鼠：單擊、雙擊、中鍵、側鍵、滾輪各做什麼（兩個預設組一樣；「還原成預設組…」也會還原）。
 
 use super::VitascopeApp;
-use crate::keymap::{self, Assign, Chord, Command, Group, KeyPreset, KeySettings, Keymap, MAX_CHORDS, Mods};
+use crate::keymap::{
+    self, Assign, Chord, Command, Group, KeyPreset, KeySettings, Keymap, MAX_CHORDS, Mods, MouseInput, WheelMode,
+};
 use crate::theme::Palette;
 use crate::{tf, tr};
 use eframe::egui::{self, Event, Id, Key};
@@ -232,6 +235,7 @@ impl VitascopeApp {
                     }
                 });
         }
+        self.mouse_section(ui, &search);
         ui.add_space(10.0);
         // macOS 的 Backspace：預設組或自己指定的用到它時就不是「從清單移除」（例如 PotPlayer 風格的從頭播放）
         let backspace_free = self.keymap.owner(Chord::new(Mods::NONE, Key::Backspace)).is_none();
@@ -404,6 +408,106 @@ impl VitascopeApp {
         }
     }
 
+    /// 滑鼠：每個按鍵一個下拉選單（`search` 是小寫的搜尋字；比對「滑鼠」和按鍵的名稱，不比對選的指令，
+    /// 不然搜尋指令名稱時兩邊都出現）
+    fn mouse_section(&mut self, ui: &mut egui::Ui, search: &str) {
+        let heading = tr!("滑鼠", "Mouse");
+        let matches = |label: &str| {
+            search.is_empty() || heading.to_lowercase().contains(search) || label.to_lowercase().contains(search)
+        };
+        let inputs: Vec<MouseInput> = MouseInput::ALL.into_iter().filter(|m| matches(m.label())).collect();
+        let wheel = matches(wheel_label());
+        if inputs.is_empty() && !wheel {
+            return;
+        }
+        ui.add_space(6.0);
+        ui.strong(heading);
+        let mut chosen: Option<(MouseInput, Option<Command>)> = None;
+        let mut chosen_wheel = None;
+        let mouse = &self.settings.keys.mouse;
+        egui::Grid::new("shortcuts_mouse")
+            .num_columns(2)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .min_col_width(0.0)
+            .show(ui, |ui| {
+                for input in inputs {
+                    let name = mouse_row_label(ui, input.label(), mouse.changed(input));
+                    egui::ComboBox::from_id_salt(("shortcuts_mouse", input))
+                        .selected_text(mouse.label(input))
+                        // 「任何指令」的清單很長：開高一點
+                        .height(360.0)
+                        .show_ui(ui, |ui| {
+                            let current = mouse.command(input);
+                            let mut item = |ui: &mut egui::Ui, cmd: Option<Command>| {
+                                let text = cmd.map_or(keymap::no_action_label(), Command::label);
+                                let on = current == cmd && (cmd.is_some() || mouse.id(input).is_empty());
+                                if ui.selectable_label(on, text).clicked() && !on {
+                                    chosen = Some((input, cmd));
+                                }
+                            };
+                            item(ui, None);
+                            match input.choices() {
+                                Some(list) => {
+                                    for &cmd in list {
+                                        item(ui, Some(cmd));
+                                    }
+                                }
+                                None => {
+                                    for group in Group::ALL {
+                                        ui.separator();
+                                        ui.weak(group.label());
+                                        for &cmd in Command::ALL.iter().filter(|c| c.group() == group) {
+                                            item(ui, Some(cmd));
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(name);
+                    ui.end_row();
+                }
+                if wheel {
+                    let seek = self.settings.seek_short;
+                    let name = mouse_row_label(ui, wheel_label(), mouse.wheel != WheelMode::default());
+                    egui::ComboBox::from_id_salt("shortcuts_mouse_wheel")
+                        .selected_text(mouse.wheel.label(seek))
+                        .show_ui(ui, |ui| {
+                            for mode in WheelMode::ALL {
+                                let on = mouse.wheel == mode;
+                                let r = ui.selectable_label(on, mode.label(seek));
+                                let r = if mode == WheelMode::Seek {
+                                    r.on_hover_text(tr!(
+                                        "往上捲前進、往下捲後退；秒數跟「設定 → 播放」的跳轉一樣",
+                                        "Scroll up to go forward, down to go back; the step is the seek time in Settings → Playback"
+                                    ))
+                                } else {
+                                    r
+                                };
+                                if r.clicked() && !on {
+                                    chosen_wheel = Some(mode);
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(name);
+                    ui.end_row();
+                }
+            });
+        if chosen.is_some() || chosen_wheel.is_some() {
+            self.keys_ui.cancel();
+            let mut keys = self.settings.keys.clone();
+            if let Some((input, cmd)) = chosen {
+                keys.mouse.set(input, cmd);
+            }
+            if let Some(mode) = chosen_wheel {
+                keys.mouse.wheel = mode;
+            }
+            self.set_keys(keys);
+        }
+    }
+
     /// 「還原成預設組…」的確認對話框（設定視窗外面畫：蓋住整個畫面）
     pub(super) fn shortcuts_reset_modal(&mut self, ctx: &egui::Context) {
         if !self.keys_ui.reset_open {
@@ -418,6 +522,7 @@ impl VitascopeApp {
                 "Reset all shortcuts to the “{}” defaults?",
                 preset.label()
             ));
+            ui.weak(tr!("滑鼠的設定也一起還原。", "Mouse settings are reset too."));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button(tr!("還原", "Reset")).clicked() {
@@ -439,6 +544,25 @@ impl VitascopeApp {
         // 對話框開著：下一幀的按鍵都交給它（空白鍵不會暫停、Esc 只關對話框）
         self.modal_open |= self.keys_ui.reset_open;
     }
+}
+
+/// 滑鼠一列的名稱（固定寬度，下拉選單才會對齊；跟預設不一樣時標「•」），回傳名稱的 id（下拉選單的無障礙名稱）
+fn mouse_row_label(ui: &mut egui::Ui, label: &str, changed: bool) -> Id {
+    ui.horizontal(|ui| {
+        ui.set_min_width(LABEL_WIDTH);
+        let id = ui.label(label).id;
+        if changed {
+            ui.weak("•")
+                .on_hover_text(tr!("跟預設不一樣", "Changed from the default"));
+        }
+        id
+    })
+    .inner
+}
+
+/// 滾輪那一列的名稱
+fn wheel_label() -> &'static str {
+    tr!("在畫面上捲動滾輪", "Wheel over the video")
 }
 
 /// 固定的按鍵（不在對照表裡，不能改）；`backspace_free`：對照表沒有用到 Backspace（macOS 才用它從清單移除）
@@ -473,18 +597,6 @@ fn fixed_keys(ui: &mut egui::Ui, platform: keymap::Platform, backspace_free: boo
                 "縮放畫面（觸控板也可以捏合）",
                 "Zoom the picture (or pinch on a touchpad)"
             ),
-        ),
-        (
-            tr!("單擊畫面", "Click the video").to_owned(),
-            tr!("播放 / 暫停", "Play / pause"),
-        ),
-        (
-            tr!("雙擊畫面", "Double-click the video").to_owned(),
-            tr!("切換全螢幕", "Toggle fullscreen"),
-        ),
-        (
-            tr!("在畫面上捲動滾輪", "Wheel over the video").to_owned(),
-            tr!("音量", "Volume"),
         ),
         (tr!("右鍵", "Right-click").to_owned(), tr!("選單", "Menu")),
     ];

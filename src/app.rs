@@ -18,7 +18,7 @@ use crate::autoshot::AutoShot;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
-use crate::keymap::{Chord, Command, Keymap, Platform};
+use crate::keymap::{Chord, Command, Keymap, MouseInput, Platform, WheelMode};
 use crate::picture::{
     Adjust, AdjustKind, ChromaScaler, Deinterlace, Downscaler, Gamut, PictureDefaults, Quality, Strength, ToneCurve,
     Upscaler,
@@ -207,6 +207,17 @@ const ESC_WINDOWS: [EscWindow; 4] = [
     EscWindow::MediaInfo,
 ];
 
+/// 上一次單擊影片畫面：緊接著雙擊時要把它做的開關切回來
+#[derive(Debug, Clone, Copy)]
+struct VideoClick {
+    /// egui 的時間
+    time: f64,
+    /// 單擊做的指令（不動作是 None）
+    cmd: Option<Command>,
+    /// 單擊之前是不是靜音（單擊是靜音時，雙擊照這個值設回去）
+    muted: bool,
+}
+
 pub struct VitascopeApp {
     player: Player,
     video: Option<VideoView>,
@@ -270,8 +281,8 @@ pub struct VitascopeApp {
     /// 開檔的次數；拖曳進度條時記下是哪個檔案開始拖的，換檔後就不再跟著拖曳跳轉
     file_gen: u64,
     drag_gen: Option<u64>,
-    /// 上一次單擊影片畫面的時間（egui 的時間），雙擊要兩下都點在畫面上才算
-    video_click_time: Option<f64>,
+    /// 上一次單擊影片畫面（雙擊要兩下都點在畫面上才算；雙擊時把第一下做的開關切回來）
+    video_click: Option<VideoClick>,
     /// 拖曳進度條期間播到結尾（mpv 會自動暫停）：放開後要繼續播，才會接著播下一個檔案
     resume_after_drag: bool,
     /// 上一幀結束時有文字輸入框在輸入（快捷鍵先停用）
@@ -620,7 +631,7 @@ impl VitascopeApp {
             last_autosave: Instant::now(),
             file_gen: 0,
             drag_gen: None,
-            video_click_time: None,
+            video_click: None,
             resume_after_drag: false,
             typing_last_frame: false,
             modal_open: false,
@@ -952,7 +963,7 @@ impl VitascopeApp {
                 self.playlist_scan = Some(rx);
             }
         }
-        self.video_click_time = None;
+        self.video_click = None;
         self.pending_auto_next = false;
         self.switching_file = true;
         self.opened_at = Instant::now();
@@ -1183,11 +1194,7 @@ impl VitascopeApp {
             Action::ToggleMute => {
                 let muted = !st.muted;
                 let _ = self.player.set_mute(muted);
-                self.osd(if muted {
-                    crate::tr!("靜音", "Mute")
-                } else {
-                    crate::tr!("取消靜音", "Unmute")
-                });
+                self.osd(mute_osd(muted));
             }
             Action::ToggleFullscreen => {
                 let fullscreen = is_fullscreen(ctx);
@@ -2876,26 +2883,7 @@ impl VitascopeApp {
             self.open_recent(&path);
         }
 
-        // 選單開著時點畫面只是關掉選單，不要順便暫停
-        let menu_was_open = self.popup_open_at_start;
-        let now = ui.ctx().input(|i| i.time);
-        let max_delay = ui.ctx().options(|o| o.input_options.max_double_click_delay);
-        let first_click_on_video = self.video_click_time.is_some_and(|t| now - t <= max_delay);
-        if menu_was_open {
-            self.video_click_time = None;
-        } else if response.double_clicked() {
-            if first_click_on_video {
-                // 第一下單擊已經切換過暫停，這裡切回來，結果只有全螢幕改變（跟 PotPlayer 一樣）
-                self.run(ui.ctx(), Action::TogglePause);
-                self.run(ui.ctx(), Action::ToggleFullscreen);
-                self.osd = None;
-            }
-            // 第一下點在別的地方（例如起始畫面的「最近開啟」）：這一下不算
-            self.video_click_time = None;
-        } else if response.clicked() {
-            self.video_click_time = Some(now);
-            self.run(ui.ctx(), Action::TogglePause);
-        }
+        self.video_mouse(ui.ctx(), &response);
 
         // 拖曳檔案到視窗上方時的提示
         if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
@@ -2920,15 +2908,112 @@ impl VitascopeApp {
         if response.hovered() && (zoom_delta - 1.0).abs() > 1e-3 {
             self.run(ui.ctx(), Action::Zoom(f64::from(zoom_delta.log2())));
         }
-        // 滑鼠滾輪調音量（比照 PotPlayer）
-        let steps = self.wheel_steps(ui.ctx(), response.hovered());
-        if steps != 0 {
-            self.run(ui.ctx(), Action::Volume(5.0 * f64::from(steps)));
+        // 滑鼠滾輪：預設調音量（比照 PotPlayer），可以改成跳轉（設定 → 快捷鍵 → 滑鼠）
+        let steps = f64::from(self.wheel_steps(ui.ctx(), response.hovered()));
+        let wheel = match self.settings.keys.mouse.wheel {
+            _ if steps == 0.0 => None,
+            WheelMode::Volume => Some(Action::Volume(5.0 * steps)),
+            // 往上捲 = 前進（舊版 mpv 的預設方向；現在的 mpv 預設滾輪是音量）
+            WheelMode::Seek => Some(Action::Seek(self.settings.seek_short * steps)),
+            WheelMode::None => None,
+        };
+        if let Some(action) = wheel {
+            self.run(ui.ctx(), action);
         }
         response.context_menu(|ui| self.context_menu(ui));
 
         self.paint_info(&ui.ctx().clone(), rect);
         self.paint_osd(ui, rect);
+    }
+
+    /// 影片畫面上的滑鼠按鍵：單擊、雙擊、中鍵、側鍵各做設定的指令（設定 → 快捷鍵 → 滑鼠）
+    fn video_mouse(&mut self, ctx: &egui::Context, response: &egui::Response) {
+        // 選單開著時點畫面只是關掉選單，不要順便暫停
+        if self.popup_open_at_start {
+            self.video_click = None;
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        let max_delay = ctx.options(|o| o.input_options.max_double_click_delay);
+        let click = self.settings.keys.mouse.command(MouseInput::Click);
+        if response.double_clicked() {
+            // 第一下點在別的地方（例如起始畫面的「最近開啟」）：這一下不算
+            if let Some(first) = self.video_click.take().filter(|c| now - c.time <= max_delay) {
+                // F1 / F2（迷你播放器、子母畫面）要接手：雙擊的選項加上迷你播放器、子母畫面，
+                // 而且在迷你播放器、子母畫面裡雙擊「全螢幕」是回到一般視窗（NormalWindow），不是全螢幕
+                match self.settings.keys.mouse.command(MouseInput::DoubleClick) {
+                    Some(cmd) => {
+                        // 第一下單擊已經切換過暫停（或靜音），這裡切回來，結果只有全螢幕改變（跟 PotPlayer 一樣）
+                        if self.undo_click(ctx, first) {
+                            self.osd = None;
+                        }
+                        self.run(ctx, self.command_action(cmd));
+                    }
+                    // 雙擊不動作：第二下就是另一次單擊（點兩下 = 切換兩次）
+                    None => self.click_video_again(ctx, now, click, first),
+                }
+            }
+        } else if response.clicked() {
+            self.click_video(ctx, now, click);
+        }
+        for (button, input) in [
+            (egui::PointerButton::Middle, MouseInput::Middle),
+            (egui::PointerButton::Extra1, MouseInput::Back),
+            (egui::PointerButton::Extra2, MouseInput::Forward),
+        ] {
+            if response.clicked_by(button)
+                && let Some(cmd) = self.settings.keys.mouse.command(input)
+            {
+                self.run(ctx, self.command_action(cmd));
+            }
+        }
+    }
+
+    /// 單擊影片畫面：做設定的指令，記下來（緊接著雙擊時要切回來）
+    fn click_video(&mut self, ctx: &egui::Context, now: f64, cmd: Option<Command>) {
+        self.video_click = Some(VideoClick {
+            time: now,
+            cmd,
+            muted: self.player.state.muted,
+        });
+        if let Some(cmd) = cmd {
+            self.run(ctx, self.command_action(cmd));
+        }
+    }
+
+    /// 雙擊不動作時的第二下：跟單擊一樣，但第一下是靜音時照第一下之前的值設回去
+    /// （跟 undo_click 同樣的理由：第二下時觀察到的靜音狀態可能還沒更新，再切換一次可能切錯）
+    fn click_video_again(&mut self, ctx: &egui::Context, now: f64, cmd: Option<Command>, first: VideoClick) {
+        let mute_again = cmd == Some(Command::ToggleMute)
+            && first.cmd == Some(Command::ToggleMute)
+            && self.player.state.audio_spdif.is_none();
+        if !mute_again {
+            self.click_video(ctx, now, cmd);
+            return;
+        }
+        self.video_click = Some(VideoClick {
+            time: now,
+            cmd,
+            muted: !first.muted,
+        });
+        let _ = self.player.set_mute(first.muted);
+        self.osd(mute_osd(first.muted));
+    }
+
+    /// 雙擊時把第一下單擊做的開關切回來（暫停、靜音）；有切回來時回傳 true
+    fn undo_click(&mut self, ctx: &egui::Context, first: VideoClick) -> bool {
+        match first.cmd {
+            Some(Command::TogglePause) => {
+                self.run(ctx, Action::TogglePause);
+                true
+            }
+            // 靜音照第一下之前的值設回去：第二下時觀察到的狀態可能還沒更新，再切換一次可能切錯
+            Some(Command::ToggleMute) => {
+                let _ = self.player.set_mute(first.muted);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// 這一幀滑鼠滾輪轉了幾格（往上為正）。觸控板的捲動是連續的，累積滿一格才算
@@ -4121,6 +4206,15 @@ fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bo
         button = button.shortcut_text(shortcut);
     }
     ui.add_enabled(enabled, button).clicked()
+}
+
+/// 切換靜音之後的 OSD
+fn mute_osd(muted: bool) -> &'static str {
+    if muted {
+        crate::tr!("靜音", "Mute")
+    } else {
+        crate::tr!("取消靜音", "Unmute")
+    }
 }
 
 fn is_fullscreen(ctx: &egui::Context) -> bool {

@@ -606,6 +606,155 @@ fn potplayer_preset(platform: Platform) -> Vec<(Command, Chord)> {
     list
 }
 
+/// 可以改的滑鼠按鍵（在影片畫面上；滾輪另外是 [`WheelMode`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MouseInput {
+    Click,
+    DoubleClick,
+    Middle,
+    /// 側鍵「上一頁」（egui 的 Extra1）
+    Back,
+    /// 側鍵「下一頁」（egui 的 Extra2）
+    Forward,
+}
+
+impl MouseInput {
+    pub const ALL: [MouseInput; 5] = [
+        MouseInput::Click,
+        MouseInput::DoubleClick,
+        MouseInput::Middle,
+        MouseInput::Back,
+        MouseInput::Forward,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MouseInput::Click => crate::tr!("單擊畫面", "Click on the video"),
+            MouseInput::DoubleClick => crate::tr!("雙擊畫面", "Double-click on the video"),
+            MouseInput::Middle => crate::tr!("中鍵", "Middle button"),
+            MouseInput::Back => crate::tr!("側鍵（上一頁）", "Back button"),
+            MouseInput::Forward => crate::tr!("側鍵（下一頁）", "Forward button"),
+        }
+    }
+
+    /// 可以選的指令（另外都可以選「不動作」）；None = 任何指令。
+    /// 單擊只能是開關（雙擊時要把第一下做的切回來）。
+    /// F1 / F2 要接手：雙擊加上迷你播放器、子母畫面；在迷你播放器、子母畫面裡雙擊「全螢幕」是回到一般視窗
+    /// （app.rs 的 video_mouse 要改）
+    pub fn choices(self) -> Option<&'static [Command]> {
+        match self {
+            MouseInput::Click => Some(&[Command::TogglePause, Command::ToggleMute]),
+            MouseInput::DoubleClick => Some(&[Command::Fullscreen]),
+            MouseInput::Middle | MouseInput::Back | MouseInput::Forward => None,
+        }
+    }
+}
+
+/// 在影片畫面上捲動滾輪做什麼（Ctrl / ⌘ + 滾輪固定是縮放）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WheelMode {
+    /// 音量 ±5（比照 PotPlayer）
+    #[default]
+    Volume,
+    /// 每格跳轉「跳轉秒數」，往上捲 = 前進（舊版 mpv 的預設方向；現在的 mpv 預設滾輪是音量）
+    Seek,
+    None,
+}
+
+impl WheelMode {
+    pub const ALL: [WheelMode; 3] = [WheelMode::Volume, WheelMode::Seek, WheelMode::None];
+
+    /// `seek_secs` 是每格跳幾秒（「設定 → 播放」的跳轉秒數）
+    pub fn label(self, seek_secs: f64) -> String {
+        match self {
+            WheelMode::Volume => crate::tr!("音量", "Volume").to_owned(),
+            WheelMode::Seek => crate::tf!("跳轉（每格 {seek_secs} 秒）", "Seek ({seek_secs} s per notch)"),
+            WheelMode::None => no_action_label().to_owned(),
+        }
+    }
+}
+
+/// 滑鼠按鍵指定為「不動作」
+pub fn no_action_label() -> &'static str {
+    crate::tr!("不動作", "Do nothing")
+}
+
+/// 滑鼠按鍵的設定（`settings.json` 的 `keys.mouse`）。按鍵存指令編號（跟 `custom` 一樣）；"" = 不動作。
+/// 認不得的編號（新版的指令）照樣保留在檔案裡，這版當成不動作
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MouseSettings {
+    pub click: String,
+    pub double_click: String,
+    pub middle: String,
+    pub back: String,
+    pub forward: String,
+    pub wheel: WheelMode,
+}
+
+impl Default for MouseSettings {
+    /// 兩個預設組一樣：單擊播放／暫停、雙擊全螢幕、滾輪音量（跟 v0.3.0 一樣），其他不動作
+    fn default() -> Self {
+        Self {
+            click: Command::TogglePause.id().to_owned(),
+            double_click: Command::Fullscreen.id().to_owned(),
+            middle: String::new(),
+            back: String::new(),
+            forward: String::new(),
+            wheel: WheelMode::Volume,
+        }
+    }
+}
+
+impl MouseSettings {
+    /// 這個按鍵存的指令編號（"" = 不動作）
+    pub fn id(&self, input: MouseInput) -> &str {
+        match input {
+            MouseInput::Click => &self.click,
+            MouseInput::DoubleClick => &self.double_click,
+            MouseInput::Middle => &self.middle,
+            MouseInput::Back => &self.back,
+            MouseInput::Forward => &self.forward,
+        }
+    }
+
+    fn id_mut(&mut self, input: MouseInput) -> &mut String {
+        match input {
+            MouseInput::Click => &mut self.click,
+            MouseInput::DoubleClick => &mut self.double_click,
+            MouseInput::Middle => &mut self.middle,
+            MouseInput::Back => &mut self.back,
+            MouseInput::Forward => &mut self.forward,
+        }
+    }
+
+    /// 這個按鍵做的指令；不動作、認不得的編號是 None
+    pub fn command(&self, input: MouseInput) -> Option<Command> {
+        Command::from_id(self.id(input))
+    }
+
+    /// 改這個按鍵的指令（None = 不動作）
+    pub fn set(&mut self, input: MouseInput, cmd: Option<Command>) {
+        *self.id_mut(input) = cmd.map(|c| c.id().to_owned()).unwrap_or_default();
+    }
+
+    /// 選單上的寫法：指令名稱、「不動作」；認不得的編號照原樣寫出來（新版的指令）
+    pub fn label(&self, input: MouseInput) -> String {
+        let id = self.id(input);
+        match Command::from_id(id) {
+            Some(cmd) => cmd.label().to_owned(),
+            None if id.is_empty() => no_action_label().to_owned(),
+            None => id.to_owned(),
+        }
+    }
+
+    /// 這個按鍵跟預設的不一樣
+    pub fn changed(&self, input: MouseInput) -> bool {
+        self.id(input) != Self::default().id(input)
+    }
+}
+
 /// 快捷鍵的設定（`settings.json` 的 `keys`）
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -615,6 +764,8 @@ pub struct KeySettings {
     /// 自己改過的：指令編號（例如 "toggle-pause"）→ 按鍵（例如 ["Space", "Shift+K"]）；空陣列 = 不指定。
     /// 用字串存：認不得的指令、按鍵（新版寫的、打錯的）照樣保留在檔案裡，只是這版不用
     pub custom: BTreeMap<String, Vec<String>>,
+    /// 滑鼠按鍵（兩個預設組一樣）
+    pub mouse: MouseSettings,
 }
 
 impl KeySettings {
@@ -650,11 +801,12 @@ impl KeySettings {
         keys
     }
 
-    /// 「還原成預設組…」：預設組不變，自己改過的全部拿掉。
+    /// 「還原成預設組…」：預設組不變，自己改過的按鍵全部拿掉，滑鼠也回到預設。
     /// 認不得的編號（新版的指令）留著：這版看不到、也沒有算在「你改過的」裡，回到新版時照樣有效
     pub fn reset_all(&self) -> Self {
         let mut keys = self.clone();
         keys.custom.retain(|id, _| Command::from_id(id).is_none());
+        keys.mouse = MouseSettings::default();
         keys
     }
 }
@@ -2166,5 +2318,88 @@ mod tests {
         assert_eq!(all.custom.len(), 1, "{:?}", all.custom);
         assert_eq!(all.custom["future-cmd"], ["F8"]);
         assert_eq!(all.preset, KeyPreset::Potplayer);
+    }
+
+    #[test]
+    fn mouse_defaults_and_choices() {
+        let m = MouseSettings::default();
+        // 跟 v0.3.0 一樣：單擊播放／暫停、雙擊全螢幕、滾輪音量
+        assert_eq!(m.command(MouseInput::Click), Some(Command::TogglePause));
+        assert_eq!(m.command(MouseInput::DoubleClick), Some(Command::Fullscreen));
+        for input in [MouseInput::Middle, MouseInput::Back, MouseInput::Forward] {
+            assert_eq!(m.command(input), None);
+            assert!(!m.changed(input));
+        }
+        assert_eq!(m.wheel, WheelMode::Volume);
+        assert_eq!(KeySettings::default().mouse, m);
+        // 單擊只能選開關（雙擊時才切得回來）；預設值都在可以選的清單裡
+        for input in MouseInput::ALL {
+            if let (Some(list), Some(cmd)) = (input.choices(), m.command(input)) {
+                assert!(list.contains(&cmd), "{input:?}");
+            }
+        }
+        assert_eq!(
+            MouseInput::Click.choices(),
+            Some(&[Command::TogglePause, Command::ToggleMute][..])
+        );
+        assert!(MouseInput::Middle.choices().is_none(), "中鍵、側鍵可以是任何指令");
+        // 名稱：兩種語言都有、不重複
+        for lang in [Lang::ZhTw, Lang::En] {
+            set_lang(lang);
+            let labels: std::collections::HashSet<_> = MouseInput::ALL.iter().map(|m| m.label()).collect();
+            assert_eq!(labels.len(), MouseInput::ALL.len());
+        }
+        set_lang(Lang::ZhTw);
+    }
+
+    #[test]
+    fn mouse_set_label_and_unknown_ids() {
+        let mut m = MouseSettings::default();
+        m.set(MouseInput::Middle, Some(Command::ToggleMute));
+        assert_eq!(m.middle, "toggle-mute");
+        assert_eq!(m.command(MouseInput::Middle), Some(Command::ToggleMute));
+        assert!(m.changed(MouseInput::Middle));
+        assert_eq!(m.label(MouseInput::Middle), "靜音");
+        m.set(MouseInput::Click, None);
+        assert_eq!(m.click, "", "不動作存成空字串");
+        assert_eq!(m.command(MouseInput::Click), None);
+        assert_eq!(m.label(MouseInput::Click), "不動作");
+        assert!(m.changed(MouseInput::Click));
+        // 新版的指令（這版認不得）：當成不動作，名稱照原樣寫，不改掉
+        m.back = "mini-player-2030".into();
+        assert_eq!(m.command(MouseInput::Back), None);
+        assert_eq!(m.label(MouseInput::Back), "mini-player-2030");
+        set_lang(Lang::En);
+        assert_eq!(m.label(MouseInput::Click), "Do nothing");
+        assert_eq!(WheelMode::Seek.label(5.0), "Seek (5 s per notch)");
+        set_lang(Lang::ZhTw);
+        assert_eq!(WheelMode::Seek.label(2.5), "跳轉（每格 2.5 秒）");
+        assert_eq!(WheelMode::Volume.label(5.0), "音量");
+        // 設定檔裡的寫法
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["wheel"], "volume");
+        assert_eq!(serde_json::to_value(WheelMode::Seek).unwrap(), "seek");
+        assert_eq!(serde_json::to_value(WheelMode::None).unwrap(), "none");
+        let back: MouseSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back, m);
+        // 只寫了一項：其他是預設值
+        let partial: MouseSettings = serde_json::from_str(r#"{"wheel": "seek"}"#).unwrap();
+        assert_eq!(partial.wheel, WheelMode::Seek);
+        assert_eq!(partial.click, "toggle-pause");
+        assert_eq!(partial.double_click, "fullscreen");
+    }
+
+    #[test]
+    fn reset_all_also_resets_the_mouse() {
+        let mut keys = custom(&[("stop", &["F9"])]);
+        keys.mouse.set(MouseInput::Middle, Some(Command::ToggleMute));
+        keys.mouse.wheel = WheelMode::Seek;
+        // 滑鼠不算在「你改過的 n 個快捷鍵」裡（換預設組時滑鼠本來就不變）
+        assert_eq!(keys.override_count(), 1);
+        let all = keys.reset_all();
+        assert_eq!(all.mouse, MouseSettings::default());
+        assert!(all.custom.is_empty());
+        // 一項一項還原只動按鍵
+        assert_eq!(keys.reset_command(Command::Stop).mouse, keys.mouse);
     }
 }
