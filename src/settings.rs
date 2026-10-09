@@ -30,8 +30,10 @@ pub struct Settings {
     /// 視窗置頂（蓋在其他視窗上面）：不置頂 / 永遠置頂 / 播放時置頂。
     /// 以前是開關 `always_on_top`，讀檔時換成這個（見 `migrate`）
     pub on_top: OnTop,
-    /// 顯示播放清單面板
+    /// 顯示側邊面板（播放清單、書籤）
     pub show_playlist: bool,
+    /// 側邊面板目前的分頁（播放清單 / 書籤）；面板開不開還是看 `show_playlist`
+    pub side_tab: SideTab,
     /// 截圖資料夾；None = 「圖片」資料夾裡的 VitaScope
     pub screenshot_dir: Option<PathBuf>,
     /// 截圖包含字幕
@@ -175,6 +177,7 @@ impl Default for Settings {
             subtitle: SubStyle::default(),
             on_top: OnTop::Never,
             show_playlist: false,
+            side_tab: SideTab::Playlist,
             screenshot_dir: None,
             screenshot_subtitles: true,
             language: crate::i18n::Lang::default(),
@@ -192,6 +195,17 @@ impl Default for Settings {
             baseline: None,
         }
     }
+}
+
+/// 側邊面板的分頁
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SideTab {
+    /// 播放清單（F6）
+    #[default]
+    Playlist,
+    /// 目前檔案的書籤（H）
+    Bookmarks,
 }
 
 /// 視窗置頂模式（比照 PotPlayer 的三種）
@@ -676,6 +690,7 @@ mod tests {
         assert_eq!(s.smooth, SmoothMode::Off, "流暢播放先預設關");
         assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
         assert_eq!(s.on_top, OnTop::Never, "預設不置頂");
+        assert_eq!(s.side_tab, SideTab::Playlist, "側邊面板預設是播放清單");
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
         assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
@@ -728,6 +743,7 @@ mod tests {
         assert_eq!(s.theme, ThemeChoice::Dark, "升級後外觀不變");
         assert_eq!(s.keys, KeySettings::default(), "升級後快捷鍵不變");
         assert_eq!(s.keys.mouse, crate::keymap::MouseSettings::default(), "升級後滑鼠不變");
+        assert_eq!(s.side_tab, SideTab::Playlist, "升級後側邊面板還是播放清單");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -933,6 +949,37 @@ mod tests {
         assert_eq!(back.on_top, OnTop::WhilePlaying);
         assert_eq!(back.volume, 40.0);
         assert!(!std::fs::read_to_string(&path).unwrap().contains("always_on_top"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn side_tab_round_trips_and_unknown_values_load_as_playlist() {
+        let dir = temp_dir("side-tab");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.side_tab = SideTab::Bookmarks;
+        s.show_playlist = true;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""side_tab": "bookmarks""#), "{text}");
+        let back = Settings::load_from(path.clone());
+        assert_eq!((back.side_tab, back.show_playlist), (SideTab::Bookmarks, true));
+        assert_eq!(serde_json::to_value(SideTab::Playlist).unwrap(), "playlist");
+        // 新版加的分頁（或手動改錯）：播放清單，其他設定照讀
+        let s = lenient(r#"{"side_tab": "history", "show_playlist": true, "volume": 31.0}"#);
+        assert_eq!(s.side_tab, SideTab::Playlist);
+        assert!(s.show_playlist);
+        assert_eq!(s.volume, 31.0);
+        // 兩個視窗：A 換分頁、B 改音量，兩個都留下
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.side_tab = SideTab::Playlist;
+        a.save().unwrap();
+        b.volume = 20.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.side_tab, SideTab::Playlist, "A 換的分頁不能被 B 蓋回去");
+        assert_eq!(back.volume, 20.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

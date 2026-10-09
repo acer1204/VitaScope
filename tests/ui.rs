@@ -9,11 +9,12 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
+use vitascope::keymap::Platform;
 use vitascope::pacing::{Plan, Reason, SmoothMode};
 use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
-use vitascope::settings::{OnTop, Settings};
+use vitascope::settings::{OnTop, Settings, SideTab};
 use vitascope::theme::ThemeChoice;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -10162,4 +10163,757 @@ fn bookmarks_from_another_window_show_up_when_the_file_opens() {
         app.bookmarks().marks(&key).len() == 1
     });
     assert_eq!(mark_times(&h), [2.0]);
+}
+
+// ───────────── 書籤分頁（側邊面板） ─────────────
+
+/// 目前檔案的書籤名稱
+fn mark_names(h: &Harness<'_, VitascopeApp>) -> Vec<String> {
+    let app = h.state();
+    let key = app.player().state.path.clone().unwrap_or_default();
+    app.bookmarks().marks(&key).iter().map(|m| m.name.clone()).collect()
+}
+
+/// 側邊面板目前的分頁（面板關著是 None）
+fn side_tab(h: &Harness<'_, VitascopeApp>) -> Option<SideTab> {
+    let s = h.state().settings();
+    s.show_playlist.then_some(s.side_tab)
+}
+
+/// 視窗的寬度指令（打開、關掉側邊面板時視窗跟著變寬、變窄）
+fn inner_width(cmds: &[egui::ViewportCommand]) -> Option<f32> {
+    cmds.iter().find_map(|c| match c {
+        egui::ViewportCommand::InnerSize(s) => Some(s.x),
+        _ => None,
+    })
+}
+
+/// 在輸入框裡打字：每個字都像真的鍵盤一樣先送按鍵（按下、放開）再送文字。
+/// 按鍵是快捷鍵的字（P、O、空白鍵…）不能變成快捷鍵
+fn type_like_a_keyboard(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    for c in text.chars() {
+        let key = match c {
+            ' ' => Some(egui::Key::Space),
+            _ => egui::Key::from_name(&c.to_ascii_uppercase().to_string()),
+        };
+        if let Some(key) = key {
+            for pressed in [true, false] {
+                h.event(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        h.event(egui::Event::Text(c.to_string()));
+        h.step();
+    }
+    h.run_steps(2);
+}
+
+/// 雙擊書籤分頁的一列（改名）。`double_click` 把 egui 的時間停在雙擊的那一刻：之後交還給 egui 自己算，
+/// 不然之後每一次點擊都在雙擊的時間內（又變成改名）
+fn double_click_row(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    let pos = h.get_by_label(label).rect().center();
+    double_click(h, pos);
+    h.input_mut().time = None;
+    h.run_steps(2);
+}
+
+/// 開 90 秒的樣本、暫停，在 `times` 秒各加一個書籤，按 H 打開書籤分頁
+fn bookmarks_tab_with(times: &[f64]) -> Harness<'static, VitascopeApp> {
+    let mut h = paused_long();
+    for &t in times {
+        paused_at(&mut h, t);
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+    }
+    assert_eq!(mark_times(&h).len(), times.len());
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    h
+}
+
+#[test]
+fn bookmark_key_adds_and_panel_lists() {
+    let mut h = paused_long();
+    let list_len = playlist_len(h.state());
+    paused_at(&mut h, 12.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("新增書籤 00:12"));
+    // H：打開側邊面板的書籤分頁（一般視窗跟播放清單一樣變寬）
+    let before = h.ctx.content_rect().width();
+    let cmds = press_and_get_commands(&mut h, egui::Key::H);
+    assert_eq!(inner_width(&cmds), Some(before + 280.0), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    h.get_by_label("書籤（1）");
+    // 雙擊改名：打字時 P（新增書籤）、O（色相）、空白鍵（暫停）都只是文字
+    double_click_row(&mut h, "00:12");
+    assert!(h.ctx.text_edit_focused(), "改名的輸入框拿到焦點");
+    type_like_a_keyboard(&mut h, "OP end");
+    assert_eq!(mark_times(&h), [12.0], "P 沒有新增書籤");
+    assert!(h.state().player().state.paused, "空白鍵沒有切換暫停");
+    assert_eq!(h.state().adjust().hue, 0, "O 沒有調色相");
+    // Enter 改好（不是全螢幕）
+    let cmds = press_and_get_commands(&mut h, egui::Key::Enter);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["OP end"]);
+    assert!(!h.ctx.text_edit_focused());
+    // 選取後 Delete 刪掉（播放清單不受影響）
+    h.get_by_label("00:12  OP end").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(mark_times(&h).is_empty());
+    assert_eq!(playlist_len(h.state()), list_len, "Delete 刪的是書籤，不是清單裡的項目");
+    h.get_by_label("書籤（0）");
+    h.get_by_label("按 P 在目前的位置新增書籤");
+}
+
+#[test]
+fn bookmark_panel_tab_and_f6_switch() {
+    let dir = three_episodes("side-tabs");
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    let before = h.ctx.content_rect().width();
+    // F6：播放清單分頁（標題跟以前一樣）
+    let cmds = press_and_get_commands(&mut h, egui::Key::F6);
+    assert_eq!(inner_width(&cmds), Some(before + 280.0), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    h.get_by_label("播放清單（1/3）");
+    h.get_by_label("1. 第1集.mp4");
+    // H：換到書籤分頁，視窗大小不變
+    let cmds = press_and_get_commands(&mut h, egui::Key::H);
+    assert_eq!(inner_width(&cmds), None, "換分頁不改視窗大小：{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    h.get_by_label("書籤（0）");
+    h.get_by_label("播放清單（1/3）");
+    assert!(h.query_by_label("1. 第1集.mp4").is_none(), "書籤分頁不列清單");
+    // F6 換回播放清單；點分頁的標題也能換
+    let cmds = press_and_get_commands(&mut h, egui::Key::F6);
+    assert_eq!(inner_width(&cmds), None, "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    h.get_by_label("書籤（0）").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    // 書籤分頁時，右鍵選單的「播放清單」、控制列的 ☰ 不是選取的樣子
+    assert_eq!(
+        h.get_by_label("☰").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    hover_context_item(&mut h, "播放清單 F6");
+    assert_eq!(
+        h.get_by_label("播放清單 F6").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("播放清單 F6").is_none(), "Esc 關掉選單");
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    // 已經在書籤分頁：H 關掉面板（視窗變回原來的寬度）
+    let cmds = press_and_get_commands(&mut h, egui::Key::H);
+    let narrowed = inner_width(&cmds).expect("關閉時視窗變窄");
+    assert!((narrowed - before).abs() < 2.0, "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None);
+    assert!(h.query_by_label("書籤（0）").is_none());
+    assert_eq!(h.state().settings().side_tab, SideTab::Bookmarks, "記得上次的分頁");
+    // F6：打開到播放清單分頁；× 關閉
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    h.get_by_label("1. 第1集.mp4");
+    h.get_by_label("×").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None);
+}
+
+/// 上次關閉時開著書籤分頁：啟動時還是書籤分頁
+#[test]
+fn bookmarks_tab_is_remembered() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    settings.side_tab = SideTab::Bookmarks;
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    h.get_by_label("書籤（0）");
+    h.get_by_label("按 P 在目前的位置新增書籤");
+    assert!(h.query_by_label_contains("1. ").is_none(), "不是播放清單分頁");
+}
+
+/// 改名：Esc 不改（也不離開全螢幕），點別的地方（輸入框沒有焦點了）就改好
+#[test]
+fn bookmark_rename_esc_cancels_and_blur_commits() {
+    let mut h = bookmarks_tab_with(&[12.0, 30.0]);
+    set_fullscreen(&mut h, true);
+    double_click_row(&mut h, "00:12");
+    type_like_a_keyboard(&mut h, "abc");
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["", ""], "Esc 不改");
+    assert!(!h.ctx.text_edit_focused());
+    h.get_by_label("00:12");
+    // 再按一次 Esc 才離開全螢幕
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    set_fullscreen(&mut h, false);
+    // 改名到一半點分頁的標題：改好
+    double_click_row(&mut h, "00:30");
+    type_like_a_keyboard(&mut h, "ED");
+    h.get_by_label("書籤（2）").click();
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["", "ED"]);
+    h.get_by_label("00:30  ED");
+    // 改名到一半按控制列的 ☰（換到播放清單分頁，輸入框不見了）：也是改好
+    double_click_row(&mut h, "00:12");
+    type_like_a_keyboard(&mut h, "OP");
+    h.get_by_label("☰").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    assert_eq!(mark_names(&h), ["OP", "ED"]);
+    h.key_press(egui::Key::H);
+    h.run_steps(2);
+    h.get_by_label("00:12  OP");
+    assert!(!h.ctx.text_edit_focused(), "回到書籤分頁時不是改名的樣子");
+}
+
+#[test]
+fn bookmark_row_context_menu() {
+    let mut h = bookmarks_tab_with(&[10.0, 40.0]);
+    paused_at(&mut h, 60.0);
+    // 跳到這裡
+    h.get_by_label("00:40").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("跳到這裡").click();
+    step_until(&mut h, "跳到 40 秒", |s| (s.time_pos - 40.0).abs() < 0.05);
+    assert_eq!(h.state().osd_text(), Some("書籤 2/2：00:40"));
+    // 複製時間
+    h.get_by_label("00:10").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("複製時間").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert_eq!(copied.as_deref(), Some("00:10"));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("已複製時間：00:10"));
+    // 改名
+    h.get_by_label("00:10").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("改名").click();
+    h.run_steps(3);
+    assert!(h.ctx.text_edit_focused());
+    type_like_a_keyboard(&mut h, "op");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["op", ""]);
+    // 刪除
+    h.get_by_label("00:10  op").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("刪除 Delete").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [40.0]);
+    h.get_by_label("書籤（1）");
+}
+
+/// 「全部刪除…」先問：對話框開著時空白鍵不暫停、Esc 只關對話框
+#[test]
+fn delete_all_bookmarks_asks_first() {
+    let mut h = bookmarks_tab_with(&[10.0, 20.0, 30.0]);
+    assert!(h.state().player().state.paused);
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("全部刪除…").click();
+    h.run_steps(2);
+    h.get_by_label("刪除這個檔案的 3 個書籤？");
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "對話框開著時空白鍵不暫停");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("刪除這個檔案的 3 個書籤？").is_none(),
+        "Esc 關掉對話框"
+    );
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks), "面板還開著");
+    assert_eq!(mark_times(&h).len(), 3, "取消：書籤都還在");
+    // 這次真的刪
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("全部刪除…").click();
+    h.run_steps(2);
+    h.get_by_label("刪除").click();
+    h.run_steps(2);
+    assert!(mark_times(&h).is_empty());
+    assert_eq!(h.state().osd_text(), Some("已刪除 3 個書籤"));
+    h.get_by_label("書籤（0）");
+    // 沒有書籤時「全部刪除…」不能按
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    assert!(h.get_by_label("全部刪除…").accesskit_node().is_disabled());
+}
+
+#[test]
+fn bookmarks_tab_empty_states_and_add_button() {
+    // 沒有開檔
+    let mut h = harness(None);
+    h.run_steps(2);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("沒有開啟檔案");
+    assert!(h.get_by_label("+ 新增書籤（P）").accesskit_node().is_disabled());
+    // 有檔案、還沒有書籤：說怎麼加；按下面的按鈕新增
+    let mut h = paused_long();
+    paused_at(&mut h, 25.0);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("按 P 在目前的位置新增書籤");
+    h.get_by_label("+ 新增書籤（P）").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [25.0]);
+    assert_eq!(h.state().osd_text(), Some("新增書籤 00:25"));
+    h.get_by_label("00:25");
+    // 點一列：精準跳到那個書籤
+    paused_at(&mut h, 70.0);
+    h.get_by_label("00:25").click();
+    step_until(&mut h, "跳到 25 秒", |s| (s.time_pos - 25.0).abs() < 0.05);
+    assert!(h.state().player().state.paused, "跳過去照樣暫停");
+}
+
+/// 沒有名稱的書籤：在有名稱的章節裡時，淡淡地寫章節名稱
+#[test]
+fn unnamed_bookmark_shows_its_chapter() {
+    let mut h = opened(sample("common/mkv_chapters.mkv"));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    paused_at(&mut h, 5.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("00:05");
+    assert!(painted(&h, "本篇"), "第二章的名稱");
+}
+
+#[test]
+fn bookmarks_context_submenu_opens_the_list() {
+    let mut h = paused_long();
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label("書籤清單 H").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    hover_context_item(&mut h, "書籤 ⏵");
+    let item = h.get_by_label("書籤清單 H");
+    assert_eq!(item.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+    item.click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None, "再按一次關掉");
+}
+
+/// 側邊面板開著、但是在書籤分頁：拖放進來的影片直接播（看不到清單，不偷偷加到清單最後）
+#[test]
+fn dropping_onto_the_bookmarks_tab_plays_the_file() {
+    let dir = three_episodes("bookmarks-drop");
+    let extra = TempDir::new("bookmarks-drop-extra");
+    let more = extra.clip("番外1.mp4");
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    // 拖到視窗上（還沒放開）：說的是「放開以播放」
+    h.input_mut().hovered_files.push(egui::HoveredFile {
+        path: Some(more.clone()),
+        ..Default::default()
+    });
+    h.run_steps(2);
+    assert!(painted(&h, "放開以播放"), "看不到清單：放開是播放");
+    assert!(!painted(&h, "放開以加入播放清單"));
+    h.input_mut().hovered_files.clear();
+    h.run_steps(2);
+    drop_file(&mut h, more);
+    step_until(&mut h, "播放番外1", |s| playing(s, "番外1.mp4"));
+}
+
+/// PotPlayer 風格：Backspace 是從頭播放。清單開著、選過一列、滑鼠在畫面上時按 Backspace：
+/// 從頭播放，清單不變（macOS 的 Backspace 不會變成「從清單移除」，P-B6）
+#[test]
+fn backspace_restarts_with_the_potplayer_preset_and_keeps_the_list() {
+    let dir = TempDir::new("backspace-potplayer");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        std::fs::copy(sample("common/mp4_long.mp4"), dir.0.join(name)).unwrap();
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.preset = vitascope::keymap::KeyPreset::Potplayer;
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到兩個影片", |app| playlist_len(app) == 2);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    // 選取清單的第 2 項（單擊只是選取）
+    h.get_by_label("2. 第2集.mp4").click();
+    h.run_steps(2);
+    // 滑鼠移到畫面上，播到 30 秒
+    let video = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(video));
+    h.state().player().seek_to(30.0, true).unwrap();
+    step_until(&mut h, "播到 30 秒", |s| s.time_pos > 29.0);
+    assert!(
+        !h.state().side_backspace_removes(Platform::Mac),
+        "PotPlayer 風格用到 Backspace：macOS 也不是移除"
+    );
+    h.key_press(egui::Key::Backspace);
+    step_until(&mut h, "Backspace 從頭播放", |s| !s.paused && s.time_pos < 2.0);
+    assert_eq!(playlist_names(h.state()), ["第1集.mp4", "第2集.mp4"], "清單不變");
+    assert!(playing(&h.state().player().state, "第1集.mp4"));
+}
+
+/// macOS 的 Backspace（影戲預設組沒用到它）：只在滑鼠在面板上、或最後點的是面板時才移除選取的項目（P-B6）。
+/// 規則在每個平台都檢查（`side_backspace_removes(Platform::Mac)`）；真的按 Backspace 只有 macOS 會移除
+#[test]
+fn mac_backspace_removes_only_when_the_panel_is_active() {
+    let mac = cfg!(target_os = "macos");
+    let dir = three_episodes("backspace-gate");
+    let mut h = playlist_panel_open(&dir);
+    let removes = |h: &Harness<'_, VitascopeApp>| h.state().side_backspace_removes(Platform::Mac);
+    assert!(!removes(&h), "還沒點過面板、滑鼠也不在面板上");
+    // 點了清單的一列：最後點的是面板
+    h.get_by_label("3. 第3集.mp4").click();
+    h.run_steps(2);
+    assert!(removes(&h));
+    assert!(
+        !h.state().side_backspace_removes(Platform::Windows),
+        "Windows、Linux 用 Delete"
+    );
+    let video = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(video));
+    h.run_steps(2);
+    assert!(removes(&h), "滑鼠移開了，但最後點的還是面板");
+    // 點了畫面（暫停）：不再是面板
+    h.get_by_label("影片畫面").click();
+    h.run_steps(2);
+    assert!(!removes(&h), "最後點的是畫面、滑鼠也在畫面上");
+    h.key_press(egui::Key::Backspace);
+    h.run_steps(2);
+    assert_eq!(playlist_len(h.state()), 3, "Backspace 沒有移除");
+    // 滑鼠移到面板上（沒有點）：可以移除
+    let row = h.get_by_label("2. 第2集.mp4").rect().center();
+    h.event(egui::Event::PointerMoved(row));
+    h.run_steps(2);
+    assert!(removes(&h), "滑鼠在面板上");
+    h.key_press(egui::Key::Backspace);
+    h.run_steps(2);
+    if mac {
+        assert_eq!(
+            playlist_names(h.state()),
+            ["第1集.mp4", "第2集.mp4"],
+            "macOS：移除選取的第3集"
+        );
+    } else {
+        assert_eq!(playlist_len(h.state()), 3, "其他平台的 Backspace 不移除");
+    }
+    // 面板關著：不移除
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    assert!(!removes(&h));
+}
+
+#[test]
+fn bookmarks_tab_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings.clone());
+    h.run_steps(2);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("Bookmarks (0)");
+    h.get_by_label("No file is open");
+    h.get_by_label("+ Add bookmark (P)");
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "pause", |s| s.paused);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("Press P to bookmark the current position");
+    paused_at(&mut h, 20.0);
+    h.get_by_label("+ Add bookmark (P)").click();
+    h.run_steps(2);
+    h.get_by_label("Bookmarks (1)");
+    h.get_by_label("00:20").click_secondary();
+    h.run_steps(2);
+    for item in ["Jump here", "Rename", "Copy time"] {
+        h.get_by_label(item);
+    }
+    h.get_by_label("Delete Delete");
+    h.get_by_label("Copy time").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Time copied: 00:20"));
+    // 分頁、「…」停在上面的說明
+    h.get_by_label("Bookmarks (1)").hover();
+    h.run_steps(3);
+    h.get_by_label("Bookmark list (H)");
+    h.get_by_label("…").hover();
+    h.run_steps(3);
+    h.get_by_label("Add or delete bookmarks");
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("Add bookmark P");
+    h.get_by_label("Delete selected Delete");
+    h.get_by_label("Delete all…").click();
+    h.run_steps(2);
+    h.get_by_label("Delete the bookmark of this file?");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [20.0]);
+    // 右鍵選單「Bookmarks ▸」的書籤清單
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Bookmarks ⏵");
+    assert_eq!(
+        h.get_by_label("Bookmark list H").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+}
+
+/// Delete 刪掉選取的書籤之後，選取移到下一個（可以連按 Delete）；刪掉最後一個時選前一個
+#[test]
+fn bookmark_delete_moves_the_selection() {
+    let mut h = bookmarks_tab_with(&[10.0, 20.0, 30.0]);
+    h.get_by_label("00:20").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [10.0, 30.0]);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [10.0], "選取移到下一個（30 秒）");
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(mark_times(&h).is_empty(), "刪掉最後一個時選前一個");
+    // 沒有選取：Delete 什麼都不做
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    h.get_by_label("書籤（0）");
+}
+
+/// 改名到一半點了別的東西（上面的一列、新增、另一個分頁、×）：改名改好，點的那一下也照做
+#[test]
+fn bookmark_rename_blur_keeps_the_click_that_caused_it() {
+    let mut h = bookmarks_tab_with(&[10.0, 20.0, 30.0]);
+    // 點上面的一列：改好，也跳到那一列
+    double_click_row(&mut h, "00:20");
+    type_like_a_keyboard(&mut h, "mid");
+    h.get_by_label("00:10").click();
+    step_until(&mut h, "跳到 10 秒", |s| (s.time_pos - 10.0).abs() < 0.05);
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["", "mid", ""]);
+    assert!(!h.ctx.text_edit_focused());
+    // 點下面的「+ 新增書籤」：改好，也加了書籤
+    double_click_row(&mut h, "00:30");
+    type_like_a_keyboard(&mut h, "end");
+    // 雙擊的第一下跳到了 30 秒：改名中換到 45 秒再新增
+    paused_at(&mut h, 45.0);
+    assert!(h.ctx.text_edit_focused());
+    h.get_by_label("+ 新增書籤（P）").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [10.0, 20.0, 30.0, 45.0]);
+    assert_eq!(mark_names(&h), ["", "mid", "end", ""]);
+    // 點播放清單分頁：改好，也換了分頁
+    double_click_row(&mut h, "00:10");
+    type_like_a_keyboard(&mut h, "op");
+    h.get_by_label_contains("播放清單（").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    assert_eq!(mark_names(&h), ["op", "mid", "end", ""]);
+    // 點 ×：改好，也關了面板
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    double_click_row(&mut h, "00:45");
+    type_like_a_keyboard(&mut h, "x");
+    h.get_by_label("×").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None);
+    assert_eq!(mark_names(&h), ["op", "mid", "end", "x"]);
+}
+
+/// 開著書籤分頁播 `file`、暫停；`marks` 是事先放好的書籤（檔案、時間），不用一個一個跳過去按 P
+fn bookmarks_tab_launch(file: PathBuf, marks: &[(&PathBuf, &[f64])]) -> Harness<'static, VitascopeApp> {
+    let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+    for (path, times) in marks {
+        for &t in *times {
+            bookmarks.add(&path.to_string_lossy(), t).unwrap();
+        }
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    settings.side_tab = SideTab::Bookmarks;
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let launch = Launch {
+        files: vec![file],
+        bookmarks,
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    settle(&mut h, &name);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.run_steps(2);
+    h
+}
+
+/// 改名到一半把那一列捲到看不見（只畫看得到的列，輸入框也跟著不見）：跟點了別的地方一樣，改好，
+/// 不會一直停在沒有焦點的改名樣子
+#[test]
+fn bookmark_rename_commits_when_scrolled_out_of_view() {
+    // 放到暫存資料夾：書籤依播放器看到的路徑記（樣本的路徑混了 / 與 \）
+    let dir = TempDir::new("bookmarks-rename-scroll");
+    let video = dir.0.join("影片.mp4");
+    std::fs::copy(sample("common/mp4_long.mp4"), &video).unwrap();
+    let times: Vec<f64> = (1..=80).map(f64::from).collect();
+    let mut h = bookmarks_tab_launch(video.clone(), &[(&video, &times)]);
+    h.get_by_label("書籤（80）");
+    double_click_row(&mut h, "00:01");
+    type_like_a_keyboard(&mut h, "first");
+    assert!(h.ctx.text_edit_focused());
+    // 滑鼠在清單上，往下捲到底
+    let over = h.get_by_label("00:03").rect().center();
+    let wheel = |h: &mut Harness<'_, VitascopeApp>, dy: f32| {
+        h.event(egui::Event::PointerMoved(over));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, dy),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.run_steps(10);
+    };
+    wheel(&mut h, -5000.0);
+    assert!(h.query_by_label("00:01").is_none(), "第一列捲到看不見了");
+    h.get_by_label("01:20");
+    assert_eq!(mark_names(&h)[0], "first", "捲走了就改好");
+    assert!(!h.ctx.text_edit_focused());
+    // 捲回來：不是改名的樣子
+    wheel(&mut h, 5000.0);
+    h.get_by_label("00:01  first");
+    assert!(!h.ctx.text_edit_focused());
+}
+
+/// 改名到一半換了檔案（拖放進來的影片）：改好的是原來那個檔案的書籤
+#[test]
+fn bookmark_rename_commits_when_the_file_changes() {
+    let dir = TempDir::new("bookmarks-rename-file");
+    let (one, two) = (dir.clip("第1集.mp4"), dir.clip("第2集.mp4"));
+    let mut h = bookmarks_tab_launch(one.clone(), &[(&one, &[1.0]), (&two, &[2.0])]);
+    double_click_row(&mut h, "00:01");
+    type_like_a_keyboard(&mut h, "x");
+    drop_file(&mut h, two.clone());
+    step_until(&mut h, "播放第2集", |s| playing(s, "第2集.mp4"));
+    h.run_steps(3);
+    let marks = |p: &PathBuf| h.state().bookmarks().marks(&p.to_string_lossy()).to_vec();
+    assert_eq!(marks(&one)[0].name, "x", "第1集的書籤改好了");
+    assert_eq!(marks(&two)[0].name, "", "第2集的書籤沒有被改");
+    assert!(!h.ctx.text_edit_focused());
+    h.get_by_label("00:02");
+}
+
+/// 「全部刪除…」開著時換了檔案（例如自動接下一個）：刪的是開對話框時那個檔案的書籤
+#[test]
+fn delete_all_bookmarks_deletes_the_file_it_was_opened_for() {
+    let dir = TempDir::new("bookmarks-clear-file");
+    let (one, two) = (dir.clip("第1集.mp4"), dir.clip("第2集.mp4"));
+    let mut h = bookmarks_tab_launch(one.clone(), &[(&one, &[1.0, 3.0]), (&two, &[2.0])]);
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("全部刪除…").click();
+    h.run_steps(2);
+    h.get_by_label("刪除這個檔案的 2 個書籤？");
+    drop_file(&mut h, two.clone());
+    step_until(&mut h, "播放第2集", |s| playing(s, "第2集.mp4"));
+    h.run_steps(3);
+    h.get_by_label("刪除").click();
+    h.run_steps(2);
+    let count = |p: &PathBuf| h.state().bookmarks().marks(&p.to_string_lossy()).len();
+    assert_eq!(count(&one), 0, "刪的是第1集的");
+    assert_eq!(count(&two), 1, "第2集的還在");
+    assert_eq!(h.state().osd_text(), Some("已刪除 2 個書籤"));
+    h.get_by_label("書籤（1）");
+}
+
+/// 改名時 Delete、Backspace 是編輯文字，不是刪掉書籤。滑鼠在面板上，不打字時 macOS 的 Backspace 會移除：
+/// 擋下來的是「正在打字」
+#[test]
+fn delete_and_backspace_in_the_rename_box_edit_the_text() {
+    let mut h = bookmarks_tab_with(&[12.0, 30.0]);
+    double_click_row(&mut h, "00:12");
+    type_like_a_keyboard(&mut h, "abcd");
+    assert!(h.state().side_backspace_removes(Platform::Mac));
+    // Backspace 刪掉 d；Home 到最前面；Delete 刪掉 a
+    for key in [egui::Key::Backspace, egui::Key::Home, egui::Key::Delete] {
+        h.key_press(key);
+        h.run_steps(2);
+    }
+    assert_eq!(mark_times(&h), [12.0, 30.0], "書籤都還在");
+    assert!(h.ctx.text_edit_focused(), "還在改名");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["bc", ""]);
+    assert!(h.state().player().state.paused, "Home 沒有從頭播放");
+}
+
+/// 不能跳轉的來源：書籤分頁說為什麼不能加，「+ 新增書籤」不能按
+#[test]
+fn unseekable_source_in_the_bookmarks_tab() {
+    let url = format!("lavf://file:{}", sample("common/mp4_long.mp4").display());
+    for (lang, cant_add, add) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            "這個檔案不能跳轉，無法加書籤",
+            "+ 新增書籤（P）",
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            "This file isn't seekable, so it can't be bookmarked",
+            "+ Add bookmark (P)",
+        ),
+    ] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        settings.show_playlist = true;
+        settings.side_tab = SideTab::Bookmarks;
+        let opts = Options {
+            keep_open: true,
+            extra: vec![("stream-lavf-o".into(), "seekable=0".into())],
+            ..Options::headless()
+        };
+        let launch = Launch {
+            files: vec![PathBuf::from(&url)],
+            ..Default::default()
+        };
+        let mut h = harness_launch_with(opts, launch, settings);
+        step_until(&mut h, "載入完成", |s| s.loaded && s.duration.is_some());
+        h.run_steps(3);
+        assert!(!h.state().player().state.seekable, "這個來源不能跳轉");
+        h.get_by_label(cant_add);
+        assert!(h.get_by_label(add).accesskit_node().is_disabled());
+    }
 }

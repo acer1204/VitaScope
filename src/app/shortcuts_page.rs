@@ -237,7 +237,7 @@ impl VitascopeApp {
         }
         self.mouse_section(ui, &search);
         ui.add_space(10.0);
-        // macOS 的 Backspace：預設組或自己指定的用到它時就不是「從清單移除」（例如 PotPlayer 風格的從頭播放）
+        // macOS 的 Backspace：預設組或自己指定的用到它時就不是「移除選取的項目」（例如 PotPlayer 風格的從頭播放）
         let backspace_free = self.keymap.owner(Chord::new(Mods::NONE, Key::Backspace)).is_none();
         fixed_keys(ui, platform, backspace_free);
     }
@@ -565,12 +565,27 @@ fn wheel_label() -> &'static str {
     tr!("在畫面上捲動滾輪", "Wheel over the video")
 }
 
-/// 固定的按鍵（不在對照表裡，不能改）；`backspace_free`：對照表沒有用到 Backspace（macOS 才用它從清單移除）
+/// 固定的按鍵（不在對照表裡，不能改）；`backspace_free`：對照表沒有用到 Backspace（macOS 才用它移除側邊面板裡選取的項目）
 fn fixed_keys(ui: &mut egui::Ui, platform: keymap::Platform, backspace_free: bool) {
+    ui.strong(tr!("固定的按鍵（不能更改）", "Fixed keys (can't be changed)"));
+    egui::Grid::new("shortcuts_fixed")
+        .num_columns(2)
+        .striped(true)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for (key, what) in fixed_rows(platform, backspace_free) {
+                ui.label(egui::RichText::new(key).monospace());
+                ui.label(what);
+                ui.end_row();
+            }
+        });
+}
+
+/// 固定的按鍵表：（按鍵、做什麼）
+fn fixed_rows(platform: keymap::Platform, backspace_free: bool) -> Vec<(String, &'static str)> {
     let mac = platform == keymap::Platform::Mac;
     let cmd = if mac { "Cmd" } else { "Ctrl" };
-    ui.strong(tr!("固定的按鍵（不能更改）", "Fixed keys (can't be changed)"));
-    let rows: Vec<(String, &str)> = vec![
+    vec![
         (
             "Esc".to_owned(),
             tr!("關閉視窗、離開全螢幕", "Close a window, leave fullscreen"),
@@ -582,10 +597,18 @@ fn fixed_keys(ui: &mut egui::Ui, platform: keymap::Platform, backspace_free: boo
                 "Delete"
             }
             .to_owned(),
-            tr!(
-                "從播放清單移除（清單開著時）",
-                "Remove from the playlist (when it is open)"
-            ),
+            // macOS 的 Backspace 另外要滑鼠在面板上或最後點的是面板（見 `side_backspace_removes`）
+            if mac && backspace_free {
+                tr!(
+                    "移除側邊面板（播放清單、書籤）裡選取的項目（Backspace：滑鼠在面板上或最後點的是面板時）",
+                    "Remove the selected item in the side panel (playlist or bookmarks); Backspace only when the pointer is over the panel or you clicked it last"
+                )
+            } else {
+                tr!(
+                    "移除側邊面板（播放清單、書籤）裡選取的項目",
+                    "Remove the selected item in the side panel (playlist or bookmarks)"
+                )
+            },
         ),
         (
             format!("{cmd} + V / X"),
@@ -599,16 +622,47 @@ fn fixed_keys(ui: &mut egui::Ui, platform: keymap::Platform, backspace_free: boo
             ),
         ),
         (tr!("右鍵", "Right-click").to_owned(), tr!("選單", "Menu")),
-    ];
-    egui::Grid::new("shortcuts_fixed")
-        .num_columns(2)
-        .striped(true)
-        .spacing([16.0, 4.0])
-        .show(ui, |ui| {
-            for (key, what) in rows {
-                ui.label(egui::RichText::new(key).monospace());
-                ui.label(what);
-                ui.end_row();
-            }
-        });
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 「固定的按鍵」的 Delete 那一列（按鍵、說明）
+    fn delete_row(platform: keymap::Platform, backspace_free: bool) -> (String, &'static str) {
+        fixed_rows(platform, backspace_free).swap_remove(1)
+    }
+
+    /// macOS 的 Backspace 有條件（滑鼠在面板上或最後點的是面板），表上要寫出來
+    #[test]
+    fn fixed_delete_row_explains_the_mac_backspace_rule() {
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let (key, what) = delete_row(keymap::Platform::Mac, true);
+        assert_eq!(key, "Delete / Backspace");
+        assert_eq!(
+            what,
+            "移除側邊面板（播放清單、書籤）裡選取的項目（Backspace：滑鼠在面板上或最後點的是面板時）"
+        );
+        for (platform, free) in [
+            (keymap::Platform::Mac, false),
+            (keymap::Platform::Windows, true),
+            (keymap::Platform::Linux, true),
+        ] {
+            let (key, what) = delete_row(platform, free);
+            assert_eq!(key, "Delete");
+            assert_eq!(what, "移除側邊面板（播放清單、書籤）裡選取的項目");
+        }
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(
+            delete_row(keymap::Platform::Mac, true).1,
+            "Remove the selected item in the side panel (playlist or bookmarks); \
+             Backspace only when the pointer is over the panel or you clicked it last"
+        );
+        assert_eq!(
+            delete_row(keymap::Platform::Windows, true).1,
+            "Remove the selected item in the side panel (playlist or bookmarks)"
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+    }
 }

@@ -445,6 +445,8 @@ commands! {
     BookmarkAdd => "bookmark-add", Bookmarks, once, ("新增書籤", "Add bookmark");
     BookmarkPrev => "bookmark-prev", Bookmarks, once, ("上一個書籤", "Previous bookmark");
     BookmarkNext => "bookmark-next", Bookmarks, once, ("下一個書籤", "Next bookmark");
+    /// 側邊面板的書籤分頁（英文不叫 "Bookmarks"：跟群組、右鍵選單的「書籤 ▸」同名）
+    BookmarkList => "bookmark-list", Bookmarks, once, ("書籤清單", "Bookmark list");
 }
 
 impl Command {
@@ -517,6 +519,7 @@ fn vitascope_preset(platform: Platform) -> Vec<(Command, Chord)> {
         (C::BookmarkPrev, Chord::new(SHIFT, Key::PageUp)),
         (C::BookmarkNext, Chord::new(SHIFT, Key::PageDown)),
         (C::BookmarkAdd, Chord::new(N, Key::P)),
+        (C::BookmarkList, Chord::new(N, Key::H)),
         (C::VolumeUp, Chord::new(N, Key::ArrowUp)),
         (C::VolumeDown, Chord::new(N, Key::ArrowDown)),
         (C::ToggleMute, Chord::new(N, Key::M)),
@@ -1224,6 +1227,19 @@ impl Keymap {
         }
     }
 
+    /// 書籤分頁沒有書籤時：「按 P 在目前的位置新增書籤」
+    pub fn bookmarks_empty_hint(&self) -> String {
+        let key = self.hint(Command::BookmarkAdd);
+        if key.is_empty() {
+            crate::tr!("這個檔案還沒有書籤", "No bookmarks in this file yet").to_owned()
+        } else {
+            crate::tf!(
+                "按 {key} 在目前的位置新增書籤",
+                "Press {key} to bookmark the current position"
+            )
+        }
+    }
+
     /// 起始畫面：「把影片拖放到這裡，或按 Ctrl+O 開啟檔案」
     pub fn drop_hint(&self) -> String {
         let key = self.hint(Command::OpenFile);
@@ -1365,6 +1381,8 @@ mod tests {
         "bookmark-add",
         "bookmark-prev",
         "bookmark-next",
+        // B2
+        "bookmark-list",
     ];
 
     #[test]
@@ -1496,7 +1514,8 @@ mod tests {
                 | C::LoadSubtitle
                 | C::BookmarkAdd
                 | C::BookmarkPrev
-                | C::BookmarkNext => false,
+                | C::BookmarkNext
+                | C::BookmarkList => false,
             };
             assert_eq!(c.repeatable(), expected, "{c:?}");
         }
@@ -1851,12 +1870,13 @@ mod tests {
             .collect()
     }
 
-    /// v0.3.0 之後刻意改的按鍵（批次二 B1）：P 新增書籤（以前沒有作用）；Shift+PgUp / PgDn 上一個 / 下一個書籤
+    /// v0.3.0 之後刻意改的按鍵（批次二 B1、B2）：P 新增書籤、H 書籤清單（以前都沒有作用）；Shift+PgUp / PgDn 上一個 / 下一個書籤
     /// （以前多按的 Shift 不影響，是換檔）。Ctrl+P、Ctrl+Shift+PgUp 之類有 Ctrl 的照舊
     fn changed_after_v030(mods: Modifiers, key: Key) -> Option<Option<Command>> {
         let no_ctrl = !mods.ctrl && !mods.command && !mods.mac_cmd;
         match key {
             Key::P if no_ctrl => Some(Some(Command::BookmarkAdd)),
+            Key::H if no_ctrl => Some(Some(Command::BookmarkList)),
             Key::PageUp if no_ctrl && mods.shift => Some(Some(Command::BookmarkPrev)),
             Key::PageDown if no_ctrl && mods.shift => Some(Some(Command::BookmarkNext)),
             _ => None,
@@ -2476,6 +2496,14 @@ mod tests {
                 );
                 assert_eq!(map.lookup(Key::P, Modifiers::NONE), Some(Command::BookmarkAdd));
                 assert_eq!(map.lookup(Key::P, cmd), Some(Command::FlipV), "Ctrl+P 照舊是上下翻轉");
+                assert_eq!(map.lookup(Key::H, Modifiers::NONE), Some(Command::BookmarkList));
+                assert_eq!(map.lookup(Key::H, Modifiers::SHIFT), Some(Command::BookmarkList));
+                assert_eq!(
+                    map.lookup(Key::H, cmd),
+                    None,
+                    "Ctrl+H 沒有作用（macOS 的 ⌘H 是隱藏程式）"
+                );
+                assert_eq!(map.labeled("書籤清單", Command::BookmarkList), "書籤清單（H）");
                 assert_eq!(
                     map.pair(Command::BookmarkPrev, Command::BookmarkNext),
                     "Shift+PgUp / PgDn"
@@ -2486,14 +2514,25 @@ mod tests {
         // 改了按鍵：提示跟著改；沒有按鍵時括號整個不寫
         let map = Keymap::build(&custom(&[("bookmark-add", &["B"])]), Platform::Windows);
         assert_eq!(map.no_bookmarks_osd(), "這個檔案還沒有書籤（按 B 新增）");
+        assert_eq!(map.bookmarks_empty_hint(), "按 B 在目前的位置新增書籤");
         let map = Keymap::build(&custom(&[("bookmark-add", &[])]), Platform::Windows);
         assert_eq!(map.no_bookmarks_osd(), "這個檔案還沒有書籤");
+        assert_eq!(map.bookmarks_empty_hint(), "這個檔案還沒有書籤");
+        assert_eq!(
+            keymap(Platform::Windows).bookmarks_empty_hint(),
+            "按 P 在目前的位置新增書籤"
+        );
         set_lang(Lang::En);
         assert_eq!(
             keymap(Platform::Windows).no_bookmarks_osd(),
             "No bookmarks in this file yet (press P to add one)"
         );
         assert_eq!(Group::Bookmarks.label(), "Bookmarks");
+        assert_eq!(Command::BookmarkList.label(), "Bookmark list");
+        assert_eq!(
+            keymap(Platform::Windows).bookmarks_empty_hint(),
+            "Press P to bookmark the current position"
+        );
         set_lang(Lang::ZhTw);
     }
 }

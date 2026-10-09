@@ -27,7 +27,7 @@ use crate::picture::{
 };
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
-use crate::settings::{OnTop, Settings, SubStyle, WindowGeometry};
+use crate::settings::{OnTop, Settings, SideTab, SubStyle, WindowGeometry};
 use crate::sound::{EqPreset, Leveling};
 use crate::theme::{self, Palette, ThemeChoice};
 use crate::update::{self, UpdateStatus};
@@ -134,7 +134,7 @@ enum Action {
     Flip(bool),
     /// 畫面的調整全部還原
     ResetView,
-    /// 播放清單面板（F6）
+    /// 側邊面板的播放清單分頁（F6）：關著就打開、在書籤分頁就換過來、已經是播放清單就關掉
     TogglePlaylist,
     /// 把清單上選取的項目移出清單（Delete）
     PlaylistRemove,
@@ -196,6 +196,10 @@ enum Action {
     BookmarkAdd,
     BookmarkStep(i32),
     BookmarkJump(u64),
+    /// 側邊面板的書籤分頁（H）：跟 F6 一樣，已經在書籤分頁就關掉
+    ToggleBookmarks,
+    /// 刪掉書籤分頁上選取的書籤（Delete）
+    BookmarkRemove,
 }
 
 /// Esc 會關掉的視窗，依這個順序一次關一個（之後的批次把自己的視窗加進來：匯出、線上搜尋字幕…）
@@ -271,6 +275,12 @@ pub struct VitascopeApp {
     history: History,
     /// 每個檔案的書籤（背景執行緒存檔）
     bookmarks: Bookmarks,
+    /// 書籤分頁上選取的書籤（編號）
+    bookmark_selected: Option<u64>,
+    /// 書籤分頁上正在改名的書籤
+    bookmark_edit: Option<bookmarks_panel::RenameEdit>,
+    /// 「全部刪除…」的確認對話框開著：要刪的是哪個檔案的書籤（開對話框時的檔案；之後換了檔也不會刪錯）
+    bookmarks_clear: Option<String>,
     /// 同資料夾的播放清單（開網址時沒有）
     playlist: Option<Playlist>,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
@@ -340,8 +350,10 @@ pub struct VitascopeApp {
     playlist_width_pref: f32,
     /// 打開播放清單時視窗加寬了多少、加寬後的寬度（關掉時縮回去；使用者自己調整過視窗就不縮）
     playlist_grew: Option<(f32, f32)>,
-    /// 滑鼠在播放清單上（全螢幕時控制列、滑鼠游標不隱藏）
+    /// 滑鼠在側邊面板（播放清單、書籤）上（全螢幕時控制列、滑鼠游標不隱藏；macOS 的 Backspace 看這個）
     pointer_over_playlist: bool,
+    /// 最後一次按下滑鼠是在側邊面板裡（macOS 的 Backspace 才是移除選取的項目，見 [`Self::side_backspace_removes`]）
+    side_clicked_last: bool,
     /// 「加入資料夾」背景掃描的結果
     folder_add: Option<Receiver<Vec<PathBuf>>>,
     /// 開著的檔案對話框（同時只開一個，見 `dialogs.rs`）
@@ -647,6 +659,9 @@ impl VitascopeApp {
             engine_lgpl: false,
             history: launch.history,
             bookmarks,
+            bookmark_selected: None,
+            bookmark_edit: None,
+            bookmarks_clear: None,
             playlist: launch.playlist.clone(),
             was_eof: false,
             wheel: 0.0,
@@ -683,6 +698,7 @@ impl VitascopeApp {
             playlist_width_pref: playlist_panel::PANEL_WIDTH,
             playlist_grew: None,
             pointer_over_playlist: false,
+            side_clicked_last: false,
             folder_add: None,
             dialog: None,
             dialog_stub: None,
@@ -1232,7 +1248,9 @@ impl VitascopeApp {
             Action::ExitFullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false)),
             Action::Open => self.open_dialog(),
             Action::About => self.about_open = true,
-            Action::TogglePlaylist => self.toggle_playlist(ctx),
+            Action::TogglePlaylist => self.toggle_side(ctx, SideTab::Playlist),
+            Action::ToggleBookmarks => self.toggle_side(ctx, SideTab::Bookmarks),
+            Action::BookmarkRemove => self.remove_selected_bookmark(),
             Action::ToggleInfo => self.toggle_info(),
             Action::CopyInfo => self.copy_info(ctx),
             Action::Screenshot => self.take_screenshot(capture::ShotDest::Folder),
@@ -2024,6 +2042,8 @@ impl VitascopeApp {
         };
         // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到
         self.bookmarks.refresh(&path);
+        // 書籤分頁上選取的是上一個檔案的書籤
+        self.bookmark_selected = None;
         if let Some((video, subs)) = self.pending_subs.take()
             && crate::playlist::same_file(&video, Path::new(&path))
         {
@@ -2117,8 +2137,9 @@ impl VitascopeApp {
     /// 3. 「關於」、對話框（`egui::Modal`）開著、正在輸入文字時，按鍵都不當快捷鍵；
     /// 4. Esc 依序關掉開著的視窗（[`ESC_WINDOWS`]）；
     /// 5. 全螢幕時 Esc 離開全螢幕；
-    /// 6. 快捷鍵對照表（`keymap`）。固定的按鍵：清單開著時，只按 Delete 一定是移出清單（排在對照表前面，
-    ///    自己指定的按鍵拿不走）；Shift／Alt+Delete、macOS 的 Backspace 排在對照表後面，對照表沒用到才移出（跟以前一樣）。
+    /// 6. 快捷鍵對照表（`keymap`）。固定的按鍵：側邊面板開著時，只按 Delete 一定是移除選取的項目（播放清單分頁移出清單、
+    ///    書籤分頁刪掉書籤；排在對照表前面，自己指定的按鍵拿不走）；Shift／Alt+Delete 排在對照表後面，對照表沒用到才移除
+    ///    （跟以前一樣）；macOS 的 Backspace 也排在後面，另外要滑鼠在面板上或最後點的是面板（[`Self::side_backspace_removes`]）。
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if std::env::var_os("VITASCOPE_DEBUG_KEYS").is_some() {
             ctx.input(|i| {
@@ -2161,14 +2182,20 @@ impl VitascopeApp {
         if !menu_open && is_fullscreen(ctx) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             actions.push(Action::ExitFullscreen);
         }
-        let playlist_open = self.settings.show_playlist;
+        let side_open = self.settings.show_playlist;
+        // 移除的是目前分頁上選取的項目
+        let remove = match self.settings.side_tab {
+            SideTab::Playlist => Action::PlaylistRemove,
+            SideTab::Bookmarks => Action::BookmarkRemove,
+        };
+        let backspace_removes = self.side_backspace_removes(Platform::current());
         let text_selected = ctx
             .with_plugin::<egui::text_selection::LabelSelectionState, _>(|s| s.has_selection())
             .unwrap_or(false);
         let keymap = &self.keymap;
         let mut commands = Vec::new();
-        // 固定的按鍵：清單開著時只按 Delete 就是移出清單，不看對照表（一幀只算一次，跟 consume_key 一樣）
-        let deleted = playlist_open
+        // 固定的按鍵：側邊面板開著時只按 Delete 就是移除，不看對照表（一幀只算一次，跟 consume_key 一樣）
+        let deleted = side_open
             && ctx.input_mut(|i| {
                 let before = i.events.len();
                 i.events.retain(|e| {
@@ -2177,7 +2204,7 @@ impl VitascopeApp {
                 i.events.len() != before
             });
         if deleted {
-            actions.push(Action::PlaylistRemove);
+            actions.push(remove);
         }
         // 先把快捷鍵吃掉，避免同一個按鍵又觸發 egui 的按鈕（例如空白鍵按下有焦點的按鈕）
         ctx.input_mut(|i| {
@@ -2223,15 +2250,15 @@ impl VitascopeApp {
             });
         });
         actions.extend(commands.into_iter().map(|c| self.command_action(c)));
-        // 固定的按鍵（不在對照表裡）：Shift／Alt+Delete 也移出清單（以前的 consume_key 會多容許 Shift、Alt）
-        if playlist_open {
+        // 固定的按鍵（不在對照表裡）：Shift／Alt+Delete 也移除（以前的 consume_key 會多容許 Shift、Alt）
+        if side_open {
             ctx.input_mut(|i| {
                 if i.consume_key(Modifiers::NONE, Key::Delete) && !deleted {
-                    actions.push(Action::PlaylistRemove);
+                    actions.push(remove);
                 }
                 // Mac 的鍵盤沒有 Delete 鍵（Alt+Backspace 是對照表的，前面已經拿走了）
-                if cfg!(target_os = "macos") && i.consume_key(Modifiers::NONE, Key::Backspace) {
-                    actions.push(Action::PlaylistRemove);
+                if backspace_removes && i.consume_key(Modifiers::NONE, Key::Backspace) {
+                    actions.push(remove);
                 }
             });
         }
@@ -2294,6 +2321,23 @@ impl VitascopeApp {
             }
             saw_copy && !fresh_copy
         })
+    }
+
+    /// macOS 的 Backspace 也是「移除側邊面板上選取的項目」（Mac 的鍵盤沒有 Delete 鍵），但只在：
+    /// 面板開著、滑鼠在面板上或最後一次點的是面板，而且快捷鍵沒有用到 Backspace。
+    /// 看滑鼠：不然選過清單的一列之後，滑鼠在畫面上誤按 Backspace，清單裡的項目（或書籤）就被移除了。
+    /// 看快捷鍵：快捷鍵用到 Backspace 時（例如 PotPlayer 風格的從頭播放），對照表先拿走了按鍵，這裡是第二道保險，
+    /// 快捷鍵頁的「固定的按鍵」也照這個規則寫。
+    /// `platform` 是參數：介面測試在每個平台都能檢查 macOS 的規則
+    #[doc(hidden)]
+    pub fn side_backspace_removes(&self, platform: Platform) -> bool {
+        platform == Platform::Mac
+            && self.settings.show_playlist
+            && (self.pointer_over_playlist || self.side_clicked_last)
+            && self
+                .keymap
+                .owner(Chord::new(crate::keymap::Mods::NONE, Key::Backspace))
+                .is_none()
     }
 
     /// 指令 → 操作（跳轉秒數之類的參數看設定）
@@ -2375,6 +2419,7 @@ impl VitascopeApp {
             Command::BookmarkAdd => Action::BookmarkAdd,
             Command::BookmarkPrev => Action::BookmarkStep(-1),
             Command::BookmarkNext => Action::BookmarkStep(1),
+            Command::BookmarkList => Action::ToggleBookmarks,
         }
     }
 
@@ -2471,7 +2516,8 @@ impl VitascopeApp {
         };
         let extra_subs: Vec<PathBuf> = subs.into_iter().filter(|s| !belongs_to_some_video(s)).collect();
         // 播放清單開著時拖放進來的：加到清單最後（沒有在播的話播第一個），不換掉清單
-        if from_drop && self.settings.show_playlist {
+        //（側邊面板開著、但看的是書籤分頁時照一般的拖放：看不到清單，加進去也不知道）
+        if from_drop && self.playlist_shown() {
             self.add_to_playlist(media);
             if !extra_subs.is_empty() {
                 self.osd(crate::tr!(
@@ -2965,7 +3011,7 @@ impl VitascopeApp {
         if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
             ui.painter()
                 .rect_filled(rect, CornerRadius::ZERO, Color32::from_black_alpha(160));
-            let hint = if self.settings.show_playlist {
+            let hint = if self.playlist_shown() {
                 crate::tr!("放開以加入播放清單", "Drop to add to the playlist")
             } else {
                 crate::tr!("放開以播放", "Drop to play")
@@ -3280,7 +3326,7 @@ impl VitascopeApp {
         if self.cmd_item(ui, true, crate::tr!("全螢幕", "Fullscreen"), Command::Fullscreen) {
             action = Some(Action::ToggleFullscreen);
         }
-        let playlist = egui::Button::selectable(self.settings.show_playlist, crate::tr!("播放清單", "Playlist"))
+        let playlist = egui::Button::selectable(self.playlist_shown(), crate::tr!("播放清單", "Playlist"))
             .shortcut_text(self.keymap.hint(Command::Playlist));
         if ui.add(playlist).clicked() {
             action = Some(Action::TogglePlaylist);
@@ -3528,7 +3574,7 @@ impl VitascopeApp {
                 {
                     self.run(ui.ctx(), Action::About);
                 }
-                let list_button = egui::Button::selectable(self.settings.show_playlist, "☰").min_size(vec2(28.0, 22.0));
+                let list_button = egui::Button::selectable(self.playlist_shown(), "☰").min_size(vec2(28.0, 22.0));
                 if ui
                     .add(list_button)
                     .on_hover_text(
@@ -4119,19 +4165,33 @@ impl eframe::App for VitascopeApp {
             self.controls_height = r.response.rect.height();
             self.pointer_over_controls = false;
         }
-        // 播放清單在影片右邊（控制列在下面、整個視窗寬，按鈕才放得下）
+        // 側邊面板（播放清單、書籤）在影片右邊（控制列在下面、整個視窗寬，按鈕才放得下）
         self.playlist_width = 0.0;
         self.pointer_over_playlist = false;
+        let mut side_rect = None;
         if self.settings.show_playlist {
             let r = egui::Panel::right("playlist")
                 .frame(Self::playlist_frame(&palette))
                 .resizable(true)
                 .default_size(self.playlist_width_pref)
                 .size_range(180.0..=600.0)
-                .show(ui, |ui| self.playlist_panel(ui));
+                .show(ui, |ui| self.side_panel(ui));
             self.playlist_width = r.response.rect.width();
             self.playlist_width_pref = self.playlist_width;
             self.pointer_over_playlist = r.response.contains_pointer();
+            side_rect = Some(r.response.rect);
+        }
+        self.finish_hidden_rename();
+        // 記下最後一次按下滑鼠是不是在面板裡（macOS 的 Backspace 用）。看事件本身的位置：
+        // 同一幀按下又放開時，egui 的 press_origin 已經清掉了
+        let pressed_at = ctx.input(|i| {
+            i.events.iter().rev().find_map(|e| match e {
+                egui::Event::PointerButton { pos, pressed: true, .. } => Some(*pos),
+                _ => None,
+            })
+        });
+        if let Some(pos) = pressed_at {
+            self.side_clicked_last = side_rect.is_some_and(|r| r.contains(pos));
         }
 
         egui::CentralPanel::no_frame()
@@ -4169,6 +4229,7 @@ impl eframe::App for VitascopeApp {
         // 這一幀畫的對話框自己記下來（下一幀的 handle_keys 看）
         self.modal_open = false;
         self.about_window(&ctx);
+        self.bookmarks_clear_modal(&ctx);
         self.subtitle_style_window(&ctx);
         self.settings_window(&ctx);
         self.control_panel(&ctx);

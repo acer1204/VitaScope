@@ -45,7 +45,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 | 平台 | 設定、播放紀錄、播放清單 | 暫存（字幕轉碼、翻轉用的著色器等） |
 |---|---|---|
-| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\` |
+| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`bookmarks.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\` |
 | macOS | `~/Library/Application Support/Vitascope/` | `~/Library/Caches/VitaScope/` |
 | Linux | `~/.config/vitascope/` | `~/.cache/vitascope/` |
 
@@ -155,7 +155,9 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   系統保留的按鍵（Ctrl+V、Ctrl+X…）不能指定；改過的標「•」，可以一項一項或全部還原。內建「影戲」與「PotPlayer 風格」兩組預設
   （見下面的快捷鍵表）。選單、按鈕提示上的按鍵跟著改。滑鼠也可以改：單擊畫面（播放／暫停、靜音、不動作）、
   雙擊畫面（全螢幕、不動作）、中鍵與側鍵（上一頁 / 下一頁，可以指定任何功能）、在畫面上捲動滾輪（音量、跳轉、不動作）
-- [ ] 書籤
+- [x] 書籤：P 在目前的位置新增、Shift+PgUp / PgDn 跳到上一個 / 下一個，進度條上有標記，右鍵選單「書籤 ▸」；
+  H 打開側邊面板的「書籤」分頁（播放清單旁邊）：點一下跳過去、雙擊改名、右鍵選單、Delete 刪除、「全部刪除…」。
+  存在設定資料夾的 `bookmarks.json`
 - [ ] 開啟網址（HTTP、HLS、DASH）、網站影片（yt-dlp）
 - [ ] 線上搜尋字幕
 - [ ] 片段輸出、轉成 GIF、縮圖總覽圖
@@ -203,6 +205,9 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | 單擊畫面 | 播放 / 暫停 |
 | PgUp / PgDn | 上一個 / 下一個檔案（同資料夾的影片，依檔名排序；播完自動接下一個） |
 | Ctrl（macOS：⌘）+ PgUp / PgDn | 上一章 / 下一章 |
+| Shift + PgUp / PgDn | 上一個 / 下一個書籤 |
+| P | 在目前的位置新增書籤 |
+| H | 書籤清單（側邊面板的「書籤」分頁；再按一次關掉） |
 | C / X / Z | 加快 / 減慢 0.1 倍、恢復正常速度（0.25×–4×，保持音調） |
 | . / , | 逐格前進 / 後退 |
 | [ / ] | 字幕提早 / 延後 0.1 秒（換檔時歸零） |
@@ -218,7 +223,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | Q | 影像調整（亮度、對比…）全部還原 |
 | Alt（macOS：Option）+ G | 控制面板：「畫質」分頁（影像調整、去交錯、去色帶、銳化）、「音效」分頁（十段等化器、音量平衡、轉成立體聲、音量上限） |
 | Ctrl（⌘）+ T | 切換視窗置頂模式（不置頂 → 永遠置頂 → 播放時置頂） |
-| F6 | 播放清單（清單開著時 Delete 移除選取的項目；macOS 也可以用 Backspace，但快捷鍵用到 Backspace 時（例如 PotPlayer 風格）就不行） |
+| F6 | 播放清單（側邊面板的「播放清單」分頁；再按一次關掉）。面板開著時 Delete 移除選取的項目（清單裡的檔案或書籤）；macOS 也可以用 Backspace，但要滑鼠在面板上或剛點過面板，而且快捷鍵沒用到 Backspace（PotPlayer 風格是從頭播放） |
 | Ctrl + F1（macOS：⌘ + I），或 Ctrl + I | 媒體資訊 |
 | Ctrl（⌘）+ E | 擷取畫面（存到截圖資料夾） |
 | Ctrl（⌘）+ C | 擷取畫面（複製到剪貼簿） |
