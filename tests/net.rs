@@ -1,13 +1,21 @@
-//! 網路功能的基礎：mpv 的 hook、wakeup、用 node 設定屬性（headless：不出畫面、不出聲音，三個平台的 CI 都跑）
+//! 網路功能（headless：不出畫面、不出聲音，三個平台的 CI 都跑；只連本機的測試伺服器 127.0.0.1）
 //!
-//! 網站影片（yt-dlp）要在 mpv 開檔前（`on_load` hook）換掉要開的網址、設定這個檔案專用的標頭，
-//! 載入後再設定章節；這裡先確認 mpv 包裝層的這些功能本身是對的。
+//! - mpv 包裝層的基礎：hook、wakeup、用 node 設定屬性。網站影片（yt-dlp）要在 mpv 開檔前（`on_load` hook）
+//!   換掉要開的網址、設定這個檔案專用的標頭，載入後再設定章節。
+//! - 播放網址：HTTP 的檔案（能跳轉）、HLS、DASH（多畫質），網路設定（User-Agent、標頭、憑證、逾時…）真的送到 mpv、送到伺服器。
+//!
+//! 開網址失敗的說明要看 FFmpeg 的記錄，在 tests/net_errors.rs（那些測試一次只能有一個播放器）。
 
+mod support;
+
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use support::http::Server;
 use vitascope::mpv::{Event, Mpv, Node};
-use vitascope::player::{Options, Player, PlayerEvent};
+use vitascope::net::{self, HlsBitrate, NetSettings};
+use vitascope::player::{Options, Player, PlayerEvent, TrackKind};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const LAVFI: &str = "av://lavfi:testsrc2=size=160x90:rate=10:duration=10";
@@ -354,4 +362,347 @@ fn player_continues_hooks_nobody_handles() {
         p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
         assert_eq!(p.mpv().hooks_pending(), 0);
     }
+}
+
+// ───────────── 播放網址、網路設定 ─────────────
+
+/// headless 播放器，網路設定照 `s` 同步套用（跟介面啟動時一樣）；`extra` 是額外的 mpv 選項（算使用者自己指定的）
+fn net_player(s: &NetSettings, extra: &[(&str, &str)]) -> Player {
+    let mut p = Player::new(Options {
+        extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        ..Options::headless()
+    })
+    .expect("建立 mpv 失敗");
+    let opts = net::mpv_options(s, &p.net_defaults());
+    for (name, _, r) in p.apply_net(&opts, true) {
+        r.unwrap_or_else(|e| panic!("無法設定 {name}：{e}"));
+    }
+    p
+}
+
+/// 播放中改網路設定（非同步，跟介面一樣），等 mpv 全部回覆、都成功。
+/// 一定要等：之後同步的 loadfile 可能插隊到還沒執行的非同步設定前面
+fn apply_async(p: &mut Player, s: &NetSettings) {
+    let opts = net::mpv_options(s, &p.net_defaults());
+    let mut left: HashSet<u64> = p
+        .apply_net(&opts, false)
+        .into_iter()
+        .map(|(name, _, r)| {
+            r.unwrap_or_else(|e| panic!("無法送出 {name}：{e}"))
+                .expect("播放中一定是非同步")
+        })
+        .collect();
+    let deadline = Instant::now() + TIMEOUT;
+    while !left.is_empty() {
+        match p.wait(deadline.saturating_duration_since(Instant::now())) {
+            Some(PlayerEvent::CommandReply { id, error }) if left.remove(&id) => {
+                assert!(error.is_none(), "mpv 不接受網路設定：{error:?}");
+            }
+            Some(_) => {}
+            None => panic!("等不到非同步設定的回覆（還有 {} 個）", left.len()),
+        }
+    }
+}
+
+fn loaded(p: &mut Player, url: &str) {
+    p.open(url).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
+        .unwrap_or_else(|e| panic!("打不開 {url}：{e}"));
+}
+
+/// 選到的影片軌的寬度（從介面看到的軌道清單）
+fn video_width(p: &Player) -> Option<i64> {
+    p.state.selected(TrackKind::Video).and_then(|t| t.width)
+}
+
+/// mpv 的版本（主, 次）；看不懂的（自己建置的、git 版）當成新版
+fn mpv_version(p: &Player) -> (u32, u32) {
+    let text = p.get_string("mpv-version").unwrap();
+    let v = text.trim_start_matches("mpv ").trim_start_matches('v');
+    let mut parts = v.split(['.', '-']).map(|n| n.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(a)), Some(Ok(b))) => (a, b),
+        _ => (u32::MAX, 0),
+    }
+}
+
+/// 含 L3 元件的播放引擎（本專案建置、components.json 列有 libxml2）。系統的 libmpv（FFmpeg 6.1）的 DASH 分離器
+/// 被中斷時會卡死（ROADMAP §7），DASH 的測試只在本專案的引擎跑；不是的話印出原因、回傳 false
+fn l3_engine(test: &str) -> bool {
+    let has = option_env!("VITASCOPE_LIBMPV_MANIFEST")
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|m| {
+            m["components"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|c| c["name"] == "libxml2"))
+        });
+    if !has {
+        eprintln!("略過 {test}：這個播放引擎還不是含 L3 元件（libxml2）的版本");
+    }
+    has
+}
+
+/// 網路測試的樣本（`python scripts/gen_samples.py` 產生；這台的 FFmpeg 做不出來時略過）
+fn net_sample(test: &str, rel: &str) -> bool {
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated")
+        .join(rel);
+    if !p.exists() {
+        eprintln!("略過 {test}：沒有樣本 {}（python scripts/gen_samples.py）", p.display());
+    }
+    p.exists()
+}
+
+#[test]
+fn http_mp4_plays_and_seeks() {
+    let server = Server::start();
+    let mut p = net_player(&NetSettings::default(), &[("pause", "yes")]);
+    let url = server.file_url("common/mp4_h264_aac.mp4");
+    loaded(&mut p, &url);
+    // 伺服器支援 Range，mpv 判斷能跳轉；網路串流用快取（cache-buffering-state 有值）
+    p.wait_state(TIMEOUT, |s| {
+        s.duration.is_some_and(|d| d > 2.8) && s.seekable && s.cache_buffering.is_some()
+    })
+    .unwrap();
+    assert_eq!(p.state.path.as_deref(), Some(url.as_str()));
+    assert!(!p.state.paused_for_cache);
+    let reqs = server.requests_to("/f/common/mp4_h264_aac.mp4");
+    assert!(!reqs.is_empty());
+    assert!(
+        reqs.iter()
+            .all(|r| r.header("Range").is_some_and(|v| v.starts_with("bytes="))),
+        "每個請求都用 Range：{reqs:#?}"
+    );
+    // 跳到中間（暫停中，停在那一格）
+    p.seek_to(1.5, true).unwrap();
+    p.wait_state(TIMEOUT, |s| (s.time_pos - 1.5).abs() < 0.05).unwrap();
+    p.set_pause(false).unwrap();
+    p.wait_state(TIMEOUT, |s| s.time_pos > 1.7).unwrap();
+}
+
+#[test]
+fn global_headers_reach_the_server() {
+    let server = Server::start();
+    let s = NetSettings {
+        user_agent: "VitaScope-Test/1.0 (a, b)".into(),
+        referrer: "http://ref.example/page?x=1,2".into(),
+        headers: vec!["X-Test: a, b".into(), "X-Other:1".into()],
+        ..NetSettings::default()
+    };
+    let mut p = net_player(&s, &[("pause", "yes")]);
+    loaded(&mut p, &server.file_url("common/mp4_h264_aac.mp4"));
+    let reqs = server.requests_to("/f/common/mp4_h264_aac.mp4");
+    for r in &reqs {
+        assert_eq!(r.header("User-Agent"), Some("VitaScope-Test/1.0 (a, b)"), "{r:#?}");
+        assert_eq!(r.header("Referer"), Some("http://ref.example/page?x=1,2"), "{r:#?}");
+        // 值裡的逗號不會把標頭拆開
+        assert_eq!(r.header("X-Test"), Some("a, b"), "{r:#?}");
+        assert_eq!(r.header("X-Other"), Some("1"), "{r:#?}");
+    }
+    // 播放中改設定（非同步）：下一次連線用新的值。User-Agent 清空 = 播放引擎預設；Referer 清空就不送
+    let s = NetSettings {
+        headers: vec!["X-Test: c, d".into()],
+        ..NetSettings::default()
+    };
+    apply_async(&mut p, &s);
+    assert_eq!(p.mpv().get_string_list("http-header-fields").unwrap(), ["X-Test: c, d"]);
+    // 只看新檔案的請求：前一個檔案已經開著的連線（快取還在讀）照樣用開檔時的設定
+    loaded(&mut p, &server.file_url("common/mkv_h264_aac_srt.mkv"));
+    let reqs = server.requests_to("/f/common/mkv_h264_aac_srt.mkv");
+    assert!(!reqs.is_empty());
+    let engine_ua = p.net_defaults().user_agent;
+    for r in &reqs {
+        assert_eq!(r.header("User-Agent"), Some(engine_ua.as_str()), "{r:#?}");
+        assert_eq!(r.header("Referer"), None, "{r:#?}");
+        assert_eq!(r.header("X-Test"), Some("c, d"), "{r:#?}");
+        assert_eq!(r.header("X-Other"), None, "{r:#?}");
+    }
+}
+
+/// 啟動時同步套用、之後非同步改的網路設定，mpv 讀回來都是設定的值（兩種引擎；系統的 libmpv 0.37 預設不檢查憑證）
+#[test]
+fn net_options_reach_mpv() {
+    let mut p = net_player(&NetSettings::default(), &[]);
+    let mib = |n: i64| n * 1024 * 1024;
+    assert_eq!(p.get_string("tls-verify").unwrap(), "yes");
+    assert_eq!(p.get_f64("network-timeout").unwrap(), 30.0);
+    assert_eq!(p.get_i64("demuxer-max-bytes").unwrap(), mib(150));
+    assert_eq!(p.get_i64("demuxer-max-back-bytes").unwrap(), mib(50));
+    assert_eq!(p.get_string("hls-bitrate").unwrap(), "max");
+    assert_eq!(p.get_string("user-agent").unwrap(), p.net_defaults().user_agent);
+    assert_eq!(p.get_string("http-proxy").unwrap(), "");
+    let lavf = p.get_string("stream-lavf-o").unwrap();
+    for kv in ["reconnect=1", "reconnect_streamed=1", "reconnect_delay_max=5"] {
+        assert!(lavf.contains(kv), "{lavf}");
+    }
+    assert!(!lavf.contains("reconnect_on_network_error"), "{lavf}");
+    assert!(p.mpv().get_string_list("http-header-fields").unwrap().is_empty());
+    // 改設定（非同步）
+    let s = NetSettings {
+        hls_bitrate: HlsBitrate::Min,
+        reconnect: false,
+        cache_mb: 64,
+        timeout_secs: 7,
+        tls_verify: false,
+        user_agent: "UA/2".into(),
+        proxy: "http://127.0.0.1:3128".into(),
+        headers: vec!["X-A: 1".into(), "X-B: 2, 3".into()],
+        ..NetSettings::default()
+    };
+    apply_async(&mut p, &s);
+    assert_eq!(p.get_string("tls-verify").unwrap(), "no");
+    assert_eq!(p.get_f64("network-timeout").unwrap(), 7.0);
+    assert_eq!(p.get_i64("demuxer-max-bytes").unwrap(), mib(64));
+    assert_eq!(p.get_i64("demuxer-max-back-bytes").unwrap(), mib(21));
+    assert_eq!(p.get_string("hls-bitrate").unwrap(), "min");
+    assert_eq!(p.get_string("user-agent").unwrap(), "UA/2");
+    assert_eq!(p.get_string("http-proxy").unwrap(), "http://127.0.0.1:3128");
+    assert_eq!(p.get_string("stream-lavf-o").unwrap(), "reconnect=0");
+    assert_eq!(
+        p.mpv().get_string_list("http-header-fields").unwrap(),
+        ["X-A: 1", "X-B: 2, 3"]
+    );
+    // 沒變的不再送
+    let opts = net::mpv_options(&s, &p.net_defaults());
+    assert!(p.apply_net(&opts, false).is_empty(), "沒變的設定又送了一次");
+    // 標頭清空
+    apply_async(&mut p, &NetSettings::default());
+    assert!(p.mpv().get_string_list("http-header-fields").unwrap().is_empty());
+    assert_eq!(p.get_string("tls-verify").unwrap(), "yes");
+
+    // VITASCOPE_MPV_OPTS（或 Options.extra）指定的選項：影戲不改
+    let s = NetSettings {
+        user_agent: "UA/3".into(),
+        headers: vec!["X-Ours: 1".into()],
+        timeout_secs: 9,
+        ..NetSettings::default()
+    };
+    let mut q = net_player(&s, &[("user-agent", "Mine/1"), ("http-header-fields", "X-Mine: 1")]);
+    assert!(q.user_overrides().contains("user-agent") && q.user_overrides().contains("http-header-fields"));
+    assert_eq!(q.get_string("user-agent").unwrap(), "Mine/1");
+    assert_eq!(q.mpv().get_string_list("http-header-fields").unwrap(), ["X-Mine: 1"]);
+    assert_eq!(q.get_f64("network-timeout").unwrap(), 9.0, "其他的照樣設定");
+    apply_async(&mut q, &NetSettings::default());
+    assert_eq!(q.get_string("user-agent").unwrap(), "Mine/1");
+    assert_eq!(q.mpv().get_string_list("http-header-fields").unwrap(), ["X-Mine: 1"]);
+}
+
+#[test]
+fn hls_vod_plays() {
+    if !net_sample("hls_vod_plays", "net/hls_vod/index.m3u8") {
+        return;
+    }
+    let server = Server::start();
+    let mut p = net_player(&NetSettings::default(), &[]);
+    loaded(&mut p, &server.file_url("net/hls_vod/index.m3u8"));
+    p.wait_state(TIMEOUT, |s| s.duration.is_some_and(|d| d > 2.5)).unwrap();
+    // 播到結尾（3 秒；不是逾時、不是錯誤）
+    match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
+        Ok(PlayerEvent::EndFile { reason, error: None }) => {
+            assert_eq!(reason, vitascope::mpv::EndReason::Eof)
+        }
+        other => panic!("HLS 沒有播到結尾：{other:?}"),
+    }
+    for seg in ["seg0.ts", "seg1.ts", "seg2.ts"] {
+        assert!(
+            !server.requests_to(&format!("/f/net/hls_vod/{seg}")).is_empty(),
+            "沒有讀到片段 {seg}"
+        );
+    }
+}
+
+/// 多畫質的 HLS：一開始選哪個畫質照 hls-bitrate（設定的「HLS / DASH 畫質」）。
+/// 本專案的引擎（mpv 0.41 起）每個畫質是一個 edition（換 edition 就換畫質，不用重開）；系統的 libmpv 0.37 是好幾條影片軌
+#[test]
+fn hls_variants() {
+    if !net_sample("hls_variants", "net/hls_multi/master.m3u8") {
+        return;
+    }
+    let server = Server::start();
+    let url = server.file_url("net/hls_multi/master.m3u8");
+    for (bitrate, want, other) in [(HlsBitrate::Max, 320, 160), (HlsBitrate::Min, 160, 320)] {
+        let s = NetSettings {
+            hls_bitrate: bitrate,
+            ..NetSettings::default()
+        };
+        let mut p = net_player(&s, &[("pause", "yes")]);
+        loaded(&mut p, &url);
+        p.wait_state(TIMEOUT, |st| st.selected(TrackKind::Video).is_some())
+            .unwrap();
+        assert_eq!(video_width(&p), Some(want), "{bitrate:?}：{:#?}", p.state.tracks);
+        if mpv_version(&p) >= (0, 41) {
+            let editions: Vec<serde_json::Value> =
+                serde_json::from_str(&p.get_string("edition-list").unwrap()).unwrap();
+            assert_eq!(editions.len(), 2, "兩個畫質是兩個 edition：{editions:#?}");
+            // 換畫質：換 edition，不用重開
+            let now = p.get_i64("current-edition").unwrap();
+            p.mpv().set_property("edition", 1 - now).unwrap();
+            p.wait_state(TIMEOUT, |st| {
+                st.selected(TrackKind::Video).and_then(|t| t.width) == Some(other)
+            })
+            .unwrap();
+        } else {
+            let widths: Vec<_> = p.state.tracks_of(TrackKind::Video).filter_map(|t| t.width).collect();
+            assert_eq!(widths.len(), 2, "兩個畫質是兩條影片軌：{widths:?}");
+        }
+    }
+}
+
+/// 多畫質的 DASH：每個畫質是一條影片軌，一開始照 hls-bitrate 選（DASH 只在本專案的引擎測）
+#[test]
+fn dash_variants() {
+    if !l3_engine("dash_variants") || !net_sample("dash_variants", "net/dash_multi/manifest.mpd") {
+        return;
+    }
+    let server = Server::start();
+    let url = server.file_url("net/dash_multi/manifest.mpd");
+    for (bitrate, want) in [(HlsBitrate::Max, 320), (HlsBitrate::Min, 160)] {
+        let s = NetSettings {
+            hls_bitrate: bitrate,
+            ..NetSettings::default()
+        };
+        let mut p = net_player(&s, &[("pause", "yes")]);
+        loaded(&mut p, &url);
+        p.wait_state(TIMEOUT, |st| st.selected(TrackKind::Video).is_some())
+            .unwrap();
+        let mut widths: Vec<_> = p.state.tracks_of(TrackKind::Video).filter_map(|t| t.width).collect();
+        widths.sort_unstable();
+        assert_eq!(widths, [160, 320], "兩個畫質是兩條影片軌");
+        assert_eq!(video_width(&p), Some(want), "{bitrate:?}：{:#?}", p.state.tracks);
+        assert_eq!(p.state.tracks_of(TrackKind::Audio).count(), 1);
+    }
+}
+
+/// 播放器介面註冊的網路 hook（開檔前、開檔失敗）：本機檔案、開不起來的檔案、網址都馬上放行，沒有卡住的
+#[test]
+fn hooks_continue_for_local_files() {
+    let server = Server::start();
+    let mut p = Player::new(Options {
+        net_hooks: true,
+        ..Options::headless()
+    })
+    .expect("建立 mpv 失敗");
+    p.open(&sample("common/mp4_h264_aac.mp4")).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert_eq!(p.hooks_continued(), 1, "on_load");
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    // 開不起來：on_load、on_load_fail 都放行，照常回報失敗
+    let missing = std::env::temp_dir().join("vitascope-net-no-such-file.mp4");
+    p.open(&missing.to_string_lossy()).unwrap();
+    let err = p.wait_for(TIMEOUT, |_| false).unwrap_err();
+    assert!(err.contains("無法載入檔案"), "{err}");
+    assert_eq!(p.hooks_continued(), 3, "on_load + on_load_fail");
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    // 網址
+    p.open(&server.file_url("common/mp4_h264_aac.mp4")).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert_eq!(p.hooks_continued(), 4);
+    assert_eq!(p.mpv().hooks_pending(), 0);
+
+    // 自動測試用的 headless 預設不註冊
+    let mut q = headless();
+    q.open(&sample("common/mp4_h264_aac.mp4")).unwrap();
+    q.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert_eq!(q.hooks_continued(), 0);
 }

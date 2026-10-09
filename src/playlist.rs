@@ -248,8 +248,12 @@ fn is_hidden(e: &std::fs::DirEntry) -> bool {
     false
 }
 
-/// 比對用的鍵：跟 `same_file` 一樣（Windows 不分大小寫），路徑分隔符號統一
+/// 比對用的鍵：跟 `same_file` 一樣（Windows 不分大小寫，網址一字不差），路徑分隔符號統一
 fn file_key(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if crate::m3u::is_url(&s) {
+        return s.into_owned();
+    }
     let joined = p
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -275,7 +279,6 @@ pub fn media_in_dir(dir: &Path) -> Vec<PathBuf> {
     items
 }
 
-/// 是否為同一個檔案。Windows 的檔名不分大小寫（包括中文以外的各種字母）
 /// 完整路徑（網址不動）。命令列、其他程式送來的相對路徑要在一開始就轉換：
 /// 清單、播放紀錄、存起來的清單比對的都是完整路徑
 pub fn absolute(path: &Path) -> PathBuf {
@@ -286,7 +289,13 @@ pub fn absolute(path: &Path) -> PathBuf {
     }
 }
 
+/// 是否為同一個檔案。Windows 的檔名不分大小寫（包括中文以外的各種字母）。
+/// 網址一字不差才算（YouTube 的影片代號分大小寫；`Path` 的比較還會把 `a//b` 當成 `a/b`）
 pub fn same_file(a: &Path, b: &Path) -> bool {
+    let (sa, sb) = (a.to_string_lossy(), b.to_string_lossy());
+    if crate::m3u::is_url(&sa) || crate::m3u::is_url(&sb) {
+        return sa == sb;
+    }
     if cfg!(windows) {
         a == b || a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
@@ -532,6 +541,31 @@ mod tests {
         let start = std::time::Instant::now();
         list.extend(many);
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn urls_compare_exactly() {
+        let same = |a: &str, b: &str| same_file(Path::new(a), Path::new(b));
+        assert!(same("https://youtu.be/AbC", "https://youtu.be/AbC"));
+        // 影片代號分大小寫（Windows 也是）
+        assert!(!same("https://youtu.be/AbC", "https://youtu.be/abc"));
+        // Path 的比較會把這些當成一樣
+        assert!(!same("https://x.example/a//b", "https://x.example/a/b"));
+        assert!(!same("https://x.example/a/", "https://x.example/a"));
+        assert!(!same("https://x.example/a/b", r"https://x.example\a\b"));
+        // 本機路徑照舊
+        assert!(same("dir/a.mp4", "dir/a.mp4"));
+        assert_eq!(same("dir/A.mp4", "dir/a.mp4"), cfg!(windows));
+        // 清單去重複也一樣
+        let mut list = Playlist::from_files(vec!["https://youtu.be/AbC".into()]);
+        let added = list.extend([
+            "https://youtu.be/abc".into(),
+            "https://youtu.be/AbC".into(),
+            "https://x.example/a//b".into(),
+            "https://x.example/a/b".into(),
+        ]);
+        assert_eq!(added, 3);
+        assert!(list.contains(Path::new("https://youtu.be/abc")));
     }
 
     #[test]

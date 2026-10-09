@@ -5,12 +5,14 @@
   samples/generated/<tier>/<id>.<ext>   外掛字幕放在影片旁邊、同檔名
   samples/generated/manifest.json       測試程式（tests/formats.rs）讀這份清單比對預期結果
   samples/generated/general/dash_h264_aac/manifest.mpd   本機的 DASH（不在 manifest.json；tests/engine_build.rs 用）
+  samples/generated/net/…                本機 HTTP 伺服器播放用的 HLS、DASH、分開的影像與聲音（不在 manifest.json；tests/net.rs 用）
   samples/generated/pacing/pan_23976.mkv  流暢播放的實機測試（tests/pacing_window.rs）；只有 --tier pacing 才產生
   samples/generated/pacing/pan_4k10.mkv   同上，4K 10-bit（軟體解碼、GPU 畫一格比較久）
 
 用法：
   python scripts/gen_samples.py                 # 產生全部等級
   python scripts/gen_samples.py --tier common   # 只產生「常見」
+  python scripts/gen_samples.py --tier net      # 只產生網路測試用的串流（HLS、DASH）
   python scripts/gen_samples.py --force         # 已存在也重新產生
   python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p、4K 平移影片（約 20 MB + 50 MB，CI 不需要）
 
@@ -570,6 +572,83 @@ def generate_dash(force: bool) -> str | None:
     return None
 
 
+# ───────────── 網路（本機 HTTP 伺服器播放，tests/net.rs；不在 manifest.json）─────────────
+# 跟格式矩陣無關（HLS、DASH 要透過 HTTP 才是網路串流的路徑），舊的播放引擎沒有 DASH 分離器。
+# 片段都是 1 秒，播放器很快就讀到下一段；多畫質的串流兩個畫質大小、位元率都不同，測試看選到哪一個
+NET_DIR = OUT / "net"
+NET_SRC = ["-f", "lavfi", "-i", f"testsrc2=size=320x240:rate=24:duration={DUR}",
+           "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={DUR}"]
+# 兩個畫質：320×240（約 400 kb/s）與 160×120（約 100 kb/s）
+NET_TWO_VIDEOS = ["-filter_complex", "[0:v]split=2[hi][lo0];[lo0]scale=160:120[lo]",
+                  "-map", "[hi]", "-map", "[lo]", *X264, "-g", "24", "-b:v:0", "400k", "-b:v:1", "100k"]
+
+
+def _ffmpeg(args: list[str], cwd: Path) -> str | None:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args],
+                       cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else f"ffmpeg exit {r.returncode}"
+    return None
+
+
+def generate_net(force: bool) -> list[str]:
+    """產生 net/ 底下的樣本；回傳失敗的說明（略過的不算失敗）。
+    在輸出資料夾裡執行、只給檔名：Windows 的路徑是反斜線，hls / dash 封裝認不出資料夾"""
+    jobs = [
+        # 一般的 HLS（單一畫質，1 秒的片段）
+        ("hls_vod", "index.m3u8", None,
+         [*NET_SRC, "-map", "0:v", "-map", "1:a", *X264, "-g", "24", *AAC,
+          "-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod",
+          "-hls_segment_filename", "seg%d.ts", "index.m3u8"]),
+        # 兩個畫質的 HLS（master playlist）
+        ("hls_multi", "master.m3u8", None,
+         [*NET_SRC, *NET_TWO_VIDEOS, "-map", "1:a", "-map", "1:a", *AAC,
+          "-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod", "-master_pl_name", "master.m3u8",
+          "-var_stream_map", "v:0,a:0 v:1,a:1", "-hls_segment_filename", "v%v_seg%d.ts", "v%v.m3u8"]),
+        # 兩個畫質 + 一條聲音的 DASH
+        ("dash_multi", "manifest.mpd", "dash",
+         [*NET_SRC, *NET_TWO_VIDEOS, "-map", "1:a", *AAC,
+          "-f", "dash", "-seg_duration", "1", "-adaptation_sets", "id=0,streams=v id=1,streams=a",
+          "manifest.mpd"]),
+    ]
+    errors = []
+    for name, main, muxer, args in jobs:
+        out = NET_DIR / name
+        if (out / main).exists() and not force:
+            print(f"  略過  net     {name}（已存在）")
+            continue
+        if muxer == "dash" and not has_dash_muxer():
+            print(f"  略過  net     {name}（這個 ffmpeg 沒有 dash 封裝格式）")
+            continue
+        # 舊的片段要清掉（片段數量可能不同）
+        shutil.rmtree(out, ignore_errors=True)
+        out.mkdir(parents=True)
+        err = _ffmpeg(args, out)
+        if err or not (out / main).exists():
+            shutil.rmtree(out, ignore_errors=True)
+            errors.append(f"{name}: {err or '沒有產生 ' + main}")
+            print(f"  失敗  net     {name}: {err}")
+        else:
+            print(f"  完成  net     {name}")
+    # 網站影片（之後的 yt-dlp 測試）：分開的影像、聲音與字幕
+    NET_DIR.mkdir(parents=True, exist_ok=True)
+    for name, args in [
+        ("video_only.mp4", [*NET_SRC, "-map", "0:v", *X264, "-g", "24", "-movflags", "+faststart", "video_only.mp4"]),
+        ("audio_only.m4a", [*NET_SRC, "-map", "1:a", *AAC, "-movflags", "+faststart", "audio_only.m4a"]),
+    ]:
+        if (NET_DIR / name).exists() and not force:
+            print(f"  略過  net     {name}（已存在）")
+            continue
+        err = _ffmpeg(args, NET_DIR)
+        if err:
+            errors.append(f"{name}: {err}")
+            print(f"  失敗  net     {name}: {err}")
+        else:
+            print(f"  完成  net     {name}")
+    (NET_DIR / "sub.vtt").write_text(vtt_text(), encoding="utf-8")
+    return errors
+
+
 # ───────────── 流暢播放（實機測試用，不在 manifest.json）─────────────
 # 1920×1080、23.976 fps、20 秒：每格往左平移 16 像素，左上角是影格編號。
 # 卡頓（某一格多停一次更新）在平移的畫面上最明顯；tests/pacing_window.rs 用 mpv 的記錄算每格顯示幾次更新
@@ -638,7 +717,7 @@ def main() -> int:
         stream.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=(*TIERS, "all", "pacing"), default="all")
+    ap.add_argument("--tier", choices=(*TIERS, "all", "pacing", "net"), default="all")
     ap.add_argument("--force", action="store_true", help="已存在的樣本也重新產生")
     args = ap.parse_args()
 
@@ -651,6 +730,8 @@ def main() -> int:
             print(f"  失敗  pacing: {err}")
             return 2
         return 0
+    if args.tier == "net":
+        return 2 if generate_net(args.force) else 0
 
     all_samples = samples()
     todo = [s for s in all_samples if args.tier in ("all", s.tier)]
@@ -680,6 +761,10 @@ def main() -> int:
         print(f"  失敗  general dash_h264_aac: {dash_error}")
         if os.environ.get("GITHUB_ACTIONS"):
             print(f"::warning::這個平台的 FFmpeg 產生不了 DASH 樣本：{dash_error}")
+    # 網路測試用的串流：產生不了的測試會略過（看得到警告），不擋其他樣本
+    net_errors = generate_net(args.force) if args.tier == "all" else []
+    if net_errors and os.environ.get("GITHUB_ACTIONS"):
+        print(f"::warning::這個平台的 FFmpeg 產生不了網路測試的樣本：{'; '.join(net_errors)}")
 
     # manifest 只列出實際存在的樣本，測試程式不必再處理「產生失敗」的情況
     entries = [manifest_entry(s) for s in all_samples if s.path.exists()]

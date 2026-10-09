@@ -1,0 +1,306 @@
+//! 測試用的本機 HTTP 伺服器（只用標準函式庫，只聽 127.0.0.1，不會碰到外面的網路）。
+//!
+//! - `/f/<路徑>`：`samples/generated` 底下的檔案；支援 `Range`（206）、HEAD，Content-Type 依副檔名
+//! - `/status/<代碼>`：回應這個狀態碼
+//! - `/slow`：收下請求、永遠不回應（測連線逾時）
+//! - `/html`：一個網頁（不是影片）
+//! - `/m3u`：網路上的播放清單：兩個 `/f/` 的網址，中間夾一個 `file:///` 的項目（匯入時要拿掉）
+//!
+//! 每個請求的方法、路徑、標頭都記下來（`requests()`），測試用來確認播放器送了什麼。
+//! 一個連線一個執行緒；每個回應之後關閉連線（`Connection: close`）。
+
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// 收到的一個請求
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub method: String,
+    /// 路徑（含查詢字串，照收到的樣子）
+    pub path: String,
+    /// 標頭（名稱、值；名稱照收到的大小寫）
+    pub headers: Vec<(String, String)>,
+}
+
+impl Request {
+    /// 某個標頭的值（名稱不分大小寫）
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+struct Shared {
+    root: PathBuf,
+    log: Mutex<Vec<Request>>,
+    stop: AtomicBool,
+}
+
+pub struct Server {
+    addr: SocketAddr,
+    shared: Arc<Shared>,
+}
+
+/// `/slow` 最多拖多久（伺服器關掉時也會結束）
+const SLOW_LIMIT: Duration = Duration::from_secs(120);
+
+impl Server {
+    /// 在 127.0.0.1 的任一個空的埠開始服務，檔案來自 `samples/generated`
+    pub fn start() -> Server {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("無法開啟測試用的 HTTP 伺服器");
+        let addr = listener.local_addr().unwrap();
+        let shared = Arc::new(Shared {
+            root,
+            log: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+        });
+        let s = shared.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                if s.stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(conn) = conn else { continue };
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    let _ = serve(conn, &s);
+                });
+            }
+        });
+        Server { addr, shared }
+    }
+
+    /// 完整的網址，例如 `url("/f/common/a.mp4")`
+    pub fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.addr)
+    }
+
+    /// `samples/generated` 底下的檔案的網址
+    pub fn file_url(&self, rel: &str) -> String {
+        let path = self.shared.root.join(rel);
+        assert!(
+            path.exists(),
+            "找不到樣本 {}，請先執行：python scripts/gen_samples.py",
+            path.display()
+        );
+        self.url(&format!("/f/{rel}"))
+    }
+
+    /// 到目前為止收到的請求
+    pub fn requests(&self) -> Vec<Request> {
+        self.shared.log.lock().unwrap().clone()
+    }
+
+    /// 路徑開頭是 `prefix` 的請求
+    pub fn requests_to(&self, prefix: &str) -> Vec<Request> {
+        self.requests()
+            .into_iter()
+            .filter(|r| r.path.starts_with(prefix))
+            .collect()
+    }
+
+    /// 等到有路徑開頭是 `prefix` 的請求（最多 `timeout`）
+    pub fn wait_request(&self, prefix: &str, timeout: Duration) -> Option<Request> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(r) = self.requests_to(prefix).into_iter().next() {
+                return Some(r);
+            }
+            if Instant::now() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        // 叫醒還在等連線的 accept
+        let _ = TcpStream::connect_timeout(&self.addr, Duration::from_secs(1));
+    }
+}
+
+fn serve(conn: TcpStream, s: &Shared) -> std::io::Result<()> {
+    conn.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(conn.try_clone()?);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(());
+    }
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_owned();
+    let path = parts.next().unwrap_or("/").to_owned();
+    let mut headers = Vec::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h)? == 0 {
+            break;
+        }
+        let h = h.trim_end_matches(['\r', '\n']);
+        if h.is_empty() {
+            break;
+        }
+        if let Some((n, v)) = h.split_once(':') {
+            headers.push((n.to_owned(), v.trim_start().to_owned()));
+        }
+    }
+    let req = Request { method, path, headers };
+    s.log.lock().unwrap().push(req.clone());
+    let mut out = conn;
+    let head = req.method == "HEAD";
+    let route = req.path.split('?').next().unwrap_or("");
+    if let Some(rel) = route.strip_prefix("/f/") {
+        return send_file(&mut out, &s.root, rel, req.header("Range"), head);
+    }
+    if let Some(code) = route.strip_prefix("/status/") {
+        let code: u16 = code.parse().unwrap_or(500);
+        return send(
+            &mut out,
+            code,
+            "text/plain",
+            format!("status {code}\n").as_bytes(),
+            head,
+        );
+    }
+    match route {
+        "/slow" => {
+            // 收下請求，一直不回應（直到逾時或伺服器關掉）
+            let start = Instant::now();
+            while !s.stop.load(Ordering::SeqCst) && start.elapsed() < SLOW_LIMIT {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(())
+        }
+        "/html" => send(
+            &mut out,
+            200,
+            "text/html; charset=utf-8",
+            b"<!doctype html><html><head><title>Not a video</title></head><body><p>hello</p></body></html>\n",
+            head,
+        ),
+        "/m3u" => {
+            let base = format!("http://{}", out.local_addr()?);
+            let body = format!(
+                "#EXTM3U\n#EXTINF:-1,第一個\n{base}/f/common/mp4_h264_aac.mp4\n#EXTINF:-1,本機檔案\nfile:///etc/passwd\n\
+                 #EXTINF:-1,第二個\n{base}/f/common/mkv_h264_aac_srt.mkv\n"
+            );
+            send(&mut out, 200, "audio/x-mpegurl", body.as_bytes(), head)
+        }
+        _ => send(&mut out, 404, "text/plain", b"not found\n", head),
+    }
+}
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        206 => "Partial Content",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        410 => "Gone",
+        416 => "Range Not Satisfiable",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Status",
+    }
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("mp4" | "m4v" | "m4s") => "video/mp4",
+        Some("m4a") => "audio/mp4",
+        Some("mkv") => "video/x-matroska",
+        Some("webm") => "video/webm",
+        Some("ts") => "video/mp2t",
+        Some("m3u8") => "application/vnd.apple.mpegurl",
+        Some("mpd") => "application/dash+xml",
+        Some("vtt") => "text/vtt",
+        Some("srt") => "application/x-subrip",
+        Some("mp3") => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+fn send(out: &mut TcpStream, code: u16, ctype: &str, body: &[u8], head: bool) -> std::io::Result<()> {
+    write!(
+        out,
+        "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason(code),
+        body.len()
+    )?;
+    if !head {
+        out.write_all(body)?;
+    }
+    out.flush()
+}
+
+/// `Range: bytes=a-b`、`bytes=a-`、`bytes=-n` → (起點, 終點（含）)；看不懂時 None（整個檔案）
+fn parse_range(range: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = range.trim().strip_prefix("bytes=")?;
+    let (a, b) = spec.split(',').next()?.split_once('-')?;
+    let (a, b) = (a.trim(), b.trim());
+    let r = match (a.parse::<u64>().ok(), b.parse::<u64>().ok()) {
+        (Some(a), Some(b)) if a <= b => (a, b.min(len.saturating_sub(1))),
+        (Some(a), None) if b.is_empty() => (a, len.saturating_sub(1)),
+        (None, Some(n)) if a.is_empty() && n > 0 => (len.saturating_sub(n), len.saturating_sub(1)),
+        _ => return None,
+    };
+    Some(if r.0 >= len { Err(()) } else { Ok(r) })
+}
+
+fn send_file(out: &mut TcpStream, root: &Path, rel: &str, range: Option<&str>, head: bool) -> std::io::Result<()> {
+    // 只服務樣本資料夾裡的檔案
+    if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+        return send(out, 404, "text/plain", b"not found\n", head);
+    }
+    let path = root.join(rel);
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return send(out, 404, "text/plain", b"not found\n", head);
+    };
+    let len = file.metadata()?.len();
+    let ctype = content_type(&path);
+    let (code, start, end) = match range.and_then(|r| parse_range(r, len)) {
+        Some(Ok((a, b))) => (206, a, b),
+        Some(Err(())) => {
+            write!(
+                out,
+                "HTTP/1.1 416 {}\r\nContent-Range: bytes */{len}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                reason(416)
+            )?;
+            return out.flush();
+        }
+        None => (200, 0, len.saturating_sub(1)),
+    };
+    let count = if len == 0 { 0 } else { end - start + 1 };
+    let mut head_text = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {count}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+        reason(code)
+    );
+    if code == 206 {
+        head_text += &format!("Content-Range: bytes {start}-{end}/{len}\r\n");
+    }
+    head_text += "\r\n";
+    out.write_all(head_text.as_bytes())?;
+    if head {
+        return out.flush();
+    }
+    file.seek(SeekFrom::Start(start))?;
+    // 播放器跳轉時會中途關掉連線：寫不出去就結束
+    std::io::copy(&mut file.take(count), out)?;
+    out.flush()
+}

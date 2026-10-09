@@ -310,7 +310,8 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/sound.rs` | 音效選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項；AC-3、E-AC-3、DTS、TrueHD 實際直通；等化器、夜間模式、音量放大、轉成立體聲用 `ao=pcm` 寫出 WAV 實際量測；等化器與音量放大在跳轉後照樣有效 |
 | `tests/async_opts.rs` | 非同步設定 mpv 選項（回覆依種類分派、先後順序、失敗時的處理）、偵測播放引擎的功能、L3 加的播放狀態 |
 | `tests/engine_build.rs` | 播放引擎的建置內容：用到的解碼器、分離器、協定、濾鏡都在，L3 元件（DASH、片段輸出、轉 GIF、音訊濾鏡）實際可用 |
-| `tests/net.rs` | 網路功能的基礎：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單） |
+| `tests/net.rs` | 網路功能：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單）；用本機的測試伺服器（`tests/support/http.rs`，只聽 127.0.0.1）播 HTTP 的檔案、HLS、DASH（多畫質一開始選哪個），User-Agent、Referer、自訂標頭真的送到伺服器，網路設定 mpv 讀回來是設定的值 |
+| `tests/net_errors.rs` | 開網址失敗的說明：HTTP 404 / 403 / 500、網頁不是影片、連線逾時（不重試）、找不到伺服器。要看 FFmpeg 的記錄（只送到第一個建立的 mpv），所以自己一個測試程式、一次只有一個播放器 |
 | `tests/pacing.rs` | 流暢播放在播放引擎這一層的行為（`vo-null-fps` 當假的螢幕更新率） |
 | `tests/pacing_window.rs` | 流暢播放與畫面輸出節奏的實機量測（會開全螢幕視窗，預設不跑；見下方） |
 
@@ -392,6 +393,7 @@ src/
 │                控制面板、「畫質」「音效」選單、像素著色器、流暢播放
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
 ├─ player.rs     播放器核心：mpv 屬性與事件 → Rust 狀態（介面和測試共用）
+├─ net.rs        網路：開啟網址的設定 → mpv 選項、哪些網址能開（依來源）、顯示名稱、能不能記進播放紀錄、連線失敗的說明
 ├─ mpv/          libmpv 的安全包裝（client API、render API：OpenGL 與軟體繪圖）
 ├─ geometry.rs   畫面調整：長寬比、裁切、縮放、旋轉、翻轉
 ├─ picture.rs    畫質：影像調整、去交錯、去色帶、銳化、縮放演算法、HDR 色調映射 → mpv 選項；picture/shader.rs 像素著色器組合

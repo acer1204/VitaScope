@@ -22,6 +22,7 @@ pub mod m3u;
 pub mod macos_open;
 pub mod mediainfo;
 pub mod mpv;
+pub mod net;
 pub mod pacing;
 pub mod picture;
 pub mod player;

@@ -1,7 +1,8 @@
 //! 播放器核心：把 mpv 的屬性與事件整理成 Rust 狀態。
 //! 介面（app）和自動測試（tests/）都透過這一層操作 mpv。
 
-use crate::mpv::{self, EndReason, Event, Format, Mpv, Value};
+use crate::mpv::{self, EndReason, Event, Format, Mpv, Node, Value};
+use crate::net;
 use crate::subs::{self, ExternalSub, SubLang};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,6 +28,9 @@ pub struct Options {
     /// 額外的 mpv 選項，排在 VITASCOPE_MPV_OPTS 之後設定（測試用，例如 `("vo-null-fps", "120")`；
     /// 環境變數是整個行程共用的，平行跑的測試會互相干擾）。跟環境變數一樣算是使用者指定的選項
     pub extra: Vec<(String, String)>,
+    /// 註冊網路功能的 hook（開檔前 on_load、開檔失敗 on_load_fail；之後網站影片用它換成 yt-dlp 取得的網址）。
+    /// 播放器介面要；headless 的自動測試預設不要（每個 hook 要等播放器處理一輪事件才放行，開檔的時間會不一樣）
+    pub net_hooks: bool,
 }
 
 impl Default for Options {
@@ -39,6 +43,7 @@ impl Default for Options {
             external_subs: true,
             wakeup: None,
             extra: Vec::new(),
+            net_hooks: true,
         }
     }
 }
@@ -49,6 +54,7 @@ impl Options {
             headless: true,
             hwdec: "no".into(),
             keep_open: false,
+            net_hooks: false,
             ..Default::default()
         }
     }
@@ -221,6 +227,10 @@ pub struct State {
     pub video_hdr: bool,
     /// 音訊輸出裝置清單（第一項是 auto）；None = 還沒讀過（見 `Player::read_audio_devices`、`watch_audio_devices`）
     pub audio_devices: Option<Vec<crate::sound::AudioDevice>>,
+    /// 網路串流的快取不夠、暫停等待中（paused-for-cache）
+    pub paused_for_cache: bool,
+    /// 快取等待的進度（0–100 %，cache-buffering-state；不在等待時是 100）；沒有開檔時 None
+    pub cache_buffering: Option<i64>,
 }
 
 impl State {
@@ -316,6 +326,9 @@ const OBSERVED: &[(&str, Format)] = &[
     ("video-params/gamma", Format::String),
     // 音訊輸出開不起來時 mpv 改用 null（沒有聲音，見 Player::new 的 audio-fallback-to-null）
     ("current-ao", Format::String),
+    // 網路串流：快取不夠時的暫停、等待的進度（緩衝中的畫面用）
+    ("paused-for-cache", Format::Flag),
+    ("cache-buffering-state", Format::Int64),
 ];
 
 /// 非同步設定選項（`set_async`、`command_async_keyed`）的指令編號從這裡開始。
@@ -362,6 +375,7 @@ async_keys!(
     Spdif,
     Af,
     AfCommand,
+    Net,
 );
 
 impl AsyncKey {
@@ -555,16 +569,45 @@ fn env_option_names(value: &str) -> impl Iterator<Item = &str> {
     value.split_whitespace().filter_map(|kv| kv.split('=').next())
 }
 
-/// VITASCOPE_DEBUG 的值 → 要 mpv 送出的記錄等級。
+/// mpv 的記錄等級，從少到多
+const LOG_LEVELS: [&str; 7] = ["fatal", "error", "warn", "info", "v", "debug", "trace"];
+
+/// VITASCOPE_DEBUG 的值 → 要印出的記錄等級。
 /// 沒設定只收錯誤；1 之類的值 = 警告與錯誤（印到 stderr，排查顯示卡、驅動之類的問題）；
 /// 也可以直接寫 mpv 的記錄等級，例如 VITASCOPE_DEBUG=v。看不懂的值當成 1，除錯設定不能讓播放器開不起來
 fn debug_log_level(value: Option<&str>) -> &'static str {
-    const LEVELS: [&str; 7] = ["fatal", "error", "warn", "info", "v", "debug", "trace"];
     match value {
         None => "error",
-        Some(v) => LEVELS.into_iter().find(|level| *level == v).unwrap_or("warn"),
+        Some(v) => LOG_LEVELS.into_iter().find(|level| *level == v).unwrap_or("warn"),
     }
 }
+
+/// 實際向 mpv 要的記錄等級：至少要警告。FFmpeg 的「HTTP error 404 Not Found」是警告，
+/// 網址開不了時靠它說明原因（只留下 `is_net_warning` 的那幾種，其他警告照舊不收）；VITASCOPE_DEBUG 要更多時照它的
+fn client_log_level(debug: Option<&str>) -> &'static str {
+    let wanted = debug_log_level(debug);
+    if log_rank(wanted) >= log_rank("warn") {
+        wanted
+    } else {
+        "warn"
+    }
+}
+
+/// 記錄等級的順序（越大越詳細）；不認得的當成最詳細
+fn log_rank(level: &str) -> usize {
+    LOG_LEVELS.iter().position(|l| *l == level).unwrap_or(LOG_LEVELS.len())
+}
+
+/// 要收進錯誤記錄的警告：FFmpeg 的 HTTP 錯誤（伺服器回應 4xx / 5xx）
+fn is_net_warning(prefix: &str, text: &str) -> bool {
+    prefix.starts_with("ffmpeg") && text.contains("HTTP error ")
+}
+
+/// 網路功能的 hook（`Options.net_hooks`）在事件裡的編號（mpv 的 reply_userdata）
+const HOOK_ON_LOAD: u64 = 1;
+const HOOK_ON_LOAD_FAIL: u64 = 2;
+/// hook 的優先順序（小的先跑）：跟 mpv 自己的 ytdl_hook 一樣
+const HOOK_PRIORITY: i32 = 10;
 
 /// 一條載入過的外掛字幕
 #[derive(Debug, Clone)]
@@ -676,6 +719,17 @@ pub struct Player {
     ao_null_wanted: bool,
     /// 最近一次精準跳轉的目標和送出的時間（見 `position_now`）；其他跳轉、換檔時清掉
     exact_seek: std::sync::Mutex<Option<(f64, Instant)>>,
+    /// 目前（或最近一次）開的檔案或網址（`open` 時記下，StartFile 時讀得到 mpv 的 path 就換成它）：
+    /// 開檔失敗時判斷是不是網路的原因
+    opening: Option<String>,
+    /// 這次開檔從什麼時候開始（`open`；mpv 自己開的檔案是處理 StartFile 的時候）；載入成功、結束時清掉
+    load_started: Option<Instant>,
+    /// 最近一次開檔失敗花了多久（從 `load_started` 算）：記錄裡看不出原因時，花滿逾時的算逾時
+    failed_after: Option<Duration>,
+    /// 已經放行的 hook 數（自動測試用）
+    hooks_continued: u64,
+    /// VITASCOPE_DEBUG：印出這個等級（`log_rank`）以內的 mpv 記錄；沒設定時不印
+    debug_print: Option<usize>,
 }
 
 /// 送出精準跳轉後這麼久（秒）以內，`position_now` 用跳轉的目標：上一次跳轉 0.3 秒內，
@@ -728,10 +782,13 @@ impl Player {
         // profile=high-quality、include=… 之類間接改到的畫質、音效選項也算使用者指定的：
         // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是這些選項）
         // af（等化器、音量平衡的濾鏡鏈）也一樣：預設是空的
+        // 網路選項也一樣（user-agent、逾時、快取…、標頭清單、FFmpeg 的連線選項）
         for name in crate::picture::MANAGED
             .into_iter()
             .chain(crate::sound::MANAGED)
             .chain(["af"])
+            .chain(net::MANAGED)
+            .chain([net::HEADERS, net::LAVF])
         {
             if let (Ok(now), Ok(default)) = (
                 mpv.get_string(name),
@@ -756,9 +813,14 @@ impl Player {
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
         }
-        mpv.request_log_messages(debug_log_level(std::env::var("VITASCOPE_DEBUG").ok().as_deref()))?;
+        let debug = std::env::var("VITASCOPE_DEBUG").ok();
+        mpv.request_log_messages(client_log_level(debug.as_deref()))?;
         for (i, (name, format)) in OBSERVED.iter().enumerate() {
             mpv.observe(i as u64 + 1, name, *format)?;
+        }
+        if opts.net_hooks {
+            mpv.hook_add(HOOK_ON_LOAD, "on_load", HOOK_PRIORITY)?;
+            mpv.hook_add(HOOK_ON_LOAD_FAIL, "on_load_fail", HOOK_PRIORITY)?;
         }
         Ok(Self {
             mpv: Arc::new(mpv),
@@ -787,6 +849,11 @@ impl Player {
             boost_pct: 0.0,
             ao_null_wanted,
             exact_seek: std::sync::Mutex::new(None),
+            opening: None,
+            load_started: None,
+            failed_after: None,
+            hooks_continued: 0,
+            debug_print: debug.as_deref().map(|v| log_rank(debug_log_level(Some(v)))),
         })
         .inspect(|_| subs::clean_cache())
     }
@@ -917,6 +984,69 @@ impl Player {
     /// 非同步設定的音效選項 mpv 不接受：忘掉記下的值，下次套用時再送
     pub fn forget_sound(&mut self, name: &str) {
         self.options_applied.remove(name);
+    }
+
+    // ───────────── 網路選項 ─────────────
+
+    /// 這個播放引擎的網路選項預設值（使用者把 User-Agent 清空時送回這個）
+    pub fn net_defaults(&self) -> net::NetDefaults {
+        let mut d = net::NetDefaults::default();
+        if let Ok(ua) = self.mpv.get_string("option-info/user-agent/default-value") {
+            d.user_agent = ua;
+        }
+        d
+    }
+
+    /// 套用網路選項（`net::mpv_options` 的結果），跟 `apply_picture` 一樣只送有變的、略過使用者自己指定的。
+    /// `sync`：啟動時（還沒開檔）同步設定；不然非同步（`AsyncKey::Net`）。
+    /// HTTP 標頭是字串清單，項目裡可能有逗號：同步時用 node 整個設定；非同步時先清空、再一項一項加
+    /// （change-list 的 append 不會用逗號拆開），回傳裡有好幾筆 `http-header-fields`
+    pub fn apply_net(
+        &mut self,
+        o: &net::NetOptions,
+        sync: bool,
+    ) -> Vec<(&'static str, AsyncKey, mpv::Result<Option<u64>>)> {
+        let net_key: fn(&str) -> AsyncKey = |_| AsyncKey::Net;
+        let mut sent = self.apply_cached(&o.scalars, sync, net_key);
+        // stream-lavf-o 是鍵值清單，字串「名稱=值,名稱=值」就是它的寫法（名稱、值都沒有逗號）
+        sent.extend(self.apply_cached(&[(net::LAVF, o.lavf.clone())], sync, net_key));
+        let value = o.headers.join("\n");
+        if self.user_overrides.contains(net::HEADERS) || self.options_applied.get(net::HEADERS) == Some(&value) {
+            return sent;
+        }
+        let results: Vec<mpv::Result<Option<u64>>> = if sync {
+            vec![
+                self.mpv
+                    .set_node(net::HEADERS, &Node::strings(o.headers.iter().cloned()))
+                    .map(|()| None),
+            ]
+        } else {
+            let clear = ["change-list", net::HEADERS, "clr", ""];
+            std::iter::once(self.command_async_keyed(AsyncKey::Net, &clear).map(Some))
+                .chain(o.headers.iter().map(|h| {
+                    self.command_async_keyed(AsyncKey::Net, &["change-list", net::HEADERS, "append", h])
+                        .map(Some)
+                }))
+                .collect()
+        };
+        if results.iter().all(Result::is_ok) {
+            self.options_applied.insert(net::HEADERS, value);
+        } else {
+            self.options_applied.remove(net::HEADERS);
+        }
+        sent.extend(results.into_iter().map(|r| (net::HEADERS, AsyncKey::Net, r)));
+        sent
+    }
+
+    /// 非同步設定的網路選項 mpv 不接受：忘掉記下的值，下次套用時再送
+    pub fn forget_net(&mut self, name: &str) {
+        self.options_applied.remove(name);
+    }
+
+    /// 已經放行的 hook 數（自動測試用：確認 hook 真的有註冊、有收到）
+    #[doc(hidden)]
+    pub fn hooks_continued(&self) -> u64 {
+        self.hooks_continued
     }
 
     /// 音訊輸出開不起來，mpv 改用 null 輸出（沒有聲音；ao 本來就指定 null 的不算）
@@ -1132,6 +1262,11 @@ impl Player {
         let flips = self.shader_flip.clone();
         self.reset_shaders_for_next_file();
         let result = self.mpv.command(&["loadfile", path, "replace"]);
+        if result.is_ok() {
+            // 開檔失敗時判斷是不是網路的原因（StartFile 時讀 mpv 的 path 可能已經太晚）
+            self.opening = Some(path.to_owned());
+            self.load_started = Some(Instant::now());
+        }
         if result.is_err() && flips.iter().any(Option::is_some) {
             // 沒有換檔：舊檔案照樣在播，翻轉放回去
             self.shader_flip = flips;
@@ -1734,7 +1869,8 @@ impl Player {
                 None
             }
             Event::Log { prefix, level, text } => {
-                if std::env::var_os("VITASCOPE_DEBUG").is_some() {
+                // 印出的跟以前一樣照 VITASCOPE_DEBUG 的等級（向 mpv 要的至少是警告，可能比要印的多）
+                if self.debug_print.is_some_and(|max| log_rank(&level) <= max) {
                     eprint!("[mpv/{level}] [{prefix}] {text}");
                 }
                 let noise = is_harmless_error(&text)
@@ -1742,14 +1878,16 @@ impl Player {
                         .probe_noise
                         .iter()
                         .any(|parts| parts.iter().all(|p| text.contains(p.as_str())));
-                if matches!(level.as_str(), "error" | "fatal") && !noise {
-                    if is_render_log(&prefix) {
-                        if self.render_errors.len() >= RENDER_ERRORS_CAP {
-                            self.render_errors.pop_front();
-                        }
-                        self.render_errors
-                            .push_back((Instant::now(), format!("[{prefix}] {}", text.trim_end())));
+                let error = matches!(level.as_str(), "error" | "fatal") && !noise;
+                if error && is_render_log(&prefix) {
+                    if self.render_errors.len() >= RENDER_ERRORS_CAP {
+                        self.render_errors.pop_front();
                     }
+                    self.render_errors
+                        .push_back((Instant::now(), format!("[{prefix}] {}", text.trim_end())));
+                }
+                // 警告只收網路的（HTTP 404 之類），其他照舊不收
+                if error || (level == "warn" && is_net_warning(&prefix, &text)) {
                     if self.recent_errors.len() >= 8 {
                         self.recent_errors.remove(0);
                     }
@@ -1769,6 +1907,14 @@ impl Player {
                 self.failure = None;
                 self.recent_errors.clear();
                 self.loaded_subs.clear();
+                // 開的是什麼（網址的話，失敗時說明網路的原因）。`open` 已經記下要開的；這裡再讀 mpv 的 path，
+                // 只在讀得到時換掉。很快就失敗的檔案（本機就拒絕的主機名稱只要幾毫秒），處理到這個事件時
+                // mpv 可能已經結束它、讀不到 path：那就留著 `open` 記的，不能因為讀不到就當成本機檔案
+                if let Ok(path) = self.mpv.get_string("path") {
+                    self.opening = Some(path);
+                }
+                // 從 `open` 算（比 mpv 真的開始早一點點，不會比較晚）；前一個檔案結束時清掉了的才從現在算
+                self.load_started.get_or_insert_with(Instant::now);
                 // 翻轉是每個檔案各自的（通常 `open` 已經拿掉了）；清單跟該有的不一樣、或不確定
                 //（開檔前的同步設定可能被晚到的非同步指令蓋掉）就再送一次。非同步指令照順序執行，這次的一定最後生效
                 self.shader_flip = [None, None];
@@ -1780,6 +1926,7 @@ impl Player {
             Event::FileLoaded => {
                 self.state.loading = false;
                 self.state.loaded = true;
+                self.load_started = None;
                 if self.external_subs {
                     self.load_external_subs();
                 }
@@ -1793,6 +1940,7 @@ impl Player {
             Event::EndFile { reason, error } => {
                 self.state.loading = false;
                 self.state.loaded = false;
+                self.failed_after = self.load_started.take().map(|t| t.elapsed());
                 let error = error.map(|e| {
                     let base = failure_reason(e.code);
                     let full = self.compose_failure(base);
@@ -1829,10 +1977,12 @@ impl Player {
                     error: result.err().map(|e| e.to_string()),
                 })
             }
-            // 播放器自己還沒註冊任何 hook；收到沒人處理的 hook 一律立刻放行，載入才不會永遠卡住
+            // 網路功能的 hook（on_load、on_load_fail）還沒有要做的事（網站影片之後才接上），
+            // 其他沒人處理的 hook 也一樣：一律立刻放行，載入才不會永遠卡住
             Event::Hook { id, name, .. } => {
-                if let Err(e) = self.mpv.hook_continue(id) {
-                    eprintln!("[vitascope] 無法繼續 hook {name}：{e}");
+                match self.mpv.hook_continue(id) {
+                    Ok(()) => self.hooks_continued += 1,
+                    Err(e) => eprintln!("[vitascope] 無法繼續 hook {name}：{e}"),
                 }
                 None
             }
@@ -1892,6 +2042,9 @@ impl Player {
             }
             "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
             "current-ao" => s.current_ao = value.as_str().filter(|v| !v.is_empty()).map(str::to_owned),
+            // 關檔時 mpv 送「不可用」：跟著變回 false / None
+            "paused-for-cache" => s.paused_for_cache = value.as_bool().unwrap_or(false),
+            "cache-buffering-state" => s.cache_buffering = value.as_i64(),
             // 讀不到（Value::None）時保留上一次的清單
             "audio-device-list" if !self.fake_devices => {
                 if let Some(json) = value.as_str() {
@@ -1957,6 +2110,20 @@ impl Player {
     fn compose_failure(&self, base: &str) -> String {
         // 常見情況直接翻成中文；其他的附上 mpv 的原始訊息，方便回報問題
         let all = self.recent_errors.join("\n");
+        // 網址：記錄裡看得出網路的原因（找不到伺服器、HTTP 404、逾時…）就用它
+        let url = self.opening.as_deref().filter(|p| crate::m3u::is_url(p));
+        let timeout = || self.mpv.get_property::<f64>("network-timeout").unwrap_or(60.0);
+        if let Some(f) = url.and_then(|u| net::classify_failure(&all, u)) {
+            return f.message(timeout());
+        }
+        // 網路串流沒有「檔案」：本機檔案的說明（檔案不存在、沒有讀取權限）不適用
+        let network = url.is_some_and(net::is_network);
+        // 記錄裡看不出原因、但花滿了逾時才失敗：是逾時。FFmpeg 7 以前（系統的 libmpv 0.37）
+        // 讀取逾時不記錄，只有 mpv 的「Failed to open」
+        if network && self.failed_after.is_some_and(|d| d.as_secs_f64() >= timeout() * 0.95) {
+            return net::NetFailure::TimedOut.message(timeout());
+        }
+        let file_only = ["No such file", "Failed to open", "Permission denied"];
         let known = [
             ("No such file", crate::tr!("找不到檔案", "file not found")),
             (
@@ -1976,7 +2143,11 @@ impl Player {
                 crate::tr!("檔案裡沒有可播放的影像或聲音", "No playable video or audio in the file"),
             ),
         ];
-        if let Some((_, zh)) = known.iter().find(|(en, _)| all.contains(en)) {
+        if let Some((_, zh)) = known
+            .iter()
+            .filter(|(en, _)| !(network && file_only.contains(en)))
+            .find(|(en, _)| all.contains(en))
+        {
             return crate::tf!("{base}：{zh}", "{base}: {zh}");
         }
         match self.recent_errors.last() {
@@ -2020,9 +2191,9 @@ fn failure_reason(code: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, debug_log_level, display_size,
-        env_option_names, env_options, has_out_format, is_harmless_error, is_hdr_gamma, is_render_log, mpv_version,
-        picture_key, sound_key, spdif_format, spdif_live,
+        ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, client_log_level, debug_log_level,
+        display_size, env_option_names, env_options, has_out_format, is_harmless_error, is_hdr_gamma, is_net_warning,
+        is_render_log, mpv_version, picture_key, sound_key, spdif_format, spdif_live,
     };
 
     #[test]
@@ -2261,6 +2432,161 @@ mod tests {
         for odd in ["true", "yes", "0", "verbose", "V"] {
             assert_eq!(debug_log_level(Some(odd)), "warn", "{odd}");
         }
+    }
+
+    #[test]
+    fn client_always_gets_warnings() {
+        // 至少要警告（FFmpeg 的 HTTP 錯誤是警告）；除錯要更多時照除錯的
+        assert_eq!(client_log_level(None), "warn");
+        assert_eq!(client_log_level(Some("error")), "warn");
+        assert_eq!(client_log_level(Some("fatal")), "warn");
+        assert_eq!(client_log_level(Some("1")), "warn");
+        assert_eq!(client_log_level(Some("v")), "v");
+        assert_eq!(client_log_level(Some("trace")), "trace");
+        // 印出的等級（debug_log_level）不變：沒設定時只印錯誤
+        assert_eq!(debug_log_level(None), "error");
+        // 印不印照等級的順序：VITASCOPE_DEBUG=error 不印警告
+        use super::log_rank;
+        assert!(log_rank("error") <= log_rank(debug_log_level(Some("error"))));
+        assert!(log_rank("warn") > log_rank(debug_log_level(Some("error"))));
+        assert!(log_rank("warn") <= log_rank(debug_log_level(Some("1"))));
+        assert!(log_rank("fatal") < log_rank("error") && log_rank("v") < log_rank("trace"));
+        assert!(log_rank("???") > log_rank("trace"));
+    }
+
+    #[test]
+    fn only_http_errors_from_ffmpeg_are_kept_as_warnings() {
+        assert!(is_net_warning("ffmpeg", "http: HTTP error 404 Not Found\n"));
+        assert!(is_net_warning("ffmpeg/demuxer", "hls: HTTP error 403 Forbidden\n"));
+        assert!(!is_net_warning("ffmpeg", "http: Stream ends prematurely at 100\n"));
+        assert!(!is_net_warning("cplayer", "HTTP error 404\n"), "不是 FFmpeg 的");
+        assert!(!is_net_warning("vo/gpu", "just a warning\n"));
+        // 送進錯誤記錄（開網址失敗時用來說明），其他警告不收
+        use crate::mpv::Event;
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let log = |prefix: &str, level: &str, text: &str| Event::Log {
+            prefix: prefix.into(),
+            level: level.into(),
+            text: text.into(),
+        };
+        p.handle(log("ffmpeg", "warn", "http: HTTP error 404 Not Found\n"));
+        p.handle(log("ffmpeg", "warn", "http: Stream ends prematurely\n"));
+        p.handle(log("ffmpeg", "info", "http: HTTP error 500 (info)\n"));
+        assert_eq!(p.recent_errors(), ["[ffmpeg] http: HTTP error 404 Not Found"]);
+        assert!(p.take_render_errors().is_empty());
+    }
+
+    /// 開網址失敗的說明不靠事件處理得多快：`open` 記下網址，StartFile 時讀不到 mpv 的 path
+    ///（檔案已經結束）也照樣當網址說明；看不出原因時不說「檔案不存在」；花滿逾時的算逾時
+    #[test]
+    fn url_failures_are_explained_without_racing_mpv() {
+        use crate::mpv::{EndReason, Error, Event};
+        use std::time::{Duration, Instant};
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let log = |prefix: &str, text: &str| Event::Log {
+            prefix: prefix.into(),
+            level: "error".into(),
+            text: text.into(),
+        };
+        let failed = || Event::EndFile {
+            reason: EndReason::Error,
+            error: Some(Error {
+                code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
+                context: String::new(),
+            }),
+        };
+        let last = |p: &super::Player| p.state.last_error.clone().unwrap_or_default();
+
+        // open 記下要開的（這裡開的是本機產生的影像，不會連網路）
+        let src = "av://lavfi:color=duration=60";
+        p.open(src).unwrap();
+        assert_eq!(p.opening.as_deref(), Some(src));
+        p.stop().unwrap();
+        // 等 mpv 真的停下（path 讀不到）；事件不處理，下面自己送
+        let start = Instant::now();
+        while p.mpv.get_string("path").is_ok() {
+            assert!(start.elapsed() < Duration::from_secs(30), "mpv 停不下來");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 沒在播：StartFile 讀不到 path（像是很快就失敗、已經結束的網址）
+        let url = "http://unreachable.invalid/a.mp4";
+        p.opening = Some(url.into());
+        p.handle(Event::StartFile);
+        assert_eq!(p.opening.as_deref(), Some(url), "讀不到 path 時留著 open 記的");
+        p.handle(log(
+            "ffmpeg",
+            "tcp: Failed to resolve hostname unreachable.invalid: No such host\n",
+        ));
+        p.handle(failed());
+        assert_eq!(last(&p), "無法開啟網址：找不到伺服器（請確認網址與網路連線）");
+
+        // 記錄裡只有一般的開檔失敗：網址不說「檔案不存在」，本機檔案照舊
+        for (opening, want_file_text) in [(url, false), (r"C:\影片\a.mp4", true)] {
+            p.opening = Some(opening.into());
+            p.handle(Event::StartFile);
+            p.handle(log("stream", &format!("Failed to open {opening}.\n")));
+            p.handle(failed());
+            let err = last(&p);
+            assert_eq!(
+                err.contains("檔案不存在，或沒有讀取權限"),
+                want_file_text,
+                "{opening}: {err}"
+            );
+            assert!(err.starts_with("無法載入檔案"), "{err}");
+        }
+
+        // 看不出原因、花滿了逾時（FFmpeg 6 讀取逾時不記錄）：逾時；沒花滿的不算
+        p.mpv.set_property("network-timeout", 2.0).unwrap();
+        for (took, want_timeout) in [(Duration::from_secs(3), true), (Duration::from_millis(100), false)] {
+            p.opening = Some(url.into());
+            p.handle(Event::StartFile);
+            p.load_started = Instant::now().checked_sub(took);
+            p.handle(log("stream", &format!("Failed to open {url}.\n")));
+            p.handle(failed());
+            let err = last(&p);
+            assert_eq!(
+                err == "無法開啟網址：連線逾時（2 秒內沒有回應）",
+                want_timeout,
+                "{took:?}: {err}"
+            );
+        }
+        // 載入成功過的不算開檔花的時間
+        p.load_started = Instant::now().checked_sub(Duration::from_secs(3));
+        p.handle(Event::FileLoaded);
+        assert_eq!(p.load_started, None);
+    }
+
+    #[test]
+    fn network_state_is_observed_last() {
+        // 只能加在最後面（前面的編號不能變）；裝置清單的編號接在後面
+        let names: Vec<&str> = super::OBSERVED.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names[names.len() - 2..], ["paused-for-cache", "cache-buffering-state"]);
+        assert_eq!(super::DEVICE_LIST_ID, super::OBSERVED.len() as u64 + 1);
+        // Net 接在 C2 之前最後一個的後面（之後的會再接在它後面，見設計 §1.9）
+        assert_eq!(AsyncKey::Net as usize, AsyncKey::AfCommand as usize + 1);
+    }
+
+    #[test]
+    fn network_state_follows_mpv() {
+        // 本機的測試伺服器不會卡住，等不到真的暫停等待快取；直接送 mpv 的屬性變化事件（不靠時間）
+        use crate::mpv::{Event, Value};
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let change = |name: &str, value: Value| Event::PropertyChange {
+            id: super::OBSERVED.iter().position(|(n, _)| *n == name).unwrap() as u64 + 1,
+            name: name.into(),
+            value,
+        };
+        assert!(!p.state.paused_for_cache);
+        assert_eq!(p.state.cache_buffering, None);
+        p.handle(change("paused-for-cache", Value::Flag(true)));
+        p.handle(change("cache-buffering-state", Value::Int64(37)));
+        assert!(p.state.paused_for_cache);
+        assert_eq!(p.state.cache_buffering, Some(37));
+        p.handle(change("paused-for-cache", Value::Flag(false)));
+        p.handle(change("cache-buffering-state", Value::None));
+        assert!(!p.state.paused_for_cache);
+        assert_eq!(p.state.cache_buffering, None);
     }
 
     #[test]

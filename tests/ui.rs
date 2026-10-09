@@ -2338,6 +2338,108 @@ fn opening_an_m3u8_plays_its_list_in_order() {
     step_until(&mut h, "下一個是第1集", |s| playing(s, "第1集.mp4"));
 }
 
+/// 本機的播放清單檔可能是從網路上下載的：裡面能讀本機檔案、執行濾鏡的特殊網址（edl://、av://、memory://）不開
+#[test]
+fn m3u8_entries_with_special_urls_are_dropped() {
+    // 資料夾、檔名有空白（半形、全形）的本機項目照樣留下
+    let dir = three_episodes("m3u unsafe");
+    dir.clip("My Movie (2020).mp4");
+    dir.clip("第\u{3000}4 集.mp4");
+    let list = dir.0.join("清單.m3u8");
+    let first = dir.0.join("第1集.mp4");
+    std::fs::write(
+        &list,
+        format!(
+            "#EXTM3U\nav://lavfi:testsrc2=duration=60\nedl://{}\n第2集.mp4\nmemory://#EXTM3U\n第1集.mp4\n\
+             My Movie (2020).mp4\n{}\n",
+            first.display(),
+            dir.0.join("第\u{3000}4 集.mp4").display()
+        ),
+    )
+    .unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, list);
+    step_until(&mut h, "從第2集開始（前面的特殊網址不開）", |s| {
+        playing(s, "第2集.mp4")
+    });
+    assert_eq!(
+        playlist_names(h.state()),
+        ["第2集.mp4", "第1集.mp4", "My Movie (2020).mp4", "第\u{3000}4 集.mp4"]
+    );
+}
+
+// ───────────── 網路 ─────────────
+
+/// 網路設定啟動時就同步套用（命令列給的第一個網址就要生效；系統的 libmpv 0.37 預設不檢查網站憑證），
+/// 之後改了非同步送出，整理過（逾時的範圍、有換行的標頭）才存、才送
+#[test]
+fn network_settings_reach_mpv_at_startup_and_when_changed() {
+    let mut settings = Settings::default();
+    settings.net.timeout_secs = 7;
+    settings.net.user_agent = "UA-Test/1".into();
+    let mut h = harness_with(None, settings);
+    h.step();
+    let p = h.state().player();
+    assert_eq!(p.get_string("tls-verify").unwrap(), "yes");
+    assert_eq!(p.get_f64("network-timeout").unwrap(), 7.0);
+    assert_eq!(p.get_string("user-agent").unwrap(), "UA-Test/1");
+    h.state_mut().change_net(|n| {
+        n.tls_verify = false;
+        n.timeout_secs = 999;
+        n.user_agent = String::new();
+        n.headers = vec!["X-A: 1, 2".into(), "X-Bad: 1\r\nX-Evil: 2".into()];
+    });
+    step_until_app(&mut h, "改的網路設定送到 mpv", |app| {
+        let p = app.player();
+        p.get_string("tls-verify").is_ok_and(|v| v == "no")
+            && p.mpv()
+                .get_string_list("http-header-fields")
+                .is_ok_and(|l| l == ["X-A: 1, 2"])
+    });
+    let net = &h.state().settings().net;
+    assert_eq!(net.timeout_secs, 120);
+    assert_eq!(net.headers, ["X-A: 1, 2"]);
+    let p = h.state().player();
+    assert_eq!(p.get_f64("network-timeout").unwrap(), 120.0);
+    assert_eq!(
+        p.get_string("user-agent").unwrap(),
+        p.net_defaults().user_agent,
+        "清空 = 播放引擎預設"
+    );
+    assert_eq!(h.state().osd_text(), None, "都設定成功，沒有「無法套用」的提示");
+}
+
+/// 網路選項 mpv 不接受（非同步的回覆是失敗）：忘掉記下的值，下次套用時再送一次。
+/// 記下的值跟 mpv 實際的值不一樣時，不再送就一直是錯的
+#[test]
+fn rejected_network_option_is_sent_again() {
+    let mut h = harness(None);
+    h.step();
+    let opts = vitascope::net::mpv_options(&Settings::default().net, &h.state().player().net_defaults());
+    assert!(
+        h.state_mut().player_mut().apply_net(&opts, false).is_empty(),
+        "啟動時已經送過，沒變的不再送"
+    );
+    // 送一個 mpv 不接受的值（經過介面的非同步設定，回覆依名稱分派）
+    h.state_mut().set_option_async(AsyncKey::Net, "hls-bitrate", "bogus");
+    step_until_app(&mut h, "mpv 回覆設定失敗", |app| {
+        app.osd_text().is_some_and(|t| t.contains("hls-bitrate"))
+    });
+    let sent: Vec<&str> = h
+        .state_mut()
+        .player_mut()
+        .apply_net(&opts, false)
+        .into_iter()
+        .map(|(name, key, r)| {
+            assert_eq!(key, AsyncKey::Net);
+            r.unwrap();
+            name
+        })
+        .collect();
+    assert_eq!(sent, ["hls-bitrate"], "失敗的那一項再送一次，其他的不送");
+}
+
 // ───────────── 媒體資訊 ─────────────
 
 #[test]

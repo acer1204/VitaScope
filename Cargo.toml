@@ -36,6 +36,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 檢查更新（查詢 GitHub Releases）
 ureq = "3"
+# 網址的解析（主機名稱、帳號密碼、查詢參數）；本來就在相依樹裡（webbrowser 用的）
+url = "2.5.8"
 
 # Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
 [target.'cfg(windows)'.dependencies]

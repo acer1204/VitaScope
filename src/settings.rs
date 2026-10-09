@@ -7,6 +7,7 @@
 //! 下次啟動直接全螢幕，跟一般播放器的習慣不同。
 
 pub use crate::keymap::KeySettings;
+pub use crate::net::NetSettings;
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
 pub use crate::sound::AudioSettings;
@@ -60,6 +61,8 @@ pub struct Settings {
     pub theme: ThemeChoice,
     /// 快捷鍵（預設組、自己改過的）
     pub keys: KeySettings,
+    /// 網路：開啟網址（HLS / DASH 畫質、重新連線、快取、逾時、憑證、標頭、proxy…）
+    pub net: NetSettings,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -191,6 +194,7 @@ impl Default for Settings {
             smooth: SmoothMode::default(),
             theme: ThemeChoice::default(),
             keys: KeySettings::default(),
+            net: NetSettings::default(),
             path: None,
             baseline: None,
         }
@@ -363,6 +367,7 @@ impl Settings {
         a.volume_max = crate::sound::snap_volume_max(a.volume_max);
         self.volume = self.volume.clamp(0.0, f64::from(a.volume_max));
         self.keys = self.keys.sanitized();
+        self.net = self.net.sanitized();
         self
     }
 
@@ -697,6 +702,16 @@ mod tests {
         assert_eq!(s.keys.mouse.double_click, "fullscreen", "雙擊畫面預設全螢幕");
         assert!(s.keys.mouse.middle.is_empty() && s.keys.mouse.back.is_empty() && s.keys.mouse.forward.is_empty());
         assert_eq!(s.keys.mouse.wheel, crate::keymap::WheelMode::Volume, "滾輪預設調音量");
+        assert_eq!(s.net, NetSettings::default());
+        assert_eq!(
+            s.net.hls_bitrate,
+            crate::net::HlsBitrate::Max,
+            "HLS / DASH 預設最高畫質"
+        );
+        assert!(s.net.reconnect, "預設自動重新連線");
+        assert!(s.net.tls_verify, "預設檢查網站憑證");
+        assert!(s.net.remember_urls, "預設記住開啟過的網址");
+        assert_eq!((s.net.cache_mb, s.net.timeout_secs), (150, 30));
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -705,9 +720,14 @@ mod tests {
         assert!(s.audio.passthrough.ac3 && s.audio.passthrough.eac3 && s.audio.passthrough.dts);
         assert!(!s.audio.passthrough.enabled && !s.audio.passthrough.dts_hd && !s.audio.passthrough.truehd);
         // 一組只寫了一項：其他項目也是規格的預設值
-        let s: Settings = serde_json::from_str(r#"{"audio":{"downmix":true},"video":{"keep_adjust":true}}"#).unwrap();
+        let s: Settings = serde_json::from_str(
+            r#"{"audio":{"downmix":true},"video":{"keep_adjust":true},"net":{"timeout_secs":10}}"#,
+        )
+        .unwrap();
         assert!(s.audio.downmix && s.audio.normalize_downmix && s.audio.volume_max == 100);
         assert!(s.video.keep_adjust && s.video.tone.compute_peak);
+        assert_eq!(s.net.timeout_secs, 10);
+        assert!(s.net.tls_verify && s.net.reconnect && s.net.cache_mb == 150);
     }
 
     #[test]
@@ -744,6 +764,50 @@ mod tests {
         assert_eq!(s.keys, KeySettings::default(), "升級後快捷鍵不變");
         assert_eq!(s.keys.mouse, crate::keymap::MouseSettings::default(), "升級後滑鼠不變");
         assert_eq!(s.side_tab, SideTab::Playlist, "升級後側邊面板還是播放清單");
+        assert_eq!(s.net, NetSettings::default(), "升級後網路設定是預設值（檢查憑證）");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn net_settings_load_leniently_sanitize_and_merge() {
+        use crate::net::HlsBitrate;
+        // 一項讀不懂（新版的畫質、型別不對）：只有那一項用預設值，同一組的其他項目、其他設定照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "net": {"hls_bitrate": "8k", "timeout_secs": 10, "reconnect": "yes",
+                "user_agent": "UA/1", "headers": ["X-A: 1"]}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert_eq!(s.net.hls_bitrate, HlsBitrate::Max);
+        assert_eq!(s.net.timeout_secs, 10);
+        assert!(s.net.reconnect);
+        assert_eq!(s.net.user_agent, "UA/1");
+        assert_eq!(s.net.headers, ["X-A: 1"]);
+        // 讀檔時整理：快取對齊選項、逾時拉回範圍、有換行的標頭拿掉（不能多塞一個標頭）
+        let dir = temp_dir("net");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"net": {"cache_mb": 999, "timeout_secs": 0, "hls_bitrate": "min",
+                "headers": ["X-Ok: 1", "X-Bad: 1\r\nX-Evil: 2"], "referrer": "http://a/\nb"}}"#,
+        )
+        .unwrap();
+        let mut a = Settings::load_from(path.clone());
+        assert_eq!((a.net.cache_mb, a.net.timeout_secs), (1000, 5));
+        assert_eq!(a.net.hls_bitrate, HlsBitrate::Min);
+        assert_eq!(a.net.headers, ["X-Ok: 1"]);
+        assert_eq!(a.net.referrer, "");
+        // 存檔、讀回來；兩個視窗各改了網路設定的不同項目：兩個都留下
+        let mut b = Settings::load_from(path.clone());
+        a.net.tls_verify = false;
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""hls_bitrate": "min""#), "{text}");
+        b.net.proxy = "http://127.0.0.1:3128".into();
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert!(!back.net.tls_verify, "A 關掉的憑證檢查不能被 B 蓋回去");
+        assert_eq!(back.net.proxy, "http://127.0.0.1:3128");
+        assert_eq!(back.net.hls_bitrate, HlsBitrate::Min);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

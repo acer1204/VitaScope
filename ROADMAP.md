@@ -752,6 +752,13 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **同步的 `set_property` 會插隊到還沒執行的非同步指令前面**（同步呼叫直接鎖住核心，非同步的是排隊）；非同步指令彼此之間照順序。
   同一個選項同時用兩種方式設定時，要想清楚最後是誰。
 - **字串清單選項設成 `""` 會變成有一個空項目的清單 `[""]`**，不是空清單；要清空用 `change-list <選項> clr ""`。
+- **FFmpeg 的記錄只送到行程裡第一個建立、還在的 mpv**（mpv 的 `common/av_log.c`：FFmpeg 的記錄函式整個程式只有一個）。
+  開網址失敗的原因（找不到伺服器、HTTP 404…）只出現在 FFmpeg 的記錄，介面的播放器是第一個建立的，所以收得到；
+  之後另外開的 mpv（匯出、縮圖之類）收不到 FFmpeg 的錯誤，要看 mpv 自己的記錄判斷。自動測試平行建立很多播放器，
+  看 FFmpeg 記錄的測試要放在自己的測試程式（`tests/net_errors.rs`），一次只建立一個播放器。
+  另外 HTTP 的錯誤碼（`HTTP error 404 Not Found`）是警告，不是錯誤：播放器要向 mpv 要警告等級的記錄才收得到。
+  FFmpeg 7 以前（Ubuntu 24.04 系統的 libmpv 0.37 用的 FFmpeg 6.1）伺服器不回應、讀取逾時時什麼都不記錄，
+  只有 mpv 的「Failed to open」：看不出原因、但花滿了 `network-timeout` 才失敗的，就當成逾時說明。
 - **Windows：觀察 `audio-device-list` 要讓程式一直有多執行緒 COM（MTA）**：mpv 在自己的執行緒初始化 MTA、關閉時拆掉，
   那是程式裡唯一的 MTA 時，系統的裝置通知還在用，關閉播放器時存取違規。啟動時先 `CoIncrementMTAUsage`，不再減回去。
 - **Linux 直接連結新版 libmpv 才有的函式，舊的 libmpv 在程式開始之前就被載入器擋掉**：Rust 預設 `-z now`（完整 RELRO），

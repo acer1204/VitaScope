@@ -5,6 +5,7 @@ mod capture;
 mod control_panel;
 mod dialogs;
 mod info_panel;
+mod network;
 mod pacing;
 mod playlist_panel;
 mod preview;
@@ -401,6 +402,8 @@ pub struct VitascopeApp {
     caps: EngineCaps,
     /// 這個引擎的縮放預設值（「標準」畫質）
     picture_defaults: PictureDefaults,
+    /// 這個引擎的網路選項預設值（User-Agent 清空時送回去）
+    net_defaults: crate::net::NetDefaults,
     /// 已送出、還沒回覆的非同步設定：指令編號 → 選項名稱（失敗時提示用）
     async_pending: HashMap<u64, String>,
     /// 流暢播放：螢幕更新率、電源、決定
@@ -724,6 +727,7 @@ impl VitascopeApp {
             audio_device: None,
             caps: EngineCaps::default(),
             picture_defaults: PictureDefaults::default(),
+            net_defaults: crate::net::NetDefaults::default(),
             async_pending: HashMap::new(),
             pacing,
             adjust,
@@ -881,6 +885,8 @@ impl VitascopeApp {
         self.video_startup();
         // 輸出裝置、獨佔模式、轉成立體聲、音訊直通
         self.sound_startup();
+        // 網路：憑證檢查、逾時、快取、重新連線、標頭（命令列給的網址也要生效）
+        self.net_startup();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -939,6 +945,10 @@ impl VitascopeApp {
             }
             // 音效選項也一樣
             self.sound_reply_failed(k, &name);
+            // 網路選項也一樣
+            if k == AsyncKey::Net {
+                self.player.forget_net(&name);
+            }
             self.async_failed(k, &name, &e);
             // 像素著色器 mpv 不接受：剛換的組合就還原（提示換成「已還原」）
             if k == AsyncKey::Shaders {

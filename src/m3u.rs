@@ -43,10 +43,14 @@ pub fn read(path: &Path) -> std::io::Result<Vec<Entry>> {
     Ok(parse(&text, base))
 }
 
-/// 清單裡的這一項要不要留下：清單裡的本機清單檔不展開（自己包含自己會一直開下去），
-/// 但網址（IPTV 的 `…/index.m3u8`）和 HLS 串流照樣播
+/// 清單裡的這一項要不要留下：
+/// - 只開本機檔案、網路串流與 IPTV 群播（`net::Origin::LocalFile`）：清單檔可能是從網路上下載的，
+///   裡面的 `edl://`、`av://` 之類的特殊網址能讀本機的檔案、執行濾鏡，mpv 對我們自己開的網址不設限
+/// - 清單裡的本機清單檔不展開（自己包含自己會一直開下去），但網址（IPTV 的 `…/index.m3u8`）和 HLS 串流照樣播
 pub fn keep_entry(p: &Path) -> bool {
-    is_url(&p.to_string_lossy()) || !crate::formats::is_playlist(p) || is_hls_file(p)
+    let s = p.to_string_lossy();
+    crate::net::allowed(&s, crate::net::Origin::LocalFile)
+        && (is_url(&s) || !crate::formats::is_playlist(p) || is_hls_file(p))
 }
 
 /// HLS 串流（有 `#EXT-X-` 標籤的 .m3u8）：裡面是一段一段的影片片段，不是播放清單
@@ -161,7 +165,8 @@ fn strip_localhost(s: &str) -> &str {
     }
 }
 
-fn percent_decode(s: &str) -> String {
+/// 解開 `%xx`（不是 UTF-8 的位元組換成 �）
+pub(crate) fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -464,6 +469,48 @@ mod tests {
         assert!(keep_entry(Path::new("http://example.com/live/news/index.m3u8")));
         assert!(keep_entry(Path::new("a.mp4")));
         assert!(!keep_entry(Path::new("does-not-exist/nested.m3u")));
+    }
+
+    #[test]
+    fn only_local_files_and_streams_are_kept() {
+        let text = [
+            "#EXTM3U",
+            "#EXTINF:-1,新聞",
+            "http://example.com/live/news.ts",
+            "rtsp://cam.example/1",
+            "udp://239.0.0.1:1234",
+            "rtp://239.0.0.1:5004",
+            "file:///tmp/a.mp4",
+            "b.mp4",
+            "My Movie (2020).mp4",
+            "第\u{3000}1 集.mp4",
+            "edl://%10%/etc/passwd",
+            "av://lavfi:testsrc",
+            "memory://#EXTM3U",
+            "lavf://file:x",
+            "ftp://x.example/a.mp4",
+            "https://example.com/a b.mp4",
+        ]
+        .join("\n");
+        // 清單所在的資料夾、項目的檔名有空白（半形、全形）照樣留下
+        let kept: Vec<String> = parse(&text, Path::new("/my base"))
+            .into_iter()
+            .filter(|e| keep_entry(&e.path))
+            .map(|e| e.path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "http://example.com/live/news.ts",
+                "rtsp://cam.example/1",
+                "udp://239.0.0.1:1234",
+                "rtp://239.0.0.1:5004",
+                "/tmp/a.mp4",
+                "/my base/b.mp4",
+                "/my base/My Movie (2020).mp4",
+                "/my base/第\u{3000}1 集.mp4",
+            ]
+        );
     }
 
     #[test]
