@@ -4,7 +4,8 @@
 
 use super::VitascopeApp;
 use crate::pacing::{
-    self as rules, Guard, Inputs, Overrides, Plan, Presents, Reason, RenderStats, SmoothMode, Verdict,
+    self as rules, AfterStall, Guard, Inputs, Overrides, Plan, Presents, Reason, RenderStats, SmoothMode, StallWatch,
+    Verdict,
 };
 use crate::player::AsyncKey;
 use crate::power::{self, PowerSource};
@@ -265,6 +266,10 @@ fn reason_text(reason: Reason) -> &'static str {
         ),
         Reason::Hidden => crate::tr!("視窗縮到最小", "the window is minimized"),
         Reason::NoRefresh => crate::tr!("偵測不到這個螢幕的更新率", "can't detect this screen's refresh rate"),
+        Reason::Resync => crate::tr!(
+            "介面停頓過，重新對齊影像與聲音",
+            "re-syncing picture and sound after the interface stalled"
+        ),
     }
 }
 
@@ -276,7 +281,7 @@ fn short_text(plan: &Plan, refresh: Option<f64>, pacing_off: bool) -> Option<Str
         Plan::Untouched => crate::tr!("已由 VITASCOPE_MPV_OPTS 指定", "set by VITASCOPE_MPV_OPTS"),
         Plan::Display { hz, .. } => return Some(format!("{} Hz", rules::fmt_hz(*hz))),
         // 跟這個視窗、這個檔案有關的暫時狀態：寫更新率就好
-        Plan::Audio(Reason::Setting | Reason::NoVideo | Reason::Hidden) => return hz(),
+        Plan::Audio(Reason::Setting | Reason::NoVideo | Reason::Hidden | Reason::Resync) => return hz(),
         Plan::Audio(Reason::Battery) => crate::tr!("使用電池，暫停", "paused on battery"),
         Plan::Audio(Reason::SoftwareRenderer) => crate::tr!("軟體繪圖，不能使用", "not with software rendering"),
         Plan::Audio(Reason::RemoteSession) => crate::tr!("遠端桌面，暫停", "paused in a remote session"),
@@ -354,6 +359,9 @@ pub(super) struct Snapshot {
     /// 真的在畫影片（有 GL 的畫面）：每一幀之間的間隔才是 swap 等垂直同步的結果。
     /// 自動測試（kittest）沒有畫面，幀的間隔是測試自己決定的，不能拿來防呆
     pub real_window: bool,
+    /// mpv 的 avsync（秒）：只在介面卡住之後要看的時候讀（同步讀取要鎖住 mpv 的核心，見 `wants_avsync`），
+    /// 其他時候是 None
+    pub avsync: Option<f64>,
 }
 
 /// 流暢播放的控制：記住查到的螢幕、電源，算出做法、套用到 mpv
@@ -399,6 +407,14 @@ pub(super) struct PacingCtl {
     monitor_size: Option<egui::Vec2>,
     /// 上一幀防呆有在量（依螢幕同步、播放中、看得到）
     sampling: bool,
+    /// 介面有沒有卡住（開著對話框、拖曳視窗、系統卡頓）
+    stall: StallWatch,
+    /// 介面卡住過，等著看 mpv 有沒有自己追上聲音：卡住結束的時間
+    stalled: Option<Instant>,
+    /// 介面卡住之後暫時改用一般播放追上聲音（`Reason::Resync`）：從什麼時候開始
+    resync: Option<Instant>,
+    /// VITASCOPE_PACING=resync：卡住之後不等 mpv，一律重新同步
+    always_resync: bool,
     render_log: RenderLog,
 }
 
@@ -449,6 +465,10 @@ impl PacingCtl {
             fullscreen: None,
             monitor_size: None,
             sampling: false,
+            stall: StallWatch::default(),
+            stalled: None,
+            resync: None,
+            always_resync: overrides.resync,
             render_log: RenderLog {
                 enabled: rules::debug(),
                 ..Default::default()
@@ -568,6 +588,14 @@ impl PacingCtl {
     /// 送出了幾個設定（自動測試用）
     pub(super) fn sets(&self) -> usize {
         self.sets
+    }
+
+    /// 這一輪要讀 mpv 的 avsync：卡住之後等完了要看，或正在重新同步
+    pub(super) fn wants_avsync(&self, now: Instant) -> bool {
+        self.resync.is_some()
+            || self
+                .stalled
+                .is_some_and(|t| now.saturating_duration_since(t) >= rules::STALL_GRACE)
     }
 
     /// 選單、提示上的短說明：設定改成 `mode` 的話，現在會怎樣（「119.88 Hz」「使用電池，暫停」…）
@@ -717,6 +745,61 @@ impl PacingCtl {
             inputs.guard = self.guard.state();
             plan = rules::decide(&inputs, previous.as_ref());
         }
+        // 介面卡住過（開著對話框、拖曳視窗、系統卡頓）：卡住時 mpv 照樣播聲音，影像停在那裡（字幕跟著影像）。
+        // mpv 依螢幕同步時會自己略過晚了的影格追上（實測 1080p 約 0.15 秒），先等一下看 avsync；
+        // 還沒追上（較舊的 mpv、解碼跟不上）才暫時改用一般播放，讓 mpv 丟掉晚了的影格，追上之後馬上回來。
+        // 都是內部的修正，不提示
+        let ms = |a: Option<f64>| a.map_or("-".to_owned(), |a| format!("{:.1} ms", a * 1000.0));
+        if let Some(gap) = self.stall.tick(now, sampling)
+            && plan.is_display()
+        {
+            if rules::debug() {
+                eprintln!("[vitascope] 流暢播放：介面停了 {:.2} 秒", gap.as_secs_f64());
+            }
+            self.stalled = Some(now);
+        }
+        if let Some(since) = self.stalled {
+            let next = rules::after_stall(now.saturating_duration_since(since), snap.avsync, self.always_resync);
+            if !plan.is_display() || !snap.playing {
+                // 別的原因（縮到最小、拔掉電源…）本來就改用一般播放了；暫停了（avsync 只在換影格時更新，
+                // 暫停中讀到的是暫停前的，不能拿來判斷），繼續播時 mpv 自己會對齊
+                self.stalled = None;
+            } else if next != AfterStall::Wait {
+                self.stalled = None;
+                if rules::debug() {
+                    eprintln!(
+                        "[vitascope] 流暢播放：介面停頓之後 avsync {}，{}",
+                        ms(snap.avsync),
+                        if next == AfterStall::Resync {
+                            "暫時改用一般播放追上聲音"
+                        } else {
+                            "mpv 已經追上"
+                        }
+                    );
+                }
+                if next == AfterStall::Resync {
+                    self.resync = Some(now);
+                }
+            }
+        }
+        if let Some(since) = self.resync {
+            let elapsed = now.saturating_duration_since(since);
+            if !plan.is_display() || !snap.playing {
+                // 暫停了：不用再追（暫停中介面不會一直跑，留著的話一般播放會一直用到下次有人叫醒介面）
+                self.resync = None;
+            } else if rules::resync_done(elapsed, snap.avsync) {
+                self.resync = None;
+                if rules::debug() {
+                    eprintln!(
+                        "[vitascope] 流暢播放：重新同步花了 {:.2} 秒（avsync {}）",
+                        elapsed.as_secs_f64(),
+                        ms(snap.avsync)
+                    );
+                }
+            } else {
+                plan = Plan::Audio(Reason::Resync);
+            }
+        }
         if Some(plan) != previous && rules::debug() {
             eprintln!("[vitascope] 流暢播放：{plan:?}");
         }
@@ -760,7 +843,9 @@ impl PacingCtl {
             self.power_changed = false;
             return;
         }
-        if plan.is_display() {
+        // 重新同步完回到依螢幕同步不用等：做法在這之前一直都是它，等只會讓追上之後多一段一般播放
+        let resynced = self.applied == Some(Plan::Audio(Reason::Resync));
+        if plan.is_display() && !resynced {
             match self.pending {
                 Some((p, since)) if p == plan => {
                     if now.saturating_duration_since(since) < DEBOUNCE {
@@ -883,6 +968,7 @@ impl VitascopeApp {
                 frame_nr,
             }
         });
+        let now = Instant::now();
         let st = &self.player.state;
         let snap = Snapshot {
             mode: self.settings.smooth,
@@ -896,8 +982,12 @@ impl VitascopeApp {
             playing: st.loaded && !st.paused && !self.frame_stepping,
             display_sync_active: st.display_sync_active,
             real_window: self.video.is_some(),
+            avsync: if self.pacing.wants_avsync(now) {
+                self.player.mpv().get_property::<f64>("avsync").ok()
+            } else {
+                None
+            },
         };
-        let now = Instant::now();
         let tick = self.pacing.tick(now, &view, &snap);
         for (name, value) in &tick.send {
             let k = if *name == "video-sync" {
@@ -954,6 +1044,8 @@ impl VitascopeApp {
             log.avsync_read = Some(now);
             if let Ok(v) = self.player.mpv().get_property::<f64>("avsync") {
                 log.avsync.push(v);
+                // 每秒一筆：實機測試看介面卡住之後多久追上（10 秒的平均會把卡住剛結束那一筆算進去，看不出來）
+                eprintln!("[vitascope] avsync：{:.2} ms", v * 1000.0);
             }
         }
         if now - since < RENDER_LOG_EVERY {
@@ -1171,6 +1263,7 @@ mod tests {
             playing: true,
             display_sync_active: false,
             real_window: true,
+            avsync: None,
         }
     }
 
@@ -1528,6 +1621,8 @@ mod tests {
         frame: u64,
         view: View,
         snap: Snapshot,
+        /// mpv 的 avsync（秒）：跟 app 一樣，只有控制要看（`wants_avsync`）的那一輪才放進 `snap`
+        avsync: Option<f64>,
     }
 
     impl Playback {
@@ -1552,7 +1647,34 @@ mod tests {
                     display_sync_active: true,
                     ..snap()
                 },
+                avsync: None,
             }
+        }
+
+        /// 隔 `dt` 毫秒跑一輪，回傳這一輪要做的事
+        fn step(&mut self, dt: f64) -> Tick {
+            self.ms += dt;
+            self.frame += 1;
+            self.view.frame_nr = self.frame;
+            let now = self.start + Duration::from_secs_f64(self.ms / 1000.0);
+            self.snap.avsync = if self.ctl.wants_avsync(now) { self.avsync } else { None };
+            self.ctl.tick(now, &self.view, &self.snap)
+        }
+
+        /// 每次螢幕更新（119.88 Hz）跑一輪，跑 `for_ms` 毫秒，收集送出的設定（不能有提示）
+        fn play(&mut self, for_ms: f64) -> Vec<(&'static str, String)> {
+            let begin = self.ms;
+            let mut sent = Vec::new();
+            while self.ms - begin < for_ms {
+                let tick = self.step(1000.0 / 119.88);
+                assert_eq!(tick.notice, None, "{} ms", self.ms);
+                sent.extend(tick.send);
+            }
+            sent
+        }
+
+        fn now(&self) -> Instant {
+            self.start + Duration::from_secs_f64(self.ms / 1000.0)
         }
 
         /// 跑 `for_ms` 毫秒；防呆第一次有結果時回傳那是這一段開始後幾毫秒
@@ -1749,6 +1871,7 @@ mod tests {
             Reason::TooSlow,
             Reason::Hidden,
             Reason::NoRefresh,
+            Reason::Resync,
         ] {
             let zh = reason_text(reason);
             crate::i18n::set_lang(crate::i18n::Lang::En);
@@ -2230,6 +2353,190 @@ mod tests {
         p.ctl.setting_changed();
         let tick = p.ctl.tick(t + Duration::from_secs(6), &p.view, &p.snap);
         assert_eq!((tick.send, tick.notice), (off(), None));
+    }
+
+    const RESYNC: Plan = Plan::Audio(Reason::Resync);
+
+    #[test]
+    fn mpv_catching_up_by_itself_after_a_stall_changes_nothing() {
+        let mut p = Playback::new();
+        assert!(p.play(2_000.0).is_empty());
+        // 介面停 10 秒（開著對話框）：先等 0.5 秒，不讀 avsync、不送任何設定
+        assert_eq!(p.step(10_000.0), Tick::default());
+        assert!(p.ctl.stalled.is_some());
+        assert!(!p.ctl.wants_avsync(p.now()));
+        // 剛停完讀到的 avsync 很大也先等（mpv 會自己略過晚了的影格）
+        p.avsync = Some(2.0);
+        assert!(p.play(400.0).is_empty());
+        assert!(!p.ctl.wants_avsync(p.now()));
+        // 等完時 mpv 已經追上（實測約 15 ms）：照樣依螢幕同步
+        p.avsync = Some(0.0153);
+        assert!(p.play(120.0).is_empty());
+        assert!(p.ctl.stalled.is_none() && p.ctl.resync.is_none());
+        assert!(!p.ctl.wants_avsync(p.now()), "看完就不再讀");
+        assert_eq!(p.ctl.status().plan, Some(DISPLAY));
+        assert!(p.play(5_000.0).is_empty());
+        // 防呆照樣在量，停住的那一段不算
+        assert_eq!(p.ctl.guard.state(), GuardState::default());
+    }
+
+    #[test]
+    fn stall_resyncs_through_audio_sync_when_mpv_lags() {
+        let mut p = Playback::new();
+        p.play(2_000.0);
+        let sets = p.ctl.sets();
+        assert_eq!(p.step(10_000.0), Tick::default());
+        p.avsync = Some(0.6);
+        let mut sent = p.play(500.0);
+        // 等完還差 600 ms：暫時改用一般播放（馬上送，不提示）
+        assert_eq!(sent, off());
+        assert_eq!(p.ctl.status().plan, Some(RESYNC));
+        assert_eq!(
+            p.ctl.status().describe(),
+            format!("未使用：{}", reason_text(Reason::Resync))
+        );
+        assert_eq!(p.ctl.short_for(SmoothMode::Auto).as_deref(), Some("119.88 Hz"));
+        assert!(p.ctl.wants_avsync(p.now()));
+        // mpv 換過去之前 avsync 還是舊的：至少維持 0.3 秒
+        p.avsync = Some(0.001);
+        sent = p.play(250.0);
+        assert!(sent.is_empty());
+        assert_eq!(p.ctl.status().plan, Some(RESYNC));
+        // 追上了：馬上回到依螢幕同步（不用再等 0.5 秒）
+        sent = p.play(60.0);
+        assert_eq!(sent, on(119.88));
+        assert!(p.ctl.status().applied && p.ctl.status().plan == Some(DISPLAY));
+        assert_eq!(p.ctl.sets(), sets + 4);
+        assert!(!p.ctl.wants_avsync(p.now()));
+        p.avsync = None;
+        assert!(p.play(3_000.0).is_empty());
+        // 一般播放的那一段防呆不量，回來之後重新量（每次螢幕更新一輪是正常的）
+        assert_eq!(p.ctl.guard.state(), GuardState::default());
+
+        // 一直追不上：最多 1.5 秒也回來
+        let mut p = Playback::new();
+        p.play(1_000.0);
+        p.step(1_000.0);
+        p.avsync = Some(0.6);
+        assert_eq!(p.play(510.0), off());
+        assert!(p.play(1_400.0).is_empty());
+        assert_eq!(p.play(150.0), on(119.88));
+    }
+
+    #[test]
+    fn stall_resync_leaves_hidden_drag_and_passthrough_alone() {
+        // 只有依螢幕同步、播放中、看得到、mpv 在同步時才看：暫停、mpv 判斷不適用、自動測試的視窗、一般播放都不算
+        type Change = fn(&mut Playback);
+        let cases: [(&str, Change); 4] = [
+            ("暫停", |p| p.snap.playing = false),
+            ("mpv 沒在同步", |p| p.snap.display_sync_active = false),
+            ("自動測試", |p| p.snap.real_window = false),
+            ("一般播放", |p| p.snap.mode = SmoothMode::Off),
+        ];
+        for (name, change) in cases {
+            let mut p = Playback::new();
+            p.play(1_000.0);
+            change(&mut p);
+            p.play(100.0);
+            p.step(5_000.0);
+            p.avsync = Some(0.6);
+            p.play(2_000.0);
+            assert!(p.ctl.stalled.is_none() && p.ctl.resync.is_none(), "{name}");
+            assert_ne!(p.ctl.status().plan, Some(RESYNC), "{name}");
+        }
+        // 縮到最小（Audio(Hidden)）：eframe 不畫、介面很久才跑一輪，不能當成卡住；還原之後照平常等 0.5 秒才回來
+        let mut p = Playback::new();
+        p.play(1_000.0);
+        p.view.visible = false;
+        assert_eq!(p.step(8.0).send, off());
+        p.avsync = Some(0.6);
+        for _ in 0..20 {
+            assert!(p.step(150.0).send.is_empty());
+        }
+        p.view.visible = true;
+        assert!(p.step(150.0).send.is_empty());
+        assert_eq!(p.play(600.0), on(119.88), "還原：等 0.5 秒");
+        assert!(p.ctl.stalled.is_none() && p.ctl.resync.is_none());
+        // 重新同步中縮到最小：交給 Hidden，還原時照平常等 0.5 秒
+        let mut p = Playback::new();
+        p.play(1_000.0);
+        p.step(3_000.0);
+        p.avsync = Some(0.6);
+        assert_eq!(p.play(510.0), off());
+        p.view.visible = false;
+        assert!(p.step(8.0).send.is_empty(), "選項一樣，只是原因不同");
+        assert_eq!(p.ctl.status().plan, Some(Plan::Audio(Reason::Hidden)));
+        assert!(p.ctl.resync.is_none());
+        p.view.visible = true;
+        assert!(p.play(400.0).is_empty(), "等 0.5 秒");
+        assert_eq!(p.play(200.0), on(119.88));
+        // 拖曳視窗（Windows 拖曳時介面停住，停下來時視窗換了位置）：防呆照樣重新量，停住照樣處理
+        let mut p = Playback::new();
+        p.play(1_900.0);
+        p.view.outer_rect = p.view.outer_rect.map(|r| r.translate(egui::vec2(300.0, 0.0)));
+        assert_eq!(p.step(2_000.0), Tick::default());
+        p.avsync = Some(0.2);
+        assert_eq!(p.play(510.0), off());
+        p.avsync = Some(0.0);
+        assert_eq!(p.play(300.0), on(119.88));
+        p.avsync = None;
+        p.play(5_000.0);
+        assert_eq!(p.ctl.guard.state(), GuardState::default());
+        // 音訊直通（display-vdrop）：一樣暫時改用一般播放，回到 vdrop
+        let mut p = Playback::new();
+        p.snap.passthrough = true;
+        assert_eq!(p.play(1_500.0), vec![("video-sync", "display-vdrop".to_owned())]);
+        p.step(3_000.0);
+        p.avsync = Some(0.6);
+        assert_eq!(p.play(510.0), off());
+        p.avsync = Some(0.0);
+        assert_eq!(
+            p.play(300.0),
+            vec![
+                ("display-fps-override", "119.880000".to_owned()),
+                ("video-sync", "display-vdrop".to_owned())
+            ]
+        );
+        // VITASCOPE_PACING=resync：不等 mpv，停完馬上重新同步
+        let mut p = Playback::new();
+        p.ctl.always_resync = true;
+        p.play(1_000.0);
+        assert_eq!(p.step(1_000.0).send, off());
+        p.avsync = Some(0.0);
+        assert_eq!(p.play(310.0), on(119.88));
+    }
+
+    #[test]
+    fn pausing_after_a_stall_ends_the_check() {
+        // 停住之後、等 mpv 的 0.5 秒內暫停（停住時按的空白鍵、播完停在最後一格）：暫停中 avsync 只在換影格時更新，
+        // 讀到的是暫停前的，不能拿來判斷；不看、也不改用一般播放
+        let mut p = Playback::new();
+        p.play(1_000.0);
+        assert_eq!(p.step(5_000.0), Tick::default());
+        assert!(p.ctl.stalled.is_some());
+        p.snap.playing = false;
+        p.avsync = Some(0.6);
+        assert!(p.step(8.0).send.is_empty());
+        assert!(p.ctl.stalled.is_none(), "暫停了就不再等（不會在暫停中讀 avsync）");
+        assert!(p.play(2_000.0).is_empty());
+        assert!(p.ctl.stalled.is_none() && p.ctl.resync.is_none());
+        assert!(!p.ctl.wants_avsync(p.now()));
+        assert_eq!(p.ctl.status().plan, Some(DISPLAY));
+        // 繼續播：照常依螢幕同步，不會補做重新同步
+        p.snap.playing = true;
+        assert!(p.play(2_000.0).is_empty());
+        assert_eq!(p.ctl.status().plan, Some(DISPLAY));
+
+        // 重新同步中暫停：馬上回到依螢幕同步（暫停中介面不會一直跑，不能一直留在一般播放、狀態寫著「介面停頓過」）
+        let mut p = Playback::new();
+        p.play(1_000.0);
+        p.step(3_000.0);
+        p.avsync = Some(0.6);
+        assert_eq!(p.play(510.0), off());
+        p.snap.playing = false;
+        assert_eq!(p.step(8.0).send, on(119.88));
+        assert!(p.ctl.resync.is_none());
+        assert!(p.ctl.status().applied && p.ctl.status().plan == Some(DISPLAY));
     }
 
     #[test]

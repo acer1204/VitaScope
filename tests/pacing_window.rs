@@ -56,6 +56,11 @@ fn run(name: &str, settings: &str, env: &[(&str, &str)]) -> Run {
 
 /// 同上，播 `media`
 fn run_media(name: &str, settings: &str, env: &[(&str, &str)], media: &Path) -> Run {
+    run_full(name, settings, env, media, SHOT_DELAY)
+}
+
+/// 同上，開始播放後 `delay` 秒截圖
+fn run_full(name: &str, settings: &str, env: &[(&str, &str)], media: &Path, delay: f64) -> Run {
     let _screen = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("vitascope-pacing-window").join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -89,7 +94,7 @@ fn run_media(name: &str, settings: &str, env: &[(&str, &str)], media: &Path) -> 
         .arg("--shot")
         .arg(dir.join("shot.png"))
         .arg("--shot-delay")
-        .arg(SHOT_DELAY.to_string())
+        .arg(delay.to_string())
         .env("APPDATA", dir.join("appdata"))
         .env("LOCALAPPDATA", dir.join("localappdata"))
         .env("XDG_CONFIG_HOME", dir.join("xdg"))
@@ -99,6 +104,7 @@ fn run_media(name: &str, settings: &str, env: &[(&str, &str)], media: &Path) -> 
         .env_remove("VITASCOPE_PACING")
         .env_remove("VITASCOPE_TEST_MINIMIZE")
         .env_remove("VITASCOPE_TEST_BUSY_UI")
+        .env_remove("VITASCOPE_TEST_STALL")
         .envs(env.iter().copied())
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(dir.join("stderr.txt")).unwrap());
@@ -247,6 +253,151 @@ fn present_vsyncs(summary: &[(String, String)]) -> Vec<(u32, usize)> {
 }
 
 const AUTO: &str = r#"{ "smooth": "auto" }"#;
+
+/// VITASCOPE_DEBUG=pacing 每秒一筆的 avsync（ms），只取 `after` 那一行之後的
+fn avsync_after(stderr: &str, after: &str) -> Vec<f64> {
+    let Some(start) = stderr.find(after) else {
+        return Vec::new();
+    };
+    stderr[start..]
+        .lines()
+        .filter_map(|l| {
+            l.split_once("[vitascope] avsync：")?
+                .1
+                .trim_end_matches(" ms")
+                .trim()
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+/// 開始播放後第 3 秒介面停 8 秒（VITASCOPE_TEST_STALL，像以前開著檔案對話框），18 秒截圖（影片 20 秒）
+const STALL: &str = "3,8";
+const STALL_SHOT: f64 = 18.0;
+
+/// 介面停住之後的檢查：停住結束後約 2 秒起 avsync 都在 50 ms 內。回傳 mpv 記錄裡停住結束的時間
+fn check_stall_recovery(name: &str, r: &Run) -> f64 {
+    assert!(
+        r.stderr.contains("測試：介面恢復"),
+        "{name}：介面沒有停住（{}）\n{}",
+        r.dir.display(),
+        r.stderr
+    );
+    // 第 0 筆是停住剛結束時讀的（mpv 還沒處理），之後每秒一筆
+    let avsync = avsync_after(&r.stderr, "測試：介面恢復");
+    eprintln!("{name}：停住之後每秒的 avsync（ms）：{avsync:?}");
+    assert!(avsync.len() >= 4, "{name}：avsync 的紀錄太少：{avsync:?}");
+    // 最後一筆可能是截圖、關視窗時讀的，不算
+    let settled = &avsync[2..avsync.len() - 1];
+    assert!(
+        settled.iter().all(|a| a.abs() < 50.0),
+        "{name}：停住 2 秒之後影像跟聲音還差 50 ms 以上：{avsync:?}"
+    );
+    // mpv 的記錄：停住時每 200 ms 說一次等不到畫面，最長的那一串的最後一次 + 0.2 秒約是停住結束的時間
+    //（關視窗時也會說幾次）
+    let (len, end) = longest_stuck(&stuck(&r.log));
+    assert!(len >= 10, "{name}：mpv 沒有記錄到停住");
+    end + 0.2
+}
+
+/// mpv「等不到畫面」最長的一串（相鄰兩次隔不到 0.5 秒）：(次數, 最後一次的時間)
+fn longest_stuck(times: &[f64]) -> (usize, f64) {
+    let (mut best, mut run) = ((0, 0.0), (0, f64::NEG_INFINITY));
+    for &t in times {
+        run = if t - run.1 < 0.5 { (run.0 + 1, t) } else { (1, t) };
+        if run.0 > best.0 {
+            best = run;
+        }
+    }
+    best
+}
+
+#[test]
+#[ignore = "會在螢幕上開全螢幕視窗（約 20 秒，兩次），介面會停 8 秒；在開發機上手動跑"]
+fn display_sync_recovers_after_a_ui_stall() {
+    // 依螢幕同步中介面停住（以前開著檔案對話框、拖曳視窗）：停住時聲音照播、影像停住；恢復之後要馬上追上
+    // （mpv 自己略過晚了的影格，追不上的話影戲暫時改用一般播放），之後回到每格剛好 5 次更新
+    for (name, forced) in [("stall-display", false), ("stall-display-resync", true)] {
+        let mut env = vec![("VITASCOPE_TEST_STALL", STALL)];
+        if forced {
+            // 不等 mpv 自己追，一律走「暫時改用一般播放」那條路（較舊的 mpv 追不上時才會走到）
+            env.push(("VITASCOPE_PACING", "resync"));
+        }
+        let r = run_full(name, r#"{ "smooth": "always" }"#, &env, &sample(), STALL_SHOT);
+        let end = check_stall_recovery(name, &r);
+        assert!(
+            r.stderr.contains("流暢播放：介面停了"),
+            "{name}：沒有發現介面停住\n{}",
+            r.stderr
+        );
+        if forced {
+            assert!(
+                r.stderr.contains("流暢播放：Audio(Resync)") && r.stderr.contains("流暢播放：重新同步花了"),
+                "{name}：沒有暫時改用一般播放\n{}",
+                r.stderr
+            );
+        } else {
+            // 等完之後真的讀了 avsync（讀不到是「-」，會被當成已經追上，重新同步那條路就永遠走不到）
+            let checked = r
+                .stderr
+                .lines()
+                .find_map(|l| l.split_once("流暢播放：介面停頓之後 avsync ")?.1.split_once(" ms，"))
+                .map(|(v, _)| v.trim().to_owned());
+            assert!(
+                checked.as_deref().is_some_and(|v| v.parse::<f64>().is_ok()),
+                "{name}：停住之後沒有讀 avsync 檢查有沒有追上（{checked:?}）\n{}",
+                r.stderr
+            );
+        }
+        // 防呆不能把停住當成「跟不上」「沒等垂直同步」
+        assert!(
+            !r.stderr.contains("NoVsync") && !r.stderr.contains("TooSlow"),
+            "{name}：{}",
+            r.stderr
+        );
+        // 回到依螢幕同步：停住結束 2 秒之後到截圖前 1 秒，mpv 用的是螢幕的更新率、每格 5 次更新
+        //（截圖要在介面上存 4K 的 PNG，除錯版會停住一下，之後的不算）
+        let samples = vsyncs(&r.log);
+        let to = samples.first().expect("沒有每格的同步記錄").0 + STALL_SHOT - 1.0;
+        let fps: Vec<(f64, f64)> = log_lines(&r.log)
+            .filter(|(t, l)| *t <= to && l.contains("FPS for display sync"))
+            .filter_map(|(t, l)| Some((t, l.split("Assuming ").nth(1)?.split_whitespace().next()?.parse().ok()?)))
+            .collect();
+        eprintln!("{name}：mpv 用過的更新率 {fps:?}");
+        let last = fps.last().expect("沒有依螢幕同步").1;
+        assert!(
+            (last - 120.0).abs() < 0.01 || (last - 119.88).abs() < 0.01,
+            "{name}：最後用的更新率 {last}"
+        );
+        if forced {
+            // 改用一般播放（0）再回來（螢幕的更新率）
+            assert!(fps.len() >= 3, "{name}：{fps:?}");
+        }
+        let (total, fives, hist) = cadence(&samples, end + 2.0, to);
+        eprintln!("{name}：停住結束 2 秒後每格更新次數：{fives}/{total} 格是 5 次，分布 {hist:?}");
+        assert!(total >= 50 && fives as f64 >= 0.995 * total as f64, "{name}：{hist:?}");
+    }
+}
+
+#[test]
+#[ignore = "會在螢幕上開全螢幕視窗（約 20 秒），介面會停 8 秒；在開發機上手動跑"]
+fn audio_mode_stays_in_sync_after_a_ui_stall() {
+    // 一般播放（流暢播放關閉）：mpv 本來就會丟掉晚了的影格，停住之後也馬上追上；影戲不動同步設定
+    let r = run_full(
+        "stall-audio",
+        "{}",
+        &[("VITASCOPE_TEST_STALL", STALL)],
+        &sample(),
+        STALL_SHOT,
+    );
+    check_stall_recovery("stall-audio", &r);
+    assert_eq!(assumed_fps(&r.log), None, "不能依螢幕同步");
+    assert!(!sets_sync_options(&r.log), "不能動 mpv 的同步設定");
+    assert!(!r.stderr.contains("流暢播放：介面停了"), "{}", r.stderr);
+    let pos = shot_position(&r.stderr).expect("沒有截圖時的播放位置");
+    assert!((pos - STALL_SHOT).abs() < 0.5, "播放位置 {pos} 跟經過的時間差太多");
+}
 
 #[test]
 #[ignore = "會在螢幕上開全螢幕視窗（約 15 秒）；在開發機上手動跑"]
@@ -694,4 +845,13 @@ fn log_parsing() {
     assert_eq!(stat(&s, "late_p50_ms"), -1.2);
     assert_eq!(present_vsyncs(&s), vec![(4, 1), (5, 230), (6, 2)]);
     assert_eq!(render_summary("沒有統計\n"), None);
+    let stderr = "[vitascope] avsync：-1.50 ms\n\
+                  [vitascope] 測試：介面恢復\n\
+                  [vitascope] avsync：690.29 ms\n\
+                  [vitascope] 流暢播放：介面停了 8.00 秒\n\
+                  [vitascope] avsync：8.19 ms\n";
+    assert_eq!(avsync_after(stderr, "測試：介面恢復"), vec![690.29, 8.19]);
+    assert!(avsync_after(stderr, "沒有這行").is_empty());
+    assert_eq!(longest_stuck(&[1.0, 4.0, 4.2, 4.4, 4.6, 9.0, 9.2]), (4, 4.6));
+    assert_eq!(longest_stuck(&[]), (0, 0.0));
 }

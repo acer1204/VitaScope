@@ -305,10 +305,11 @@ cargo test --test picture_shot -- --ignored --nocapture --test-threads=1
 
 | 環境變數 | 作用 |
 |---|---|
-| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v`。`VITASCOPE_DEBUG=pacing` 另外印出流暢播放的決定（螢幕更新率、電源、套用的設定），並每 10 秒印一次畫面輸出的統計（render 花的時間、等影格的時間、每格重繪幾次、交出影格比預定時間早或晚多少、顯示卡什麼時候畫完影格） |
+| `VITASCOPE_DEBUG=1` | 印出 mpv 的警告與錯誤、影片畫面的像素取樣；也可以直接指定 mpv 的記錄等級，例如 `VITASCOPE_DEBUG=v`。`VITASCOPE_DEBUG=pacing` 另外印出流暢播放的決定（螢幕更新率、電源、套用的設定），並每 10 秒印一次畫面輸出的統計（render 花的時間、等影格的時間、每格重繪幾次、交出影格比預定時間早或晚多少、顯示卡什麼時候畫完影格）、每秒印一次影像與聲音差多少（avsync） |
 | `VITASCOPE_MPV_OPTS="名稱=值 名稱=值"` | 額外指定 mpv 選項（以空白分隔），例如 `VITASCOPE_MPV_OPTS="gpu-dumb-mode=yes"`；指定了 `video-sync` 或 `display-fps-override` 時流暢播放不會去改它們 |
 | `VITASCOPE_PACING=off` | 流暢播放完全不動作（跟沒有這個功能時一樣） |
 | `VITASCOPE_PACING=block` | 畫面輸出照以前的做法：每格在介面的執行緒上等到影格的預定時間（可以跟 `off` 一起用，以逗號隔開） |
+| `VITASCOPE_PACING=resync` | 流暢播放中介面停頓過之後，不等 mpv 自己追上，一律暫時改用一般播放追上聲音（實機測試這條路用） |
 
 流暢播放的實機量測（全螢幕播 1080p、4K 10-bit 平移影片，從 mpv 的記錄算每格顯示幾次螢幕更新；每次會在螢幕上開視窗約 15 秒，
 一般播放的比較（介面閒著、一直重畫、一直重畫又播 4K，以前與現在的畫面輸出各三次）共 18 次）：

@@ -69,13 +69,17 @@ fn parse_args() -> (Launch, bool) {
         }
     }
     // 流暢播放的實機測試：VITASCOPE_TEST_MINIMIZE=3,6 截圖前縮到最小再還原；
-    // VITASCOPE_TEST_BUSY_UI=1 介面一直重畫（模擬滑鼠在視窗上移動）。只跟 --shot 一起用
+    // VITASCOPE_TEST_BUSY_UI=1 介面一直重畫（模擬滑鼠在視窗上移動）；VITASCOPE_TEST_STALL=3,10 第 3 秒讓介面停 10 秒
+    //（像開著檔案對話框）。只跟 --shot 一起用
     let minimize = std::env::var("VITASCOPE_TEST_MINIMIZE").unwrap_or_default();
     let busy_ui = std::env::var_os("VITASCOPE_TEST_BUSY_UI").is_some_and(|v| v == "1");
     launch.autoshot = shot.map(|p| {
         AutoShot::new(p, Duration::from_secs_f64(delay))
             .minimize_at(vitascope::autoshot::parse_minimize(&minimize))
             .busy_ui(busy_ui)
+            .stall_at(vitascope::autoshot::parse_stall(
+                &std::env::var("VITASCOPE_TEST_STALL").unwrap_or_default(),
+            ))
     });
     // 流暢播放出問題時回到以前的做法：VITASCOPE_PACING=off（只在啟動時讀一次）
     launch.pacing = vitascope::pacing::Overrides::from_env();

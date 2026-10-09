@@ -2,6 +2,7 @@
 
 mod capture;
 mod control_panel;
+mod dialogs;
 mod info_panel;
 mod pacing;
 mod playlist_panel;
@@ -40,6 +41,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub use dialogs::{DialogKind, DialogRequest, Pick};
 pub use pacing::{PacingStatus, PlatformProbe};
 
 pub const APP_NAME: &str = "影戲 VitaScope";
@@ -287,6 +289,10 @@ pub struct VitascopeApp {
     pointer_over_playlist: bool,
     /// 「加入資料夾」背景掃描的結果
     folder_add: Option<Receiver<Vec<PathBuf>>>,
+    /// 開著的檔案對話框（同時只開一個，見 `dialogs.rs`）
+    dialog: Option<dialogs::PendingDialog>,
+    /// 介面測試：對話框不真的打開，要求送到這裡
+    dialog_stub: Option<dialogs::DialogStub>,
     /// 手動整理的清單要不要存起來（自動測試、`--shot` 不存）
     persist_playlist: bool,
     /// 存下的清單是這次還原的、或這次手動整理過：才可以覆蓋 / 刪掉（雙擊一個影片開起來的不能刪掉上次存的清單）
@@ -570,6 +576,8 @@ impl VitascopeApp {
             playlist_grew: None,
             pointer_over_playlist: false,
             folder_add: None,
+            dialog: None,
+            dialog_stub: None,
             persist_playlist: launch.persist_playlist,
             owns_session: launch.playlist.is_some(),
             instance: launch.instance,
@@ -1020,9 +1028,7 @@ impl VitascopeApp {
         if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
             dialog = dialog.set_directory(dir);
         }
-        if let Some(path) = dialog.pick_file() {
-            self.open(&path);
-        }
+        self.show_dialog(DialogKind::Open, Pick::File, dialog);
     }
 
     fn osd(&mut self, text: impl Into<String>) {
@@ -1329,6 +1335,11 @@ impl VitascopeApp {
 
     /// 選單「載入字幕檔…」「載入音軌檔…」：從目前影片的資料夾開始找
     fn load_file_dialog(&mut self, subtitle: bool) {
+        let kind = if subtitle {
+            DialogKind::LoadSubtitle
+        } else {
+            DialogKind::LoadAudio
+        };
         let (title, filter, exts) = if subtitle {
             (
                 crate::tr!("載入字幕檔", "Load subtitle file"),
@@ -1350,8 +1361,7 @@ impl VitascopeApp {
         if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
             dialog = dialog.set_directory(dir);
         }
-        let Some(path) = dialog.pick_file() else { return };
-        self.load_extra_file(&path, subtitle);
+        self.show_dialog(kind, Pick::File, dialog);
     }
 
     /// 載入字幕檔、音軌檔（`subtitle` = 字幕）並切換過去。音軌跟選單換音軌一樣：會直通的話先清空濾鏡鏈
@@ -3550,6 +3560,7 @@ impl eframe::App for VitascopeApp {
         self.poll_screenshots(ctx);
         self.poll_previews(ctx);
         self.poll_folder_add();
+        self.poll_dialog();
         self.poll_instance(ctx);
         // macOS：已經開著時從 Finder 開的檔案
         #[cfg(target_os = "macos")]

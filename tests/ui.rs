@@ -8,7 +8,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use vitascope::app::{Launch, PlatformProbe, VitascopeApp};
+use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
 use vitascope::pacing::{Plan, Reason, SmoothMode};
 use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
 use vitascope::power::PowerSource;
@@ -6606,4 +6606,355 @@ fn dropping_a_file_after_the_end_plays_it() {
     step_until(&mut h, "新檔開始播放", |s| playing(s, "mkv_multitrack.mkv"));
     wait_real(&mut h, 0.5);
     assert!(!h.state().player().state.paused, "新檔不應該是暫停的");
+}
+
+// ───────────── 檔案對話框 ─────────────
+
+#[test]
+fn file_dialog_results_do_what_the_dialogs_did() {
+    // 對話框改在背景開之後，選好的結果另外處理（`on_dialog_result`）：每一種的效果跟以前選完之後一樣
+    let dir = TempDir::new("dialog-results");
+    let sub = |name: &str| {
+        let d = dir.0.join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    };
+    let (play, add, folder) = (sub("play"), sub("add"), sub("folder"));
+    let movie = play.join("m.mkv");
+    std::fs::copy(sample("common/mkv_multitrack.mkv"), &movie).unwrap();
+    for (d, name) in [(&add, "c.mp4"), (&add, "b.mp4"), (&folder, "y.mp4"), (&folder, "x.mp4")] {
+        std::fs::copy(sample("common/mp4_h264_aac.mp4"), d.join(name)).unwrap();
+    }
+    let settings_path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(settings_path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    h.step();
+    let names = |app: &VitascopeApp| -> Vec<String> {
+        app.playlist().map_or(Vec::new(), |l| {
+            l.items()
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        })
+    };
+
+    // 開啟影片
+    h.state_mut().on_dialog_result(DialogKind::Open, vec![movie.clone()]);
+    settle(&mut h, "m.mkv");
+    step_until_app(&mut h, "同資料夾的清單", |app| playlist_len(app) == 1);
+
+    // 載入字幕檔、音軌檔：加進目前的影片並選上
+    let subs = h.state().player().state.tracks_of(TrackKind::Sub).count();
+    h.state_mut()
+        .on_dialog_result(DialogKind::LoadSubtitle, vec![sample("common/extsub_srt_utf8.srt")]);
+    assert_eq!(h.state().osd_text(), Some("載入字幕：extsub_srt_utf8.srt"));
+    step_until(&mut h, "多一條外掛字幕並選上", |s| {
+        s.tracks_of(TrackKind::Sub).count() == subs + 1 && s.selected(TrackKind::Sub).is_some_and(|t| t.external)
+    });
+    h.state_mut()
+        .on_dialog_result(DialogKind::LoadAudio, vec![sample("common/mkv_extaudio.mka")]);
+    assert_eq!(h.state().osd_text(), Some("載入音軌：mkv_extaudio.mka"));
+    step_until(&mut h, "換成外掛的音軌", |s| {
+        s.selected(TrackKind::Audio).is_some_and(|t| t.external)
+    });
+
+    // 播放清單：加入檔案（依檔名排序）、加入資料夾（在背景掃）
+    h.state_mut()
+        .on_dialog_result(DialogKind::PlaylistAddFiles, vec![add.join("c.mp4"), add.join("b.mp4")]);
+    assert_eq!(h.state().osd_text(), Some("加入播放清單：2 個檔案"));
+    assert_eq!(names(h.state()), ["m.mkv", "b.mp4", "c.mp4"]);
+    h.state_mut()
+        .on_dialog_result(DialogKind::PlaylistAddFolder, vec![folder.clone()]);
+    step_until_app(&mut h, "加入資料夾", |app| playlist_len(app) == 5);
+    assert_eq!(names(h.state()), ["m.mkv", "b.mp4", "c.mp4", "x.mp4", "y.mp4"]);
+    assert!(playing(&h.state().player().state, "m.mkv"), "加進清單不換檔");
+
+    // 儲存清單：沒有副檔名的補上 .m3u8
+    h.state_mut()
+        .on_dialog_result(DialogKind::PlaylistSave, vec![dir.0.join("清單")]);
+    assert_eq!(h.state().osd_text(), Some("已儲存播放清單：清單.m3u8"));
+    let saved = std::fs::read_to_string(dir.0.join("清單.m3u8")).unwrap();
+    for name in ["m.mkv", "b.mp4", "c.mp4", "x.mp4", "y.mp4"] {
+        assert!(saved.contains(name), "{name}：{saved}");
+    }
+
+    // 開啟清單：換成檔案裡的清單，從第一個開始播
+    let m3u = dir.0.join("另一個.m3u8");
+    std::fs::write(&m3u, "#EXTM3U\nadd/c.mp4\nadd/b.mp4\n").unwrap();
+    h.state_mut().on_dialog_result(DialogKind::PlaylistOpen, vec![m3u]);
+    step_until(&mut h, "播清單的第一個", |s| playing(s, "c.mp4"));
+    assert_eq!(names(h.state()), ["c.mp4", "b.mp4"]);
+
+    // 截圖資料夾：改設定並存檔
+    let shots = dir.0.join("截圖");
+    h.state_mut()
+        .on_dialog_result(DialogKind::ScreenshotDir, vec![shots.clone()]);
+    assert_eq!(h.state().settings().screenshot_dir.as_deref(), Some(shots.as_path()));
+    assert_eq!(
+        h.state().osd_text().map(str::to_owned),
+        Some(format!("截圖資料夾：{}", shots.display()))
+    );
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(saved["screenshot_dir"], shots.to_string_lossy().as_ref());
+
+    // 像素著色器的組合：加入選好的檔案（不能用的不加）
+    let (invert, _, hlsl) = write_shaders(&dir);
+    let id = h.state_mut().add_shader_preset();
+    h.state_mut()
+        .on_dialog_result(DialogKind::ShaderFiles(id), vec![invert.clone(), hlsl]);
+    assert_eq!(
+        h.state().settings().video.shaders.presets[0].files,
+        vec![path_str(&invert)]
+    );
+    assert_eq!(
+        h.state().osd_text(),
+        Some("無法加入 bad.hlsl：這不是 mpv 格式的 GLSL 著色器（需要 //!HOOK）")
+    );
+}
+
+type DialogLog = std::sync::Arc<std::sync::Mutex<Vec<(DialogKind, Pick)>>>;
+
+/// each_button_opens_its_file_dialog：「另存新檔」對話框開著多久（測試的替身在這段時間內不回覆）
+const SAVE_AS_CHOOSING: Duration = Duration::from_millis(1000);
+
+/// 對話框不真的打開：記下開了哪一種、怎麼選，`answer` 決定選了什麼（None = 取消）。
+/// 跟真的對話框一樣在開對話框的執行緒上回覆（Windows、Linux 是背景執行緒；macOS 是介面的執行緒，開著時暫停）
+fn record_dialogs(
+    h: &mut Harness<'_, VitascopeApp>,
+    answer: impl Fn(DialogKind) -> Option<Vec<PathBuf>> + Send + Sync + 'static,
+) -> DialogLog {
+    let seen = DialogLog::default();
+    let log = seen.clone();
+    h.state_mut().stub_dialogs_with(move |kind, pick| {
+        log.lock().unwrap().push((kind, pick));
+        answer(kind)
+    });
+    seen
+}
+
+/// 等對話框關掉、選好的結果處理完，回傳這段時間開過的對話框
+fn dialogs_done(h: &mut Harness<'_, VitascopeApp>, seen: &DialogLog) -> Vec<(DialogKind, Pick)> {
+    step_until_app(h, "對話框關掉", |app| app.dialog_pending().is_none());
+    h.run_steps(2);
+    std::mem::take(&mut *seen.lock().unwrap())
+}
+
+#[test]
+fn each_button_opens_its_file_dialog() {
+    // 每個按鈕開哪一種對話框、怎麼選（單選、多選、資料夾、存檔），選好之後照真的路處理（不是直接呼叫 on_dialog_result）
+    let (dir, _path, mut h) = video_settings_harness("dialog-buttons", "common/mkv_multitrack.mkv");
+    let (invert, keep, _) = write_shaders(&dir);
+    let shot = dir.0.join("另存");
+    let answers = (invert.clone(), keep.clone(), shot.clone());
+    let seen = record_dialogs(&mut h, move |kind| match kind {
+        DialogKind::ShaderFiles(_) => Some(vec![answers.0.clone(), answers.1.clone()]),
+        DialogKind::ScreenshotSaveAs => {
+            // 使用者花一點時間選：開著時暫停，影片不能往前（存的是選「另存新檔」時的畫面）
+            std::thread::sleep(SAVE_AS_CHOOSING);
+            Some(vec![answers.2.clone()])
+        }
+        _ => None,
+    });
+    // 使用者回報的路：設定 → 畫質 → 像素著色器 → 新增組合 → 加入檔案…
+    open_settings_page(&mut h, "畫質");
+    click_in_view(&mut h, "新增組合");
+    let id = h.state().settings().video.shaders.presets[0].id;
+    click_in_view(&mut h, "加入檔案…");
+    assert_eq!(
+        dialogs_done(&mut h, &seen),
+        [(DialogKind::ShaderFiles(id), Pick::Files)]
+    );
+    assert_eq!(
+        h.state().settings().video.shaders.presets[0].files,
+        vec![path_str(&invert), path_str(&keep)]
+    );
+    assert!(!h.state().player().state.paused, "選完照樣在播");
+    // 設定 → 截圖 → 變更…
+    h.get_by_label("截圖").click();
+    h.run_steps(2);
+    click_in_view(&mut h, "變更…");
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::ScreenshotDir, Pick::Folder)]);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 控制列的「字幕」「音軌」選單
+    for (menu, item, kind) in [
+        ("字幕", "載入字幕檔…", DialogKind::LoadSubtitle),
+        ("音軌", "載入音軌檔…", DialogKind::LoadAudio),
+    ] {
+        h.get_by_label(menu).click();
+        h.run_steps(2);
+        h.get_by_label(item).click();
+        h.run_steps(2);
+        assert_eq!(dialogs_done(&mut h, &seen), [(kind, Pick::File)], "{item}");
+    }
+    // 播放清單面板的「…」選單
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    for (item, kind, pick) in [
+        ("加入檔案…", DialogKind::PlaylistAddFiles, Pick::Files),
+        ("加入資料夾…", DialogKind::PlaylistAddFolder, Pick::Folder),
+        ("開啟播放清單檔…", DialogKind::PlaylistOpen, Pick::File),
+        ("儲存播放清單檔…", DialogKind::PlaylistSave, Pick::Save),
+    ] {
+        h.get_by_label("…").click();
+        h.run_steps(2);
+        h.get_by_label(item).click();
+        h.run_steps(2);
+        assert_eq!(dialogs_done(&mut h, &seen), [(kind, pick)], "{item}");
+    }
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    // 開檔
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::Open, Pick::File)]);
+    // 右鍵「擷取畫面 ▸ 另存新檔…」：在介面的執行緒上開（開著時暫停），補上 .png，存好之後繼續播
+    // 這個子選單在選單的下方（kittest 的視窗小）：捲到看得到、移過去再點開
+    hover_context_item(&mut h, "擷取畫面 ⏵");
+    h.get_by_label("擷取畫面 ⏵").click();
+    h.run_steps(2);
+    let before = h.state().player().get_f64("time-pos").unwrap();
+    h.get_by_label("另存新檔…").click();
+    h.run_steps(2);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "對話框已經開過、關了（在介面的執行緒上）"
+    );
+    let moved = h.state().player().get_f64("time-pos").unwrap() - before;
+    assert!(
+        moved < SAVE_AS_CHOOSING.as_secs_f64() / 2.0,
+        "對話框開著時沒有暫停：影片往前了 {moved:.2} 秒"
+    );
+    assert_eq!(
+        dialogs_done(&mut h, &seen),
+        [(DialogKind::ScreenshotSaveAs, Pick::Save)]
+    );
+    wait_for_png(&mut h, &dir.0, 1);
+    assert_eq!(pngs_in(&dir.0), [shot.with_extension("png")]);
+    assert!(!h.state().player().state.paused, "存好之後繼續播");
+}
+
+/// 等開對話框的執行緒送來要求（背景執行緒，不一定已經跑到）
+#[cfg(not(target_os = "macos"))]
+fn next_dialog(requests: &std::sync::mpsc::Receiver<vitascope::app::DialogRequest>) -> vitascope::app::DialogRequest {
+    requests.recv_timeout(Duration::from_secs(5)).expect("沒有開對話框")
+}
+
+/// 對話框在背景執行緒開：介面照樣跑（macOS 一定要在介面的執行緒上開，開著時暫停，見 each_button_opens_its_file_dialog）
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn one_file_dialog_at_a_time_while_playback_continues() {
+    let mut h = playing_multitrack();
+    // 對話框不真的打開：開對話框的執行緒把要求送到這裡、等測試回覆（在介面的執行緒上開的話，介面會卡住、測試失敗）
+    let requests = h.state_mut().stub_dialogs();
+    let open = |h: &mut Harness<'_, VitascopeApp>| {
+        h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+        h.run_steps(2);
+    };
+    open(&mut h);
+    let req = next_dialog(&requests);
+    assert_eq!((req.kind, req.pick), (DialogKind::Open, Pick::File));
+    assert_eq!(h.state().dialog_pending(), Some(DialogKind::Open));
+    // 開著時照樣在播（以前介面整個停住，只剩聲音）
+    let t0 = h.state().player().state.time_pos;
+    wait_real(&mut h, 0.6);
+    let st = &h.state().player().state;
+    assert!(!st.paused && st.time_pos > t0 + 0.3, "{t0} → {}", st.time_pos);
+    // 同時只開一個：再按一次不開第二個，提示已經開著（Linux 的對話框可能躲在主視窗後面）
+    open(&mut h);
+    assert!(
+        requests.recv_timeout(Duration::from_millis(300)).is_err(),
+        "已經開著，不能再開"
+    );
+    assert_eq!(h.state().osd_text(), Some("檔案對話框已經開著"));
+    assert_eq!(h.state().dialog_pending(), Some(DialogKind::Open));
+    // 選好了：開對話框的執行緒叫醒介面（暫停中介面不會自己重畫），開那個檔案，之後又可以開
+    req.reply.send(Some(vec![sample("common/mp4_h264_aac.mp4")])).unwrap();
+    let start = Instant::now();
+    loop {
+        h.step();
+        let causes = h.ctx.repaint_causes();
+        if causes.iter().any(|c| c.file.ends_with("dialogs.rs")) {
+            break;
+        }
+        assert!(start.elapsed() < TIMEOUT, "選好之後沒有叫醒介面：{causes:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    step_until(&mut h, "開啟選好的檔案", |s| playing(s, "mp4_h264_aac.mp4"));
+    assert_eq!(h.state().dialog_pending(), None);
+    // 取消：什麼都不做
+    open(&mut h);
+    next_dialog(&requests).reply.send(None).unwrap();
+    step_until_app(&mut h, "取消", |app| app.dialog_pending().is_none());
+    assert!(playing(&h.state().player().state, "mp4_h264_aac.mp4"));
+    // 開對話框的執行緒出錯結束（channel 斷了）：當成關了
+    open(&mut h);
+    drop(next_dialog(&requests));
+    step_until_app(&mut h, "執行緒結束", |app| app.dialog_pending().is_none());
+    open(&mut h);
+    let req = next_dialog(&requests);
+    assert_eq!(req.kind, DialogKind::Open);
+    req.reply.send(None).unwrap();
+    step_until_app(&mut h, "取消", |app| app.dialog_pending().is_none());
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn subtitle_chosen_for_a_replaced_file_is_not_loaded() {
+    // 對話框開著時影片照樣播：可能播完換到清單的下一個，或自己換了檔案。給原來那個影片選的字幕不能加到新的影片上
+    let mut h = playing_multitrack();
+    let requests = h.state_mut().stub_dialogs();
+    let load_subtitle = |h: &mut Harness<'_, VitascopeApp>| {
+        h.get_by_label("字幕").click();
+        h.run_steps(2);
+        h.get_by_label("載入字幕檔…").click();
+        h.run_steps(2);
+    };
+    let srt = sample("common/extsub_srt_utf8.srt");
+    load_subtitle(&mut h);
+    let req = next_dialog(&requests);
+    assert_eq!((req.kind, req.pick), (DialogKind::LoadSubtitle, Pick::File));
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    req.reply.send(Some(vec![srt.clone()])).unwrap();
+    step_until_app(&mut h, "對話框關掉", |app| app.dialog_pending().is_none());
+    assert_eq!(h.state().osd_text(), Some("影片已經換了，沒有載入 extsub_srt_utf8.srt"));
+    wait_real(&mut h, 0.3);
+    assert_eq!(h.state().player().state.tracks_of(TrackKind::Sub).count(), 0);
+    // 同一個影片：照樣載入並選上
+    load_subtitle(&mut h);
+    next_dialog(&requests).reply.send(Some(vec![srt])).unwrap();
+    step_until(&mut h, "載入外掛字幕並選上", |s| {
+        s.selected(TrackKind::Sub).is_some_and(|t| t.external)
+    });
+    assert_eq!(h.state().osd_text(), Some("載入字幕：extsub_srt_utf8.srt"));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn save_as_screenshot_waits_for_the_open_dialog() {
+    // 「另存截圖」在介面的執行緒上開：已經開著別的對話框（Linux 的對話框擋不住主視窗）時不開，也不暫停
+    let mut h = playing_multitrack();
+    let requests = h.state_mut().stub_dialogs();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    let req = next_dialog(&requests);
+    // 這個子選單在選單的下方（kittest 的視窗小）：捲到看得到、移過去再點開
+    hover_context_item(&mut h, "擷取畫面 ⏵");
+    h.get_by_label("擷取畫面 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label("另存新檔…").click();
+    h.run_steps(2);
+    // 沒有這個檢查的話會在介面的執行緒上再開一個（測試的替身等不到回覆，20 秒後才放開）
+    assert!(
+        requests.recv_timeout(Duration::from_millis(300)).is_err(),
+        "不能再開另存截圖"
+    );
+    assert_eq!(h.state().osd_text(), Some("檔案對話框已經開著"));
+    assert!(!h.state().player().state.paused);
+    assert_eq!(h.state().dialog_pending(), Some(DialogKind::Open));
+    req.reply.send(None).unwrap();
+    step_until_app(&mut h, "取消", |app| app.dialog_pending().is_none());
 }

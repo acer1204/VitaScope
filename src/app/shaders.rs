@@ -4,7 +4,7 @@
 
 use super::control_panel::adjust_locked_hover;
 use super::quality::dumb_hover;
-use super::{Action, VitascopeApp, mpv_opts_override};
+use super::{Action, DialogKind, Pick, VitascopeApp, mpv_opts_override};
 use crate::picture::shader::{self, ShaderApply, ShaderInfo, ShaderProblem, Verdict};
 use crate::picture::{ShaderPreset, new_preset_id};
 use crate::player::AsyncKey;
@@ -262,9 +262,7 @@ impl VitascopeApp {
         if let Some(dir) = last_dir {
             dialog = dialog.set_directory(dir);
         }
-        if let Some(paths) = dialog.pick_files() {
-            self.add_shader_files(preset, &paths);
-        }
+        self.show_dialog(DialogKind::ShaderFiles(preset), Pick::Files, dialog);
     }
 
     fn apply_shader_edit(&mut self, edit: Edit) {

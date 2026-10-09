@@ -60,6 +60,9 @@ pub enum Reason {
     Hidden,
     /// 查不到螢幕的更新率
     NoRefresh,
+    /// 介面卡住過（對話框、拖曳視窗、系統卡頓）：暫時改用一般播放，讓 mpv 丟掉晚了的影格追上聲音，
+    /// 追上之後馬上回到依螢幕同步（見 [`StallWatch`]、[`resync_done`]）
+    Resync,
 }
 
 /// 要怎麼設定 mpv
@@ -341,6 +344,76 @@ impl Guard {
     }
 }
 
+// ───────────── 介面卡住之後重新同步 ─────────────
+
+/// 依螢幕同步、播放中，介面兩輪之間隔了這麼久就算卡住過。
+/// 依螢幕同步時介面每次螢幕更新（120 Hz 是 8 ms，最慢 24 Hz 也只有 42 ms）就跑一輪。
+/// 實測（120 Hz、24p）停 0.1、0.2 秒時 mpv 排好的影格還夠，影像跟聲音完全沒差；停 0.3 秒就差到約 190 ms。
+/// 防呆不量的 0.1 秒（`MAX_DT`）以上的停頓還很常見（拖曳視窗、顯示卡驅動重設），不必每次都看
+pub const STALL: Duration = Duration::from_millis(300);
+/// 卡住之後先等這麼久再看 avsync：mpv 依螢幕同步時差 20 ms 以上就會略過影格追上，
+/// 實測（這版 mpv、120 Hz）停 0.3～10 秒之後，1080p 約 0.15 秒、4K 軟體解碼 1 秒內就追上，剩下 15 ms 左右再慢慢修正
+pub const STALL_GRACE: Duration = Duration::from_millis(500);
+/// 等完之後 avsync（秒）還超過這個：mpv 沒有自己追上，改用一般播放追（字幕跟著影像，差 50 ms 以上看得出來）
+pub const STALL_LIMIT: f64 = 0.050;
+/// 重新同步最少維持這麼久：剛送出 `video-sync=audio` 時 mpv 還沒換過去，avsync 還是舊的
+pub const RESYNC_MIN: Duration = Duration::from_millis(300);
+/// 重新同步最多維持這麼久（追不上也回到依螢幕同步，剩下的交給 mpv 自己修正）
+pub const RESYNC_MAX: Duration = Duration::from_millis(1500);
+/// 重新同步時 avsync 小於這個（秒）就算追上了：mpv 依螢幕同步時差 20 ms 以上才會略過、重複影格
+pub const RESYNC_OK: f64 = 0.020;
+
+/// 看介面有沒有卡住：記下上一輪（依螢幕同步、播放中、看得到時）的時間
+#[derive(Debug, Default)]
+pub struct StallWatch {
+    last: Option<Instant>,
+}
+
+impl StallWatch {
+    /// 每一輪呼叫；`watching`：依螢幕同步已經套用、mpv 在同步、播放中、看得到（跟防呆量的條件一樣）。
+    /// 這一輪跟上一輪都在看、中間隔了 [`STALL`] 以上：回傳隔了多久。
+    /// 不在看的時候（暫停、縮到最小、一般播放）不算：那時介面本來就不會每次更新都跑
+    pub fn tick(&mut self, now: Instant, watching: bool) -> Option<Duration> {
+        if !watching {
+            self.last = None;
+            return None;
+        }
+        let gap = now.saturating_duration_since(self.last.replace(now)?);
+        (gap >= STALL).then_some(gap)
+    }
+}
+
+/// 卡住之後的下一步（見 [`after_stall`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterStall {
+    /// 還在等 mpv 自己追
+    Wait,
+    /// mpv 自己追上了（或沒有聲音，沒有要對齊的）
+    Recovered,
+    /// 還沒追上：暫時改用一般播放（`Reason::Resync`）
+    Resync,
+}
+
+/// 卡住 `elapsed` 之後怎麼辦：等 [`STALL_GRACE`]，那時 avsync（秒，讀不到是 None）還超過 [`STALL_LIMIT`]
+/// 就重新同步。`always`（`VITASCOPE_PACING=resync`）：不等 mpv，一律重新同步
+pub fn after_stall(elapsed: Duration, avsync: Option<f64>, always: bool) -> AfterStall {
+    if always {
+        AfterStall::Resync
+    } else if elapsed < STALL_GRACE {
+        AfterStall::Wait
+    } else if avsync.is_none_or(|a| a.abs() < STALL_LIMIT) {
+        AfterStall::Recovered
+    } else {
+        AfterStall::Resync
+    }
+}
+
+/// 重新同步開始 `elapsed` 之後可以回到依螢幕同步了嗎：維持了 [`RESYNC_MIN`] 而且 avsync（秒，讀不到是 None）
+/// 小於 [`RESYNC_OK`]，或已經 [`RESYNC_MAX`]
+pub fn resync_done(elapsed: Duration, avsync: Option<f64>) -> bool {
+    elapsed >= RESYNC_MAX || (elapsed >= RESYNC_MIN && avsync.is_some_and(|a| a.abs() < RESYNC_OK))
+}
+
 fn median(values: &VecDeque<f64>) -> f64 {
     let mut v: Vec<f64> = values.iter().copied().collect();
     v.sort_by(f64::total_cmp);
@@ -356,7 +429,7 @@ fn median(values: &VecDeque<f64>) -> f64 {
 
 // ───────────── 環境變數 VITASCOPE_PACING ─────────────
 
-/// `VITASCOPE_PACING=off|block|no-drain`（可以用逗號隔開好幾個）：出問題時回到以前的做法
+/// `VITASCOPE_PACING=off|block|no-drain|resync`（可以用逗號隔開好幾個）：出問題時回到以前的做法
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Overrides {
     /// 不用流暢播放，也不動 mpv 的同步設定
@@ -365,6 +438,8 @@ pub struct Overrides {
     pub block: bool,
     /// 視窗縮到最小時不排空影格
     pub no_drain: bool,
+    /// 依螢幕同步時介面卡住過，不等 mpv 自己追上，一律暫時改用一般播放（實機測試這條路用）
+    pub resync: bool,
 }
 
 impl Overrides {
@@ -381,6 +456,7 @@ pub fn parse_overrides(env: Option<&str>) -> Overrides {
             "off" => o.off = true,
             "block" => o.block = true,
             "no-drain" => o.no_drain = true,
+            "resync" => o.resync = true,
             _ => {}
         }
     }
@@ -1361,6 +1437,68 @@ mod tests {
     }
 
     #[test]
+    fn stall_watch_needs_two_watched_passes() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        let mut w = StallWatch::default();
+        // 第一輪只記時間；之後每次螢幕更新一輪，不算卡住
+        assert_eq!(w.tick(ms(0), true), None);
+        for n in (8..1_000).step_by(8) {
+            assert_eq!(w.tick(ms(n), true), None, "{n}");
+        }
+        // 差一點點不到、剛好到
+        assert_eq!(w.tick(ms(992 + 299), true), None);
+        assert_eq!(w.tick(ms(1_291 + 300), true), Some(Duration::from_millis(300)));
+        assert_eq!(w.tick(ms(1_600), true), None, "回報一次之後從這一輪重新算");
+        assert_eq!(w.tick(ms(11_600), true), Some(Duration::from_secs(10)));
+        // 不在看（暫停、縮到最小、一般播放）的時候不算，回來之後的第一輪也不算
+        assert_eq!(w.tick(ms(11_608), false), None);
+        assert_eq!(w.tick(ms(20_000), false), None);
+        assert_eq!(w.tick(ms(30_000), true), None);
+        assert_eq!(w.tick(ms(30_008), true), None);
+        // 時間倒退（不應該發生）也不算
+        assert_eq!(w.tick(ms(29_000), true), None);
+    }
+
+    #[test]
+    fn after_a_stall_wait_for_mpv_then_decide() {
+        let ms = Duration::from_millis;
+        // 等的時間內不管 avsync 多少都先等（剛停完時讀到的 avsync 可能還是舊的）
+        for avsync in [None, Some(0.0), Some(2.0), Some(-1.0)] {
+            assert_eq!(after_stall(ms(0), avsync, false), AfterStall::Wait);
+            assert_eq!(after_stall(ms(499), avsync, false), AfterStall::Wait);
+        }
+        // 等完：mpv 自己追上了（差不到 50 ms）
+        assert_eq!(after_stall(ms(500), Some(0.0153), false), AfterStall::Recovered);
+        assert_eq!(after_stall(ms(500), Some(-0.049), false), AfterStall::Recovered);
+        // 讀不到（沒有聲音，沒有要對齊的）
+        assert_eq!(after_stall(ms(500), None, false), AfterStall::Recovered);
+        // 還沒追上
+        assert_eq!(after_stall(ms(500), Some(0.050), false), AfterStall::Resync);
+        assert_eq!(after_stall(ms(700), Some(-0.6), false), AfterStall::Resync);
+        // VITASCOPE_PACING=resync：不等
+        assert_eq!(after_stall(ms(0), Some(0.0), true), AfterStall::Resync);
+    }
+
+    #[test]
+    fn resync_lasts_until_caught_up() {
+        let ms = Duration::from_millis;
+        // 剛換過去：avsync 還是舊的，再小也不算
+        assert!(!resync_done(ms(0), Some(0.0)));
+        assert!(!resync_done(ms(299), Some(0.001)));
+        // 維持夠久、追上了
+        assert!(resync_done(ms(300), Some(0.0)));
+        assert!(resync_done(ms(300), Some(-0.019)));
+        // 還沒追上、讀不到：繼續
+        assert!(!resync_done(ms(300), Some(0.020)));
+        assert!(!resync_done(ms(1_000), Some(-0.4)));
+        assert!(!resync_done(ms(1_000), None));
+        // 最多 1.5 秒
+        assert!(resync_done(ms(1_500), Some(0.4)));
+        assert!(resync_done(ms(1_500), None));
+    }
+
+    #[test]
     fn dragging_the_window_resets_and_long_stalls_are_ignored() {
         // Windows 拖曳視窗時介面停住：間隔很長、很亂。拖曳中一直有 window_moved，不量
         let mut s = Sim::new();
@@ -1411,7 +1549,15 @@ mod tests {
             Overrides {
                 off: false,
                 block: true,
-                no_drain: true
+                no_drain: true,
+                resync: false,
+            }
+        );
+        assert_eq!(
+            parse_overrides(Some("RESYNC")),
+            Overrides {
+                resync: true,
+                ..Default::default()
             }
         );
     }
