@@ -10,6 +10,7 @@ mod preview;
 mod quality;
 mod settings_window;
 mod shaders;
+mod shortcuts_page;
 mod sound;
 mod tuning_menu;
 
@@ -92,6 +93,11 @@ enum Action {
     /// 逐格：true = 前進
     FrameStep(bool),
     AbLoop,
+    /// A-B 重播：用目前的時間設定起點（0）或終點（1）；取消
+    AbSet(usize),
+    AbClear,
+    /// 換下一條音軌、下一個字幕（字幕最後是「關閉」）
+    NextTrack(TrackKind),
     /// 跳到前 / 後幾個章節
     Chapter(i64),
     /// 回到開頭
@@ -274,6 +280,12 @@ pub struct VitascopeApp {
     modal_open: bool,
     /// 快捷鍵對照表（預設組 + 設定裡自己改過的）；選單、提示上的按鍵說明也從這裡來
     keymap: Keymap,
+    /// 「設定 → 快捷鍵」：正在錄的按鍵、衝突的詢問、搜尋、還原的確認
+    keys_ui: shortcuts_page::ShortcutsUi,
+    /// 按著沒放的鍵（實體按鍵；[`Self::mark_repeats`]）
+    keys_held: Vec<Key>,
+    /// Ctrl（⌘）+C 按著沒放：之後的「複製」是自動重複
+    copy_held: bool,
     /// 「字幕外觀」視窗
     sub_style_open: bool,
     /// 正在逐格（暫停中）：mpv 逐格時會短暫取消暫停，這段期間不算「播放中」，到結尾也不換檔
@@ -613,6 +625,9 @@ impl VitascopeApp {
             typing_last_frame: false,
             modal_open: false,
             keymap,
+            keys_ui: Default::default(),
+            keys_held: Vec::new(),
+            copy_held: false,
             sub_style_open: false,
             frame_stepping: false,
             stepping_unpaused_since: None,
@@ -1267,6 +1282,50 @@ impl VitascopeApp {
                 };
                 let _ = self.player.cycle_ab_loop();
                 self.osd(msg);
+            }
+            Action::AbSet(which) if loaded => {
+                // 按下時 mpv 自己的目前時間：觀察到的 time_pos 可能還是跳轉前的（非同步的跳轉還沒做完）
+                let t = self.player.get_f64("time-pos").unwrap_or(st.time_pos).max(0.0);
+                let [a, b] = self.player.ab_loop_points();
+                // 新的點優先：另一個點在錯的那一邊時拿掉（重新開始一段）
+                let (a, b) = if which == 0 {
+                    (Some(t), b.filter(|&b| b > t))
+                } else {
+                    (a.filter(|&a| a < t), Some(t))
+                };
+                let _ = self.player.set_ab_loop(a, b);
+                // 播放中：讀時間到設定終點之間可能又播了一格。mpv 只在設定的那一刻比較「目前位置 <= 終點」，
+                // 已經過了終點就不會繞回起點，所以自己跳回去（跟 mpv 播到終點時做的一樣：精準跳到起點）
+                if let (Some(a), Some(b)) = (a, b)
+                    && self.player.get_f64("time-pos").is_ok_and(|now| now > b)
+                {
+                    let _ = self.player.seek_to(a, true);
+                }
+                self.osd(match (a, b) {
+                    (Some(a), Some(b)) => {
+                        crate::tf!("A-B 重播：{} → {}", "A-B loop: {} → {}", fmt_time(a), fmt_time(b))
+                    }
+                    (Some(a), None) => crate::tf!("A-B 重播：起點 {}", "A-B loop: start {}", fmt_time(a)),
+                    (None, b) => crate::tf!("A-B 重播：終點 {}", "A-B loop: end {}", fmt_time(b.unwrap_or(t))),
+                });
+            }
+            Action::AbClear if loaded => {
+                let _ = self.player.clear_ab_loop();
+                self.osd(crate::tr!("取消 A-B 重播", "Cancel A-B loop"));
+            }
+            Action::NextTrack(kind) if loaded => {
+                // 第二字幕不算（選它會跟主字幕對調）
+                let ids: Vec<i64> = st
+                    .tracks_of(kind)
+                    .filter(|t| kind != TrackKind::Sub || Some(t.id) != st.secondary_sid)
+                    .map(|t| t.id)
+                    .collect();
+                let current = st.selected(kind).map(|t| t.id);
+                match next_track(&ids, current, kind == TrackKind::Sub) {
+                    Some(next) => self.select_track(kind, next),
+                    None if kind == TrackKind::Sub => self.osd(crate::tr!("沒有字幕", "No subtitles")),
+                    None => self.osd(crate::tr!("沒有其他音軌", "No other audio track")),
+                }
             }
             Action::Chapter(delta) if loaded => self.step_chapter(delta),
             Action::SubDelay(delta) if loaded => {
@@ -1974,7 +2033,7 @@ impl VitascopeApp {
     }
 
     /// 按鍵的處理順序：
-    /// 1. 播完後的倒數、2. 設定頁正在錄按鍵（之後的批次加在最前面）；
+    /// 1. 播完後的倒數（之後的批次加在最前面）；2. 「設定 → 快捷鍵」正在錄按鍵（[`Self::capture_key`]）；
     /// 3. 「關於」、對話框（`egui::Modal`）開著、正在輸入文字時，按鍵都不當快捷鍵；
     /// 4. Esc 依序關掉開著的視窗（[`ESC_WINDOWS`]）；
     /// 5. 全螢幕時 Esc 離開全螢幕；
@@ -1995,6 +2054,12 @@ impl VitascopeApp {
                     }
                 }
             });
+        }
+        // 每一幀都要看（包括錄按鍵、對話框開著時），按著的鍵才不會記錯
+        let copy_repeat = self.mark_repeats(ctx);
+        // 設定頁正在錄按鍵：按鍵都給它（Esc 取消錄，不關設定視窗）
+        if self.capture_key(ctx) {
+            return;
         }
         // 「關於」、確認對話框開著時，按鍵都交給它（Esc 關閉對話框，而不是關掉後面的視窗或離開全螢幕）；
         // 正在輸入文字（例如字幕外觀的字型名稱）時，字母鍵不能變成快捷鍵。
@@ -2037,9 +2102,11 @@ impl VitascopeApp {
         // 先把快捷鍵吃掉，避免同一個按鍵又觸發 egui 的按鈕（例如空白鍵按下有焦點的按鈕）
         ctx.input_mut(|i| {
             // Ctrl+C 不會變成按鍵事件：egui 把它轉成「複製」（Event::Copy）。有選取文字時是複製文字
+            // 按住不放時每一下自動重複都是一個「複製」：開關類的指令只算第一下
             if !text_selected
                 && i.events.iter().any(|e| matches!(e, egui::Event::Copy))
                 && let Some(cmd) = keymap.on_copy()
+                && (!copy_repeat || cmd.repeatable())
             {
                 commands.push(cmd);
             }
@@ -2056,11 +2123,17 @@ impl VitascopeApp {
                 else {
                     return true;
                 };
+                let egui::Event::Key { repeat, .. } = e else {
+                    return true;
+                };
                 let Some((cmd, chord)) = keymap.lookup_chord(*key, *modifiers) else {
                     return true;
                 };
-                // 按住不放（自動重複）照樣每一下都做，跟以前一樣；`Command::repeatable` 先記著，
-                // 等快捷鍵設定頁那一批再讓開關類的指令不重複
+                // 按住不放（自動重複）：跳轉、音量這類一直做；開關類的只算第一下（按住空白鍵不會一直切換暫停）。
+                // 照樣吃掉，不給 egui 的按鈕
+                if *repeat && !cmd.repeatable() {
+                    return false;
+                }
                 let once = (cmd, chord);
                 if !fired.contains(&once) {
                     fired.push(once);
@@ -2088,6 +2161,59 @@ impl VitascopeApp {
         for a in actions {
             self.run(ctx, a);
         }
+    }
+
+    /// 重新標出這一幀的按鍵哪些是自動重複（按著沒放又收到「按下」），回傳這一幀的「複製」是不是都是自動重複。
+    ///
+    /// egui 用按下時的按鍵（邏輯鍵）記「按著」，放開時才拿掉；Windows 放開時的邏輯鍵看的是放開那一刻的修飾鍵，
+    /// 先放開 Shift 再放開 = 時，按下是 `+`、放開是 `=`，`+` 就一直留在 egui 的「按著」裡，之後每一次按 `+`
+    /// 都被當成自動重複（開關類的指令、錄按鍵都不理）。這裡改用實體按鍵記（按下、放開一定一樣；沒有實體按鍵時用邏輯鍵）。
+    /// Ctrl+C 不是按鍵事件（egui 變成「複製」，自動重複也是一個個「複製」）：放開 C、放開 Ctrl 之前的都算重複
+    fn mark_repeats(&mut self, ctx: &egui::Context) -> bool {
+        let held = &mut self.keys_held;
+        let copy_held = &mut self.copy_held;
+        ctx.input_mut(|i| {
+            let (mut saw_copy, mut fresh_copy) = (false, false);
+            for e in &mut i.events {
+                match e {
+                    egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed,
+                        repeat,
+                        ..
+                    } => {
+                        let id = physical_key.unwrap_or(*key);
+                        if *pressed {
+                            *repeat = held.contains(&id);
+                            if !*repeat {
+                                held.push(id);
+                            }
+                        } else {
+                            held.retain(|&k| k != id);
+                            if *key == Key::C || id == Key::C {
+                                *copy_held = false;
+                            }
+                        }
+                    }
+                    egui::Event::Copy => {
+                        saw_copy = true;
+                        fresh_copy |= !*copy_held;
+                        *copy_held = true;
+                    }
+                    // 切到別的視窗時收不到放開（例如 Ctrl+O 開了檔案對話框）：全部當成放開了
+                    egui::Event::WindowFocused(false) => {
+                        held.clear();
+                        *copy_held = false;
+                    }
+                    _ => {}
+                }
+            }
+            if !saw_copy && !i.modifiers.command {
+                *copy_held = false;
+            }
+            saw_copy && !fresh_copy
+        })
     }
 
     /// 指令 → 操作（跳轉秒數之類的參數看設定）
@@ -2152,6 +2278,20 @@ impl VitascopeApp {
             Command::OpenFile => Action::Open,
             Command::Screenshot => Action::Screenshot,
             Command::CopyFrame => Action::CopyFrame,
+            Command::AbSetStart => Action::AbSet(0),
+            Command::AbSetEnd => Action::AbSet(1),
+            Command::AbClear => Action::AbClear,
+            Command::AudioDelayReset => Action::AudioDelay(None),
+            Command::NextAudioTrack => Action::NextTrack(TrackKind::Audio),
+            Command::ToggleEq => Action::ToggleEq,
+            Command::SubDelayReset => Action::SubDelay(None),
+            Command::NextSubtitle => Action::NextTrack(TrackKind::Sub),
+            Command::FillWindow => Action::ToggleFill,
+            Command::GammaDown => Action::Adjust(AdjustKind::Gamma, -1),
+            Command::GammaUp => Action::Adjust(AdjustKind::Gamma, 1),
+            Command::ToggleSmooth => Action::ToggleSmooth,
+            Command::ScreenshotAs => Action::ScreenshotAs,
+            Command::LoadSubtitle => Action::LoadSubtitle,
         }
     }
 
@@ -3336,13 +3476,15 @@ impl VitascopeApp {
                         }
                     }
                     ui.separator();
-                    if ui
-                        .selectable_label(
-                            g.fill,
-                            crate::tr!("填滿視窗（裁掉黑邊）", "Fill window (cut the black bars)"),
-                        )
-                        .clicked()
-                    {
+                    let mut fill = egui::Button::selectable(
+                        g.fill,
+                        crate::tr!("填滿視窗（裁掉黑邊）", "Fill window (cut the black bars)"),
+                    );
+                    let fill_key = keys.hint(Command::FillWindow);
+                    if !fill_key.is_empty() {
+                        fill = fill.shortcut_text(fill_key);
+                    }
+                    if ui.add(fill).clicked() {
                         action = Some(Action::ToggleFill);
                     }
                     let crop = keys.any_of(Command::CropCycle);
@@ -3433,6 +3575,12 @@ impl VitascopeApp {
         let selected = st.selected(kind).map(|t| t.id);
         let secondary = st.secondary_sid;
         let delay = if is_sub { st.sub_delay } else { st.audio_delay };
+        let delay_note = self.keymap.delay_note(is_sub);
+        let load_hint = if is_sub {
+            self.keymap.hint(Command::LoadSubtitle)
+        } else {
+            String::new()
+        };
         // 選中的是外掛文字字幕：可以換編碼重新載入
         let encoding = st
             .selected(kind)
@@ -3523,17 +3671,7 @@ impl VitascopeApp {
                             action = Some(step(None));
                         }
                     });
-                    ui.weak(if is_sub {
-                        crate::tr!(
-                            "快捷鍵 [ / ]。正數 = 字幕晚一點出現",
-                            "Keys [ / ]. Positive = subtitles appear later"
-                        )
-                    } else {
-                        crate::tr!(
-                            "快捷鍵 - / =。正數 = 聲音晚一點",
-                            "Keys - / =. Positive = sound plays later"
-                        )
-                    });
+                    ui.weak(delay_note);
                 });
                 if let Some((current, detected, forced)) = encoding {
                     ui.menu_button(crate::tr!("字幕編碼", "Subtitle encoding"), |ui| {
@@ -3558,7 +3696,7 @@ impl VitascopeApp {
                 } else {
                     crate::tr!("載入音軌檔…", "Load audio file…")
                 };
-                if ui.button(load).clicked() {
+                if menu_item(ui, true, load, &load_hint) {
                     action = Some(if is_sub {
                         Action::LoadSubtitle
                     } else {
@@ -3963,6 +4101,19 @@ impl VitascopeApp {
     }
 }
 
+/// 選單裡的勾選項目：後面寫按鍵（沒有按鍵時跟原本的勾選框一模一樣）
+fn with_hint(ui: &mut egui::Ui, hint: &str, add: impl FnOnce(&mut egui::Ui) -> egui::Response) -> egui::Response {
+    if hint.is_empty() {
+        return add(ui);
+    }
+    ui.horizontal(|ui| {
+        let r = add(ui);
+        ui.weak(hint);
+        r
+    })
+    .inner
+}
+
 /// 選單項目：文字 + 右側的快捷鍵說明，回傳是否被點選
 fn menu_item(ui: &mut egui::Ui, enabled: bool, text: &str, shortcut: &str) -> bool {
     let mut button = egui::Button::new(text);
@@ -4026,9 +4177,39 @@ pub fn fmt_time(secs: f64) -> String {
     }
 }
 
+/// 「下一條音軌」「下一個字幕」：`ids` 裡 `current` 的下一個。字幕（`allow_off`）最後一個的下一個是關閉、
+/// 關閉的下一個是第一個；音軌繞回第一個。沒有可以換的時 None
+fn next_track(ids: &[i64], current: Option<i64>, allow_off: bool) -> Option<Option<i64>> {
+    let first = *ids.first()?;
+    match current.and_then(|c| ids.iter().position(|&i| i == c)) {
+        Some(p) if p + 1 < ids.len() => Some(Some(ids[p + 1])),
+        Some(_) if allow_off => Some(None),
+        Some(_) => (ids.len() > 1).then_some(Some(first)),
+        None => Some(Some(first)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, mpv_opts_override, short_versions};
+    use super::{
+        fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, mpv_opts_override, next_track, short_versions,
+    };
+
+    #[test]
+    fn next_track_cycles() {
+        let ids = [1, 2, 3];
+        // 字幕：1 → 2 → 3 → 關閉 → 1
+        assert_eq!(next_track(&ids, Some(1), true), Some(Some(2)));
+        assert_eq!(next_track(&ids, Some(3), true), Some(None));
+        assert_eq!(next_track(&ids, None, true), Some(Some(1)));
+        // 音軌繞回第一條；只有一條時沒得換
+        assert_eq!(next_track(&ids, Some(3), false), Some(Some(1)));
+        assert_eq!(next_track(&[7], Some(7), false), None);
+        assert_eq!(next_track(&[7], Some(7), true), Some(None));
+        // 目前選的不在清單裡（例如第二字幕）：從第一個開始；沒有軌道
+        assert_eq!(next_track(&ids, Some(9), false), Some(Some(1)));
+        assert_eq!(next_track(&[], None, true), None);
+    }
 
     #[test]
     fn formats_time() {

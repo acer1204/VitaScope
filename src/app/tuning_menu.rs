@@ -3,7 +3,7 @@
 
 use super::quality::{dumb_hover, follow_quality, scaler_choice};
 use super::sound::{auto_device_label, leveling_hover, volume_max_hover, volume_max_label};
-use super::{Action, VitascopeApp};
+use super::{Action, VitascopeApp, with_hint};
 use crate::keymap::Command;
 use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{
@@ -64,10 +64,11 @@ impl VitascopeApp {
                 None => crate::tr!("流暢播放", "Smooth playback").to_owned(),
             };
             let locked = self.pacing_status().plan == Some(Plan::Untouched);
-            let r = ui
-                .add_enabled(!locked, egui::Checkbox::new(&mut on, label))
-                .on_hover_text(smooth_hover())
-                .on_disabled_hover_text(smooth_locked_hover());
+            let r = with_hint(ui, &self.keymap.hint(Command::ToggleSmooth), |ui| {
+                ui.add_enabled(!locked, egui::Checkbox::new(&mut on, label))
+                    .on_hover_text(smooth_hover())
+                    .on_disabled_hover_text(smooth_locked_hover())
+            });
             if r.changed() {
                 action = Some(Action::ToggleSmooth);
             }
@@ -232,12 +233,13 @@ impl VitascopeApp {
             }
             let eq_off = self.eq_disabled();
             let mut eq_on = a.eq.enabled;
-            let r = ui
-                .add_enabled(
+            let r = with_hint(ui, &self.keymap.hint(Command::ToggleEq), |ui| {
+                ui.add_enabled(
                     eq_off.is_none(),
                     egui::Checkbox::new(&mut eq_on, tr!("等化器", "Equalizer")),
                 )
-                .on_disabled_hover_text(eq_off.unwrap_or_default());
+                .on_disabled_hover_text(eq_off.unwrap_or_default())
+            });
             if r.changed() {
                 action = Some(Action::ToggleEq);
             }

@@ -256,7 +256,7 @@ impl VitascopeApp {
                 ) {
                     action = Some(Action::Screenshot);
                 }
-                if menu_item(ui, true, crate::tr!("另存新檔…", "Save as…"), "") {
+                if self.cmd_item(ui, true, crate::tr!("另存新檔…", "Save as…"), Command::ScreenshotAs) {
                     action = Some(Action::ScreenshotAs);
                 }
                 if self.cmd_item(

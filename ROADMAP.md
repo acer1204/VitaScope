@@ -426,7 +426,22 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：接 AV 擴大機／電視實際直通 AC-3、DTS、TrueHD（擴大機顯示格式）、直通時其他程式沒有聲音
 
 功能
-- [ ] 自訂快捷鍵（提供 PotPlayer 風格的預設組）
+- [x] 自訂快捷鍵（提供 PotPlayer 風格的預設組）：所有指令在 `keymap.rs` 一張表（編號存進設定檔，發佈後不改名），
+  「設定 → 快捷鍵」錄按鍵（Esc 取消；Ctrl+V、Ctrl+X 這類 egui 變成貼上 / 剪下的按鍵、Esc、Alt+F4、macOS 的 ⌘Q / ⌘H 是保留的）、
+  衝突時「改到這裡 / 取消」、一項一項還原或「還原成預設組…」（確認對話框開著時按鍵都交給它）。預設組「影戲」跟 v0.3.0 一樣，
+  「PotPlayer 風格」換了 Backspace、F / D、Enter / Alt+Enter、F3、`[` `]` `\`、`<` `>` `/`。新增可以指定的指令：A-B 起點 / 終點 / 取消、
+  延遲歸零、下一條音軌 / 字幕、Gamma、填滿視窗、流暢播放、等化器、另存截圖、載入字幕檔。開關類的指令不跟著自動重複。
+  兩個視窗同時改：各改各的指令都留下，還原的不會從檔案回來
+  （自動：keymap 單元測試（v0.3.0 按鍵逐一比對、兩個預設組、保留按鍵、衝突、Shift 符號鍵）、設定檔合併；kittest 錄按鍵、
+  衝突、保留按鍵（照 egui-winit 送貼上 / 剪下事件）、錄的時候 Esc、PotPlayer 預設組（逐格、全螢幕、從頭播放、A-B、字幕同步）、
+  還原對話框擋住空白鍵與 Esc、按住不放不重複、選單與按鈕提示跟著改、英文介面）
+  - [ ] 手動確認：實際鍵盤錄按鍵（Ctrl+V 在剪貼簿有、沒有文字時都顯示說明；Shift+= 記成 +，先放開 Shift 再放開 = 之後再按一次照樣有作用；
+    Windows 的 Ctrl+Insert / Shift+Insert / Shift+Delete 錄成 Ctrl+C / V / X）；macOS 的 ⌘ 組合鍵；
+    macOS 用 PotPlayer 風格時 Backspace 是從頭播放（固定按鍵清單不寫 Backspace）
+  - [ ] 手動確認：主人對照 PotPlayer 的按鍵（Backspace、F / D、`[` `]` `\`、`<` `>` `/` 與每次幾秒、F3、Alt+Enter、Ctrl+T、P、H、A；
+    Home 與 L 在 PotPlayer 有沒有作用：現在照設計的對照表，這組的 Home、L 沒有按鍵）
+  - [ ] 手動確認：A-B 重播播放中按 `]` 設定終點，播到終點會繞回起點
+  - [ ] 滑鼠按鍵的自訂（下一步）
 - [ ] 書籤：在檔案中標記時間點並命名
 - [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；播放引擎已含 libxml2，本機的 DASH 有自動測試）
 - [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）

@@ -61,6 +61,8 @@ impl VitascopeApp {
         if !self.settings_open {
             // 下次打開時重新檢查著色器檔案（可能換過內容）
             self.shader_info.clear();
+            // 錄到一半的按鍵、還沒回答的詢問都取消
+            self.keys_ui.close();
             return;
         }
         let mut open = true;
@@ -96,7 +98,7 @@ impl VitascopeApp {
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
                                 Page::System => changed |= self.system_page(ui),
-                                Page::Shortcuts => shortcuts_page(ui),
+                                Page::Shortcuts => self.shortcuts_page(ui),
                             }
                         });
                     });
@@ -108,6 +110,11 @@ impl VitascopeApp {
         if !open {
             self.settings_open = false;
         }
+        // 錄到一半的按鍵、還沒回答的詢問、還原的確認：只在快捷鍵分頁開著時才有
+        if !self.settings_open || self.settings_page != Page::Shortcuts {
+            self.keys_ui.close();
+        }
+        self.shortcuts_reset_modal(ctx);
         if let Some(a) = action {
             self.run(ctx, a);
         }
@@ -254,6 +261,8 @@ impl VitascopeApp {
 
     fn playback_page(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
+        // 跳轉秒數的標題：按鍵從對照表來（換了按鍵、預設組時跟著改）
+        let seek_labels = [self.keymap.seek_label(false), self.keymap.seek_label(true)];
         let s = &mut self.settings;
         changed |= ui
             .checkbox(
@@ -285,7 +294,7 @@ impl VitascopeApp {
             .num_columns(2)
             .spacing([12.0, 8.0])
             .show(ui, |ui| {
-                ui.label(tr!("← / → 跳轉", "← / → seek"));
+                ui.label(&seek_labels[0]);
                 changed |= commit(
                     ui.add(
                         egui::DragValue::new(&mut s.seek_short)
@@ -295,7 +304,7 @@ impl VitascopeApp {
                     ),
                 );
                 ui.end_row();
-                ui.label(crate::tf!("{CMD} + ← / → 跳轉", "{CMD} + ← / → seek"));
+                ui.label(&seek_labels[1]);
                 changed |= commit(
                     ui.add(
                         egui::DragValue::new(&mut s.seek_long)
@@ -845,111 +854,4 @@ impl VitascopeApp {
         ));
         changed
     }
-}
-
-/// 快捷鍵一覽（唯讀）
-/// 快捷鍵說明裡的 Ctrl（macOS 是 ⌘）
-const CMD: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
-
-fn shortcuts_page(ui: &mut egui::Ui) {
-    let cmd = CMD;
-    let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
-    let rows: Vec<(String, &str)> = vec![
-        (tr!("空白鍵", "Space").to_owned(), tr!("播放 / 暫停", "Play / pause")),
-        ("← / →".to_owned(), tr!("後退 / 前進", "Seek backward / forward")),
-        (format!("{cmd} + ← / →"), tr!("大幅後退 / 前進", "Seek further")),
-        ("↑ / ↓".to_owned(), tr!("音量", "Volume")),
-        ("M".to_owned(), tr!("靜音", "Mute")),
-        (
-            tr!("F、Enter、雙擊畫面", "F, Enter, double-click").to_owned(),
-            tr!("全螢幕", "Fullscreen"),
-        ),
-        (
-            "PgUp / PgDn".to_owned(),
-            tr!("上一個 / 下一個檔案", "Previous / next file"),
-        ),
-        (
-            format!("{cmd} + PgUp / PgDn"),
-            tr!("上一章 / 下一章", "Previous / next chapter"),
-        ),
-        (
-            "C / X / Z".to_owned(),
-            tr!("加快 / 減慢 / 正常速度", "Faster / slower / normal speed"),
-        ),
-        (". / ,".to_owned(), tr!("逐格前進 / 後退", "Next / previous frame")),
-        ("L".to_owned(), tr!("A-B 重播", "A-B loop")),
-        ("Home".to_owned(), tr!("從頭播放", "Play from the start")),
-        ("[ / ]".to_owned(), tr!("字幕提早 / 延後", "Subtitle delay")),
-        ("- / = (+)".to_owned(), tr!("聲音提早 / 延後", "Audio delay")),
-        (format!("A / {cmd} + F6"), tr!("畫面比例", "Aspect ratio")),
-        (
-            format!("{} + Q", if cfg!(target_os = "macos") { "Control" } else { "Ctrl" }),
-            tr!("裁切", "Crop"),
-        ),
-        (
-            "9 / 1 / 5".to_owned(),
-            tr!("放大 / 縮小 / 100%", "Zoom in / out / 100%"),
-        ),
-        (format!("{alt} + ←↑↓→"), tr!("移動畫面", "Move the picture")),
-        (format!("{cmd} + 5"), tr!("畫面移回中間", "Center the picture")),
-        (format!("{alt} + K"), tr!("旋轉 90°", "Rotate 90°")),
-        (
-            format!("{cmd} + Z / P"),
-            tr!("左右 / 上下翻轉", "Flip horizontally / vertically"),
-        ),
-        (format!("{alt} + Backspace"), tr!("畫面調整還原", "Reset the picture")),
-        ("W / E".to_owned(), tr!("亮度 - / +", "Brightness - / +")),
-        ("R / T".to_owned(), tr!("對比 - / +", "Contrast - / +")),
-        ("Y / U".to_owned(), tr!("飽和度 - / +", "Saturation - / +")),
-        ("I / O".to_owned(), tr!("色相 - / +", "Hue - / +")),
-        ("Q".to_owned(), tr!("影像調整還原", "Reset image adjustments")),
-        (
-            format!("{alt} + G"),
-            tr!(
-                "控制面板（影像調整、等化器）",
-                "Control panel (image adjustments, equalizer)"
-            ),
-        ),
-        (format!("{cmd} + T"), tr!("視窗置頂", "Always on top")),
-        ("F6".to_owned(), tr!("播放清單", "Playlist")),
-        (
-            if cfg!(target_os = "macos") {
-                "Delete / ⌫".to_owned()
-            } else {
-                "Delete".to_owned()
-            },
-            tr!(
-                "從播放清單移除（清單開著時）",
-                "Remove from the playlist (when it is open)"
-            ),
-        ),
-        (
-            if cfg!(target_os = "macos") {
-                "⌘ + I".to_owned()
-            } else {
-                "Ctrl + F1 / Ctrl + I".to_owned()
-            },
-            tr!("媒體資訊", "Media info"),
-        ),
-        (format!("{cmd} + E"), tr!("擷取畫面（存檔）", "Save a screenshot")),
-        (format!("{cmd} + C"), tr!("擷取畫面（剪貼簿）", "Copy the frame")),
-        (format!("{cmd} + O"), tr!("開啟檔案", "Open a file")),
-        ("F5".to_owned(), tr!("設定", "Settings")),
-        ("F1".to_owned(), tr!("關於", "About")),
-        (
-            "Esc".to_owned(),
-            tr!("關閉視窗 / 離開全螢幕", "Close a panel / leave fullscreen"),
-        ),
-    ];
-    egui::Grid::new("settings_shortcuts")
-        .num_columns(2)
-        .striped(true)
-        .spacing([16.0, 4.0])
-        .show(ui, |ui| {
-            for (key, what) in rows {
-                ui.label(egui::RichText::new(key).monospace());
-                ui.label(what);
-                ui.end_row();
-            }
-        });
 }

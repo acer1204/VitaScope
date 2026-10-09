@@ -263,15 +263,18 @@ fn dropping_subtitle_adds_it_to_current_video() {
     );
 }
 
-/// 按下按鍵（同一幀內），回傳這一幀送給視窗的指令
+/// 按下、放開按鍵（同一幀內），回傳這一幀送給視窗的指令。
+/// 一定要放開：沒放開的鍵再按一次，egui 會當成按住不放的自動重複（開關類的指令不重複）
 fn press_and_get_commands(h: &mut Harness<'_, VitascopeApp>, key: egui::Key) -> Vec<egui::ViewportCommand> {
-    h.input_mut().events.push(egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE,
-    });
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
     h.step();
     h.output()
         .viewport_output
@@ -4636,6 +4639,7 @@ fn picture_page_renders_in_english() {
     assert!(h.query_by_label_contains("亮度").is_none(), "沒有中文");
 }
 
+/// 設定頁改成可以編輯、一個指令一列（A3）：原本找「W / E」這種成對的說明，改成找每一列的名稱和按鍵按鈕
 #[test]
 fn shortcuts_page_lists_the_picture_keys() {
     let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
@@ -4644,24 +4648,32 @@ fn shortcuts_page_lists_the_picture_keys() {
             vitascope::i18n::Lang::ZhTw,
             "快捷鍵",
             [
-                "亮度 - / +",
-                "對比 - / +",
-                "飽和度 - / +",
-                "色相 - / +",
+                "亮度 −",
+                "亮度 +",
+                "對比 −",
+                "對比 +",
+                "飽和度 −",
+                "飽和度 +",
+                "色相 −",
+                "色相 +",
                 "影像調整還原",
-                "控制面板（影像調整、等化器）",
+                "控制面板",
             ],
         ),
         (
             vitascope::i18n::Lang::En,
             "Shortcuts",
             [
-                "Brightness - / +",
-                "Contrast - / +",
-                "Saturation - / +",
-                "Hue - / +",
+                "Brightness −",
+                "Brightness +",
+                "Contrast −",
+                "Contrast +",
+                "Saturation −",
+                "Saturation +",
+                "Hue −",
+                "Hue +",
                 "Reset image adjustments",
-                "Control panel (image adjustments, equalizer)",
+                "Control panel",
             ],
         ),
     ] {
@@ -4673,13 +4685,820 @@ fn shortcuts_page_lists_the_picture_keys() {
         h.run_steps(2);
         h.get_by_label(page).click();
         h.run_steps(2);
-        for key in ["W / E", "R / T", "Y / U", "I / O", "Q", &format!("{alt} + G")] {
+        for key in ["W", "E", "R", "T", "Y", "U", "I", "O", "Q", &format!("{alt}+G")] {
             h.get_by_label(key);
         }
         for row in rows {
             h.get_by_label(row);
         }
     }
+}
+
+// ───────────── 快捷鍵設定頁、PotPlayer 預設組 ─────────────
+
+const RECORDING: &str = "請按下新的按鍵…（Esc 取消）";
+
+/// 打開「設定 → 快捷鍵」（`page` 是分頁的名稱，看介面語言）；`search` 不是空的就輸入搜尋，
+/// 只留下符合的指令（按鈕才不會在捲動區外面、「+」這種按鈕才只有一個）
+fn shortcuts_page(h: &mut Harness<'_, VitascopeApp>, page: &str, search: &str) {
+    if h.query_by_label(page).is_none() {
+        h.key_press(egui::Key::F5);
+        h.run_steps(2);
+    }
+    h.get_by_label(page).click();
+    h.run_steps(2);
+    if !search.is_empty() {
+        h.get_by_role(egui::accesskit::Role::TextInput).focus();
+        h.run_steps(1);
+        h.get_by_role(egui::accesskit::Role::TextInput).type_text(search);
+        h.run_steps(2);
+    }
+}
+
+/// 同一幀按下、放開（含修飾鍵），回傳這一幀送給視窗的指令
+fn press_mods_and_get_commands(
+    h: &mut Harness<'_, VitascopeApp>,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Vec<egui::ViewportCommand> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+    h.step();
+    viewport_commands(h)
+}
+
+#[test]
+fn shortcut_record_adds_a_chord() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    // 只按了修飾鍵還不算
+    h.key_press(egui::Key::ShiftLeft);
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::K);
+    h.run_steps(2);
+    assert!(h.query_by_label(RECORDING).is_none(), "錄好了");
+    assert_eq!(h.state().settings().keys.custom["toggle-pause"], ["Space", "Shift+K"]);
+    h.get_by_label("Shift+K");
+    h.get_by_label("•");
+    // 馬上生效（設定視窗開著也一樣）
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::K);
+    step_until(&mut h, "Shift+K 暫停", |s| s.paused);
+    // 這一列還原：Shift+K 不再有作用，空白鍵照舊
+    h.get_by_label("↺").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    assert!(h.query_by_label("Shift+K").is_none());
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::K);
+    h.run_steps(5);
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "Shift+K 不再切換");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "空白鍵繼續播放", |s| !s.paused);
+    // 移除一組按鍵：空白鍵不再暫停，存成「不指定」
+    h.get_by_label("×").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.custom["toggle-pause"], Vec::<String>::new());
+    h.get_by_label("（未指定）");
+    h.key_press(egui::Key::Space);
+    h.run_steps(5);
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused, "空白鍵不再暫停");
+}
+
+#[test]
+fn shortcut_conflict_moves_the_key() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    // 取消：兩個指令都不變
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::M);
+    h.run_steps(2);
+    h.get_by_label("M 已經用在「靜音」。");
+    h.get_by_label("取消").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("已經用在").is_none());
+    assert!(h.state().settings().keys.custom.is_empty());
+    // 改到這裡：M 變成播放／暫停，靜音沒有按鍵
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::M);
+    h.run_steps(2);
+    h.get_by_label("改到這裡").click();
+    h.run_steps(2);
+    let keys = &h.state().settings().keys;
+    assert_eq!(keys.custom["toggle-pause"], ["Space", "M"]);
+    assert_eq!(keys.custom["toggle-mute"], Vec::<String>::new());
+    assert!(
+        h.state()
+            .keymap()
+            .chords(vitascope::keymap::Command::ToggleMute)
+            .is_empty()
+    );
+    h.key_press(egui::Key::M);
+    step_until(&mut h, "M 暫停", |s| s.paused);
+    assert!(!h.state().player().state.muted, "M 不再是靜音");
+}
+
+#[test]
+fn reserved_chord_is_refused() {
+    let mac = cfg!(target_os = "macos");
+    let cmd = if mac { "Cmd" } else { "Ctrl" };
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+V、{cmd}+X 不能指定"));
+    if cfg!(target_os = "windows") {
+        h.get_by_label("Ctrl+Insert、Shift+Insert、Shift+Delete 會當成 Ctrl+C、Ctrl+V、Ctrl+X");
+    }
+    // 真正的程式裡 Ctrl+V、Ctrl+X 不是按鍵事件：egui-winit 送的是貼上（剪貼簿有文字時）、剪下
+    for (event, key) in [(egui::Event::Paste("文字".into()), "V"), (egui::Event::Cut, "X")] {
+        h.event(event);
+        h.run_steps(2);
+        h.get_by_label(&format!("{cmd}+{key} 是系統保留的按鍵，不能指定"));
+        h.get_by_label(RECORDING);
+    }
+    // 原始的按鍵事件（介面測試、其他平台）也一樣
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::V);
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+V 是系統保留的按鍵，不能指定"));
+    if mac {
+        h.key_press_modifiers(egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND, egui::Key::Q);
+        h.run_steps(2);
+        h.get_by_label("Cmd+Q 是系統保留的按鍵，不能指定");
+    }
+    assert!(h.state().settings().keys.custom.is_empty());
+    // Ctrl+C 從「複製」來，可以指定：它是擷取畫面（剪貼簿）的，所以先問
+    h.event(egui::Event::Copy);
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+C 已經用在「擷取畫面（剪貼簿）」。"));
+    h.get_by_label("取消").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    assert!(!h.state().player().state.paused);
+}
+
+#[test]
+fn recording_esc_cancels_and_keeps_the_window_open() {
+    let mut h = playing_multitrack();
+    set_fullscreen(&mut h, true);
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    // Esc 只取消錄按鍵：設定視窗還開著、不離開全螢幕
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    assert!(h.query_by_label(RECORDING).is_none());
+    h.get_by_label("一般");
+    assert!(h.state().settings().keys.custom.is_empty());
+    // 下一個 Esc 才關設定視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_none());
+    // 錄的時候 F5 也是被錄的按鍵，不是開關設定視窗
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_some(), "設定視窗還開著");
+    h.get_by_label("F5 已經用在「設定」。");
+}
+
+#[test]
+fn potplayer_preset_rebinds_f_and_d() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("PotPlayer 風格").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().keys.preset,
+        vitascope::keymap::KeyPreset::Potplayer
+    );
+    assert!(h.query_by_label_contains("你改過的").is_none(), "沒有改過的快捷鍵");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // F / D 逐格
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t0 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::F);
+    step_until(&mut h, "F 逐格前進", |s| s.paused && s.time_pos > t0 + 0.01);
+    let t1 = h.state().player().state.time_pos;
+    assert!(t1 - t0 < 0.2, "只前進一格：{t0} → {t1}");
+    h.key_press(egui::Key::D);
+    step_until(&mut h, "D 逐格後退", |s| s.paused && s.time_pos < t1 - 0.01);
+    // Enter、Alt+Enter 全螢幕
+    for mods in [egui::Modifiers::NONE, egui::Modifiers::ALT] {
+        let cmds = press_mods_and_get_commands(&mut h, mods, egui::Key::Enter);
+        assert!(
+            cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+            "{mods:?} {cmds:?}"
+        );
+    }
+    // Backspace 從頭播放（播放清單沒開）
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "前進 5 秒", |s| s.time_pos > 4.0);
+    h.key_press(egui::Key::Backspace);
+    step_until(&mut h, "Backspace 從頭播放", |s| !s.paused && s.time_pos < 2.0);
+    // 選單上的按鍵跟著換
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("全螢幕 Enter").is_some());
+    assert!(h.query_by_label("逐格前進 F").is_some());
+}
+
+#[test]
+fn potplayer_ab_keys_set_points() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.preset = vitascope::keymap::KeyPreset::Potplayer;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t1 = h.state().player().state.time_pos;
+    // [ 設定起點：就是按下時的時間（不是字幕提早）
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "[ 設定起點", |s| {
+        s.ab_loop[0].is_some_and(|a| (a - t1).abs() < 0.05) && s.ab_loop[1].is_none()
+    });
+    assert!(h.state().osd_text().unwrap().starts_with("A-B 重播：起點"));
+    assert_eq!(h.state().player().state.sub_delay, 0.0);
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "前進", |s| s.time_pos > t1 + 3.0);
+    h.run_steps(5);
+    let t2 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::CloseBracket);
+    step_until(&mut h, "] 設定終點", |s| {
+        s.ab_loop[0].is_some_and(|a| (a - t1).abs() < 0.05) && s.ab_loop[1].is_some_and(|b| (b - t2).abs() < 0.05)
+    });
+    assert!(h.state().osd_text().unwrap().contains('→'));
+    // \ 取消
+    h.key_press(egui::Key::Backslash);
+    step_until(&mut h, "\\ 取消", |s| s.ab_loop == [None, None]);
+    assert_eq!(h.state().osd_text(), Some("取消 A-B 重播"));
+    // 只設終點；再設一個在它後面的起點：舊的終點拿掉（重新開始一段）
+    h.key_press(egui::Key::CloseBracket);
+    step_until(&mut h, "只有終點", |s| {
+        s.ab_loop[0].is_none() && s.ab_loop[1].is_some()
+    });
+    assert!(h.state().osd_text().unwrap().starts_with("A-B 重播：終點"));
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "再前進", |s| s.time_pos > t2 + 3.0);
+    h.run_steps(5);
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "新的起點、沒有終點", |s| {
+        s.ab_loop[0].is_some_and(|a| a > t2 + 3.0) && s.ab_loop[1].is_none()
+    });
+    // 字幕同步：Shift+. 延後、Shift+, 提早、/ 歸零
+    for _ in 0..2 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Period);
+    }
+    step_until(&mut h, "Shift+. 兩次", |s| close_to(s.sub_delay, 0.2));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Comma);
+    step_until(&mut h, "Shift+, 一次", |s| close_to(s.sub_delay, 0.1));
+    h.key_press(egui::Key::Slash);
+    step_until(&mut h, "/ 歸零", |s| close_to(s.sub_delay, 0.0));
+}
+
+#[test]
+fn reset_to_preset_asks_first_and_the_dialog_takes_the_keys() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings
+        .keys
+        .custom
+        .insert("toggle-pause".into(), vec!["Space".into(), "K".into()]);
+    settings.keys.custom.insert("next-file".into(), vec!["N".into()]);
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("你改過的 2 個快捷鍵（標 •）換預設組時照樣保留");
+    h.get_by_label("還原成預設組…").click();
+    h.run_steps(2);
+    h.get_by_label("把所有快捷鍵還原成「影戲」的預設值？");
+    // 對話框開著：空白鍵不會暫停，Esc 只關對話框
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused, "對話框開著時空白鍵不能暫停");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("預設值？").is_none(), "Esc 關掉對話框");
+    h.get_by_label("一般");
+    assert_eq!(h.state().settings().keys.custom.len(), 2, "取消：不變");
+    // 再開一次，按「還原」
+    h.get_by_label("還原成預設組…").click();
+    h.run_steps(2);
+    h.get_by_label("還原").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    assert_eq!(h.state().keymap().hint(vitascope::keymap::Command::NextFile), "PgDn");
+    assert!(h.query_by_label_contains("你改過的").is_none());
+    // 對話框關掉之後按鍵照常
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+}
+
+#[test]
+fn non_repeatable_commands_ignore_auto_repeat() {
+    let mut h = playing_multitrack();
+    let key = |h: &mut Harness<'_, VitascopeApp>, key, pressed| {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    };
+    // 按住空白鍵：第一下暫停，之後的自動重複（egui 看到沒放開的鍵又按下，標成重複）不再切換
+    for _ in 0..2 {
+        key(&mut h, egui::Key::Space, true);
+    }
+    key(&mut h, egui::Key::Space, false);
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "只暫停一次");
+    // 音量這類照樣重複：按住 ↓ 三下
+    let v0 = h.state().player().state.volume;
+    for _ in 0..3 {
+        key(&mut h, egui::Key::ArrowDown, true);
+    }
+    key(&mut h, egui::Key::ArrowDown, false);
+    step_until(&mut h, "音量 −15", |s| close_to(s.volume, v0 - 15.0));
+}
+
+/// 按著鍵的時候切到別的視窗（例如 Ctrl+O 開了檔案對話框）就收不到放開：回來再按同一個鍵是新的一下，不是自動重複
+#[test]
+fn a_key_held_when_the_window_loses_focus_works_again_afterwards() {
+    let mut h = playing_multitrack();
+    let space = |h: &mut Harness<'_, VitascopeApp>| {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    };
+    // 按下空白鍵（暫停），還沒放開視窗就失去焦點
+    space(&mut h);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.event(egui::Event::WindowFocused(false));
+    h.step();
+    h.event(egui::Event::WindowFocused(true));
+    h.step();
+    // 回來再按：繼續播放
+    space(&mut h);
+    step_until(&mut h, "繼續播放", |s| !s.paused);
+}
+
+#[test]
+fn menu_hints_follow_the_keymap() {
+    let dir = TempDir::new("menu-hints");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        dir.clip(name);
+    }
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    step_until_app(&mut h, "掃描到兩個影片", |app| playlist_len(app) == 2);
+    settle(&mut h, "第1集.mp4");
+    // 把下一個檔案的 PgDn 換成 N
+    shortcuts_page(&mut h, "快捷鍵", "下一個檔案");
+    h.get_by_label("PgDn").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.key_press(egui::Key::N);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.custom["next-file"], ["N"]);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 控制列按鈕的提示
+    h.get_by_label("⏭").hover();
+    h.run_steps(3);
+    h.get_by_label("下一個檔案（N）");
+    // 右鍵選單
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("下一個檔案 N").is_some());
+    assert!(h.query_by_label("下一個檔案 PgDn").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::N);
+    step_until(&mut h, "N → 第2集", |s| playing(s, "第2集.mp4"));
+}
+
+/// 新的指令（預設沒有按鍵）指定按鍵後都有作用
+#[test]
+fn new_commands_work_once_bound() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    for (id, key) in [
+        ("sub-delay-reset", "F13"),
+        ("audio-delay-reset", "F14"),
+        ("next-audio-track", "F15"),
+        ("next-subtitle", "F16"),
+        ("gamma-up", "F17"),
+        ("gamma-down", "F18"),
+        ("fill-window", "F19"),
+        ("toggle-eq", "F20"),
+        ("toggle-smooth", "F21"),
+        ("ab-set-start", "F22"),
+        ("ab-clear", "F23"),
+        ("load-subtitle", "F24"),
+        ("screenshot-as", "F25"),
+    ] {
+        settings.keys.custom.insert(id.into(), vec![key.into()]);
+    }
+    let mut h = playing_multitrack_with(settings);
+    // 延遲歸零
+    h.key_press(egui::Key::CloseBracket);
+    h.key_press(egui::Key::Equals);
+    step_until(&mut h, "字幕、音訊延遲 +0.1", |s| {
+        close_to(s.sub_delay, 0.1) && close_to(s.audio_delay, 0.1)
+    });
+    h.key_press(egui::Key::F13);
+    step_until(&mut h, "字幕延遲歸零", |s| close_to(s.sub_delay, 0.0));
+    h.key_press(egui::Key::F14);
+    step_until(&mut h, "音訊延遲歸零", |s| close_to(s.audio_delay, 0.0));
+    // 下一條音軌：日本語 → 國語 → 日本語
+    let audio = |s: &State| s.selected(TrackKind::Audio).and_then(|t| t.title.clone());
+    step_until(&mut h, "第一條音軌", |s| audio(s).as_deref() == Some("日本語"));
+    h.key_press(egui::Key::F15);
+    step_until(&mut h, "換成國語", |s| audio(s).as_deref() == Some("國語"));
+    h.key_press(egui::Key::F15);
+    step_until(&mut h, "繞回日本語", |s| audio(s).as_deref() == Some("日本語"));
+    // 下一個字幕：第一個 → 第二個 → 關閉 → 第一個
+    let subs: Vec<i64> = h
+        .state()
+        .player()
+        .state
+        .tracks_of(TrackKind::Sub)
+        .map(|t| t.id)
+        .collect();
+    let (first, second) = (subs[0], subs[1]);
+    step_until(&mut h, "第一個字幕", |s| s.sid == Some(first));
+    h.key_press(egui::Key::F16);
+    step_until(&mut h, "第二個字幕", |s| s.sid == Some(second));
+    h.key_press(egui::Key::F16);
+    step_until(&mut h, "關閉字幕", |s| s.sid.is_none());
+    assert_eq!(h.state().osd_text(), Some("字幕：關閉"));
+    h.key_press(egui::Key::F16);
+    step_until(&mut h, "回到第一個", |s| s.sid == Some(first));
+    // Gamma
+    h.key_press(egui::Key::F17);
+    h.key_press(egui::Key::F17);
+    h.key_press(egui::Key::F18);
+    h.run_steps(2);
+    assert_eq!(h.state().adjust().gamma, 1);
+    // 填滿視窗、等化器、流暢播放
+    h.key_press(egui::Key::F19);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("填滿視窗：開啟"));
+    let eq = h.state().settings().audio.eq.enabled;
+    h.key_press(egui::Key::F20);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().audio.eq.enabled, !eq);
+    let smooth = h.state().settings().smooth;
+    h.key_press(egui::Key::F21);
+    h.run_steps(2);
+    assert_ne!(h.state().settings().smooth, smooth);
+    // A-B：只設起點，再取消
+    h.key_press(egui::Key::F22);
+    step_until(&mut h, "設定起點", |s| s.ab_loop[0].is_some());
+    h.key_press(egui::Key::F23);
+    step_until(&mut h, "取消", |s| s.ab_loop == [None, None]);
+    // 載入字幕檔…、另存截圖…：開的是各自的對話框（取消）
+    let seen = record_dialogs(&mut h, |_| None);
+    // 先跑幾幀讓按鍵生效：對話框在背景執行緒開，沒開之前 dialogs_done 會馬上回傳
+    h.key_press(egui::Key::F24);
+    h.run_steps(2);
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::LoadSubtitle, Pick::File)]);
+    h.key_press(egui::Key::F25);
+    h.run_steps(2);
+    assert_eq!(
+        dialogs_done(&mut h, &seen),
+        [(DialogKind::ScreenshotSaveAs, Pick::Save)]
+    );
+}
+
+#[test]
+fn shortcuts_page_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "Shortcuts", "");
+    for label in [
+        "Preset:",
+        "VitaScope",
+        "PotPlayer style",
+        "Reset to the preset…",
+        "Fixed keys (can't be changed)",
+        "A-B loop: set start",
+        "Reset subtitle delay",
+        "Next audio track",
+        "Save screenshot as…",
+    ] {
+        h.get_by_label(label);
+    }
+    shortcuts_page(&mut h, "Shortcuts", "Play / pause");
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label("Press the new key… (Esc to cancel)");
+    h.get_by_label(&format!("{cmd}+V and {cmd}+X can't be assigned"));
+    h.event(egui::Event::Cut);
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+X is reserved by the system and can't be assigned"));
+    h.key_press(egui::Key::M);
+    h.run_steps(2);
+    h.get_by_label("M is already used for “Mute”.");
+    h.get_by_label("Use it here").click();
+    h.run_steps(2);
+    h.get_by_label("Your 2 changed shortcuts (marked •) are kept when you switch presets");
+    h.get_by_label("Reset to the preset…").click();
+    h.run_steps(2);
+    h.get_by_label("Reset all shortcuts to the “VitaScope” defaults?");
+    h.get_by_label("Reset").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    // 只改了一個：英文是單數
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::K);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.override_count(), 1);
+    h.get_by_label("Your 1 changed shortcut (marked •) is kept when you switch presets");
+}
+
+/// 固定的按鍵清單：macOS 的 Backspace 只在快捷鍵沒用到它時才是「從清單移除」（PotPlayer 風格是從頭播放）
+#[test]
+fn fixed_keys_list_follows_the_backspace_binding() {
+    let mac = cfg!(target_os = "macos");
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label(if mac { "Delete / Backspace" } else { "Delete" });
+    h.get_by_label("PotPlayer 風格").click();
+    h.run_steps(2);
+    h.get_by_label("Delete");
+    assert!(h.query_by_label("Delete / Backspace").is_none());
+}
+
+/// 換預設組：自己改過的照樣保留，而且比預設組優先（PotPlayer 的 F 是逐格前進，但自己把逐格前進改成 G 了）
+#[test]
+fn switching_presets_keeps_changed_keys() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("next-file".into(), vec!["N".into()]);
+    settings.keys.custom.insert("frame-next".into(), vec!["G".into()]);
+    let custom = settings.keys.custom.clone();
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("你改過的 2 個快捷鍵（標 •）換預設組時照樣保留");
+    h.get_by_label("PotPlayer 風格").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().keys.preset,
+        vitascope::keymap::KeyPreset::Potplayer
+    );
+    assert_eq!(h.state().settings().keys.custom, custom, "改過的不變");
+    h.get_by_label("你改過的 2 個快捷鍵（標 •）換預設組時照樣保留");
+    let keymap = h.state().keymap();
+    assert_eq!(
+        keymap.lookup(egui::Key::N, egui::Modifiers::NONE),
+        Some(vitascope::keymap::Command::NextFile)
+    );
+    assert_eq!(keymap.hint(vitascope::keymap::Command::NextFile), "N");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    // G 逐格前進（自己改的）；F 沒有作用（預設組的 F 被自己改的取代）；D 是 PotPlayer 的逐格後退
+    let t0 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::G);
+    step_until(&mut h, "G 逐格前進", |s| s.paused && s.time_pos > t0 + 0.01);
+    h.run_steps(3);
+    let t1 = h.state().player().state.time_pos;
+    let cmds = press_and_get_commands(&mut h, egui::Key::F);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    wait_real(&mut h, 0.3);
+    assert_eq!(h.state().player().state.time_pos, t1, "F 不再逐格");
+    h.key_press(egui::Key::D);
+    step_until(&mut h, "D 逐格後退", |s| s.paused && s.time_pos < t1 - 0.01);
+}
+
+/// 錄到一半換到別的分頁：不錄了（不然看不到在錄，下一個按鍵卻被錄走、其他快捷鍵也都沒反應）
+#[test]
+fn changing_settings_page_stops_recording() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.get_by_label("一般").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::K);
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty(), "K 沒有被錄走");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "空白鍵照常暫停", |s| s.paused);
+    shortcuts_page(&mut h, "快捷鍵", "");
+    assert!(h.query_by_label(RECORDING).is_none());
+}
+
+/// 搜尋也比對按鍵；錄到一半點搜尋框就不錄了（打的字不會被錄成按鍵）
+#[test]
+fn shortcut_search_matches_keys_and_stops_recording() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "PgDn");
+    h.get_by_label("下一個檔案");
+    h.get_by_label("下一章");
+    assert!(h.query_by_label("播放／暫停").is_none());
+    assert!(h.query_by_label("上一個檔案").is_none());
+    // 開始錄「下一個檔案」，再點搜尋框、打字
+    h.get_by_label("PgDn").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    h.run_steps(2);
+    assert!(h.query_by_label(RECORDING).is_none(), "點搜尋框就不錄了");
+    h.key_press(egui::Key::K);
+    h.event(egui::Event::Text("k".into()));
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty(), "K 沒有被錄走");
+    assert!(h.query_by_label_contains("已經用在").is_none());
+    // 打的字進了搜尋框（「PgDnk」什麼都找不到）
+    assert!(h.query_by_label("下一個檔案").is_none());
+}
+
+/// 先放開 Shift 再放開符號鍵：Windows 放開時收到的是沒有 Shift 的鍵（按下 `?`、放開 `/`）。
+/// 按著的鍵要用實體按鍵記，不然 `?` 一直算「按著」，之後每一次按都被當成自動重複
+#[test]
+fn shifted_symbol_keys_work_again_after_shift_is_released_first() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("toggle-mute".into(), vec!["?".into()]);
+    settings
+        .keys
+        .custom
+        .insert("toggle-pause".into(), vec!["Space".into(), "Cmd+C".into()]);
+    settings.keys.custom.insert("copy-frame".into(), vec![]);
+    let mut h = playing_multitrack_with(settings);
+    let key = |h: &mut Harness<'_, VitascopeApp>, key, physical, pressed, modifiers| {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: Some(physical),
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+        h.step();
+    };
+    let shift = egui::Modifiers::SHIFT;
+    let none = egui::Modifiers::NONE;
+    key(&mut h, egui::Key::Questionmark, egui::Key::Slash, true, shift);
+    key(&mut h, egui::Key::Slash, egui::Key::Slash, false, none);
+    step_until(&mut h, "? 靜音", |s| s.muted);
+    key(&mut h, egui::Key::Questionmark, egui::Key::Slash, true, shift);
+    key(&mut h, egui::Key::Slash, egui::Key::Slash, false, none);
+    step_until(&mut h, "再按一次 ? 取消靜音", |s| !s.muted);
+    // 按住 Ctrl+C：自動重複時每一下都是一個「複製」，開關類的指令只算第一下
+    let command = egui::Modifiers::COMMAND;
+    for _ in 0..2 {
+        h.event(egui::Event::Copy);
+        h.step();
+    }
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "只暫停一次");
+    // 放開 C 再按：再切換一次
+    key(&mut h, egui::Key::C, egui::Key::C, false, command);
+    h.event(egui::Event::Copy);
+    step_until(&mut h, "再按一次 Ctrl+C 繼續播放", |s| !s.paused);
+}
+
+/// 設定的 A-B 終點一定會繞回起點：終點用 mpv 自己的時間、不能四捨五入（24 fps 的 1.0833… 寫成「1.083333」
+/// 就比那一格早，mpv 認定已經過了終點，永遠不繞回去）
+#[test]
+fn ab_end_point_set_on_a_frame_loops_back() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.preset = vitascope::keymap::KeyPreset::Potplayer;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    step_until(&mut h, "開始播放", |s| s.loaded && !s.paused && s.time_pos > 0.1);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "[ 設定起點", |s| s.ab_loop[0].is_some());
+    let a = h.state().player().ab_loop_points()[0].unwrap();
+    // 播一秒再暫停（這個短片只有開頭一個關鍵影格，往前跳會跳到片尾）
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "播一秒", |s| !s.paused && s.time_pos > a + 1.0);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "再暫停", |s| s.paused);
+    h.run_steps(5);
+    // 逐格到一格：時間寫成小數 6 位會比它小（大約每兩格就有一格）
+    let now = |h: &Harness<'_, VitascopeApp>| h.state().player().get_f64("time-pos").unwrap();
+    let rounded_down = |t: f64| format!("{t:.6}").parse::<f64>().unwrap() < t;
+    let mut b = now(&h);
+    for _ in 0..8 {
+        if rounded_down(b) {
+            break;
+        }
+        h.key_press(egui::Key::F);
+        step_until(&mut h, "F 逐格前進", |s| s.paused && s.time_pos > b + 0.01);
+        h.run_steps(3);
+        b = now(&h);
+    }
+    assert!(rounded_down(b), "找不到這樣的一格：{b}");
+    h.key_press(egui::Key::CloseBracket);
+    step_until(&mut h, "] 設定終點", |s| s.ab_loop[1].is_some());
+    assert_eq!(
+        h.state().player().ab_loop_points(),
+        [Some(a), Some(b)],
+        "就是那一格的時間"
+    );
+    // 繼續播放：馬上到終點、繞回起點
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "繞回起點，或是播過終點", |s| {
+        !s.paused && (s.time_pos < b - 0.5 || s.time_pos > b + 0.8)
+    });
+    let t = h.state().player().state.time_pos;
+    assert!(t < b - 0.5, "播到終點要繞回起點 {a}：現在 {t}，終點 {b}");
+}
+
+/// 新指令有按鍵時，選單、設定頁上也寫出來（沒有按鍵時跟以前一樣）
+#[test]
+fn menus_show_the_keys_of_new_commands() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    for (id, key) in [
+        ("fill-window", "F19"),
+        ("toggle-eq", "F20"),
+        ("toggle-smooth", "F21"),
+        ("sub-delay-reset", "F13"),
+        ("load-subtitle", "F24"),
+        ("screenshot-as", "F22"),
+        ("seek-back", "J"),
+        ("seek-forward", "L"),
+    ] {
+        settings.keys.custom.insert(id.into(), vec![key.into()]);
+    }
+    let mut h = playing_multitrack_with(settings);
+    // 畫面 → 裁切 → 填滿視窗
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("畫面 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label_contains("裁切").click();
+    h.run_steps(2);
+    h.get_by_label("填滿視窗（裁掉黑邊） F19");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 字幕 → 字幕延遲的說明、載入字幕檔…
+    hover_context_item(&mut h, "字幕 ⏵");
+    h.get_by_label("載入字幕檔… F24");
+    h.get_by_label_contains("字幕延遲").click();
+    h.run_steps(2);
+    h.get_by_label("快捷鍵 [ / ]，歸零 F13。正數 = 字幕晚一點出現");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 擷取畫面 → 另存新檔…
+    hover_context_item(&mut h, "擷取畫面 ⏵");
+    h.get_by_label("擷取畫面 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label("另存新檔… F22");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 畫質 → 流暢播放、音效 → 等化器：勾選框後面寫按鍵
+    open_picture_menu(&mut h);
+    h.get_by_label("F21");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_sound_menu(&mut h);
+    h.get_by_label("F20");
+    h.get_by_label("等化器");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 設定 → 播放：跳轉秒數的標題
+    open_settings_page(&mut h, "播放");
+    h.get_by_label("J / L 跳轉");
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    h.get_by_label(&format!("{cmd}+← / → 跳轉"));
 }
 
 // ───────────── 畫質：去交錯、去色帶、銳化、縮放演算法、HDR ─────────────

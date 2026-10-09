@@ -357,6 +357,10 @@ fn slot<'a>(root: &'a mut serde_json::Value, path: &[String]) -> Option<&'a mut 
 const MERGE_BY_ID: &[&str] = &["video", "shaders", "presets"];
 /// 固定長度、逐格合併的陣列：等化器每一段的增益。兩個視窗各調了不同的段落，都留下
 const MERGE_BY_INDEX: &[&str] = &["audio", "eq", "gains"];
+/// 項目可以被刪掉的物件：自己改過的快捷鍵（「還原」就是拿掉那一項）。
+/// 一般的物件只合併現在有的項目，這個視窗刪掉的會從檔案裡回來；這裡跟上次讀檔、存檔時比，
+/// 這個視窗刪掉的也從檔案拿掉（跟 `merge_by_id` 的刪除一樣）。每一項（一個指令的按鍵）還是整個當成一個值
+const MERGE_DELETES: &[&str] = &["keys", "custom"];
 
 /// 三方合併：`now` 跟 `base` 不同的地方寫進 `disk`，其他的保留 `disk` 的。
 /// 物件（例如字幕外觀）逐項合併：兩個視窗各改了一項，兩項都留下。
@@ -382,6 +386,11 @@ fn merge(
                     _ => value.clone(),
                 };
                 disk.insert(key.clone(), merged);
+            }
+            if path.as_slice() == MERGE_DELETES {
+                for key in base.keys().filter(|k| !now.contains_key(*k)) {
+                    disk.remove(key);
+                }
             }
             Value::Object(disk)
         }
@@ -680,6 +689,43 @@ mod tests {
         let back = Settings::load_from(path);
         assert_eq!(back.keys.custom["stop"], ["S"]);
         assert_eq!(back.keys.custom["restart"], ["Backspace"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keys_custom_reset_survives_save() {
+        let dir = temp_dir("keys-reset");
+        let path = dir.join("settings.json");
+        let mut a = Settings::load_from(path.clone());
+        a.keys.custom.insert("stop".into(), vec!["S".into()]);
+        a.keys.custom.insert("restart".into(), vec!["Backspace".into()]);
+        a.save().unwrap();
+        // 另一個視窗也開著，改了別的指令
+        let mut b = Settings::load_from(path.clone());
+        b.keys.custom.insert("toggle-mute".into(), vec!["N".into()]);
+        b.save().unwrap();
+        // 這個視窗還原了「停止」：存檔後不能從檔案裡回來，別的視窗改的照樣留下
+        a.keys.custom.remove("stop");
+        a.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert!(!back.keys.custom.contains_key("stop"), "{:?}", back.keys.custom);
+        assert_eq!(back.keys.custom["restart"], ["Backspace"]);
+        assert_eq!(back.keys.custom["toggle-mute"], ["N"]);
+        // 全部還原
+        a.keys = a.keys.reset_all();
+        a.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.keys.custom.len(), 1, "只剩另一個視窗改的：{:?}", back.keys.custom);
+        assert_eq!(back.keys.custom["toggle-mute"], ["N"]);
+        // 預設組照一般的值合併
+        a.keys.preset = crate::keymap::KeyPreset::Potplayer;
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""preset": "potplayer""#), "{text}");
+        assert_eq!(
+            Settings::load_from(path).keys.preset,
+            crate::keymap::KeyPreset::Potplayer
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

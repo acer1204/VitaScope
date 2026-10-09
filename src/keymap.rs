@@ -384,13 +384,21 @@ commands! {
     NextFile => "next-file", Playback, once, ("下一個檔案", "Next file");
     PrevChapter => "prev-chapter", Playback, once, ("上一章", "Previous chapter");
     NextChapter => "next-chapter", Playback, once, ("下一章", "Next chapter");
+    AbSetStart => "ab-set-start", Playback, once, ("A-B 重播：設定起點", "A-B loop: set start");
+    AbSetEnd => "ab-set-end", Playback, once, ("A-B 重播：設定終點", "A-B loop: set end");
+    AbClear => "ab-clear", Playback, once, ("取消 A-B 重播", "Cancel A-B loop");
     VolumeUp => "volume-up", Sound, repeat, ("音量 +", "Volume up");
     VolumeDown => "volume-down", Sound, repeat, ("音量 −", "Volume down");
     ToggleMute => "toggle-mute", Sound, once, ("靜音", "Mute");
     AudioDelayDown => "audio-delay-down", Sound, repeat, ("聲音提早", "Audio earlier");
     AudioDelayUp => "audio-delay-up", Sound, repeat, ("聲音延後", "Audio later");
+    AudioDelayReset => "audio-delay-reset", Sound, once, ("音訊延遲歸零", "Reset audio delay");
+    NextAudioTrack => "next-audio-track", Sound, once, ("下一條音軌", "Next audio track");
+    ToggleEq => "toggle-eq", Sound, once, ("等化器開／關", "Equalizer on/off");
     SubDelayDown => "sub-delay-down", Subtitles, repeat, ("字幕提早", "Subtitles earlier");
     SubDelayUp => "sub-delay-up", Subtitles, repeat, ("字幕延後", "Subtitles later");
+    SubDelayReset => "sub-delay-reset", Subtitles, once, ("字幕延遲歸零", "Reset subtitle delay");
+    NextSubtitle => "next-subtitle", Subtitles, once, ("下一個字幕", "Next subtitle");
     AspectCycle => "aspect-cycle", Picture, once, ("畫面比例", "Aspect ratio");
     CropCycle => "crop-cycle", Picture, once, ("裁切", "Crop");
     ZoomIn => "zoom-in", Picture, repeat, ("放大", "Zoom in");
@@ -405,6 +413,7 @@ commands! {
     FlipH => "flip-h", Picture, once, ("左右翻轉", "Flip horizontally");
     FlipV => "flip-v", Picture, once, ("上下翻轉", "Flip vertically");
     ResetView => "reset-view", Picture, once, ("重設畫面", "Reset the picture");
+    FillWindow => "fill-window", Picture, once, ("填滿視窗", "Fill window");
     BrightnessDown => "brightness-down", Quality, repeat, ("亮度 −", "Brightness −");
     BrightnessUp => "brightness-up", Quality, repeat, ("亮度 +", "Brightness +");
     ContrastDown => "contrast-down", Quality, repeat, ("對比 −", "Contrast −");
@@ -414,6 +423,9 @@ commands! {
     HueDown => "hue-down", Quality, repeat, ("色相 −", "Hue −");
     HueUp => "hue-up", Quality, repeat, ("色相 +", "Hue +");
     AdjustReset => "adjust-reset", Quality, once, ("影像調整還原", "Reset image adjustments");
+    GammaDown => "gamma-down", Quality, repeat, ("Gamma −", "Gamma −");
+    GammaUp => "gamma-up", Quality, repeat, ("Gamma +", "Gamma +");
+    ToggleSmooth => "toggle-smooth", Quality, once, ("流暢播放開／關", "Smooth playback on/off");
     Fullscreen => "fullscreen", Window, once, ("全螢幕", "Fullscreen");
     OnTop => "on-top", Window, once, ("視窗置頂", "Always on top");
     ControlPanel => "control-panel", Window, once, ("控制面板", "Control panel");
@@ -425,6 +437,8 @@ commands! {
     OpenFile => "open-file", Files, once, ("開啟檔案", "Open file");
     Screenshot => "screenshot", Files, once, ("擷取畫面（存檔）", "Save screenshot");
     CopyFrame => "copy-frame", Files, once, ("擷取畫面（剪貼簿）", "Copy frame");
+    ScreenshotAs => "screenshot-as", Files, once, ("另存截圖…", "Save screenshot as…");
+    LoadSubtitle => "load-subtitle", Files, once, ("載入字幕檔…", "Load subtitle file…");
 }
 
 impl Command {
@@ -445,12 +459,17 @@ pub enum KeyPreset {
     /// 影戲原本的按鍵
     #[default]
     Vitascope,
+    /// 比照 PotPlayer 的按鍵（只換幾個 PotPlayer 使用者手會記得的鍵，其他跟影戲一樣）
+    Potplayer,
 }
 
 impl KeyPreset {
+    pub const ALL: [KeyPreset; 2] = [KeyPreset::Vitascope, KeyPreset::Potplayer];
+
     pub fn label(self) -> &'static str {
         match self {
             KeyPreset::Vitascope => crate::tr!("影戲", "VitaScope"),
+            KeyPreset::Potplayer => crate::tr!("PotPlayer 風格", "PotPlayer style"),
         }
     }
 
@@ -458,6 +477,7 @@ impl KeyPreset {
     pub fn bindings(self, platform: Platform) -> Vec<(Command, Chord)> {
         match self {
             KeyPreset::Vitascope => vitascope_preset(platform),
+            KeyPreset::Potplayer => potplayer_preset(platform),
         }
     }
 }
@@ -546,6 +566,46 @@ fn vitascope_preset(platform: Platform) -> Vec<(Command, Chord)> {
         .collect()
 }
 
+/// PotPlayer 風格：以影戲的為底，換掉這些指令的按鍵（主人對照 PotPlayer 確認後只改這張表）：
+/// - Backspace 從頭播放（取代 Home）；F / D 逐格前進 / 後退（`.` `,` 空出來）；
+/// - 全螢幕 Enter、Alt+Enter（F 給了逐格）；F3 也是開啟檔案；
+/// - `[` `]` `\` A-B 重播的起點、終點、取消；字幕提早 / 延後改成 Shift+, / Shift+.（`<` `>`），`/` 字幕延遲歸零。
+///   `<` `>` 不是 egui 的按鍵，美式鍵盤上收到的是 Shift + 逗號 / 句號（其他配置的 `<` 可能是別的鍵，使用者自己改）；
+/// - L（A-B 依序切換）沒有按鍵：PotPlayer 用 `[` `]` `\`（設計 P§2.1 的表）
+fn potplayer_preset(platform: Platform) -> Vec<(Command, Chord)> {
+    use Command as C;
+    const N: Mods = Mods::NONE;
+    const CMD: Mods = Mods::CMD;
+    const ALT: Mods = Mods::ALT;
+    const SHIFT: Mods = Mods::SHIFT;
+    let changed: [(Command, &[Chord]); 12] = [
+        (C::Restart, &[Chord::new(N, Key::Backspace)]),
+        (C::AbLoop, &[]),
+        (C::FrameNext, &[Chord::new(N, Key::F)]),
+        (C::FramePrev, &[Chord::new(N, Key::D)]),
+        (C::Fullscreen, &[Chord::new(N, Key::Enter), Chord::new(ALT, Key::Enter)]),
+        (C::OpenFile, &[Chord::new(CMD, Key::O), Chord::new(N, Key::F3)]),
+        (C::AbSetStart, &[Chord::new(N, Key::OpenBracket)]),
+        (C::AbSetEnd, &[Chord::new(N, Key::CloseBracket)]),
+        (C::AbClear, &[Chord::new(N, Key::Backslash)]),
+        (C::SubDelayDown, &[Chord::new(SHIFT, Key::Comma)]),
+        (C::SubDelayUp, &[Chord::new(SHIFT, Key::Period)]),
+        (C::SubDelayReset, &[Chord::new(N, Key::Slash)]),
+    ];
+    let mut list: Vec<(Command, Chord)> = vitascope_preset(platform)
+        .into_iter()
+        .filter(|(cmd, _)| !changed.iter().any(|(c, _)| c == cmd))
+        .collect();
+    for (cmd, chords) in changed {
+        list.extend(
+            chords
+                .iter()
+                .map(|c| (cmd, Chord::new(c.mods.normalized(platform), c.key))),
+        );
+    }
+    list
+}
+
 /// 快捷鍵的設定（`settings.json` 的 `keys`）
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -572,6 +632,67 @@ impl KeySettings {
         }
         self
     }
+
+    /// 這個指令的按鍵改過（跟預設組不一樣；也包含改成「不指定」）
+    pub fn overridden(&self, cmd: Command) -> bool {
+        self.custom.contains_key(cmd.id())
+    }
+
+    /// 改過幾個指令（認不得的編號不算：這版看不到、也改不到）
+    pub fn override_count(&self) -> usize {
+        self.custom.keys().filter(|id| Command::from_id(id).is_some()).count()
+    }
+
+    /// 這個指令還原成預設組的按鍵
+    pub fn reset_command(&self, cmd: Command) -> Self {
+        let mut keys = self.clone();
+        keys.custom.remove(cmd.id());
+        keys
+    }
+
+    /// 「還原成預設組…」：預設組不變，自己改過的全部拿掉。
+    /// 認不得的編號（新版的指令）留著：這版看不到、也沒有算在「你改過的」裡，回到新版時照樣有效
+    pub fn reset_all(&self) -> Self {
+        let mut keys = self.clone();
+        keys.custom.retain(|id, _| Command::from_id(id).is_none());
+        keys
+    }
+}
+
+/// 錄到的按鍵要怎麼處理（[`Keymap::try_assign`]）
+#[derive(Debug, Clone, PartialEq)]
+pub enum Assign {
+    /// 系統保留的按鍵，不能指定
+    Reserved,
+    /// 本來就是這樣，不用改
+    Unchanged,
+    /// 已經用在別的指令：問使用者要不要改到這裡（[`Keymap::assign_stealing`]）
+    Conflict(Command),
+    /// 可以直接改：改好的設定
+    Changed(KeySettings),
+}
+
+/// 設定頁錄到的按鍵 → 要存的按鍵；修飾鍵本身（只按了 Shift…）是 None。
+/// 要按 Shift 才打得出來的符號（美式鍵盤的 Shift+= 是 `+`、Shift+/ 是 `?`）不記 Shift：
+/// egui 收到的是符號本身，比對時多按的 Shift 不影響，記了 Shift 反而在不用按 Shift 的鍵盤配置上按不到
+pub fn recorded_chord(key: Key, modifiers: egui::Modifiers, platform: Platform) -> Option<Chord> {
+    if is_modifier_key(key) {
+        return None;
+    }
+    let mut mods = Mods::from_egui(modifiers, platform);
+    if matches!(
+        key,
+        Key::Plus
+            | Key::Questionmark
+            | Key::Exclamationmark
+            | Key::Colon
+            | Key::Pipe
+            | Key::OpenCurlyBracket
+            | Key::CloseCurlyBracket
+    ) {
+        mods.shift = false;
+    }
+    Some(Chord::new(mods, key))
 }
 
 /// 實際用的對照表：預設組 + 自己改過的
@@ -703,6 +824,72 @@ impl Keymap {
             .join(sep)
     }
 
+    /// 這組按鍵現在是哪個指令的（被別的指令先拿走、沒有作用的不算）
+    pub fn owner(&self, chord: Chord) -> Option<Command> {
+        Command::ALL.iter().copied().find(|&c| self.chords(c).contains(&chord))
+    }
+
+    /// `cmd` 換掉第 `slot` 組按鍵（None = 新增一組），改成 `chord`：
+    /// 系統保留的不行；已經是別的指令的要先問（[`Assign::Conflict`]）
+    pub fn try_assign(&self, keys: &KeySettings, cmd: Command, slot: Option<usize>, chord: Chord) -> Assign {
+        if reserved(chord, self.platform) {
+            return Assign::Reserved;
+        }
+        match self.owner(chord) {
+            Some(other) if other != cmd => return Assign::Conflict(other),
+            _ => {}
+        }
+        let list = self.with_chord(cmd, slot, chord);
+        if list == self.chords(cmd) {
+            return Assign::Unchanged;
+        }
+        let mut keys = keys.clone();
+        keys.custom.insert(cmd.id().to_owned(), config_list(&list));
+        Assign::Changed(keys)
+    }
+
+    /// 衝突時選「改到這裡」：從原本的指令拿掉（那個指令也記成改過的，設定裡不會有重複的按鍵），再指定給 `cmd`
+    pub fn assign_stealing(&self, keys: &KeySettings, cmd: Command, slot: Option<usize>, chord: Chord) -> KeySettings {
+        let mut keys = keys.clone();
+        if let Some(other) = self.owner(chord).filter(|&o| o != cmd) {
+            let rest: Vec<Chord> = self.chords(other).iter().copied().filter(|&c| c != chord).collect();
+            keys.custom.insert(other.id().to_owned(), config_list(&rest));
+        }
+        if !reserved(chord, self.platform) {
+            let list = self.with_chord(cmd, slot, chord);
+            keys.custom.insert(cmd.id().to_owned(), config_list(&list));
+        }
+        keys
+    }
+
+    /// 拿掉 `cmd` 的第 `index` 組按鍵（全部拿掉 = 不指定，存成空陣列）
+    pub fn unassign(&self, keys: &KeySettings, cmd: Command, index: usize) -> KeySettings {
+        let mut list = self.chords(cmd).to_vec();
+        if index < list.len() {
+            list.remove(index);
+        }
+        let mut keys = keys.clone();
+        keys.custom.insert(cmd.id().to_owned(), config_list(&list));
+        keys
+    }
+
+    /// `cmd` 現在的按鍵換掉第 `slot` 組（或加在最後），去掉重複的、最多 `MAX_CHORDS` 組
+    fn with_chord(&self, cmd: Command, slot: Option<usize>, chord: Chord) -> Vec<Chord> {
+        let mut list = self.chords(cmd).to_vec();
+        match slot {
+            Some(i) if i < list.len() => list[i] = chord,
+            _ => list.push(chord),
+        }
+        let mut unique: Vec<Chord> = Vec::new();
+        for c in list {
+            if !unique.contains(&c) {
+                unique.push(c);
+            }
+        }
+        unique.truncate(MAX_CHORDS);
+        unique
+    }
+
     // ───────────── 選單、提示上的按鍵說明（沒有指定按鍵時，括號整個不寫） ─────────────
 
     /// 「標題（按鍵）」；中文用全形括號
@@ -811,6 +998,55 @@ impl Keymap {
         }
     }
 
+    /// 字幕、音訊延遲子選單的說明：「快捷鍵 [ / ]。正數 = 字幕晚一點出現」；
+    /// 歸零有按鍵時也寫出來（PotPlayer 風格：「快捷鍵 Shift+, / Shift+.，歸零 /。…」）
+    pub fn delay_note(&self, subtitle: bool) -> String {
+        // 兩個都寫完整（PotPlayer 風格的「Shift+, / Shift+.」省略成「Shift+, / .」看不懂）
+        let both = |a: Command, b: Command| {
+            [self.hint(a), self.hint(b)]
+                .into_iter()
+                .filter(|h| !h.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        let (keys, reset, what) = if subtitle {
+            (
+                both(Command::SubDelayDown, Command::SubDelayUp),
+                self.hint(Command::SubDelayReset),
+                crate::tr!("正數 = 字幕晚一點出現", "Positive = subtitles appear later"),
+            )
+        } else {
+            (
+                both(Command::AudioDelayDown, Command::AudioDelayUp),
+                self.hint(Command::AudioDelayReset),
+                crate::tr!("正數 = 聲音晚一點", "Positive = sound plays later"),
+            )
+        };
+        match (keys.is_empty(), reset.is_empty()) {
+            (true, true) => what.to_owned(),
+            (false, true) => crate::tf!("快捷鍵 {keys}。{what}", "Keys {keys}. {what}"),
+            (true, false) => crate::tf!("歸零 {reset}。{what}", "Reset {reset}. {what}"),
+            (false, false) => crate::tf!(
+                "快捷鍵 {keys}，歸零 {reset}。{what}",
+                "Keys {keys}, reset {reset}. {what}"
+            ),
+        }
+    }
+
+    /// 「設定 → 播放」跳轉秒數的標題：「← / → 跳轉」「Ctrl+← / → 跳轉」；沒有按鍵時只寫「跳轉」「大幅跳轉」
+    pub fn seek_label(&self, long: bool) -> String {
+        let keys = if long {
+            self.pair(Command::SeekBackLong, Command::SeekForwardLong)
+        } else {
+            self.pair(Command::SeekBack, Command::SeekForward)
+        };
+        match (keys.is_empty(), long) {
+            (true, false) => crate::tr!("跳轉", "Seek").to_owned(),
+            (true, true) => crate::tr!("大幅跳轉", "Seek further").to_owned(),
+            (false, _) => crate::tf!("{keys} 跳轉", "{keys} seek"),
+        }
+    }
+
     /// 起始畫面：「把影片拖放到這裡，或按 Ctrl+O 開啟檔案」
     pub fn drop_hint(&self) -> String {
         let key = self.hint(Command::OpenFile);
@@ -835,6 +1071,11 @@ impl Keymap {
             .collect::<Vec<_>>()
             .join(sep)
     }
+}
+
+/// 存進設定檔的按鍵清單
+fn config_list(chords: &[Chord]) -> Vec<String> {
+    chords.iter().map(Chord::to_config).collect()
 }
 
 /// 「標題（說明）」；說明是空的就只有標題
@@ -928,6 +1169,21 @@ mod tests {
         "open-file",
         "screenshot",
         "copy-frame",
+        // A3
+        "ab-set-start",
+        "ab-set-end",
+        "ab-clear",
+        "audio-delay-reset",
+        "next-audio-track",
+        "toggle-eq",
+        "sub-delay-reset",
+        "next-subtitle",
+        "fill-window",
+        "gamma-down",
+        "gamma-up",
+        "toggle-smooth",
+        "screenshot-as",
+        "load-subtitle",
     ];
 
     #[test]
@@ -971,7 +1227,10 @@ mod tests {
             for g in Group::ALL {
                 assert!(!g.label().is_empty());
             }
-            assert!(!KeyPreset::Vitascope.label().is_empty());
+            for p in KeyPreset::ALL {
+                assert!(!p.label().is_empty());
+            }
+            assert_ne!(KeyPreset::Vitascope.label(), KeyPreset::Potplayer.label());
         }
         set_lang(Lang::ZhTw);
     }
@@ -1009,7 +1268,9 @@ mod tests {
                 | C::SaturationDown
                 | C::SaturationUp
                 | C::HueDown
-                | C::HueUp => true,
+                | C::HueUp
+                | C::GammaDown
+                | C::GammaUp => true,
                 C::TogglePause
                 | C::Stop
                 | C::Restart
@@ -1039,7 +1300,19 @@ mod tests {
                 | C::CycleTheme
                 | C::OpenFile
                 | C::Screenshot
-                | C::CopyFrame => false,
+                | C::CopyFrame
+                | C::AbSetStart
+                | C::AbSetEnd
+                | C::AbClear
+                | C::AudioDelayReset
+                | C::NextAudioTrack
+                | C::ToggleEq
+                | C::SubDelayReset
+                | C::NextSubtitle
+                | C::FillWindow
+                | C::ToggleSmooth
+                | C::ScreenshotAs
+                | C::LoadSubtitle => false,
             };
             assert_eq!(c.repeatable(), expected, "{c:?}");
         }
@@ -1196,25 +1469,114 @@ mod tests {
 
     #[test]
     fn preset_has_no_duplicates_and_keeps_owner_keys() {
-        for p in Platform::ALL {
-            let list = KeyPreset::Vitascope.bindings(p);
-            for (i, (cmd, chord)) in list.iter().enumerate() {
-                assert!(
-                    !list[..i].iter().any(|(_, c)| c == chord),
-                    "{p:?} 重複的按鍵：{chord:?}（{cmd:?}）"
+        for preset in KeyPreset::ALL {
+            for p in Platform::ALL {
+                let list = preset.bindings(p);
+                for (i, (cmd, chord)) in list.iter().enumerate() {
+                    assert!(
+                        !list[..i].iter().any(|(_, c)| c == chord),
+                        "{preset:?} {p:?} 重複的按鍵：{chord:?}（{cmd:?}）"
+                    );
+                    assert!(!reserved(*chord, p), "{preset:?} {p:?} {chord:?}");
+                    assert_eq!(Chord::parse(&chord.to_config(), p), Some(*chord));
+                }
+                let map = Keymap::build(
+                    &KeySettings {
+                        preset,
+                        ..Default::default()
+                    },
+                    p,
                 );
-                assert!(!reserved(*chord, p), "{p:?} {chord:?}");
-                assert_eq!(Chord::parse(&chord.to_config(), p), Some(*chord));
+                assert!(map.shadowed().is_empty());
+                // 主人定的按鍵：Q、W…O、Alt+G（兩個預設組都一樣）
+                set_lang(Lang::ZhTw);
+                assert_eq!(map.hint(Command::AdjustReset), "Q");
+                assert_eq!(map.adjust_keys(), "W/E 亮度・R/T 對比・Y/U 飽和度・I/O 色相");
+                assert_eq!(
+                    map.hint(Command::ControlPanel),
+                    if p == Platform::Mac { "Option+G" } else { "Alt+G" }
+                );
             }
-            let map = keymap(p);
-            assert!(map.shadowed().is_empty());
-            // 主人定的按鍵：Q、W…O、Alt+G
+        }
+    }
+
+    /// PotPlayer 風格跟影戲只差這些指令（§1.3 的清單；主人對照 PotPlayer 後只改這裡和 `potplayer_preset`）
+    #[test]
+    fn potplayer_preset_differs_only_in_the_listed_keys() {
+        use Command as C;
+        let changed = [
+            C::Restart,
+            C::AbLoop,
+            C::FrameNext,
+            C::FramePrev,
+            C::Fullscreen,
+            C::OpenFile,
+            C::AbSetStart,
+            C::AbSetEnd,
+            C::AbClear,
+            C::SubDelayDown,
+            C::SubDelayUp,
+            C::SubDelayReset,
+        ];
+        for p in Platform::ALL {
+            let vita = keymap(p);
+            let pot = Keymap::build(
+                &KeySettings {
+                    preset: KeyPreset::Potplayer,
+                    ..Default::default()
+                },
+                p,
+            );
+            for &cmd in Command::ALL {
+                if !changed.contains(&cmd) {
+                    assert_eq!(pot.chords(cmd), vita.chords(cmd), "{p:?} {cmd:?}");
+                }
+            }
+            let n = Modifiers::NONE;
+            let shift = Modifiers::SHIFT;
+            let alt = Modifiers::ALT;
+            for (key, mods, want) in [
+                (Key::Backspace, n, Some(C::Restart)),
+                (Key::F, n, Some(C::FrameNext)),
+                (Key::D, n, Some(C::FramePrev)),
+                (Key::Enter, n, Some(C::Fullscreen)),
+                (Key::Enter, alt, Some(C::Fullscreen)),
+                (Key::F3, n, Some(C::OpenFile)),
+                (Key::OpenBracket, n, Some(C::AbSetStart)),
+                (Key::CloseBracket, n, Some(C::AbSetEnd)),
+                (Key::Backslash, n, Some(C::AbClear)),
+                (Key::Comma, shift, Some(C::SubDelayDown)),
+                (Key::Period, shift, Some(C::SubDelayUp)),
+                (Key::Slash, n, Some(C::SubDelayReset)),
+                // 空出來的鍵：逐格的 . ,、從頭播放的 Home、A-B 依序切換的 L（P§2.1 的表）
+                (Key::Period, n, None),
+                (Key::Comma, n, None),
+                (Key::Home, n, None),
+                (Key::L, n, None),
+                // 沒換的照舊：Alt+Backspace 重設畫面、Ctrl+T 視窗置頂
+                (Key::Backspace, alt, Some(C::ResetView)),
+            ] {
+                assert_eq!(pot.lookup(key, mods), want, "{p:?} {mods:?} {key:?}");
+            }
+            let cmd_t = if p == Platform::Mac {
+                Modifiers::MAC_CMD | Modifiers::COMMAND
+            } else {
+                Modifiers::COMMAND
+            };
+            assert_eq!(pot.lookup(Key::T, cmd_t), Some(C::OnTop));
+            assert_eq!(pot.lookup(Key::O, cmd_t), Some(C::OpenFile));
+            // 選單、提示上顯示的是 PotPlayer 的鍵
             set_lang(Lang::ZhTw);
-            assert_eq!(map.hint(Command::AdjustReset), "Q");
-            assert_eq!(map.adjust_keys(), "W/E 亮度・R/T 對比・Y/U 飽和度・I/O 色相");
+            assert_eq!(pot.hint(C::Restart), "Backspace");
+            assert_eq!(pot.resume_osd("1:23"), "從 1:23 繼續播放（Backspace 從頭播放）");
+            let alt_name = if p == Platform::Mac { "Option" } else { "Alt" };
             assert_eq!(
-                map.hint(Command::ControlPanel),
-                if p == Platform::Mac { "Option+G" } else { "Alt+G" }
+                pot.labeled_all("全螢幕", C::Fullscreen),
+                format!("全螢幕（Enter / {alt_name}+Enter）")
+            );
+            assert_eq!(
+                pot.delay_note(true),
+                "快捷鍵 Shift+, / Shift+.，歸零 /。正數 = 字幕晚一點出現"
             );
         }
     }
@@ -1570,6 +1932,27 @@ mod tests {
                             "Resuming from 1:23 (Home plays from the start)",
                         ),
                     ),
+                    (
+                        map.delay_note(true),
+                        pick(
+                            "快捷鍵 [ / ]。正數 = 字幕晚一點出現",
+                            "Keys [ / ]. Positive = subtitles appear later",
+                        ),
+                    ),
+                    (
+                        map.delay_note(false),
+                        pick(
+                            "快捷鍵 - / =。正數 = 聲音晚一點",
+                            "Keys - / =. Positive = sound plays later",
+                        ),
+                    ),
+                    // 「設定 → 播放」的跳轉秒數；大幅跳轉以前寫「Ctrl + ← / →」（macOS「⌘ + ← / →」），
+                    // 改成跟快捷鍵頁、選單一樣的寫法
+                    (map.seek_label(false), pick("← / → 跳轉", "← / → seek")),
+                    (
+                        map.seek_label(true),
+                        pick(&format!("{cmd}+← / → 跳轉"), &format!("{cmd}+← / → seek")),
+                    ),
                 ];
                 for (got, want) in texts {
                     assert_eq!(got, want, "{p:?} {lang:?}");
@@ -1611,5 +1994,177 @@ mod tests {
         let s = custom(&[("prev-chapter", &[]), ("next-chapter", &[])]);
         let map = Keymap::build(&s, Platform::Windows);
         assert_eq!(map.pair(Command::PrevChapter, Command::NextChapter), "");
+        // 延遲的說明：只剩一個鍵、都沒有
+        let s = custom(&[
+            ("sub-delay-down", &[]),
+            ("audio-delay-down", &[]),
+            ("audio-delay-up", &[]),
+        ]);
+        let map = Keymap::build(&s, Platform::Windows);
+        assert_eq!(map.delay_note(true), "快捷鍵 ]。正數 = 字幕晚一點出現");
+        assert_eq!(map.delay_note(false), "正數 = 聲音晚一點");
+        // 歸零有按鍵時也寫出來
+        let s = custom(&[
+            ("audio-delay-down", &[]),
+            ("audio-delay-up", &[]),
+            ("audio-delay-reset", &["F9"]),
+        ]);
+        let map = Keymap::build(&s, Platform::Windows);
+        assert_eq!(map.delay_note(false), "歸零 F9。正數 = 聲音晚一點");
+        let pot = Keymap::build(
+            &KeySettings {
+                preset: KeyPreset::Potplayer,
+                ..Default::default()
+            },
+            Platform::Windows,
+        );
+        assert_eq!(
+            pot.delay_note(true),
+            "快捷鍵 Shift+, / Shift+.，歸零 /。正數 = 字幕晚一點出現"
+        );
+        set_lang(Lang::En);
+        assert_eq!(
+            pot.delay_note(true),
+            "Keys Shift+, / Shift+., reset /. Positive = subtitles appear later"
+        );
+        assert_eq!(map.delay_note(false), "Reset F9. Positive = sound plays later");
+        set_lang(Lang::ZhTw);
+        // 跳轉沒有按鍵：只寫「跳轉」「大幅跳轉」
+        let s = custom(&[("seek-back", &[]), ("seek-forward", &[]), ("seek-back-long", &[])]);
+        let map = Keymap::build(&s, Platform::Windows);
+        assert_eq!(map.seek_label(false), "跳轉");
+        assert_eq!(map.seek_label(true), "Ctrl+→ 跳轉");
+        let s = custom(&[("seek-back-long", &[]), ("seek-forward-long", &[])]);
+        assert_eq!(Keymap::build(&s, Platform::Windows).seek_label(true), "大幅跳轉");
+    }
+
+    #[test]
+    fn recorded_chords_drop_shift_from_shifted_symbols() {
+        let w = Platform::Windows;
+        let m = Platform::Mac;
+        let shift = Modifiers::SHIFT;
+        // 美式鍵盤的 Shift+= 收到的是 Plus：記成「+」，不記 Shift
+        assert_eq!(
+            recorded_chord(Key::Plus, shift, w),
+            Some(Chord::new(Mods::NONE, Key::Plus))
+        );
+        for key in [
+            Key::Questionmark,
+            Key::Exclamationmark,
+            Key::Colon,
+            Key::Pipe,
+            Key::OpenCurlyBracket,
+            Key::CloseCurlyBracket,
+        ] {
+            assert_eq!(
+                recorded_chord(key, shift, w),
+                Some(Chord::new(Mods::NONE, key)),
+                "{key:?}"
+            );
+        }
+        // 一般的鍵照樣記 Shift；`<` 不是 egui 的按鍵，收到的是 Shift + 逗號
+        assert_eq!(recorded_chord(Key::K, shift, w), Some(Chord::new(Mods::SHIFT, Key::K)));
+        assert_eq!(
+            recorded_chord(Key::Comma, shift, w),
+            Some(Chord::new(Mods::SHIFT, Key::Comma))
+        );
+        // Ctrl 在 Windows 是 Cmd、在 macOS 是 Control
+        assert_eq!(
+            recorded_chord(Key::K, Modifiers::CTRL, w),
+            Some(Chord::new(Mods::CMD, Key::K))
+        );
+        assert_eq!(
+            recorded_chord(Key::K, Modifiers::CTRL, m),
+            Some(Chord::new(Mods::CTRL, Key::K))
+        );
+        assert_eq!(
+            recorded_chord(Key::K, Modifiers::MAC_CMD | Modifiers::COMMAND, m),
+            Some(Chord::new(Mods::CMD, Key::K))
+        );
+        // 只按了修飾鍵：還沒錄到
+        for key in [Key::ShiftLeft, Key::ControlRight, Key::AltLeft, Key::SuperLeft] {
+            assert_eq!(recorded_chord(key, shift, w), None);
+        }
+    }
+
+    #[test]
+    fn assign_checks_reserved_conflicts_and_caps() {
+        let p = Platform::Windows;
+        let keys = KeySettings::default();
+        let map = Keymap::build(&keys, p);
+        let k = |s: &str| Chord::parse(s, p).unwrap();
+        // 系統保留
+        assert_eq!(
+            map.try_assign(&keys, Command::TogglePause, None, k("Ctrl+V")),
+            Assign::Reserved
+        );
+        assert_eq!(
+            map.try_assign(&keys, Command::TogglePause, None, k("Esc")),
+            Assign::Reserved
+        );
+        // 已經是自己的
+        assert_eq!(
+            map.try_assign(&keys, Command::TogglePause, None, k("Space")),
+            Assign::Unchanged
+        );
+        assert_eq!(
+            map.try_assign(&keys, Command::TogglePause, Some(0), k("Space")),
+            Assign::Unchanged
+        );
+        // 別的指令的
+        assert_eq!(
+            map.try_assign(&keys, Command::TogglePause, None, k("M")),
+            Assign::Conflict(Command::ToggleMute)
+        );
+        // 新增一組、換掉一組
+        let Assign::Changed(added) = map.try_assign(&keys, Command::TogglePause, None, k("Shift+K")) else {
+            panic!()
+        };
+        assert_eq!(added.custom["toggle-pause"], ["Space", "Shift+K"]);
+        let Assign::Changed(replaced) = map.try_assign(&keys, Command::TogglePause, Some(0), k("K")) else {
+            panic!()
+        };
+        assert_eq!(replaced.custom["toggle-pause"], ["K"]);
+        assert!(replaced.overridden(Command::TogglePause));
+        assert_eq!(replaced.override_count(), 1);
+        // 改到這裡：兩個指令都記下來，設定裡沒有重複的按鍵
+        let stolen = map.assign_stealing(&keys, Command::TogglePause, None, k("M"));
+        assert_eq!(stolen.custom["toggle-pause"], ["Space", "M"]);
+        assert_eq!(stolen.custom["toggle-mute"], Vec::<String>::new());
+        let after = Keymap::build(&stolen, p);
+        assert_eq!(after.lookup(Key::M, Modifiers::NONE), Some(Command::TogglePause));
+        assert!(after.chords(Command::ToggleMute).is_empty());
+        assert!(after.shadowed().is_empty());
+        // 最多 MAX_CHORDS 組
+        let full = custom(&[("stop", &["F9", "F10", "F11", "F12"])]);
+        let map = Keymap::build(&full, p);
+        assert_eq!(
+            map.try_assign(&full, Command::Stop, None, k("S")),
+            Assign::Unchanged,
+            "已經 4 組（設定頁不會出現「+」）"
+        );
+        let Assign::Changed(swapped) = map.try_assign(&full, Command::Stop, Some(3), k("S")) else {
+            panic!()
+        };
+        assert_eq!(swapped.custom["stop"], ["F9", "F10", "F11", "S"]);
+        // 移除一組、全部移除 = 不指定（空陣列）
+        let one = map.unassign(&full, Command::Stop, 1);
+        assert_eq!(one.custom["stop"], ["F9", "F11", "F12"]);
+        let map = Keymap::build(&custom(&[("stop", &["F9"])]), p);
+        let none = map.unassign(&custom(&[("stop", &["F9"])]), Command::Stop, 0);
+        assert_eq!(none.custom["stop"], Vec::<String>::new());
+        // 還原一項、全部還原（預設組不變；認不得的也拿掉）
+        let mut keys = custom(&[("stop", &["F9"]), ("restart", &[]), ("future-cmd", &["F8"])]);
+        keys.preset = KeyPreset::Potplayer;
+        assert_eq!(keys.override_count(), 2, "認不得的不算");
+        let one = keys.reset_command(Command::Stop);
+        assert!(!one.overridden(Command::Stop));
+        assert!(one.overridden(Command::Restart));
+        let all = keys.reset_all();
+        assert_eq!(all.override_count(), 0);
+        // 新版的指令（這版認不得）照樣留在設定檔裡
+        assert_eq!(all.custom.len(), 1, "{:?}", all.custom);
+        assert_eq!(all.custom["future-cmd"], ["F8"]);
+        assert_eq!(all.preset, KeyPreset::Potplayer);
     }
 }

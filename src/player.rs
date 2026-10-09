@@ -1228,6 +1228,26 @@ impl Player {
         self.mpv.command(&["ab-loop"])
     }
 
+    /// A-B 重播的起點、終點（None = 沒設）。匯出片段也用這裡設定範圍。
+    /// 時間用數字設定，不能轉成字串：mpv 只在設定的那一刻看「目前位置 <= 終點」才會在終點繞回起點，
+    /// 終點四捨五入到比目前那一格的時間小一點點（例如 30 fps 的 1.0333…→「1.033333」），就永遠不會繞回去。
+    /// None 用 "no" 清掉
+    pub fn set_ab_loop(&self, a: Option<f64>, b: Option<f64>) -> mpv::Result<()> {
+        for (name, t) in [("ab-loop-a", a), ("ab-loop-b", b)] {
+            match t {
+                Some(t) => self.mpv.set_property(name, t)?,
+                None => self.mpv.set_property(name, "no")?,
+            }
+        }
+        Ok(())
+    }
+
+    /// 直接問 mpv 目前的 A-B 重播點（剛設定的值，屬性變化的通知可能還沒到）。
+    /// 用數字讀（字串只到小數 6 位）；沒設時 mpv 給的是 "no"，讀不成數字就是 None
+    pub fn ab_loop_points(&self) -> [Option<f64>; 2] {
+        ["ab-loop-a", "ab-loop-b"].map(|name| self.mpv.get_property::<f64>(name).ok())
+    }
+
     /// 取消 A-B 重播（mpv 換檔時會沿用，所以開新檔時要清掉）
     pub fn clear_ab_loop(&self) -> mpv::Result<()> {
         self.mpv.set_property("ab-loop-a", "no")?;
