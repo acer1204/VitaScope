@@ -165,7 +165,6 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 
 - [ ] mpv 的 Lua / JavaScript 腳本
 - [ ] 外掛 API
-- [ ] 補幀（mpv interpolation、VapourSynth）
 - [ ] 串流錄製
 - [ ] DVD / 藍光（ISO 或資料夾）
 - [ ] 擷取裝置（視訊鏡頭、擷取卡）
@@ -175,6 +174,14 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [ ] Windows HDR 輸出，支援 NVIDIA RTX 視訊增強（把一般影片轉成 HDR、超解析度）
 - [ ] 3D、360° 影片
 - [ ] 自動更新
+
+### L9 未來評估（暫緩，等條件成熟再決定）
+
+評估過、但要等外部條件成熟才決定做不做的項目；評估紀錄見 [ROADMAP.md 的 L9](ROADMAP.md#l9-未來評估)。
+
+- [ ] 補幀：把 24 fps 的動畫即時補到 60 / 120 fps（類似以前的 AMD Fluid Motion），AMD、NVIDIA 都要能用。
+  等 FFmpeg 下一個正式版（內含 NVIDIA 光流補幀濾鏡 `fruc_vulkan`）發佈後再評估，屆時跟「引擎支援 VapourSynth、使用者自備 SVP／RIFE」
+  「內建 RIFE」等做法一起比較
 
 ### 快捷鍵
 
