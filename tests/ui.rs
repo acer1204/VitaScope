@@ -13,7 +13,7 @@ use vitascope::pacing::{Plan, Reason, SmoothMode};
 use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
-use vitascope::settings::Settings;
+use vitascope::settings::{OnTop, Settings};
 use vitascope::theme::ThemeChoice;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -1467,29 +1467,27 @@ fn hover_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
 
 #[test]
 fn always_on_top_from_context_menu_and_keys() {
-    let mut h = playing_multitrack();
-    click_context_item(&mut h, "視窗置頂");
-    let cmds = viewport_commands(&h);
-    assert!(
-        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
-        "{cmds:?}"
-    );
-    assert!(h.state().settings().always_on_top);
-    // Ctrl+T 切回一般
-    h.input_mut().events.push(egui::Event::Key {
-        key: egui::Key::T,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::COMMAND,
-    });
-    h.step();
-    let cmds = viewport_commands(&h);
-    assert!(
-        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
-        "{cmds:?}"
-    );
-    assert!(!h.state().settings().always_on_top);
+    // 右鍵選單「視窗置頂 ▸」的三個選項：各自換模式、送對的視窗層級（播放中：播放時置頂 = 置頂）
+    let dir = TempDir::new("on-top-menu");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(settings);
+    for (item, mode, level) in [
+        ("永遠置頂", OnTop::Always, egui::WindowLevel::AlwaysOnTop),
+        ("不置頂", OnTop::Never, egui::WindowLevel::Normal),
+        ("播放時置頂", OnTop::WhilePlaying, egui::WindowLevel::AlwaysOnTop),
+        ("不置頂", OnTop::Never, egui::WindowLevel::Normal),
+    ] {
+        let levels = pick_on_top_from_menu(&mut h, item);
+        assert_eq!(levels, [level], "{item}");
+        assert_eq!(h.state().settings().on_top, mode, "{item}");
+        assert_eq!(Settings::load_from(path.clone()).on_top, mode, "馬上存檔：{item}");
+        assert_eq!(h.state().osd_text(), Some(mode_osd(mode)));
+    }
+    // Ctrl+T 依序切換：不置頂 → 永遠置頂（其他順序見 ctrl_t_cycles_the_on_top_modes）
+    assert_eq!(press_ctrl_t(&mut h), [egui::WindowLevel::AlwaysOnTop]);
+    assert_eq!(h.state().settings().on_top, OnTop::Always);
 }
 
 #[test]
@@ -1510,6 +1508,433 @@ fn leaving_fullscreen_restores_always_on_top() {
         cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
         "{cmds:?}"
     );
+    // 播放時置頂：播放中離開全螢幕也再設一次（動畫結束後再一次）；暫停中（實際是一般視窗）不設成置頂
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying);
+    let leave_fullscreen = |h: &mut Harness<'_, VitascopeApp>| {
+        set_fullscreen(h, true);
+        h.input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .fullscreen = Some(false);
+        h.step();
+        window_levels(h)
+    };
+    assert_eq!(leave_fullscreen(&mut h), [egui::WindowLevel::AlwaysOnTop]);
+    assert_eq!(
+        levels_during(&mut h, 1.3),
+        [egui::WindowLevel::AlwaysOnTop],
+        "動畫結束後再設一次"
+    );
+    h.key_press(egui::Key::Space);
+    let levels = levels_until(&mut h, "暫停", |s| s.paused);
+    assert_eq!(levels, [egui::WindowLevel::Normal]);
+    assert_eq!(leave_fullscreen(&mut h), [], "暫停中離開全螢幕不置頂");
+    assert_eq!(levels_during(&mut h, 1.3), []);
+}
+
+/// 這一幀送給視窗的層級指令
+fn window_levels(h: &Harness<'_, VitascopeApp>) -> Vec<egui::WindowLevel> {
+    viewport_commands(h)
+        .into_iter()
+        .filter_map(|c| match c {
+            egui::ViewportCommand::WindowLevel(l) => Some(l),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 一直跑介面幀直到播放器狀態符合條件，回傳這段期間送給視窗的所有層級指令
+fn levels_until(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    cond: impl Fn(&State) -> bool,
+) -> Vec<egui::WindowLevel> {
+    let start = Instant::now();
+    let mut levels = Vec::new();
+    loop {
+        h.step();
+        levels.extend(window_levels(h));
+        if cond(&h.state().player().state) {
+            return levels;
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "等待逾時：{what}\n目前狀態：{:#?}",
+            h.state().player().state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 實際經過一段時間、一直更新介面，回傳期間送給視窗的所有層級指令
+fn levels_during(h: &mut Harness<'_, VitascopeApp>, seconds: f64) -> Vec<egui::WindowLevel> {
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut levels = Vec::new();
+    while Instant::now() < end {
+        h.step();
+        levels.extend(window_levels(h));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    levels
+}
+
+/// 按下、放開 Ctrl（macOS：Cmd）+ T（同一幀內），回傳這一幀送給視窗的層級指令。
+/// 不用 `key_press_modifiers`：它把修飾鍵分成好幾幀送，`output()` 只看得到最後一幀
+fn press_ctrl_t(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::WindowLevel> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::T,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+    }
+    h.step();
+    window_levels(h)
+}
+
+/// 右鍵選單「視窗置頂 ▸」裡選一個模式，回傳那一幀送給視窗的層級指令
+fn pick_on_top_from_menu(h: &mut Harness<'_, VitascopeApp>, item: &str) -> Vec<egui::WindowLevel> {
+    hover_context_item(h, "視窗置頂");
+    h.get_by_label(item).click();
+    h.step();
+    let levels = window_levels(h);
+    h.run_steps(2);
+    levels
+}
+
+fn mode_osd(mode: OnTop) -> &'static str {
+    match mode {
+        OnTop::Never => "視窗置頂：關閉",
+        OnTop::Always => "視窗置頂：永遠",
+        OnTop::WhilePlaying => "視窗置頂：播放時",
+    }
+}
+
+#[test]
+fn on_top_while_playing_follows_playback() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = harness_with(None, settings);
+    assert_eq!(levels_during(&mut h, 0.2), [], "沒有檔案：一般視窗");
+    // 開始播放：置頂（只送一次；拖進檔案的那一幀也算）
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(sample("common/mp4_h264_aac.mp4"))));
+    let levels = levels_until(&mut h, "開始播放", |s| s.loaded && !s.paused && s.time_pos > 0.0);
+    assert_eq!(levels, [egui::WindowLevel::AlwaysOnTop]);
+    h.run_steps(5);
+    // 暫停：一般視窗；繼續：置頂
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    assert_eq!(levels_during(&mut h, 0.2), []);
+    // 暫停中逐格（mpv 會短暫取消暫停、播一格再停）：算暫停，維持一般視窗
+    for _ in 0..3 {
+        let before = h.state().player().state.time_pos;
+        h.key_press(egui::Key::Period);
+        let mut levels = levels_until(&mut h, "逐格前進一格", |s| s.paused && s.time_pos > before);
+        levels.extend(levels_during(&mut h, 0.2));
+        assert_eq!(levels, [], "逐格");
+    }
+    h.key_press(egui::Key::Space);
+    assert_eq!(
+        levels_until(&mut h, "繼續播放", |s| !s.paused),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    // 跳到快結束、播完停在最後一格（keep-open 會暫停）：一般視窗
+    let duration = h.state().player().state.duration.unwrap();
+    let _ = h.state().player().seek_to(duration - 0.3, true);
+    assert_eq!(
+        levels_until(&mut h, "播完停在最後一格", |s| s.eof && s.paused),
+        [egui::WindowLevel::Normal]
+    );
+    assert_eq!(levels_during(&mut h, 0.2), []);
+    // 從頭播放：置頂；停止：一般視窗
+    h.key_press(egui::Key::Home);
+    assert_eq!(
+        levels_until(&mut h, "從頭播放", |s| s.loaded && !s.paused && !s.eof),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    let _ = h.state().player().stop();
+    assert_eq!(levels_until(&mut h, "停止", |s| !s.loaded), [egui::WindowLevel::Normal]);
+    assert_eq!(levels_during(&mut h, 0.2), [], "沒有檔案：維持一般視窗");
+}
+
+#[test]
+fn on_top_level_is_sent_only_when_it_changes() {
+    let mut h = playing_multitrack();
+    assert_eq!(levels_during(&mut h, 0.3), [], "不置頂：什麼都不送");
+    assert_eq!(
+        pick_on_top_from_menu(&mut h, "永遠置頂"),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    assert_eq!(levels_during(&mut h, 0.5), [], "播放中不會一直送");
+    // 播放中從永遠置頂換成播放時置頂：實際一樣是置頂，不用再送
+    assert_eq!(pick_on_top_from_menu(&mut h, "播放時置頂"), []);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying);
+    assert_eq!(levels_during(&mut h, 0.5), []);
+    // 暫停中換成永遠置頂：從一般換成置頂
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    assert_eq!(levels_during(&mut h, 0.3), []);
+    assert_eq!(
+        pick_on_top_from_menu(&mut h, "永遠置頂"),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    assert_eq!(levels_during(&mut h, 0.3), []);
+}
+
+#[test]
+fn ctrl_t_cycles_the_on_top_modes() {
+    let dir = TempDir::new("on-top-keys");
+    let path = dir.0.join("settings.json");
+    for lang in vitascope::i18n::Lang::ALL {
+        let en = lang == vitascope::i18n::Lang::En;
+        let mut settings = Settings::load_from(path.clone());
+        settings.auto_next = false;
+        settings.language = lang;
+        settings.on_top = OnTop::Never;
+        let mut h = playing_multitrack_with(settings);
+        // 播放中：不置頂 → 永遠置頂（置頂）→ 播放時置頂（還是置頂，不用再送）→ 不置頂（一般）
+        for (mode, zh, english, levels) in [
+            (
+                OnTop::Always,
+                "視窗置頂：永遠",
+                "Always on top: always",
+                vec![egui::WindowLevel::AlwaysOnTop],
+            ),
+            (
+                OnTop::WhilePlaying,
+                "視窗置頂：播放時",
+                "Always on top: while playing",
+                vec![],
+            ),
+            (
+                OnTop::Never,
+                "視窗置頂：關閉",
+                "Always on top: off",
+                vec![egui::WindowLevel::Normal],
+            ),
+        ] {
+            assert_eq!(press_ctrl_t(&mut h), levels, "{mode:?}");
+            assert_eq!(h.state().settings().on_top, mode);
+            assert_eq!(h.state().osd_text(), Some(if en { english } else { zh }));
+            assert_eq!(Settings::load_from(path.clone()).on_top, mode, "馬上存檔");
+            h.run_steps(2);
+        }
+    }
+}
+
+#[test]
+fn general_page_on_top_combo_box() {
+    let dir = TempDir::new("on-top-page");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("視窗置頂");
+    h.get_by_value("不置頂").click();
+    h.run_steps(2);
+    h.get_by_label("播放時置頂").click();
+    h.step();
+    // 跟右鍵選單一樣：馬上套用（播放中：置頂）、存檔、提示
+    assert_eq!(window_levels(&h), [egui::WindowLevel::AlwaysOnTop]);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying);
+    assert_eq!(Settings::load_from(path.clone()).on_top, OnTop::WhilePlaying);
+    assert_eq!(h.state().osd_text(), Some("視窗置頂：播放時"));
+    h.run_steps(2);
+    h.get_by_value("播放時置頂").click();
+    h.run_steps(2);
+    h.get_by_label("不置頂").click();
+    h.step();
+    assert_eq!(window_levels(&h), [egui::WindowLevel::Normal]);
+    assert_eq!(Settings::load_from(path).on_top, OnTop::Never);
+    h.run_steps(2);
+    h.get_by_value("不置頂");
+}
+
+#[test]
+fn wayland_refuses_both_on_top_modes() {
+    let refused = "這個桌面環境（Wayland）不支援讓程式自己設定視窗置頂";
+    let wayland = |on_top: OnTop| {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.on_top = on_top;
+        let mut h = harness_launch(
+            Launch {
+                files: vec![sample("common/mkv_multitrack.mkv")],
+                wayland: Some(true),
+                ..Default::default()
+            },
+            settings,
+        );
+        settle(&mut h, "mkv_multitrack.mkv");
+        h
+    };
+    let mut h = wayland(OnTop::Never);
+    // 快捷鍵、右鍵選單、設定視窗：永遠置頂、播放時置頂都不行
+    assert_eq!(press_ctrl_t(&mut h), []);
+    assert_eq!(h.state().settings().on_top, OnTop::Never);
+    assert_eq!(h.state().osd_text(), Some(refused));
+    h.run_steps(2);
+    for item in ["永遠置頂", "播放時置頂"] {
+        assert_eq!(pick_on_top_from_menu(&mut h, item), [], "{item}");
+        assert_eq!(h.state().settings().on_top, OnTop::Never, "{item}");
+        assert_eq!(h.state().osd_text(), Some(refused));
+    }
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("不置頂").click();
+    h.run_steps(2);
+    h.get_by_label("播放時置頂").click();
+    h.step();
+    assert_eq!(h.state().settings().on_top, OnTop::Never);
+    assert_eq!(h.state().osd_text(), Some(refused));
+    assert_eq!(levels_during(&mut h, 0.3), []);
+    // 在別的桌面環境開的置頂（兩種都一樣）：照樣可以用 Ctrl+T 關掉
+    for on_top in [OnTop::Always, OnTop::WhilePlaying] {
+        let mut h = wayland(on_top);
+        assert_eq!(press_ctrl_t(&mut h), [egui::WindowLevel::Normal], "{on_top:?}");
+        assert_eq!(h.state().settings().on_top, OnTop::Never, "{on_top:?}");
+        assert_eq!(h.state().osd_text(), Some("視窗置頂：關閉"));
+    }
+}
+
+/// 一直跑介面幀直到整個播放器符合條件（例如背景掃描完的播放清單），回傳期間送給視窗的層級指令
+fn levels_until_app(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    cond: impl Fn(&VitascopeApp) -> bool,
+) -> Vec<egui::WindowLevel> {
+    let start = Instant::now();
+    let mut levels = Vec::new();
+    loop {
+        h.step();
+        levels.extend(window_levels(h));
+        if cond(h.state()) {
+            return levels;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn on_top_while_playing_stays_on_top_across_file_changes() {
+    // 播放時置頂：換下一個／上一個檔案、播完自動播下一個時，中間不會先變一般視窗再變回置頂
+    let dir = TempDir::new("on-top-switch");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        dir.clip(name);
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = true;
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = harness_with(None, settings);
+    let started = |name: &'static str| move |s: &State| playing(s, name) && !s.paused && !s.eof && s.time_pos > 0.0;
+    // 拖進第1集（不在啟動時開：建立視窗那一幀送的指令看不到）
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(dir.0.join("第1集.mp4"))));
+    let mut levels = levels_until(&mut h, "播放第1集", started("第1集.mp4"));
+    levels.extend(levels_until_app(&mut h, "掃描到兩個影片", |app| {
+        playlist_len(app) == 2
+    }));
+    assert_eq!(levels, [egui::WindowLevel::AlwaysOnTop]);
+    h.key_press(egui::Key::PageDown);
+    let mut levels = levels_until(&mut h, "PgDn → 第2集", started("第2集.mp4"));
+    levels.extend(levels_during(&mut h, 0.2));
+    assert_eq!(levels, [], "換下一個檔案");
+    h.key_press(egui::Key::PageUp);
+    let mut levels = levels_until(&mut h, "PgUp → 第1集", started("第1集.mp4"));
+    levels.extend(levels_during(&mut h, 0.2));
+    assert_eq!(levels, [], "換上一個檔案");
+    // 第1集播完（keep-open 停在最後一格、暫停）馬上自動播第2集：不算播完
+    let duration = h.state().player().state.duration.unwrap();
+    let _ = h.state().player().seek_to(duration - 0.3, true);
+    let mut levels = levels_until(&mut h, "自動播第2集", started("第2集.mp4"));
+    levels.extend(levels_during(&mut h, 0.2));
+    assert_eq!(levels, [], "自動播下一個");
+    // 最後一個播完、沒有下一個：停在最後一格，一般視窗
+    let duration = h.state().player().state.duration.unwrap();
+    let _ = h.state().player().seek_to(duration - 0.3, true);
+    let mut levels = levels_until(&mut h, "第2集播完", |s| {
+        playing(s, "第2集.mp4") && s.eof && s.paused
+    });
+    levels.extend(levels_during(&mut h, 0.3));
+    assert_eq!(levels, [egui::WindowLevel::Normal], "清單播完");
+}
+
+#[test]
+fn resuming_right_after_leaving_fullscreen_stays_on_top() {
+    // 播放時置頂：暫停中離開全螢幕、一秒內又繼續播放。macOS 動畫結束時會把層級改回一般，
+    // 這時送的置頂會被蓋掉：動畫結束後要再設一次
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = playing_multitrack_with(settings);
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    set_fullscreen(&mut h, true);
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.step();
+    assert_eq!(window_levels(&h), [], "暫停中離開全螢幕：不置頂");
+    h.key_press(egui::Key::Space);
+    assert_eq!(
+        levels_until(&mut h, "繼續播放", |s| !s.paused),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    assert_eq!(
+        levels_during(&mut h, 1.3),
+        [egui::WindowLevel::AlwaysOnTop],
+        "動畫結束後再設一次"
+    );
+    assert_eq!(levels_during(&mut h, 0.3), []);
+}
+
+#[test]
+fn on_top_submenu_header_shows_the_assigned_key() {
+    // 「視窗置頂 ▸」標題上的按鍵從快捷鍵對照表來：改了就跟著改，沒有指定按鍵就不寫
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    for (keys, header) in [(vec!["F13".to_owned()], "視窗置頂 F13 ⏵"), (vec![], "視窗置頂 ⏵")] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.keys.custom.insert("on-top".into(), keys);
+        let mut h = playing_multitrack_with(settings);
+        h.get_by_label("影片畫面").click_secondary();
+        h.run_steps(2);
+        assert!(h.query_by_label(header).is_some(), "選單上沒有「{header}」");
+        assert!(
+            h.query_by_label(&format!("視窗置頂 {cmd}+T ⏵")).is_none(),
+            "{cmd}+T 已經不是切換視窗置頂"
+        );
+    }
+}
+
+#[test]
+fn theme_note_sits_under_the_appearance_row() {
+    // 偵測不到系統深淺色的提示緊接在「外觀」下面，不會跑到「視窗置頂」底下
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, None);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    let theme = h.get_by_value("跟隨系統").rect();
+    let note = h.get_by_label("偵測不到系統的深淺色設定，暫時用深色").rect();
+    let on_top = h.get_by_label("視窗置頂").rect();
+    assert!(theme.bottom() <= note.top(), "提示在外觀下面：{theme:?} {note:?}");
+    assert!(note.bottom() <= on_top.top(), "提示在視窗置頂上面：{note:?} {on_top:?}");
 }
 
 fn ratio(s: &State) -> f64 {
@@ -3090,7 +3515,8 @@ fn menu_shortcut_hints_match_v030() {
             "全螢幕 F".into(),
             "播放清單 F6".into(),
             format!("媒體資訊 {info}"),
-            format!("視窗置頂 {cmd}+T"),
+            // 子選單：按鍵寫在標題上（依序切換三種模式）
+            format!("視窗置頂 {cmd}+T ⏵"),
             "設定… F5".into(),
             "關於影戲 F1".into(),
         ],
@@ -4158,7 +4584,7 @@ fn picture_keys_adjust_and_reset() {
         wait_for_png(&mut h, &dir.0, 1);
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::T);
         h.run_steps(2);
-        assert!(h.state().settings().always_on_top, "Ctrl+T 視窗置頂");
+        assert_eq!(h.state().settings().on_top, OnTop::Always, "Ctrl+T 視窗置頂：永遠置頂");
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::I);
         h.run_steps(2);
         h.get_by_label_contains("640×360（16:9）");

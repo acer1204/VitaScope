@@ -9,6 +9,7 @@ use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{
     ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover,
 };
+use crate::settings::OnTop;
 use crate::sound::{AUTO_DEVICE, AudioDevice, SPDIF_CODECS, spdif_label};
 use crate::theme::ThemeChoice;
 use crate::{tf, tr};
@@ -154,19 +155,29 @@ impl VitascopeApp {
                         }
                     });
                 ui.end_row();
+                // 提示緊接在外觀下面（不要跑到視窗置頂那一列底下）
+                if crate::theme::system_unknown(ui.ctx(), self.settings.theme) {
+                    ui.label("");
+                    ui.weak(tr!(
+                        "偵測不到系統的深淺色設定，暫時用深色",
+                        "Couldn't detect the system's light/dark setting; using dark for now"
+                    ));
+                    ui.end_row();
+                }
+                ui.label(tr!("視窗置頂", "Always on top"));
+                let current = self.settings.on_top;
+                egui::ComboBox::from_id_salt("settings_on_top")
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for mode in OnTop::ALL {
+                            if ui.selectable_label(current == mode, mode.label()).clicked() && mode != current {
+                                // 跟快捷鍵、右鍵選單走同一條路（馬上套用、存檔；Wayland 不支援時會提示）
+                                *action = Some(Action::SetOnTop(mode));
+                            }
+                        }
+                    });
+                ui.end_row();
             });
-        if crate::theme::system_unknown(ui.ctx(), self.settings.theme) {
-            ui.weak(tr!(
-                "偵測不到系統的深淺色設定，暫時用深色",
-                "Couldn't detect the system's light/dark setting; using dark for now"
-            ));
-        }
-        ui.add_space(6.0);
-        let mut on_top = self.settings.always_on_top;
-        if ui.checkbox(&mut on_top, tr!("視窗置頂", "Always on top")).changed() {
-            // 跟快捷鍵、右鍵選單走同一條路（Wayland 不支援時會提示）
-            *action = Some(Action::ToggleOnTop);
-        }
         changed
     }
 

@@ -427,7 +427,7 @@ commands! {
     GammaUp => "gamma-up", Quality, repeat, ("Gamma +", "Gamma +");
     ToggleSmooth => "toggle-smooth", Quality, once, ("流暢播放開／關", "Smooth playback on/off");
     Fullscreen => "fullscreen", Window, once, ("全螢幕", "Fullscreen");
-    OnTop => "on-top", Window, once, ("視窗置頂", "Always on top");
+    OnTop => "on-top", Window, once, ("切換視窗置頂模式", "Cycle always-on-top mode");
     ControlPanel => "control-panel", Window, once, ("控制面板", "Control panel");
     Playlist => "playlist", Window, once, ("播放清單", "Playlist");
     MediaInfo => "media-info", Window, once, ("媒體資訊", "Media info");
@@ -1705,7 +1705,7 @@ mod tests {
                 (Key::Comma, n, None),
                 (Key::Home, n, None),
                 (Key::L, n, None),
-                // 沒換的照舊：Alt+Backspace 重設畫面、Ctrl+T 視窗置頂
+                // 沒換的照舊：Alt+Backspace 重設畫面、Ctrl+T 切換視窗置頂模式
                 (Key::Backspace, alt, Some(C::ResetView)),
             ] {
                 assert_eq!(pot.lookup(key, mods), want, "{p:?} {mods:?} {key:?}");

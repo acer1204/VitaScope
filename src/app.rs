@@ -25,7 +25,7 @@ use crate::picture::{
 };
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
 use crate::playlist::Playlist;
-use crate::settings::{Settings, SubStyle, WindowGeometry};
+use crate::settings::{OnTop, Settings, SubStyle, WindowGeometry};
 use crate::sound::{EqPreset, Leveling};
 use crate::theme::{self, Palette, ThemeChoice};
 use crate::update::{self, UpdateStatus};
@@ -108,8 +108,9 @@ enum Action {
     LoadSubtitle,
     LoadAudio,
     SubtitleStyle,
-    /// 視窗置頂（開 / 關）
-    ToggleOnTop,
+    /// 視窗置頂模式：依序切換（不置頂 → 永遠置頂 → 播放時置頂）/ 指定
+    CycleOnTop,
+    SetOnTop(OnTop),
     /// 畫面比例：依序切換 / 指定（None = 原始比例）
     AspectCycle,
     SetAspect(Option<usize>),
@@ -354,6 +355,11 @@ pub struct VitascopeApp {
     playlist_view: (f32, f32),
     /// 主視窗（開檔對話框的擁有者；視窗置頂時對話框才不會被蓋在下面）
     owner: Option<Owner>,
+    /// Wayland：不讓程式自己把視窗設成置頂
+    wayland: bool,
+    /// 最後送給視窗的層級（true = 置頂；啟動時是 main.rs 建立視窗時設的）。
+    /// 實際要不要置頂（`on_top_now`）變了才再送，不要每一幀都送
+    on_top_sent: bool,
     /// 上一幀是否全螢幕（macOS 離開全螢幕時會把「置頂」拿掉，要再設一次）
     was_fullscreen: bool,
     /// 什麼時候再設一次視窗置頂（macOS 離開全螢幕的動畫結束之後）
@@ -499,6 +505,9 @@ pub struct Launch {
     /// 測試用：當成建立 App 時看到的 GL context 能／不能做 HDR 動態峰值偵測（介面測試沒有 GL context）；None = 看 GL context
     #[doc(hidden)]
     pub gl_compute_peak: Option<bool>,
+    /// 測試用：當成是 / 不是 Wayland（不能設置頂）；None = 看視窗（介面測試沒有視窗：不是）
+    #[doc(hidden)]
+    pub wayland: Option<bool>,
 }
 
 impl VitascopeApp {
@@ -580,6 +589,9 @@ impl VitascopeApp {
             eprintln!("[vitascope] {msg}");
         }
         let owner = Owner::from_creation(cc);
+        let wayland = launch.wayland.unwrap_or_else(|| owner.is_some_and(|o| o.is_wayland()));
+        // 建立視窗時的層級（main.rs 用同一個 `at_launch`）：只有「永遠置頂」，「播放時置頂」等開始播放才置頂
+        let on_top_sent = settings.on_top.at_launch();
         // 自動測試沒有真的視窗（沒有 handle），查不到更新率，跟以前一樣播放
         let probe = launch.platform.or_else(|| {
             owner.map(|o| Box::new(pacing::RealProbe::new(o.window, &cc.egui_ctx)) as Box<dyn PlatformProbe>)
@@ -667,6 +679,8 @@ impl VitascopeApp {
             playlist_follow: None,
             playlist_view: (0.0, 0.0),
             owner,
+            wayland,
+            on_top_sent,
             was_fullscreen: false,
             reapply_level_at: None,
             settings_open: false,
@@ -1440,23 +1454,15 @@ impl VitascopeApp {
                 }
                 self.osd(crate::tr!("畫面已重設", "Picture reset"));
             }
-            // Wayland 不能設成置頂（存下來的設定是在別的桌面環境開的，照樣可以關掉）
-            Action::ToggleOnTop if !self.settings.always_on_top && self.owner.is_some_and(|o| o.is_wayland()) => {
-                self.osd(crate::tr!(
-                    "這個桌面環境（Wayland）不支援讓程式自己設定視窗置頂",
-                    "This desktop (Wayland) does not let programs keep themselves on top"
-                ));
+            Action::CycleOnTop => {
+                // Wayland 只能關掉（存下來的設定是在別的桌面環境開的）：開著時直接回到不置頂
+                let next = match self.settings.on_top {
+                    mode if self.wayland && mode != OnTop::Never => OnTop::Never,
+                    mode => mode.next(),
+                };
+                self.set_on_top(ctx, next);
             }
-            Action::ToggleOnTop => {
-                self.settings.always_on_top = !self.settings.always_on_top;
-                self.apply_window_level(ctx);
-                self.save_settings();
-                self.osd(if self.settings.always_on_top {
-                    crate::tr!("視窗置頂：開啟", "Always on top: on")
-                } else {
-                    crate::tr!("視窗置頂：關閉", "Always on top: off")
-                });
-            }
+            Action::SetOnTop(mode) => self.set_on_top(ctx, mode),
             Action::SetTheme(choice) => self.set_theme(ctx, choice),
             Action::CycleTheme => {
                 let choice = self.settings.theme.toggled(ctx.theme());
@@ -1665,18 +1671,63 @@ impl VitascopeApp {
         changed
     }
 
-    /// macOS 離開全螢幕時會把視窗層級改回一般（設定還是「置頂」）：離開時再設一次，
-    /// 動畫結束後（約一秒）再設一次。其他系統重設一次沒有影響
-    fn keep_window_level(&mut self, ctx: &egui::Context) {
-        let fullscreen = is_fullscreen(ctx);
-        if std::mem::replace(&mut self.was_fullscreen, fullscreen) && !fullscreen && self.settings.always_on_top {
+    /// 換視窗置頂模式（快捷鍵、右鍵選單、設定視窗都走這裡）：馬上套用、存檔、提示
+    fn set_on_top(&mut self, ctx: &egui::Context, mode: OnTop) {
+        // Wayland 不能設成置頂（兩種置頂模式都不行；關掉可以）
+        if self.wayland && mode != OnTop::Never {
+            self.osd(crate::tr!(
+                "這個桌面環境（Wayland）不支援讓程式自己設定視窗置頂",
+                "This desktop (Wayland) does not let programs keep themselves on top"
+            ));
+            return;
+        }
+        if mode != self.settings.on_top {
+            self.settings.on_top = mode;
+            self.save_settings();
+        }
+        self.sync_window_level(ctx);
+        self.osd(mode.osd());
+    }
+
+    /// 現在視窗實際上要不要置頂（依模式與播放狀態）。
+    /// 播放時置頂：有檔案、沒有暫停、沒有停在最後一格（keep-open 播完會暫停），逐格也算暫停。
+    /// 程式自己在換檔（`open` 一定會取消暫停）也算在播：舊檔案的暫停、播完狀態要等新檔案開始才會更新，
+    /// 不然自動播下一個、換上一個／下一個檔案時視窗會先變一般再變回置頂。
+    /// 迷你播放器、子母畫面回到一般視窗時也用這個
+    fn on_top_now(&self) -> bool {
+        let st = &self.player.state;
+        let playing =
+            self.switching_file || ((st.loaded || st.loading) && !st.paused && !st.eof && !self.frame_stepping);
+        self.settings.on_top.effective(playing)
+    }
+
+    /// 實際要不要置頂變了才送給視窗（每一幀檢查）
+    fn sync_window_level(&mut self, ctx: &egui::Context) {
+        if self.on_top_now() != self.on_top_sent {
             self.apply_window_level(ctx);
+        }
+    }
+
+    /// 每一幀：實際要不要置頂變了就送（播放時置頂：開始播、暫停、播完…）。
+    /// macOS 離開全螢幕時會把視窗層級改回一般（設定還是「置頂」）：離開時再設一次，
+    /// 動畫結束後（約一秒）再設一次。其他系統重設一次沒有影響。
+    /// 播放時置頂、離開時剛好暫停：一樣要等動畫結束再看一次（這一秒內繼續播放時送的置頂會被 macOS 蓋掉）
+    fn keep_window_level(&mut self, ctx: &egui::Context) {
+        self.sync_window_level(ctx);
+        let fullscreen = is_fullscreen(ctx);
+        if std::mem::replace(&mut self.was_fullscreen, fullscreen)
+            && !fullscreen
+            && self.settings.on_top != OnTop::Never
+        {
+            if self.on_top_now() {
+                self.apply_window_level(ctx);
+            }
             self.reapply_level_at = Some(Instant::now() + Duration::from_secs(1));
             ctx.request_repaint_after(Duration::from_millis(1100));
         }
         if self.reapply_level_at.is_some_and(|t| Instant::now() >= t) {
             self.reapply_level_at = None;
-            if self.settings.always_on_top && !fullscreen {
+            if self.on_top_now() && !fullscreen {
                 self.apply_window_level(ctx);
             }
         }
@@ -1755,8 +1806,10 @@ impl VitascopeApp {
         self.attention_at = Some(Instant::now() + Duration::from_millis(300));
     }
 
-    fn apply_window_level(&self, ctx: &egui::Context) {
-        let level = if self.settings.always_on_top {
+    /// 把現在該有的層級送給視窗（不管上次送了什麼）
+    fn apply_window_level(&mut self, ctx: &egui::Context) {
+        self.on_top_sent = self.on_top_now();
+        let level = if self.on_top_sent {
             egui::WindowLevel::AlwaysOnTop
         } else {
             egui::WindowLevel::Normal
@@ -2275,7 +2328,7 @@ impl VitascopeApp {
             Command::HueUp => Action::Adjust(AdjustKind::Hue, 1),
             Command::AdjustReset => Action::AdjustReset,
             Command::Fullscreen => Action::ToggleFullscreen,
-            Command::OnTop => Action::ToggleOnTop,
+            Command::OnTop => Action::CycleOnTop,
             Command::ControlPanel => Action::ToggleControlPanel,
             Command::Playlist => Action::TogglePlaylist,
             Command::MediaInfo => Action::ToggleInfo,
@@ -3214,10 +3267,8 @@ impl VitascopeApp {
         if menu_item(ui, loaded, crate::tr!("複製媒體資訊", "Copy media info"), "") {
             action = Some(Action::CopyInfo);
         }
-        let on_top = egui::Button::selectable(self.settings.always_on_top, crate::tr!("視窗置頂", "Always on top"))
-            .shortcut_text(self.keymap.hint(Command::OnTop));
-        if ui.add(on_top).clicked() {
-            action = Some(Action::ToggleOnTop);
+        if let Some(mode) = self.on_top_menu(ui) {
+            action = Some(Action::SetOnTop(mode));
         }
         if self.cmd_item(ui, true, crate::tr!("設定…", "Settings…"), Command::Settings) {
             action = Some(Action::Settings);
@@ -4180,6 +4231,33 @@ fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
 }
 
 impl VitascopeApp {
+    /// 右鍵選單「視窗置頂 ▸」：三種模式（快捷鍵寫在子選單的標題上，它是依序切換）；回傳選了哪一個
+    fn on_top_menu(&self, ui: &mut egui::Ui) -> Option<OnTop> {
+        use egui::containers::menu::SubMenuButton;
+        let label = crate::tr!("視窗置頂", "Always on top");
+        let hint = self.keymap.hint(Command::OnTop);
+        let button = if hint.is_empty() {
+            SubMenuButton::new(label)
+        } else {
+            SubMenuButton::from_button(egui::Button::new((
+                label,
+                egui::Atom::grow(),
+                egui::RichText::new(hint).weak(),
+                SubMenuButton::RIGHT_ARROW,
+            )))
+        };
+        let current = self.settings.on_top;
+        let mut picked = None;
+        button.ui(ui, |ui| {
+            for mode in OnTop::ALL {
+                if ui.radio(current == mode, mode.label()).clicked() && mode != current {
+                    picked = Some(mode);
+                }
+            }
+        });
+        picked
+    }
+
     /// 指令的選單項目：右側的按鍵說明從快捷鍵對照表來（沒有指定按鍵就不寫）
     fn cmd_item(&self, ui: &mut egui::Ui, enabled: bool, text: &str, cmd: Command) -> bool {
         menu_item(ui, enabled, text, &self.keymap.hint(cmd))

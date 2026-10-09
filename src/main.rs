@@ -192,7 +192,8 @@ fn main() -> eframe::Result {
             _ => viewport = viewport.with_position(g.pos),
         }
     }
-    if settings.always_on_top {
+    // 只有「永遠置頂」一開始就置頂；「播放時置頂」由 App 在開始播放時才設（App 記的初始層級也用 `at_launch`）
+    if settings.on_top.at_launch() {
         viewport = viewport.with_always_on_top();
     }
     let options = eframe::NativeOptions {

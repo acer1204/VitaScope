@@ -27,8 +27,9 @@ pub struct Settings {
     pub resume: bool,
     /// 字幕外觀
     pub subtitle: SubStyle,
-    /// 視窗置頂（蓋在其他視窗上面）
-    pub always_on_top: bool,
+    /// 視窗置頂（蓋在其他視窗上面）：不置頂 / 永遠置頂 / 播放時置頂。
+    /// 以前是開關 `always_on_top`，讀檔時換成這個（見 `migrate`）
+    pub on_top: OnTop,
     /// 顯示播放清單面板
     pub show_playlist: bool,
     /// 截圖資料夾；None = 「圖片」資料夾裡的 VitaScope
@@ -172,7 +173,7 @@ impl Default for Settings {
             auto_next: true,
             resume: true,
             subtitle: SubStyle::default(),
-            always_on_top: false,
+            on_top: OnTop::Never,
             show_playlist: false,
             screenshot_dir: None,
             screenshot_subtitles: true,
@@ -189,6 +190,82 @@ impl Default for Settings {
             keys: KeySettings::default(),
             path: None,
             baseline: None,
+        }
+    }
+}
+
+/// 視窗置頂模式（比照 PotPlayer 的三種）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnTop {
+    /// 不置頂
+    #[default]
+    Never,
+    /// 永遠置頂
+    Always,
+    /// 播放時置頂：暫停、停止、播完（停在最後一格）時回到一般視窗
+    WhilePlaying,
+}
+
+impl OnTop {
+    pub const ALL: [OnTop; 3] = [OnTop::Never, OnTop::Always, OnTop::WhilePlaying];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OnTop::Never => crate::tr!("不置頂", "Never"),
+            OnTop::Always => crate::tr!("永遠置頂", "Always"),
+            OnTop::WhilePlaying => crate::tr!("播放時置頂", "While playing"),
+        }
+    }
+
+    /// 快捷鍵依序切換：不置頂 → 永遠置頂 → 播放時置頂 → 不置頂
+    pub fn next(self) -> Self {
+        match self {
+            OnTop::Never => OnTop::Always,
+            OnTop::Always => OnTop::WhilePlaying,
+            OnTop::WhilePlaying => OnTop::Never,
+        }
+    }
+
+    /// 換成這個模式時的提示
+    pub fn osd(self) -> &'static str {
+        match self {
+            OnTop::Never => crate::tr!("視窗置頂：關閉", "Always on top: off"),
+            OnTop::Always => crate::tr!("視窗置頂：永遠", "Always on top: always"),
+            OnTop::WhilePlaying => crate::tr!("視窗置頂：播放時", "Always on top: while playing"),
+        }
+    }
+
+    /// 現在視窗要不要置頂；`playing` = 有檔案、正在播放（沒有暫停、沒有停在最後一格）
+    pub fn effective(self, playing: bool) -> bool {
+        match self {
+            OnTop::Never => false,
+            OnTop::Always => true,
+            OnTop::WhilePlaying => playing,
+        }
+    }
+
+    /// 視窗一開始要不要置頂（main.rs 建視窗、App 記下「已經送過的層級」都用這個，兩邊不會不一致）：
+    /// 只有永遠置頂；播放時置頂一開始還沒在播，是一般視窗
+    pub fn at_launch(self) -> bool {
+        self.effective(false)
+    }
+}
+
+/// 舊版的視窗置頂開關（v0.3.0 以前）：讀檔時換成 `on_top`，存檔時從檔案拿掉
+const OLD_ON_TOP: &str = "always_on_top";
+
+/// 讀檔前把舊的設定名稱換成新的。兩個都有時以新的為準
+///（新版存檔時會拿掉舊的；兩個都在代表是舊版後來寫的，舊版沒讀到 `on_top`，寫的是它自己的預設值）
+fn migrate(value: &mut serde_json::Value) {
+    let Some(fields) = value.as_object_mut() else { return };
+    if let Some(old) = fields.remove(OLD_ON_TOP)
+        && !fields.contains_key("on_top")
+        && let Some(on) = old.as_bool()
+    {
+        let mode = if on { OnTop::Always } else { OnTop::Never };
+        if let Ok(v) = serde_json::to_value(mode) {
+            fields.insert("on_top".into(), v);
         }
     }
 }
@@ -232,7 +309,8 @@ impl Settings {
 
     /// 讀不懂的設定（例如新版加的語言、手動改錯）只有那一項用預設值，其他設定照樣讀進來。
     /// 群組（字幕外觀、畫質、音效…）裡也是逐項：一項讀不懂，同一組的其他項目照樣讀進來
-    fn from_value_lenient(value: serde_json::Value) -> Self {
+    fn from_value_lenient(mut value: serde_json::Value) -> Self {
+        migrate(&mut value);
         if let Ok(s) = serde_json::from_value(value.clone()) {
             return s;
         }
@@ -288,10 +366,14 @@ impl Settings {
         let on_disk = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let merged = match (&self.baseline, on_disk) {
+        let mut merged = match (&self.baseline, on_disk) {
             (Some(base), Some(disk)) => merge(&current, base, disk, &mut Vec::new()),
             _ => current.clone(),
         };
+        // 舊的設定名稱不再寫（已經換成 `on_top`；其他不認得的設定照樣保留，可能是新版寫的）
+        if let Some(fields) = merged.as_object_mut() {
+            fields.remove(OLD_ON_TOP);
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -488,12 +570,12 @@ mod tests {
         let path = dir.join("settings.json");
         let mut s = Settings::load_from(path.clone());
         assert_eq!(s.volume, Settings::default().volume, "沒有檔案時用預設值");
-        s.always_on_top = true;
+        s.on_top = OnTop::Always;
         s.show_playlist = true;
         s.volume = 42.0;
         s.save().unwrap();
         let back = Settings::load_from(path.clone());
-        assert!(back.always_on_top && back.show_playlist);
+        assert!(back.on_top == OnTop::Always && back.show_playlist);
         assert_eq!(back.volume, 42.0);
         // 自動截圖用的設定：讀得到，但不寫回去
         let mut shot = back.detached();
@@ -593,6 +675,7 @@ mod tests {
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::Off, "流暢播放先預設關");
         assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
+        assert_eq!(s.on_top, OnTop::Never, "預設不置頂");
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
         assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
@@ -632,7 +715,8 @@ mod tests {
         .unwrap();
         let s = Settings::load_from(path);
         assert_eq!(s.volume, 64.0);
-        assert!(s.muted && s.always_on_top && !s.auto_next && !s.hwdec && !s.single_instance);
+        assert!(s.muted && !s.auto_next && !s.hwdec && !s.single_instance);
+        assert_eq!(s.on_top, OnTop::Always, "舊的「視窗置頂」開著：永遠置頂");
         assert_eq!(s.subtitle.size, 50.0);
         assert!(s.subtitle.bold);
         assert_eq!(s.language, crate::i18n::Lang::En);
@@ -777,6 +861,95 @@ mod tests {
             crate::keymap::KeyPreset::Potplayer
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_always_on_top_switch_becomes_a_mode() {
+        let dir = temp_dir("on-top-old");
+        let path = dir.join("settings.json");
+        for (old, mode) in [(true, OnTop::Always), (false, OnTop::Never)] {
+            std::fs::write(&path, format!(r#"{{"always_on_top": {old}, "volume": 61.0}}"#)).unwrap();
+            let mut s = Settings::load_from(path.clone());
+            assert_eq!(s.on_top, mode, "always_on_top = {old}");
+            assert_eq!(s.volume, 61.0);
+            // 存檔：寫新的名稱，舊的不再寫
+            s.volume = 62.0;
+            s.save().unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("always_on_top"), "{text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["on_top"], serde_json::to_value(mode).unwrap(), "{text}");
+            assert_eq!(Settings::load_from(path.clone()).on_top, mode);
+        }
+        // 逐項讀取（有別的設定讀不懂）時也換過來
+        let s = lenient(r#"{"always_on_top": true, "language": "ja", "volume": 12.0}"#);
+        assert_eq!(s.on_top, OnTop::Always);
+        assert_eq!(s.volume, 12.0);
+        // 新舊都有：以新的為準；舊的不是開關：當成沒有
+        let s = lenient(r#"{"always_on_top": false, "on_top": "while-playing"}"#);
+        assert_eq!(s.on_top, OnTop::WhilePlaying);
+        let s = lenient(r#"{"always_on_top": "yes", "seek_short": 9.0}"#);
+        assert_eq!((s.on_top, s.seek_short), (OnTop::Never, 9.0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn on_top_mode_round_trips_and_unknown_values_load_as_never() {
+        let dir = temp_dir("on-top");
+        let path = dir.join("settings.json");
+        for mode in OnTop::ALL {
+            let mut s = Settings::load_from(path.clone());
+            s.on_top = mode;
+            s.save().unwrap();
+            assert_eq!(Settings::load_from(path.clone()).on_top, mode);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""on_top": "while-playing""#), "{text}");
+        assert_eq!(serde_json::to_value(OnTop::Always).unwrap(), "always");
+        assert_eq!(serde_json::to_value(OnTop::Never).unwrap(), "never");
+        // 新版加的模式（或手動改錯）：不置頂，其他設定照讀
+        let s = lenient(r#"{"on_top": "on-hover", "volume": 33.0, "seek_short": 8.0, "theme": "light"}"#);
+        assert_eq!(s.on_top, OnTop::Never);
+        assert_eq!((s.volume, s.seek_short, s.theme), (33.0, 8.0, ThemeChoice::Light));
+        // 兩個視窗：A 換置頂模式、B 改音量，兩個都留下
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.on_top = OnTop::Always;
+        a.save().unwrap();
+        b.volume = 20.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.on_top, OnTop::Always, "A 改的置頂模式不能被 B 蓋回去");
+        assert_eq!(back.volume, 20.0);
+        // 舊的設定檔、兩個視窗都開著：A 改了模式，B 只改音量，存檔時不會用舊的值蓋回去
+        std::fs::write(&path, r#"{"always_on_top": true}"#).unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.on_top = OnTop::WhilePlaying;
+        a.save().unwrap();
+        b.volume = 40.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.on_top, OnTop::WhilePlaying);
+        assert_eq!(back.volume, 40.0);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("always_on_top"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn on_top_cycle_and_effective_state() {
+        assert_eq!(OnTop::Never.next(), OnTop::Always);
+        assert_eq!(OnTop::Always.next(), OnTop::WhilePlaying);
+        assert_eq!(OnTop::WhilePlaying.next(), OnTop::Never);
+        for playing in [false, true] {
+            assert!(!OnTop::Never.effective(playing));
+            assert!(OnTop::Always.effective(playing));
+            assert_eq!(OnTop::WhilePlaying.effective(playing), playing);
+        }
+        // 開視窗時：只有永遠置頂一開始就置頂，播放時置頂等開始播放
+        assert!(!OnTop::Never.at_launch());
+        assert!(OnTop::Always.at_launch());
+        assert!(!OnTop::WhilePlaying.at_launch());
     }
 
     #[test]
