@@ -185,7 +185,8 @@ fn peak_settings(peak: Option<u32>) -> String {
 
 /// 記錄裡這次的 GL context 能不能做動態峰值偵測：「OpenGL 3.3 · GLSL 3.30；HDR 動態峰值偵測：不能用…」。
 /// 引擎功能的記錄（`compute_peak: …`）要跟它一樣（建立 App 時讀 GL context 的結果真的進了 `caps`），
-/// GLSL 4.20 以下、OpenGL ES 一定不能用（mpv 關掉 compute shader）
+/// 只有軟體繪圖的簡化流程（`dumb: true`）例外：GL 可以用也不做（Linux CI 的 llvmpipe 是 GL 4.5）。
+/// GLSL 4.20 以下、OpenGL ES 一定不能用（mpv 關掉 compute shader）。回傳 GL context 的結果
 fn gl_compute_peak(log: &str) -> bool {
     let line = log
         .lines()
@@ -196,8 +197,9 @@ fn gl_compute_peak(log: &str) -> bool {
         .lines()
         .find(|l| l.contains("播放引擎功能："))
         .unwrap_or_else(|| panic!("沒有引擎功能的記錄\n{log}"));
+    let expected = can && !caps.contains("dumb: true");
     assert!(
-        caps.contains(&format!("compute_peak: {can}")),
+        caps.contains(&format!("compute_peak: {expected}")),
         "引擎功能跟 GL context 的結果不一樣：\n{line}\n{caps}"
     );
     let glsl = line
