@@ -4,13 +4,14 @@
 //! 每一列是同一個能點也能拖的元件（`Ui::dnd_drag_source` 一按下就算開始拖，點擊會被吃掉）；
 //! 放下的位置看滑鼠在第幾列之間（列與列的空隙也算），拖到上下邊緣會自動捲動。
 
-use super::{ACCENT, DialogKind, Pick, VitascopeApp, file_name, icon_button};
+use super::{DialogKind, Pick, VitascopeApp, file_name, icon_button};
 use crate::formats;
 use crate::m3u;
 use crate::playlist::Playlist;
+use crate::theme::Palette;
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, DragAndDrop, Layout, Rect, RichText, Sense, Stroke, TextWrapMode,
-    ViewportCommand, WidgetInfo, WidgetType, vec2,
+    self, Align, Align2, CursorIcon, DragAndDrop, Layout, Rect, RichText, Sense, Stroke, TextWrapMode, ViewportCommand,
+    WidgetInfo, WidgetType, vec2,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -237,8 +238,11 @@ impl VitascopeApp {
             let content_top = out.inner_rect.top() - out.state.offset.y;
             let to = ((p.y - content_top) / row_h).round().clamp(0.0, count as f32) as usize;
             let y = content_top + to as f32 * row_h;
-            ui.painter_at(out.inner_rect.expand(1.0))
-                .hline(out.inner_rect.x_range(), y, Stroke::new(2.0, ACCENT));
+            ui.painter_at(out.inner_rect.expand(1.0)).hline(
+                out.inner_rect.x_range(),
+                y,
+                Stroke::new(2.0, Palette::of(ui.visuals()).accent),
+            );
             ctx.set_cursor_icon(CursorIcon::Grabbing);
             autoscroll(&ctx, &out, p);
             if ctx.input(|i| i.pointer.any_released()) && DragAndDrop::take_payload::<DragRow>(&ctx).is_some() {
@@ -512,10 +516,10 @@ impl VitascopeApp {
         }
     }
 
-    /// 清單面板的底色（跟控制列一樣）
-    pub(super) fn playlist_frame() -> egui::Frame {
+    /// 清單面板的底色（跟著主題）
+    pub(super) fn playlist_frame(palette: &Palette) -> egui::Frame {
         egui::Frame::NONE
-            .fill(Color32::from_gray(28))
+            .fill(palette.side)
             .inner_margin(egui::Margin::symmetric(8, 6))
     }
 }
@@ -530,14 +534,15 @@ fn paint_row(ui: &egui::Ui, rect: Rect, resp: &egui::Response, name: &str, selec
             .rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
     }
     let gutter = 16.0;
-    let color = if current { ACCENT } else { visuals.text_color() };
+    let accent = Palette::of(visuals).accent;
+    let color = if current { accent } else { visuals.text_color() };
     if current {
         ui.painter().text(
             rect.left_center() + vec2(3.0, 0.0),
             Align2::LEFT_CENTER,
             "▶",
             egui::FontId::proportional(10.0),
-            ACCENT,
+            accent,
         );
     }
     let mut text = RichText::new(name).color(color);

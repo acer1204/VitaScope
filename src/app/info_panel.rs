@@ -73,6 +73,9 @@ impl VitascopeApp {
             .interactable(false)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                // 蓋在影片上：淺色主題也用深色的樣式
+                crate::theme::dark_overlay(ui);
+                let accent = crate::theme::Palette::of(ui.visuals()).accent;
                 egui::Frame::NONE
                     .fill(Color32::from_black_alpha(190))
                     .corner_radius(6)
@@ -88,10 +91,8 @@ impl VitascopeApp {
                                     for (i, line) in lines.iter().enumerate() {
                                         let head = if i == 0 { *title } else { "" };
                                         ui.add(
-                                            egui::Label::new(
-                                                RichText::new(head).font(font.clone()).color(super::ACCENT),
-                                            )
-                                            .selectable(false),
+                                            egui::Label::new(RichText::new(head).font(font.clone()).color(accent))
+                                                .selectable(false),
                                         );
                                         ui.add(
                                             egui::Label::new(

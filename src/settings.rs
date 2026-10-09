@@ -9,6 +9,7 @@
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
 pub use crate::sound::AudioSettings;
+pub use crate::theme::ThemeChoice;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -51,6 +52,8 @@ pub struct Settings {
     pub audio: AudioSettings,
     /// 流暢播放（依螢幕更新率同步影像）
     pub smooth: SmoothMode,
+    /// 外觀：深色 / 淺色 / 跟隨系統
+    pub theme: ThemeChoice,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -179,6 +182,7 @@ impl Default for Settings {
             video: VideoSettings::default(),
             audio: AudioSettings::default(),
             smooth: SmoothMode::default(),
+            theme: ThemeChoice::default(),
             path: None,
             baseline: None,
         }
@@ -574,6 +578,7 @@ mod tests {
         assert_eq!(s.video, VideoSettings::default());
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::Off, "流暢播放先預設關");
+        assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -616,6 +621,34 @@ mod tests {
         assert_eq!(s.video, VideoSettings::default());
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::default());
+        assert_eq!(s.theme, ThemeChoice::Dark, "升級後外觀不變");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn theme_is_saved_and_unknown_values_load_as_dark() {
+        let dir = temp_dir("theme");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.theme = ThemeChoice::Light;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""theme": "light""#), "{text}");
+        assert_eq!(Settings::load_from(path.clone()).theme, ThemeChoice::Light);
+        // 新版加的外觀（或手動改錯）：用深色，其他設定照讀
+        let s = lenient(r#"{"theme": "sepia", "volume": 33.0, "seek_short": 8.0}"#);
+        assert_eq!(s.theme, ThemeChoice::Dark);
+        assert_eq!((s.volume, s.seek_short), (33.0, 8.0));
+        // 兩個視窗：A 換外觀、B 改音量，兩個都留下
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.theme = ThemeChoice::System;
+        a.save().unwrap();
+        b.volume = 20.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.theme, ThemeChoice::System, "A 改的外觀不能被 B 蓋回去");
+        assert_eq!(back.volume, 20.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

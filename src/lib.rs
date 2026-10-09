@@ -31,6 +31,7 @@ pub mod settings;
 pub mod sound;
 pub mod subs;
 pub mod syscmd;
+pub mod theme;
 pub mod thumbs;
 pub mod update;
 pub mod video;

@@ -25,6 +25,7 @@ use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEv
 use crate::playlist::Playlist;
 use crate::settings::{Settings, SubStyle, WindowGeometry};
 use crate::sound::{EqPreset, Leveling};
+use crate::theme::{self, Palette, ThemeChoice};
 use crate::update::{self, UpdateStatus};
 use crate::video::VideoView;
 use eframe::egui::{
@@ -61,9 +62,6 @@ const TASKBAR_ALLOWANCE: f32 = 48.0;
 const AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 /// 右鍵選單的播放速度選項
 const SPEED_PRESETS: [f64; 10] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0, 4.0];
-const ACCENT: Color32 = Color32::from_rgb(0x4f, 0x9d, 0xff);
-/// A-B 重播在進度條上的顏色
-const AB_COLOR: Color32 = Color32::from_rgb(0xff, 0xc1, 0x07);
 /// 起始畫面列出幾個最近開啟的檔案
 const RECENT_ON_START: usize = 6;
 /// 右鍵選單列出幾個最近開啟的檔案
@@ -180,6 +178,10 @@ enum Action {
     SetLeveling(Leveling),
     /// 音量上限（%）：100 / 130 / 150 / 200
     SetVolumeMax(u32),
+    /// 外觀：深色 / 淺色 / 跟隨系統（設定頁）
+    SetTheme(ThemeChoice),
+    /// 外觀：深色 ↔ 淺色（跟隨系統時換成跟現在看到的相反）
+    CycleTheme,
 }
 
 pub struct VitascopeApp {
@@ -459,7 +461,9 @@ impl VitascopeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, player: Player, settings: Settings, launch: Launch) -> Self {
         crate::i18n::set_lang(settings.language);
         crate::fonts::install_cjk(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // 一定要明確設主題偏好：eframe 預設跟隨系統，只設深色樣式的話系統是淺色時第一幀就變成淺色
+        theme::install(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx, settings.theme);
 
         // 啟動時音量最多 100%：上次放大到 150% 也從 100% 開始，開啟時不會突然很大聲（set_volume 限制在 0–100）
         let _ = player.set_volume(settings.volume);
@@ -744,6 +748,18 @@ impl VitascopeApp {
     /// 這次執行的影像調整（介面測試用）
     pub fn adjust(&self) -> Adjust {
         self.adjust
+    }
+
+    /// 目前主題的介面顏色（介面測試用）
+    pub fn palette(&self) -> Palette {
+        Palette::of(&self.egui_ctx.global_style().visuals)
+    }
+
+    /// 「切換深色／淺色」（還沒有預設的快捷鍵；介面測試用）
+    #[doc(hidden)]
+    pub fn cycle_theme(&mut self) {
+        let ctx = self.egui_ctx.clone();
+        self.run(&ctx, Action::CycleTheme);
     }
 
     /// 啟動時（還沒開任何檔案）偵測播放引擎的功能，同步套用要在第一個檔案就生效的設定
@@ -1353,6 +1369,16 @@ impl VitascopeApp {
                     crate::tr!("視窗置頂：關閉", "Always on top: off")
                 });
             }
+            Action::SetTheme(choice) => self.set_theme(ctx, choice),
+            Action::CycleTheme => {
+                let choice = self.settings.theme.toggled(ctx.theme());
+                self.set_theme(ctx, choice);
+                self.osd(if choice == ThemeChoice::Light {
+                    crate::tr!("外觀：淺色", "Appearance: light")
+                } else {
+                    crate::tr!("外觀：深色", "Appearance: dark")
+                });
+            }
             Action::LoadAudio if loaded => self.load_file_dialog(false),
             Action::Restart if loaded && st.seekable => {
                 let _ = self.player.seek_to(0.0, true);
@@ -1363,6 +1389,13 @@ impl VitascopeApp {
             }
             _ => {}
         }
+    }
+
+    /// 換外觀：馬上套用、存檔
+    fn set_theme(&mut self, ctx: &egui::Context, choice: ThemeChoice) {
+        self.settings.theme = choice;
+        theme::apply(ctx, choice);
+        self.save_settings();
     }
 
     /// 選單「載入字幕檔…」「載入音軌檔…」：從目前影片的資料夾開始找
@@ -2352,7 +2385,7 @@ impl VitascopeApp {
             ui.label(
                 egui::RichText::new(crate::tr!("可以自由使用、修改、散布；散布修改後的版本時，也必須公開原始碼。", "Free to use, modify and share; modified versions you distribute must also publish their source code."))
                     .small()
-                    .color(Color32::from_gray(150)),
+                    .color(Palette::of(ui.visuals()).faint),
             );
             ui.separator();
 
@@ -2375,7 +2408,7 @@ impl VitascopeApp {
                     ui.label(crate::tr!("GitHub 上還沒有發佈任何版本", "No version has been released on GitHub yet"));
                 }
                 Some(UpdateStatus::Failed(e)) => {
-                    ui.colored_label(Color32::from_rgb(0xff, 0x8a, 0x80), crate::tf!("檢查更新失敗：{e}", "Update check failed: {e}"));
+                    ui.colored_label(Palette::of(ui.visuals()).problem, crate::tf!("檢查更新失敗：{e}", "Update check failed: {e}"));
                     ui.horizontal(|ui| {
                         if ui.button(crate::tr!("再試一次", "Try again")).clicked() {
                             start_check = true;
@@ -2934,6 +2967,8 @@ impl VitascopeApp {
                 .max_rect(rect.shrink(40.0))
                 .layout(Layout::top_down(Align::Center)),
         );
+        // 畫在黑色的影片畫面上：淺色主題也用深色的樣式（「最近開啟」的按鈕底色）
+        theme::dark_overlay(&mut ui);
         let recent: Vec<&String> = self.history.recent.iter().take(RECENT_ON_START).collect();
         let recent_height = if recent.is_empty() {
             0.0
@@ -2964,7 +2999,7 @@ impl VitascopeApp {
             ui.label(
                 egui::RichText::new(msg)
                     .size(15.0)
-                    .color(Color32::from_rgb(0xff, 0x8a, 0x80)),
+                    .color(Palette::of(ui.visuals()).problem),
             );
         }
         // 最近開啟的檔案，點一下就開
@@ -3069,9 +3104,11 @@ impl VitascopeApp {
             // 速度不是 1× 時顯示在時間旁邊；視窗太窄、會擠到右邊的按鈕時就不顯示（OSD 和右鍵選單還看得到）
             if (st.speed - 1.0).abs() > 1e-6 {
                 let font = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
-                let galley = ui
-                    .painter()
-                    .layout_no_wrap(format!("{}×", fmt_speed(st.speed)), font, ACCENT);
+                let galley = ui.painter().layout_no_wrap(
+                    format!("{}×", fmt_speed(st.speed)),
+                    font,
+                    Palette::of(ui.visuals()).accent,
+                );
                 let needed = galley.size().x + ui.spacing().item_spacing.x;
                 if ui.available_width() >= self.right_controls_width + needed {
                     ui.label(galley).on_hover_text(crate::tr!(
@@ -3509,9 +3546,10 @@ impl VitascopeApp {
         }
 
         let painter = ui.painter();
+        let palette = Palette::of(ui.visuals());
         let thickness = if active { 6.0 } else { 4.0 };
         let bar = Rect::from_center_size(rect.center(), vec2(rect.width(), thickness));
-        painter.rect_filled(bar, CornerRadius::same(3), Color32::from_gray(70));
+        painter.rect_filled(bar, CornerRadius::same(3), palette.track);
         let pos = self.seek_drag.unwrap_or(st.time_pos);
         let frac = if duration > 0.0 {
             (pos / duration).clamp(0.0, 1.0) as f32
@@ -3519,20 +3557,20 @@ impl VitascopeApp {
             0.0
         };
         let played = Rect::from_min_max(bar.min, pos2(bar.left() + bar.width() * frac, bar.max.y));
-        painter.rect_filled(played, CornerRadius::same(3), ACCENT);
+        painter.rect_filled(played, CornerRadius::same(3), palette.accent);
         if duration > 0.0 {
             let x_of = |t: f64| bar.left() + bar.width() * (t / duration).clamp(0.0, 1.0) as f32;
             // A-B 重播：區段塗上顏色；只設了起點時畫一條線
             match st.ab_loop {
                 [Some(a), Some(b)] => {
                     let section = Rect::from_x_y_ranges(x_of(a.min(b))..=x_of(a.max(b)), bar.y_range());
-                    painter.rect_filled(section, CornerRadius::ZERO, AB_COLOR.gamma_multiply(0.6));
+                    painter.rect_filled(section, CornerRadius::ZERO, palette.ab.gamma_multiply(0.6));
                 }
                 [Some(a), None] => {
                     let x = x_of(a);
                     painter.line_segment(
                         [pos2(x, bar.top() - 4.0), pos2(x, bar.bottom() + 4.0)],
-                        Stroke::new(2.0, AB_COLOR),
+                        Stroke::new(2.0, palette.ab),
                     );
                 }
                 _ => {}
@@ -3542,7 +3580,7 @@ impl VitascopeApp {
                 let x = x_of(c.time);
                 painter.line_segment(
                     [pos2(x, bar.top() - 1.0), pos2(x, bar.bottom() + 1.0)],
-                    Stroke::new(2.0, Color32::from_gray(24)),
+                    Stroke::new(2.0, palette.tick),
                 );
             }
         }
@@ -3551,7 +3589,7 @@ impl VitascopeApp {
                 pos2(played.right(), bar.center().y),
                 7.0,
                 Color32::WHITE,
-                Stroke::new(2.0, ACCENT),
+                Stroke::new(2.0, palette.accent),
             );
         }
 
@@ -3654,9 +3692,8 @@ impl eframe::App for VitascopeApp {
         let fullscreen = is_fullscreen(&ctx);
         let show_controls = self.controls_visible(&ctx, fullscreen);
 
-        let panel_frame = Frame::NONE
-            .fill(Color32::from_gray(24))
-            .inner_margin(Margin::symmetric(10, 6));
+        let palette = Palette::of(ui.visuals());
+        let panel_frame = Frame::NONE.fill(palette.panel).inner_margin(Margin::symmetric(10, 6));
         if !fullscreen {
             let r = egui::Panel::bottom("controls")
                 .frame(panel_frame)
@@ -3670,7 +3707,7 @@ impl eframe::App for VitascopeApp {
         self.pointer_over_playlist = false;
         if self.settings.show_playlist {
             let r = egui::Panel::right("playlist")
-                .frame(Self::playlist_frame())
+                .frame(Self::playlist_frame(&palette))
                 .resizable(true)
                 .default_size(self.playlist_width_pref)
                 .size_range(180.0..=600.0)
@@ -3681,7 +3718,7 @@ impl eframe::App for VitascopeApp {
         }
 
         egui::CentralPanel::no_frame()
-            .frame(Frame::NONE.fill(Color32::BLACK))
+            .frame(Frame::NONE.fill(palette.video))
             .show(ui, |ui| self.video_area(ui));
 
         let mut overlay_height = 0.0;
@@ -3693,6 +3730,8 @@ impl eframe::App for VitascopeApp {
                 let r = egui::Area::new(Id::new("overlay_controls"))
                     .anchor(Align2::LEFT_BOTTOM, Vec2::ZERO)
                     .show(&ctx, |ui| {
+                        // 蓋在影片上：淺色主題也是深色的控制列
+                        theme::dark_overlay(ui);
                         ui.set_width(width);
                         Frame::NONE
                             .fill(Color32::from_black_alpha(170))
@@ -3800,6 +3839,7 @@ fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
             .max_rect(area.shrink2(vec2(16.0, 12.0)))
             .layout(Layout::top_down(Align::Center)),
     );
+    theme::dark_overlay(&mut ui);
     let prefix = if has_cover { "" } else { "♪  " };
     // 不能選取文字：可選取的文字會攔下滑鼠點擊，點在歌名上就不能暫停、開右鍵選單
     ui.add(

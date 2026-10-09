@@ -10,6 +10,7 @@ use crate::picture::{
     ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover,
 };
 use crate::sound::{AUTO_DEVICE, AudioDevice, SPDIF_CODECS, spdif_label};
+use crate::theme::ThemeChoice;
 use crate::{tf, tr};
 use eframe::egui::{self, Id, pos2, vec2};
 
@@ -133,7 +134,26 @@ impl VitascopeApp {
                         }
                     });
                 ui.end_row();
+                ui.label(tr!("外觀", "Appearance"));
+                let current = self.settings.theme;
+                egui::ComboBox::from_id_salt("settings_theme")
+                    .selected_text(current.label())
+                    .show_ui(ui, |ui| {
+                        for choice in ThemeChoice::ALL {
+                            if ui.selectable_label(current == choice, choice.label()).clicked() && choice != current {
+                                // 馬上套用、存檔（跟切換深淺色的指令走同一條路）
+                                *action = Some(Action::SetTheme(choice));
+                            }
+                        }
+                    });
+                ui.end_row();
             });
+        if crate::theme::system_unknown(ui.ctx(), self.settings.theme) {
+            ui.weak(tr!(
+                "偵測不到系統的深淺色設定，暫時用深色",
+                "Couldn't detect the system's light/dark setting; using dark for now"
+            ));
+        }
         ui.add_space(6.0);
         let mut on_top = self.settings.always_on_top;
         if ui.checkbox(&mut on_top, tr!("視窗置頂", "Always on top")).changed() {

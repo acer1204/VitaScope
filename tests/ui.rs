@@ -14,6 +14,7 @@ use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::Settings;
+use vitascope::theme::ThemeChoice;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -2445,6 +2446,347 @@ fn single_window_can_be_switched_off_on_the_system_page() {
     h.get_by_label("只開一個視窗").click();
     h.run_steps(2);
     assert!(!h.state().settings().single_instance);
+}
+
+// ───────────── 外觀：深色／淺色 ─────────────
+
+/// 跟真正的播放器（eframe）一樣：建立 App 之前主題偏好是「跟隨系統」（egui 的預設），之後也沒有人改它；
+/// 作業系統回報的深淺色是 `system`（Windows、macOS 有，Linux 是 None）。
+/// kittest 建好 App 之後會自己把主題設成深色，這裡改回 App 設的，不然測不出系統是淺色時的問題
+fn harness_like_eframe(settings: Settings, system: Option<egui::Theme>) -> Harness<'static, VitascopeApp> {
+    harness_like_eframe_launch(Launch::default(), settings, system)
+}
+
+/// 同上，啟動時開 `launch` 的檔案
+fn harness_like_eframe_launch(
+    launch: Launch,
+    settings: Settings,
+    system: Option<egui::Theme>,
+) -> Harness<'static, VitascopeApp> {
+    let player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    let set_by_app = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = set_by_app.clone();
+    let mut h = Harness::builder().with_size([960.0, 600.0]).build_eframe(move |cc| {
+        cc.egui_ctx.set_theme(egui::ThemePreference::System);
+        let app = VitascopeApp::new(cc, player, settings, launch);
+        *seen.lock().unwrap() = Some(cc.egui_ctx.options(|o| o.theme_preference));
+        app
+    });
+    let pref = set_by_app.lock().unwrap().expect("建立了 App");
+    h.ctx.set_theme(pref);
+    h.input_mut().system_theme = system;
+    h.run_steps(2);
+    h
+}
+
+/// 這一幀畫的、整個蓋住 `rect` 的長方形的底色（由下往上：最後畫的在前面）
+fn fills_covering(h: &Harness<'_, VitascopeApp>, rect: egui::Rect) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, rect: egui::Rect, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(r) if r.rect.expand(0.5).contains_rect(rect) => out.push(r.fill),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, rect, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &h.output().shapes {
+        walk(&clipped.shape, rect, &mut out);
+    }
+    out.reverse();
+    out
+}
+
+/// 這一幀畫的、內容包含 `text` 的字用的顏色（同樣的字可能畫在好幾個地方，例如 OSD）
+fn text_colors(h: &Harness<'_, VitascopeApp>, text: &str) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text().contains(text) => {
+                out.extend(t.galley.job.sections.iter().map(|s| s.format.color));
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, text, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &h.output().shapes {
+        walk(&clipped.shape, text, &mut out);
+    }
+    assert!(!out.is_empty(), "這一幀沒有畫「{text}」");
+    out
+}
+
+/// 這一幀有沒有畫底色是 `fill` 的長方形
+fn has_rect_filled(h: &Harness<'_, VitascopeApp>, fill: egui::Color32) -> bool {
+    fn walk(shape: &egui::Shape, fill: egui::Color32) -> bool {
+        match shape {
+            egui::Shape::Rect(r) => r.fill == fill,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|s| walk(s, fill)),
+            _ => false,
+        }
+    }
+    h.output().shapes.iter().any(|c| walk(&c.shape, fill))
+}
+
+fn luma(c: egui::Color32) -> u32 {
+    (u32::from(c.r()) * 299 + u32::from(c.g()) * 587 + u32::from(c.b()) * 114) / 1000
+}
+
+/// 控制列（影片畫面下面那一條）的底色
+fn control_bar_fill(h: &Harness<'_, VitascopeApp>) -> egui::Color32 {
+    let video = h.get_by_label("影片畫面").rect();
+    let below = egui::Rect::from_min_size(
+        egui::pos2(video.left() + 4.0, video.bottom() + 2.0),
+        egui::vec2(4.0, 4.0),
+    );
+    *fills_covering(h, below).first().expect("控制列有底色")
+}
+
+/// 播放清單面板（影片畫面右邊）的底色：取面板左邊的留白，不會碰到按鈕、清單項目
+fn playlist_fill(h: &Harness<'_, VitascopeApp>) -> egui::Color32 {
+    let video = h.get_by_label("影片畫面").rect();
+    let inside = egui::Rect::from_center_size(egui::pos2(video.right() + 5.0, video.center().y), egui::vec2(2.0, 2.0));
+    *fills_covering(h, inside).first().expect("播放清單有底色")
+}
+
+#[test]
+fn dark_choice_is_not_flipped_by_a_light_system() {
+    // v0.3.0 的問題：系統是淺色的 Windows、macOS 上，第一幀就換成 egui 的淺色樣式，
+    // 蓋在寫死的深色控制列上（控制列的時間、按鈕變成深灰字配深色底）
+    let h = harness_like_eframe(Settings::default(), Some(egui::Theme::Light));
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert!(h.ctx.global_style().visuals.dark_mode, "介面是深色的樣式");
+    assert_eq!(
+        h.state().palette().panel,
+        egui::Color32::from_gray(24),
+        "深色跟以前一樣"
+    );
+    assert_eq!(control_bar_fill(&h), egui::Color32::from_gray(24));
+}
+
+#[test]
+fn light_choice_from_the_settings_file_on_a_dark_system() {
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::Light;
+    let h = harness_like_eframe(settings, Some(egui::Theme::Dark));
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(!h.ctx.global_style().visuals.dark_mode);
+    assert!(luma(control_bar_fill(&h)) > 200, "淺色的控制列");
+}
+
+#[test]
+fn follow_system_uses_the_reported_theme() {
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, Some(egui::Theme::Light));
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(luma(control_bar_fill(&h)) > 200);
+    // 系統換成深色（Windows 的設定、macOS 的外觀）：跟著換
+    h.input_mut().system_theme = Some(egui::Theme::Dark);
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(control_bar_fill(&h), egui::Color32::from_gray(24));
+    // 設定頁不提示（系統有回報）
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("跟隨系統");
+    assert!(h.query_by_label_contains("偵測不到系統的深淺色設定").is_none());
+}
+
+#[test]
+fn follow_system_without_a_system_answer_is_dark_with_a_note() {
+    // Linux：作業系統不回報深淺色，暫時用深色，設定頁說明
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, None);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("偵測不到系統的深淺色設定，暫時用深色");
+}
+
+#[test]
+fn theme_setting_switches_and_saves() {
+    let dir = TempDir::new("theme-setting");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(playlist_fill(&h), egui::Color32::from_gray(28), "深色的播放清單");
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("外觀");
+    h.get_by_value("深色").click();
+    h.run_steps(2);
+    h.get_by_label("淺色").click();
+    h.run_steps(3);
+    // 馬上換、馬上存
+    assert_eq!(h.state().settings().theme, ThemeChoice::Light);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(!h.ctx.global_style().visuals.dark_mode);
+    assert_eq!(Settings::load_from(path.clone()).theme, ThemeChoice::Light);
+    assert!(luma(control_bar_fill(&h)) > 200, "控制列跟著主題");
+    assert!(luma(playlist_fill(&h)) > 200, "播放清單也是：{:?}", playlist_fill(&h));
+    // 影片畫面還是黑的
+    let video = h.get_by_label("影片畫面").rect();
+    assert_eq!(
+        fills_covering(&h, video.shrink(8.0)).first(),
+        Some(&egui::Color32::BLACK)
+    );
+    assert_eq!(h.state().palette().video, egui::Color32::BLACK);
+    // 跟隨系統
+    h.get_by_value("淺色").click();
+    h.run_steps(2);
+    h.get_by_label("跟隨系統").click();
+    h.run_steps(3);
+    assert_eq!(Settings::load_from(path).theme, ThemeChoice::System);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "自動測試沒有系統的回報：深色");
+}
+
+#[test]
+fn idle_screen_stays_dark_in_the_light_theme() {
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::Light;
+    settings.auto_next = false;
+    // 開檔失敗：起始畫面上顯示錯誤訊息（錯誤色依樣式選深色或淺色的一組）
+    let launch = Launch {
+        files: vec![PathBuf::from("Z:/不存在/沒有這個檔案.mkv")],
+        ..Default::default()
+    };
+    let mut h = harness_like_eframe_launch(launch, settings, None);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    step_until(&mut h, "開檔失敗", |s| s.last_error.is_some());
+    h.run_steps(5);
+    let video = h.get_by_label("影片畫面").rect();
+    assert_eq!(
+        fills_covering(&h, video.shrink(8.0)).first(),
+        Some(&egui::Color32::BLACK)
+    );
+    h.get_by_label_contains("拖放到這裡");
+    // 畫在黑色的影片畫面上：用深色樣式的錯誤色（淺色主題的深紅色在黑底上看不清楚）
+    let dark = vitascope::theme::Palette::of(&egui::Visuals::dark());
+    let light = vitascope::theme::Palette::of(&egui::Visuals::light());
+    let colors = text_colors(&h, "無法載入檔案");
+    assert!(colors.contains(&dark.problem), "{colors:?}");
+    assert!(!colors.contains(&light.problem), "{colors:?}");
+}
+
+#[test]
+fn media_info_stays_dark_in_the_light_theme() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    // 標題用深色樣式的強調色（半透明黑底上的亮藍色），不是淺色主題的深藍色
+    let dark = vitascope::theme::Palette::of(&egui::Visuals::dark());
+    let light = vitascope::theme::Palette::of(&egui::Visuals::light());
+    let colors = text_colors(&h, "播放流暢度");
+    assert!(colors.contains(&dark.accent), "{colors:?}");
+    assert!(!colors.contains(&light.accent), "{colors:?}");
+}
+
+#[test]
+fn ab_section_follows_the_theme() {
+    let mut h = playing_multitrack();
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 設定起點", |s| s.ab_loop[0].is_some());
+    let a = h.state().player().state.ab_loop[0].unwrap();
+    step_until(&mut h, "播放半秒", |s| s.time_pos > a + 0.5);
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 設定終點", |s| s.ab_loop[1].is_some());
+    h.run_steps(2);
+    // 淺色主題用深一點的琥珀色（原本的顏色跟淺灰的進度條底差不多亮）
+    let dark = vitascope::theme::Palette::of(&egui::Visuals::dark());
+    let light = vitascope::theme::Palette::of(&egui::Visuals::light());
+    assert!(has_rect_filled(&h, light.ab.gamma_multiply(0.6)), "淺色的 A-B 區段");
+    assert!(!has_rect_filled(&h, dark.ab.gamma_multiply(0.6)));
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert!(has_rect_filled(&h, dark.ab.gamma_multiply(0.6)), "深色跟以前一樣");
+}
+
+#[test]
+fn fullscreen_controls_stay_dark_in_the_light_theme() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    // 暫停：全螢幕播放中滑鼠不動 2 秒控制列會藏起來（CI 的機器慢，載入就可能超過 2 秒）
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    let button_fill = |h: &Harness<'_, VitascopeApp>| {
+        let rect = h.get_by_label("⛶").rect();
+        *fills_covering(h, egui::Rect::from_center_size(rect.center(), egui::vec2(2.0, 2.0)))
+            .first()
+            .expect("按鈕有底色")
+    };
+    // 視窗模式：控制列跟著主題，按鈕是淺色的
+    assert!(luma(button_fill(&h)) > 180, "{:?}", button_fill(&h));
+    // 全螢幕：控制列蓋在影片上，一律是深色的
+    set_fullscreen(&mut h, true);
+    assert!(luma(button_fill(&h)) < 100, "{:?}", button_fill(&h));
+}
+
+#[test]
+fn cycle_theme_switches_dark_and_light() {
+    let mut h = harness(None);
+    h.step();
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Light);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert_eq!(h.state().osd_text(), Some("外觀：淺色"));
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Dark);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(h.state().osd_text(), Some("外觀：深色"));
+    // 跟隨系統（系統是淺色）：換成跟現在看到的相反
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, Some(egui::Theme::Light));
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Dark);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+}
+
+#[test]
+fn theme_labels_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, None);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Appearance");
+    h.get_by_label("Couldn't detect the system's light/dark setting; using dark for now");
+    h.get_by_value("Follow the system").click();
+    h.run_steps(2);
+    h.get_by_label("Dark");
+    h.get_by_label("Light").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Light);
+    h.state_mut().cycle_theme();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Appearance: dark"));
 }
 
 // ───────────── 單一執行個體 ─────────────
