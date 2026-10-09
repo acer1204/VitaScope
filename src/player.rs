@@ -1829,6 +1829,13 @@ impl Player {
                     error: result.err().map(|e| e.to_string()),
                 })
             }
+            // 播放器自己還沒註冊任何 hook；收到沒人處理的 hook 一律立刻放行，載入才不會永遠卡住
+            Event::Hook { id, name, .. } => {
+                if let Err(e) = self.mpv.hook_continue(id) {
+                    eprintln!("[vitascope] 無法繼續 hook {name}：{e}");
+                }
+                None
+            }
             _ => None,
         }
     }

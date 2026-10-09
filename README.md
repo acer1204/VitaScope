@@ -310,6 +310,7 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/sound.rs` | 音效選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項；AC-3、E-AC-3、DTS、TrueHD 實際直通；等化器、夜間模式、音量放大、轉成立體聲用 `ao=pcm` 寫出 WAV 實際量測；等化器與音量放大在跳轉後照樣有效 |
 | `tests/async_opts.rs` | 非同步設定 mpv 選項（回覆依種類分派、先後順序、失敗時的處理）、偵測播放引擎的功能、L3 加的播放狀態 |
 | `tests/engine_build.rs` | 播放引擎的建置內容：用到的解碼器、分離器、協定、濾鏡都在，L3 元件（DASH、片段輸出、轉 GIF、音訊濾鏡）實際可用 |
+| `tests/net.rs` | 網路功能的基礎：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單） |
 | `tests/pacing.rs` | 流暢播放在播放引擎這一層的行為（`vo-null-fps` 當假的螢幕更新率） |
 | `tests/pacing_window.rs` | 流暢播放與畫面輸出節奏的實機量測（會開全螢幕視窗，預設不跑；見下方） |
 

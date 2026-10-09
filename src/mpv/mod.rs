@@ -9,6 +9,7 @@ use libmpv2_sys as sys;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
@@ -149,6 +150,141 @@ impl Value {
     }
 }
 
+/// 要送給 mpv 的 node（只做設定用）：字串清單、鍵值清單、`chapter-list` 這類
+/// 不能用逗號字串表示的值（字串清單的項目裡可能有逗號）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Node {
+    Str(String),
+    Int(i64),
+    Double(f64),
+    Flag(bool),
+    Array(Vec<Node>),
+    /// 鍵值清單，照給的順序；鍵裡的 NUL 跟字串一樣截斷
+    Map(Vec<(String, Node)>),
+}
+
+impl Node {
+    /// 字串清單，例如 `http-header-fields`、`glsl-shaders`
+    pub fn strings<S: Into<String>>(items: impl IntoIterator<Item = S>) -> Node {
+        Node::Array(items.into_iter().map(|s| Node::Str(s.into())).collect())
+    }
+}
+
+/// `Node` 轉成的 C `mpv_node` 樹。每一塊記憶體都用原始指標記在這裡（`into_raw`），
+/// 活到 mpv 讀完（`mpv_set_property` 回傳前 mpv 會複製一份），Drop 時全部釋放。
+/// 不用 `Vec<Vec<mpv_node>>` 之類直接持有：搬動 Box、Vec 可能讓之前取得的指標失效
+struct NodeTree {
+    root: sys::mpv_node,
+    strings: Vec<*mut c_char>,
+    values: Vec<*mut [sys::mpv_node]>,
+    keys: Vec<*mut [*mut c_char]>,
+    lists: Vec<*mut sys::mpv_node_list>,
+}
+
+impl NodeTree {
+    /// 項目太多（超過 c_int）時回傳 None
+    fn new(node: &Node) -> Option<NodeTree> {
+        let mut tree = NodeTree {
+            // SAFETY: mpv_node 是純資料，全 0 = MPV_FORMAT_NONE
+            root: unsafe { std::mem::zeroed() },
+            strings: Vec::new(),
+            values: Vec::new(),
+            keys: Vec::new(),
+            lists: Vec::new(),
+        };
+        // 中途失敗：已經配置的都記在 tree 裡，Drop 會釋放
+        tree.root = tree.build(node)?;
+        Some(tree)
+    }
+
+    fn string(&mut self, s: &str) -> *mut c_char {
+        let p = cstring(s).into_raw();
+        self.strings.push(p);
+        p
+    }
+
+    fn build(&mut self, node: &Node) -> Option<sys::mpv_node> {
+        // SAFETY: 同上，之後只填 format 對應的 union 欄位
+        let mut out: sys::mpv_node = unsafe { std::mem::zeroed() };
+        match node {
+            Node::Str(s) => {
+                out.format = sys::mpv_format_MPV_FORMAT_STRING;
+                out.u.string = self.string(s);
+            }
+            Node::Int(v) => {
+                out.format = sys::mpv_format_MPV_FORMAT_INT64;
+                out.u.int64 = *v;
+            }
+            Node::Double(v) => {
+                out.format = sys::mpv_format_MPV_FORMAT_DOUBLE;
+                out.u.double_ = *v;
+            }
+            Node::Flag(v) => {
+                // MPV_FORMAT_FLAG 的資料是 int
+                out.format = sys::mpv_format_MPV_FORMAT_FLAG;
+                out.u.flag = (*v).into();
+            }
+            Node::Array(items) => {
+                let values = items.iter().map(|n| self.build(n)).collect::<Option<Vec<_>>>()?;
+                out.format = sys::mpv_format_MPV_FORMAT_NODE_ARRAY;
+                out.u.list = self.list(values, None)?;
+            }
+            Node::Map(pairs) => {
+                // 先建所有的值（遞迴），再建鍵；兩邊數量一定一樣
+                let values = pairs.iter().map(|(_, n)| self.build(n)).collect::<Option<Vec<_>>>()?;
+                let keys = pairs.iter().map(|(k, _)| self.string(k)).collect();
+                out.format = sys::mpv_format_MPV_FORMAT_NODE_MAP;
+                out.u.list = self.list(values, Some(keys))?;
+            }
+        }
+        Some(out)
+    }
+
+    /// 陣列、鍵值清單一定要有 mpv_node_list（mpv 不檢查 u.list 是不是 NULL）；
+    /// 空的清單 values、keys 用 NULL（client.h：num 為 0 時可以是 NULL）
+    fn list(&mut self, values: Vec<sys::mpv_node>, keys: Option<Vec<*mut c_char>>) -> Option<*mut sys::mpv_node_list> {
+        let num = c_int::try_from(values.len()).ok()?;
+        let values = if values.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            let p = Box::into_raw(values.into_boxed_slice());
+            self.values.push(p);
+            p as *mut sys::mpv_node
+        };
+        let keys = match keys {
+            Some(k) if !k.is_empty() => {
+                let p = Box::into_raw(k.into_boxed_slice());
+                self.keys.push(p);
+                p as *mut *mut c_char
+            }
+            _ => std::ptr::null_mut(),
+        };
+        let list = Box::into_raw(Box::new(sys::mpv_node_list { num, values, keys }));
+        self.lists.push(list);
+        Some(list)
+    }
+}
+
+impl Drop for NodeTree {
+    fn drop(&mut self) {
+        // SAFETY: 每個指標都是上面 into_raw 得到的，只在這裡釋放一次；mpv 不保留這些記憶體
+        unsafe {
+            for p in self.lists.drain(..) {
+                drop(Box::from_raw(p));
+            }
+            for p in self.values.drain(..) {
+                drop(Box::from_raw(p));
+            }
+            for p in self.keys.drain(..) {
+                drop(Box::from_raw(p));
+            }
+            for p in self.strings.drain(..) {
+                drop(CString::from_raw(p));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndReason {
     Eof,
@@ -201,6 +337,13 @@ pub enum Event {
         result: Result<()>,
     },
     QueueOverflow,
+    /// 註冊過的 hook 觸發了（`hook_add`）。mpv 停在那裡等，處理完一定要 `hook_continue(id)` 剛好一次，
+    /// 不然載入永遠卡住。`userdata` 是註冊時給的值，`id` 是 mpv 給的序號
+    Hook {
+        name: String,
+        id: u64,
+        userdata: u64,
+    },
     Other(u32),
 }
 
@@ -244,6 +387,9 @@ pub fn has_time_ns() -> bool {
 pub struct Mpv {
     handle: NonNull<sys::mpv_handle>,
     wakeup: Option<Box<Callback>>,
+    /// 已經以 `Event::Hook` 交出去、還沒 continue 的 hook 序號。對同一個 hook continue 兩次、
+    /// 或給錯序號是未定義行為（client.h），所以 `hook_continue` 只放行這裡有的
+    hooks_pending: Mutex<Vec<u64>>,
 }
 
 // SAFETY: libmpv 的 client API 可以從任何執行緒呼叫（client.h「Thread safety」一節）
@@ -271,7 +417,11 @@ impl Mpv {
         let raw = unsafe { sys::mpv_create() };
         let handle = NonNull::new(raw).ok_or_else(|| Error::new(sys::mpv_error_MPV_ERROR_NOMEM, "mpv_create"))?;
         // 先包起來：之後任何一步失敗，Drop 都會正確釋放
-        let mpv = Mpv { handle, wakeup: None };
+        let mpv = Mpv {
+            handle,
+            wakeup: None,
+            hooks_pending: Mutex::new(Vec::new()),
+        };
 
         for (name, value) in options {
             let (n, v) = (cstring(name), cstring(value));
@@ -397,6 +547,29 @@ impl Mpv {
         list
     }
 
+    /// 用 mpv_node 設定屬性或選項（`http-header-fields`、`chapter-list`、`file-local-options/…`）。
+    /// 字串清單用這個設定，項目裡的逗號不會被當成分隔
+    pub fn set_node(&self, name: &str, value: &Node) -> Result<()> {
+        let n = cstring(name);
+        let Some(mut tree) = NodeTree::new(value) else {
+            return Err(Error::new(
+                sys::mpv_error_MPV_ERROR_INVALID_PARAMETER,
+                crate::tf!("設定屬性 {name}：項目太多", "setting property {name}: too many items"),
+            ));
+        };
+        // SAFETY: tree 擁有整棵樹的記憶體，活到 mpv_set_property 回傳之後；mpv 只讀、會自己複製一份
+        let code = unsafe {
+            sys::mpv_set_property(
+                self.raw(),
+                n.as_ptr(),
+                sys::mpv_format_MPV_FORMAT_NODE,
+                &mut tree.root as *mut sys::mpv_node as *mut c_void,
+            )
+        };
+        drop(tree);
+        check(code, || crate::tf!("設定屬性 {name}", "setting property {name}"))
+    }
+
     pub fn observe(&self, id: u64, name: &str, format: Format) -> Result<()> {
         let n = cstring(name);
         let code = unsafe { sys::mpv_observe_property(self.raw(), id, n.as_ptr(), format.raw()) };
@@ -409,6 +582,38 @@ impl Mpv {
         check(unsafe { sys::mpv_request_log_messages(self.raw(), l.as_ptr()) }, || {
             format!("request_log_messages {level}")
         })
+    }
+
+    /// 註冊 hook（`on_load`、`on_load_fail`…，見 mpv 說明的 Hooks 一節）。觸發時這個 handle 收到
+    /// `Event::Hook { userdata, .. }`，只能在這個 handle 上 continue。`priority` 越小越先執行，
+    /// 同優先順序照註冊順序。不認得的名稱不會觸發。hook 不能取消註冊，handle 釋放時 mpv 會自己放行
+    pub fn hook_add(&self, userdata: u64, name: &str, priority: i32) -> Result<()> {
+        let n = cstring(name);
+        let code = unsafe { sys::mpv_hook_add(self.raw(), userdata, n.as_ptr(), priority) };
+        check(code, || crate::tf!("註冊 hook {name}", "adding hook {name}"))
+    }
+
+    /// 讓停在 hook 的 mpv 繼續。每個 `Event::Hook` 剛好一次；序號不是等待中的（已經 continue 過、
+    /// 或根本沒收到）就回傳錯誤，不交給 mpv。任何執行緒都可以呼叫
+    pub fn hook_continue(&self, id: u64) -> Result<()> {
+        let pending = {
+            let mut list = self.hooks_pending.lock().unwrap_or_else(|e| e.into_inner());
+            list.iter().position(|&x| x == id).map(|i| list.swap_remove(i))
+        };
+        if pending.is_none() {
+            return Err(Error::new(
+                sys::mpv_error_MPV_ERROR_INVALID_PARAMETER,
+                crate::tf!("hook {id} 不是等待中的 hook", "hook {id} is not pending"),
+            ));
+        }
+        check(unsafe { sys::mpv_hook_continue(self.raw(), id) }, || {
+            crate::tf!("繼續 hook {id}", "continuing hook {id}")
+        })
+    }
+
+    /// 還沒 continue 的 hook 數（自動測試用）
+    pub fn hooks_pending(&self) -> usize {
+        self.hooks_pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// 等待下一個事件；`timeout` 為 0 時只檢查不等待。沒有事件時回傳 `None`。
@@ -458,6 +663,16 @@ impl Mpv {
                 result: check(ev.error, || crate::tr!("非同步指令", "async command").into()),
             },
             sys::mpv_event_id_MPV_EVENT_QUEUE_OVERFLOW => Event::QueueOverflow,
+            sys::mpv_event_id_MPV_EVENT_HOOK => {
+                let h = unsafe { &*(ev.data as *const sys::mpv_event_hook) };
+                // 先記下來，hook_continue 才放行這個序號
+                self.hooks_pending.lock().unwrap_or_else(|e| e.into_inner()).push(h.id);
+                Event::Hook {
+                    name: str_of(h.name),
+                    id: h.id,
+                    userdata: ev.reply_userdata,
+                }
+            }
             other => Event::Other(other),
         };
         Some(event)
@@ -471,6 +686,12 @@ impl Mpv {
         unsafe { sys::mpv_set_wakeup_callback(self.raw(), Some(trampoline), data) };
         // 先換上新的 callback，舊的才能安全釋放
         self.wakeup = Some(boxed);
+    }
+
+    /// 叫醒正在等的 `wait_event`（它回傳 `None`），也會呼叫 wakeup callback（在呼叫這個函式的執行緒上）。
+    /// 任何執行緒都可以呼叫；背景工作做完時用它通知處理事件的執行緒
+    pub fn wakeup(&self) {
+        unsafe { sys::mpv_wakeup(self.raw()) }
     }
 }
 
@@ -573,5 +794,137 @@ impl PropertyValue for &str {
     fn read(_: impl FnOnce(sys::mpv_format, *mut c_void) -> c_int) -> std::result::Result<Self, c_int> {
         // 借用的字串無法擁有 mpv 配置的記憶體；讀取請用 String
         Err(sys::mpv_error_MPV_ERROR_PROPERTY_FORMAT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 把 C 的 mpv_node 樹讀回 Node，同時檢查 mpv 會依賴的形狀
+    /// SAFETY: `n` 必須是 NodeTree 建出來、還活著的樹
+    unsafe fn read_back(n: &sys::mpv_node) -> Node {
+        unsafe {
+            let items = |l: *mut sys::mpv_node_list, map: bool| -> Vec<(Option<String>, Node)> {
+                assert!(!l.is_null(), "陣列、鍵值清單一定要有 mpv_node_list");
+                let l = &*l;
+                assert!(l.num >= 0);
+                if l.num == 0 {
+                    assert!(l.values.is_null() && l.keys.is_null(), "空的清單用 NULL");
+                    return Vec::new();
+                }
+                let values = std::slice::from_raw_parts(l.values, l.num as usize);
+                if map {
+                    let keys = std::slice::from_raw_parts(l.keys, l.num as usize);
+                    keys.iter()
+                        .zip(values)
+                        .map(|(&k, v)| {
+                            assert!(!k.is_null(), "鍵不可以是 NULL");
+                            (Some(CStr::from_ptr(k).to_str().unwrap().to_owned()), read_back(v))
+                        })
+                        .collect()
+                } else {
+                    assert!(l.keys.is_null(), "陣列沒有鍵");
+                    values.iter().map(|v| (None, read_back(v))).collect()
+                }
+            };
+            match n.format {
+                sys::mpv_format_MPV_FORMAT_STRING => {
+                    assert!(!n.u.string.is_null());
+                    Node::Str(CStr::from_ptr(n.u.string).to_str().unwrap().to_owned())
+                }
+                sys::mpv_format_MPV_FORMAT_INT64 => Node::Int(n.u.int64),
+                sys::mpv_format_MPV_FORMAT_DOUBLE => Node::Double(n.u.double_),
+                sys::mpv_format_MPV_FORMAT_FLAG => {
+                    assert!(matches!(n.u.flag, 0 | 1), "旗標是 int 0 或 1");
+                    Node::Flag(n.u.flag != 0)
+                }
+                sys::mpv_format_MPV_FORMAT_NODE_ARRAY => {
+                    Node::Array(items(n.u.list, false).into_iter().map(|(_, v)| v).collect())
+                }
+                sys::mpv_format_MPV_FORMAT_NODE_MAP => Node::Map(
+                    items(n.u.list, true)
+                        .into_iter()
+                        .map(|(k, v)| (k.unwrap(), v))
+                        .collect(),
+                ),
+                other => panic!("不該出現的 format {other}"),
+            }
+        }
+    }
+
+    fn round_trip(node: &Node) -> Node {
+        let tree = NodeTree::new(node).unwrap();
+        // SAFETY: tree 還活著
+        unsafe { read_back(&tree.root) }
+    }
+
+    #[test]
+    fn node_tree_matches_the_rust_value() {
+        let chapters = Node::Array(vec![
+            Node::Map(vec![
+                ("title".into(), Node::Str("開場".into())),
+                ("time".into(), Node::Double(0.0)),
+            ]),
+            Node::Map(vec![
+                ("title".into(), Node::Str("A, B".into())),
+                ("time".into(), Node::Int(90)),
+            ]),
+        ]);
+        assert_eq!(round_trip(&chapters), chapters);
+        let mixed = Node::Map(vec![
+            ("empty-array".into(), Node::Array(Vec::new())),
+            ("empty-map".into(), Node::Map(Vec::new())),
+            ("flags".into(), Node::Array(vec![Node::Flag(true), Node::Flag(false)])),
+            (
+                "nested".into(),
+                Node::Array(vec![Node::Array(vec![Node::Map(vec![("深".into(), Node::Int(-1))])])]),
+            ),
+            ("".into(), Node::Str(String::new())),
+            ("max".into(), Node::Int(i64::MAX)),
+            ("pi".into(), Node::Double(std::f64::consts::PI)),
+        ]);
+        assert_eq!(round_trip(&mixed), mixed);
+        for scalar in [
+            Node::Str("x".into()),
+            Node::Int(7),
+            Node::Double(-0.5),
+            Node::Flag(true),
+        ] {
+            assert_eq!(round_trip(&scalar), scalar);
+        }
+        assert_eq!(round_trip(&Node::Array(Vec::new())), Node::Array(Vec::new()));
+        assert_eq!(round_trip(&Node::Map(Vec::new())), Node::Map(Vec::new()));
+    }
+
+    #[test]
+    fn node_strings_keep_commas_and_truncate_at_nul() {
+        let headers = Node::strings(["X-A: 1,2", "Cookie: a=b; c=d"]);
+        assert_eq!(
+            headers,
+            Node::Array(vec![Node::Str("X-A: 1,2".into()), Node::Str("Cookie: a=b; c=d".into())])
+        );
+        assert_eq!(round_trip(&headers), headers);
+        // 跟 cstring 一樣：NUL 之後的不送（字串、鍵都是）
+        assert_eq!(round_trip(&Node::Str("ab\0cd".into())), Node::Str("ab".into()));
+        assert_eq!(
+            round_trip(&Node::Map(vec![("k\0x".into(), Node::Int(1))])),
+            Node::Map(vec![("k".into(), Node::Int(1))])
+        );
+    }
+
+    #[test]
+    fn node_tree_owns_every_allocation() {
+        let node = Node::Map(vec![
+            ("a".into(), Node::strings(["1", "2", "3"])),
+            ("b".into(), Node::Array(Vec::new())),
+            ("c".into(), Node::Map(vec![("d".into(), Node::Str("e".into()))])),
+        ]);
+        let tree = NodeTree::new(&node).unwrap();
+        // 字串：鍵 a b c d + 值 1 2 3 e；清單：外層、a、b、c；空的 b 沒有 values / keys
+        assert_eq!(tree.strings.len(), 8);
+        assert_eq!(tree.lists.len(), 4);
+        assert_eq!(tree.values.len(), 3);
+        assert_eq!(tree.keys.len(), 2);
     }
 }
