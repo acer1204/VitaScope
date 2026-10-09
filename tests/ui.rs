@@ -8210,6 +8210,20 @@ fn disabled_filters(h: &Harness<'_, VitascopeApp>) -> Vec<String> {
         .collect()
 }
 
+/// 濾鏡失敗的紀錄穩定下來（1 秒內沒有新的，最多等 5 秒）之後的內容
+fn settled_disabled_filters(h: &mut Harness<'_, VitascopeApp>) -> Vec<String> {
+    let mut last = disabled_filters(h);
+    for _ in 0..5 {
+        wait_real(h, 1.0);
+        let now = disabled_filters(h);
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
 #[test]
 fn sound_menu_items() {
     let (_dir, path, mut h) = sound_harness_with(
@@ -8820,8 +8834,10 @@ fn unpredicted_spdif_clears_and_revives_the_eq_chain() {
     wait_af(&mut h, "直通開始之後清空", str::is_empty);
     wait_real(&mut h, 0.3);
     assert_eq!(prop(&h, "af"), "", "直通中沒有濾鏡");
-    // 濾鏡在清空之前可能已經碰到直通的資料、失敗了（預測不到，沒辦法事先清空）：記下來，之後比對內容
-    let mut failed = disabled_filters(&h);
+    // 濾鏡在清空之前可能已經碰到直通的資料、失敗了（預測不到，沒辦法事先清空）：記下來，之後比對內容。
+    // af 屬性先變成空的，舊的濾鏡鏈要等音訊執行緒重建才拆掉，失敗的紀錄可能晚一點才到（CI 的 macOS 上超過 0.3 秒）：
+    // 等紀錄一秒內沒有再變才記下
+    let mut failed = settled_disabled_filters(&mut h);
     // 關掉直通（舊的引擎要重新開檔）：等化器回來，不再失敗
     h.state().player().mpv().set_property("audio-spdif", "").unwrap();
     if !h.state().engine_caps().spdif_live {
