@@ -265,6 +265,12 @@ def samples() -> list[Sample]:
         # 每 2 秒剛好一個關鍵影格（不因為畫面變化多插）：片段匯出（不重新編碼）的關鍵影格對齊測試用
         S("mkv_h264_gop2", "general", "mkv", X264 + ["-g", "48", "-keyint_min", "48", "-sc_threshold", "0"], AAC,
           "h264", "aac", dur=12, note="12 秒、每 2 秒一個關鍵影格（片段匯出）"),
+        # 每 10 秒一個關鍵影格的 TS：用時間跳轉常落在關鍵影格之後（片段匯出要從更前面重讀）
+        S("ts_h264_gop10", "general", "ts", X264 + ["-g", "240", "-keyint_min", "240", "-sc_threshold", "0"], AAC,
+          "h264", "aac", fmt=["-f", "mpegts"], dur=20, note="20 秒、每 10 秒一個關鍵影格的 TS（片段匯出）"),
+        # 每 30 秒一個關鍵影格：A 之前的關鍵影格在讀取起點前面很遠（片段匯出往前讀的秒數）
+        S("mkv_h264_gop30", "general", "mkv", X264 + ["-g", "720", "-keyint_min", "720", "-sc_threshold", "0"], AAC,
+          "h264", "aac", dur=75, note="75 秒、每 30 秒一個關鍵影格（片段匯出）"),
         # Matroska 裡的 WebVTT，mpv 回報的編碼名稱是 webvtt-webm
         S("mkv_h264_aac_webvtt", "general", "mkv", X264, AAC, "h264", "aac", sub_embed="webvtt", subs=["webvtt-webm"]),
         S("extsub_vtt", "general", "mp4", X264, AAC, "h264", "aac", sub_ext="vtt", subs=["webvtt"]),

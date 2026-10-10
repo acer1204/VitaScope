@@ -9,6 +9,10 @@
 //!
 //! 匯出都在另外開的 mpv 裡做（不動正在播放的那一個）。FFmpeg 的記錄只送到第一個建立的 mpv（主播放器），
 //! 所以這裡判斷失敗只看 mpv 自己的訊息（「Failed writing packet」「Disabling filter」之類）。
+//!
+//! 各種匯出在子模組：[`clip`]（片段）。
+
+pub mod clip;
 
 use crate::geometry::Geometry;
 use crate::instance::Wake;
@@ -259,6 +263,8 @@ pub enum Note {
     KeyframeAligned,
     /// 片段不含字幕軌、不保留語言標籤（目前播放引擎的限制）
     NoSubtitleTrack,
+    /// 片段沒有聲音：正在播放的音軌放不進片段（外掛的音軌、不能直接存的音訊格式），檔案裡也沒有別的放得進的
+    NoAudioTrack,
     /// 播放引擎沒有色調映射濾鏡：HDR 影片的亮部會變白
     HdrClipped,
     /// 杜比視界 Profile 5 不轉換顏色（顏色可能不對）
@@ -275,6 +281,10 @@ impl Note {
             Note::NoSubtitleTrack => crate::tr!(
                 "片段不含字幕，也不保留音軌的語言標籤",
                 "Clips contain no subtitles and don't keep the audio language tag"
+            ),
+            Note::NoAudioTrack => crate::tr!(
+                "片段沒有聲音：目前的音軌是外掛的，或是不能直接存成片段的格式",
+                "The clip has no sound: the current audio track is external, or its format can't be saved as a clip"
             ),
             Note::HdrClipped => crate::tr!(
                 "播放引擎沒有色調映射濾鏡：HDR 影片的亮部會變白",
@@ -363,9 +373,14 @@ pub enum Failure {
     Timeline,
     /// 直播不能匯出片段
     Live,
+    /// 網路影片有總長度、但不能跳轉（伺服器不支援 Range）：匯出用的 mpv 讀不到中間的段落
+    NotSeekable,
+    /// 播放引擎沒有匯出片段要的指令（dump-cache）
+    NoDump,
     /// 這種音訊格式不能直接存成片段（APE、DSD、Musepack）
     AudioCodec,
-    /// 寫好了，但換不成正式的名稱（暫存檔留著，內容是完整的；使用者不改名的話，之後啟動時會被清掉）
+    /// 寫好了，但換不成正式的名稱（暫存檔留著，內容是完整的；登記在快取資料夾的清單裡，
+    /// 啟動時清暫存檔不會刪它，見 [`keep_file`]）
     Finish { error: String, temp: PathBuf },
     /// 其他檔案操作的錯誤（系統的原文）
     Io(String),
@@ -478,6 +493,12 @@ impl Failure {
             )
             .into(),
             Failure::Live => tr!("直播不能匯出片段", "Clips can't be saved from live streams").into(),
+            Failure::NotSeekable => tr!(
+                "這個網路影片不能跳轉（伺服器不支援）",
+                "This online video isn't seekable (the server doesn't support it)"
+            )
+            .into(),
+            Failure::NoDump => tr!("播放引擎不支援匯出片段", "The playback engine can't save clips").into(),
             Failure::AudioCodec => tr!(
                 "這種音訊格式不能直接存成片段",
                 "This audio format can't be saved as a clip"
@@ -485,11 +506,10 @@ impl Failure {
             .into(),
             Failure::Finish { error, temp } => {
                 let temp = temp.display();
-                // 留下的檔案名稱還是暫存檔的樣子：使用者沒改名的話，之後啟動時會被當成留下的暫存檔清掉（超過一小時）
+                // 留下的檔案名稱還是暫存檔的樣子，請使用者自己改名（登記過，啟動時清暫存檔不會刪它）
                 tf!(
-                    "無法完成存檔：{error}。完整的檔案暫時留在 {temp}，請自己改名，不然之後啟動影戲時會被當成暫存檔刪掉",
-                    "Couldn't finish saving: {error}. The complete file is at {temp}; rename it yourself, \
-                     or it will be deleted as a leftover temporary file when VitaScope starts later"
+                    "無法完成存檔：{error}。完整的檔案留在 {temp}，請自己改成想要的名稱",
+                    "Couldn't finish saving: {error}. The complete file is at {temp}; rename it yourself"
                 )
             }
             Failure::Io(e) | Failure::Engine(e) => e.clone(),
@@ -533,6 +553,8 @@ struct Shared {
     writing: AtomicBool,
     /// 還沒換成正式名稱的暫存檔（取消、失敗、丟掉 `Job` 時刪掉）
     temp: Mutex<Option<PathBuf>>,
+    /// 換不成正式名稱、留下的完整檔案登記在這個資料夾的清單裡（[`keep_file`]）；None = 不登記
+    keep_dir: Mutex<Option<PathBuf>>,
 }
 
 impl Shared {
@@ -702,6 +724,18 @@ impl Ctl {
         self.shared.temp()
     }
 
+    /// 換不成正式名稱時，留下的完整檔案登記在 `dir`（快取的 `export` 資料夾，[`cache_dir`]）的清單裡：
+    /// 啟動時清暫存檔（[`sweep_leftovers`]）不會刪它。每種匯出開始時都要設定（App 有快取資料夾時才會清暫存檔）
+    pub fn set_keep_dir(&self, dir: Option<PathBuf>) {
+        *self.shared.keep_dir.lock().unwrap_or_else(|e| e.into_inner()) = dir;
+    }
+
+    /// 登記留下的檔案的資料夾（[`set_keep_dir`](Self::set_keep_dir)；測試確認每種匯出都有設定）
+    #[doc(hidden)]
+    pub fn keep_dir(&self) -> Option<PathBuf> {
+        self.shared.keep_dir.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// 把登記的暫存檔換成正式的名稱（絕不覆蓋，見 `save::finish_new`）。
     /// 已經取消時（包括 `Job` 被丟掉時還在寫檔的工作）不換，回傳 `Cancelled`，暫存檔由執行緒結束時刪掉。
     /// 換名稱失敗時暫存檔留著（內容是完整的），原因裡寫它在哪裡
@@ -720,8 +754,15 @@ impl Ctl {
             // 暫存檔不見了（被別人刪掉、根本沒寫出來）：沒有東西可以留
             Err(e) if !temp.exists() => Err(Failure::Io(e.to_string())),
             Err(e) => {
-                // 內容是完整的，留著：提示裡寫出位置，請使用者自己改名（名稱還是暫存檔的樣子，超過一小時之後啟動時會被清掉）
+                // 內容是完整的，留著：提示裡寫出位置，請使用者自己改名。名稱還是暫存檔的樣子，
+                // 登記起來，啟動時清暫存檔才不會把它當成當掉留下的刪掉
                 self.set_temp(None);
+                let keep_dir = self.shared.keep_dir.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                if let Some(dir) = keep_dir
+                    && let Err(err) = keep_file(&dir, &temp)
+                {
+                    eprintln!("[vitascope] 無法登記留下的檔案 {}：{err}", temp.display());
+                }
                 Err(Failure::Finish {
                     error: e.to_string(),
                     temp,
@@ -829,21 +870,84 @@ fn is_mpv_cache(name: &str) -> bool {
 
 /// 啟動時清掉上次留下的暫存檔（當掉、被強制結束、關機時沒機會刪）：
 /// `<快取>/export` 裡影戲的暫存檔與 mpv 的磁碟快取檔，以及匯出資料夾（`folders`）裡影戲的暫存檔，
-/// 都只刪超過一小時沒有修改的。回傳刪了幾個。資料夾可能在網路磁碟上，要在背景執行緒呼叫
+/// 都只刪超過一小時沒有修改的。登記過的完整檔案（換不成正式名稱留下的，[`keep_file`]）不刪。
+/// 回傳刪了幾個。資料夾可能在網路磁碟上，要在背景執行緒呼叫
 pub fn sweep_leftovers(cache_root: &Path, folders: &[PathBuf]) -> usize {
+    let cache = cache_dir(cache_root);
+    // 比對檔名就好：暫存檔的名稱有行程編號與流水號，不會重複（資料夾的寫法可能不同：大小寫、結尾的斜線）
+    let kept: Vec<String> = kept_files(&cache)
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    let is_kept = |name: &str| kept.iter().any(|k| k == name);
     let mut removed = save::sweep_matching(
-        &cache_dir(cache_root),
-        |n| save::is_part(n) || is_mpv_cache(n),
+        &cache,
+        |n| (save::is_part(n) && !is_kept(n)) || is_mpv_cache(n),
         LEFTOVER_AGE,
     );
     let mut seen: Vec<&PathBuf> = Vec::new();
     for dir in folders {
         if !seen.contains(&dir) {
             seen.push(dir);
-            removed += save::sweep(dir, LEFTOVER_AGE);
+            removed += save::sweep_matching(dir, |n| save::is_part(n) && !is_kept(n), LEFTOVER_AGE);
         }
     }
     removed
+}
+
+/// 留下的完整檔案的清單（`<快取>/export/kept.json`，JSON 的路徑陣列）
+pub const KEPT_LIST: &str = "kept.json";
+
+/// 同一個行程裡改清單的不要同時做（讀、加、寫回）
+static KEPT_LOCK: Mutex<()> = Mutex::new(());
+
+/// 讀清單（壞掉、沒有時是空的）
+fn read_kept(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read(dir.join(KEPT_LIST))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<PathBuf>>(&b).ok())
+        .unwrap_or_default()
+}
+
+/// 寫回清單：先寫暫存檔再換掉，寫到一半不會留下壞掉的清單
+fn write_kept(dir: &Path, list: &[PathBuf]) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let temp = save::temp_in(dir, "kept", "json");
+    let text = serde_json::to_vec_pretty(list).map_err(std::io::Error::other)?;
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, dir.join(KEPT_LIST)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// 登記一個換不成正式名稱、留下的完整檔案（`dir` = 快取的 `export` 資料夾）：
+/// 名稱還是暫存檔的樣子，啟動時清暫存檔看到清單裡有它就不刪（使用者改名或刪掉之後才從清單拿掉）
+pub fn keep_file(dir: &Path, path: &Path) -> std::io::Result<()> {
+    let _guard = KEPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut list = read_kept(dir);
+    if !list.iter().any(|p| p == path) {
+        list.push(path.to_path_buf());
+    }
+    write_kept(dir, &list)
+}
+
+/// 登記過、還在的檔案（`dir` = 快取的 `export` 資料夾）。確定已經不在的（使用者改名、刪掉了）從清單拿掉
+pub fn kept_files(dir: &Path) -> Vec<PathBuf> {
+    let _guard = KEPT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let list = read_kept(dir);
+    // 確定不在 = 所在的資料夾讀得到、檔案不在裡面。資料夾查不到（隨身碟拔掉、網路磁碟還沒連上、
+    // 沒有權限：系統一樣回報「找不到」）的算還在，拿掉的話之後接回來時就會被當成暫存檔刪掉
+    let gone = |p: &PathBuf| {
+        let folder_there = p
+            .parent()
+            .is_some_and(|d| std::fs::metadata(d).is_ok_and(|m| m.is_dir()));
+        folder_there && matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    };
+    let alive: Vec<PathBuf> = list.iter().filter(|p| !gone(p)).cloned().collect();
+    if alive.len() != list.len() {
+        let _ = write_kept(dir, &alive);
+    }
+    alive
 }
 
 // ───────────── 磁碟空間 ─────────────
@@ -1031,6 +1135,11 @@ impl LogTail {
         self.lines.iter().cloned().collect()
     }
 
+    /// 清掉收過的（只看接下來的記錄，例如寫檔那一段）
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+
     /// 從收到的記錄判斷原因（見 `map_mpv_error`）
     pub fn failure(&self) -> Option<Failure> {
         map_mpv_error(&self.lines())
@@ -1050,6 +1159,9 @@ pub fn map_mpv_error(lines: &[LogLine]) -> Option<Failure> {
                 "Failed to create file cache",
                 "Failed to create cache temporary file",
                 "Failed to retrieve packet from cache",
+                // 讀快取時寫不進磁碟快取（快取所在的磁碟滿了）
+                "Failed to write to cache file",
+                "Could not write all data",
             ],
             |_| Failure::CacheFailed,
         ),
@@ -1428,7 +1540,7 @@ mod tests {
 
     #[test]
     fn map_mpv_error_known_lines() {
-        let cases: [(&str, Failure); 20] = [
+        let cases: [(&str, Failure); 22] = [
             ("Failed writing packet.", Failure::WriteFailed),
             ("Writing trailer failed.", Failure::WriteFailed),
             ("Failed opening output file.", Failure::NoPermission(None)),
@@ -1441,6 +1553,12 @@ mod tests {
                 Failure::FilterFailed,
             ),
             ("Failed to create file cache.", Failure::CacheFailed),
+            // 讀快取時磁碟快取寫不進去（demux/cache.c）：快取所在的磁碟滿了，不是讀取逾時
+            (
+                "Failed to write to cache file: No space left on device",
+                Failure::CacheFailed,
+            ),
+            ("Could not write all data.", Failure::CacheFailed),
             (
                 "Cannot open file '/x/a.mkv': No such file or directory",
                 Failure::SourceMissing,
@@ -1655,7 +1773,8 @@ mod tests {
             "無法匯出：磁碟空間不足（需要約 3.00 GB，剩 1.0 MB）"
         );
         assert_eq!(Failure::Engine("Odd.".into()).message(), "Odd.");
-        // 換不成正式名稱時留下的完整檔案：名稱還是暫存檔的樣子，要提醒使用者改名（不然之後啟動時會被清掉）
+        // 換不成正式名稱時留下的完整檔案：名稱還是暫存檔的樣子，要提醒使用者改名。
+        // 它登記過、啟動時清暫存檔不會刪（D2），說明裡不能再說「會被刪掉」
         let temp = PathBuf::from("/x/a.1-2.vitascope-part.mkv");
         let finish = Failure::Finish {
             error: "busy".into(),
@@ -1663,12 +1782,12 @@ mod tests {
         };
         let text = finish.message();
         assert!(
-            text.contains(&temp.display().to_string()) && text.contains("改名") && text.contains("刪掉"),
+            text.contains(&temp.display().to_string()) && text.contains("改") && !text.contains("刪"),
             "{text}"
         );
         crate::i18n::set_lang(crate::i18n::Lang::En);
         let text = finish.message();
-        assert!(text.contains("rename it") && text.contains("deleted"), "{text}");
+        assert!(text.contains("rename it") && !text.contains("delete"), "{text}");
         assert!(!text.contains("  "), "英文的說明裡不能有連續的空白：{text}");
         // 美式拼法（跟其他英文介面一樣）
         assert!(Failure::SourceUnreadable.message().contains("recognized"));
@@ -1685,6 +1804,18 @@ mod tests {
             assert!(!f.osd().contains("輸出"), "{}", f.osd());
         }
         assert!(!Note::NoSubtitleTrack.message().is_empty());
+        // 片段不能存的原因（D2）
+        assert_eq!(
+            Failure::NotSeekable.osd(),
+            "無法匯出：這個網路影片不能跳轉（伺服器不支援）"
+        );
+        assert_eq!(Failure::NoDump.message(), "播放引擎不支援匯出片段");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert!(Failure::NotSeekable.message().contains("isn't seekable"));
+        assert_eq!(Failure::NoDump.message(), "The playback engine can't save clips");
+        assert!(Note::NoAudioTrack.message().contains("no sound"));
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert!(Note::NoAudioTrack.message().contains("沒有聲音"));
         assert_eq!(Kind::Sheet.label(), "縮圖總覽圖");
     }
 }

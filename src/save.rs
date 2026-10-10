@@ -26,11 +26,20 @@ const BUSY_RETRY: Duration = Duration::from_secs(2);
 /// 名稱一直被別人搶先用掉時最多換幾次名稱（不會發生；避免無限迴圈）
 const MAX_NAME_TRIES: usize = 1000;
 
-/// 暫存檔的完整路徑：`<dir>/<stem>.<pid>-<seq>.vitascope-part.<ext>`。只產生名稱，不建立檔案
+/// 暫存檔的完整路徑：`<dir>/<stem>.<pid>-<seq>.vitascope-part.<ext>`。不建立檔案。
+/// 跳過已經存在的名稱：流水號每次啟動都從 1 開始、行程編號會重複使用，之前換不成正式名稱而留下的
+/// 完整檔案（`export::keep_file`）可能剛好同名，寫檔程式開檔時會把它清空。會查資料夾：在背景執行緒呼叫
 pub fn temp_in(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let stem = crate::screenshot::sanitize_stem(stem);
-    dir.join(format!("{stem}.{}-{seq}{PART_MARK}{ext}", std::process::id()))
+    let mut tries = 0;
+    loop {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!("{stem}.{}-{seq}{PART_MARK}{ext}", std::process::id()));
+        tries += 1;
+        if std::fs::symlink_metadata(&path).is_err() || tries >= MAX_NAME_TRIES {
+            return path;
+        }
+    }
 }
 
 /// 是不是影戲的暫存檔（`temp_in` 產生的名稱）
@@ -193,6 +202,33 @@ mod tests {
         assert_eq!(c.parent(), Some(dir));
         assert!(c.to_string_lossy().ends_with(".gif"));
         assert!(!is_part("影片.mkv") && !is_part("vitascope-part.mkv"));
+    }
+
+    #[test]
+    fn temp_name_skips_files_that_already_exist() {
+        // 之前留下的完整檔案（行程編號重複使用、流水號從 1 開始）剛好同名：不能拿來當暫存檔（開檔會清空它）
+        let dir = scratch("taken");
+        let probe = temp_in(&dir, "片段", "mkv");
+        let name = probe.file_name().unwrap().to_string_lossy().into_owned();
+        let seq: u64 = name
+            .split_once(&format!(".{}-", std::process::id()))
+            .and_then(|(_, rest)| rest.split_once(PART_MARK))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap();
+        // 接下來的 50 個名稱都已經有檔案（別的測試同時拿走的流水號也沒關係：拿到的一定是不存在的）
+        let taken: Vec<PathBuf> = (seq + 1..=seq + 50)
+            .map(|n| dir.join(format!("片段.{}-{n}{PART_MARK}mkv", std::process::id())))
+            .collect();
+        for p in &taken {
+            std::fs::write(p, b"kept").unwrap();
+        }
+        let fresh = temp_in(&dir, "片段", "mkv");
+        assert!(!fresh.exists(), "{}", fresh.display());
+        assert!(!taken.contains(&fresh));
+        for p in &taken {
+            assert_eq!(std::fs::read(p).unwrap(), b"kept");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
