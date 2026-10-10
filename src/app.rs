@@ -298,6 +298,8 @@ pub struct VitascopeApp {
     bookmarks: Bookmarks,
     /// 找 yt-dlp、deno（背景，找到後記住）
     ytdl: crate::ytdl::Locator,
+    /// 這一幀讀到的 `ytdl` 結果（第幾幀、結果），見 `ytdl_frame_snapshot`
+    ytdl_frame: std::cell::RefCell<Option<(u64, install::YtdlSnapshot)>>,
     /// 書籤分頁上選取的書籤（編號）
     bookmark_selected: Option<u64>,
     /// 書籤分頁上正在改名的書籤
@@ -734,6 +736,7 @@ impl VitascopeApp {
             history: launch.history,
             bookmarks,
             ytdl,
+            ytdl_frame: std::cell::RefCell::new(None),
             bookmark_selected: None,
             bookmark_edit: None,
             bookmarks_clear: None,
@@ -875,6 +878,19 @@ impl VitascopeApp {
     /// 播放器核心（介面測試用來檢查狀態）
     pub fn player(&self) -> &Player {
         &self.player
+    }
+
+    /// 測試用：開檔後視窗還沒配合新影片調整完（畫面設定好之後才調整，可能比知道影片尺寸晚好幾幀）。
+    /// 介面測試等它調整完再操作選單、按鈕：視窗改大小時選單跟著移動，會點到別的項目
+    #[doc(hidden)]
+    pub fn window_fit_pending(&self) -> bool {
+        self.fit_window_pending || self.refit_now
+    }
+
+    /// 測試用：當成這一幀從 mpv 收到這個事件（模擬很慢的電腦上，事件晚到、跟別的事件分在不同批）
+    #[doc(hidden)]
+    pub fn deliver_player_event(&mut self, ev: PlayerEvent) {
+        self.on_player_event(ev);
     }
 
     /// 測試用：改動介面記下的播放狀態（例如模擬還沒更新的 time-pos）
@@ -2086,8 +2102,9 @@ impl VitascopeApp {
                 self.audio_restore = None;
                 self.net_live = false;
                 self.live_end_shown = false;
-                // 上一個檔案的音訊輸出開不起來、改用 null：mpv 換檔時沿用同一個輸出，不重開的話之後的檔案都沒有聲音
-                if self.player.audio_fell_back() {
+                // 上一個檔案的音訊輸出開不起來、改用 null：mpv 換檔時沿用同一個輸出，不重開的話之後的檔案都沒有聲音。
+                // 看 StartFile 那一刻的（現在的狀態可能已經是這個檔案的了：同一批事件裡它也改用了 null）
+                if self.player.take_fell_back_at_start() {
                     self.retry_audio_output();
                 }
             }
@@ -2150,7 +2167,9 @@ impl VitascopeApp {
                 let resent = !self.switching_file && !self.geometry.is_default() && self.sync_shape(early_shape);
                 if !resent {
                     self.video_reconfigured = true;
-                    if self.refit_until.is_some_and(|t| Instant::now() < t) {
+                    // 已經送出開新檔（例如剛改長寬比就換畫質）：這是舊檔案收尾的 VideoReconfig，不拿來調整視窗
+                    //（尺寸是舊的；換畫質不動視窗）。新檔案開始時（StartFile）refit_until 就清掉了
+                    if !self.switching_file && self.refit_until.is_some_and(|t| Instant::now() < t) {
                         self.refit_now = true;
                     }
                 }

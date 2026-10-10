@@ -825,6 +825,11 @@ pub struct Player {
     watching_devices: bool,
     /// 測試用的假裝置清單：有的話不讀 mpv 的（見 `set_fake_audio_devices`）
     fake_devices: bool,
+    /// 開始下一個檔案（StartFile）時，上一個檔案的音訊輸出改用了 null（見 `take_fell_back_at_start`）
+    fell_back_at_start: bool,
+    /// StartFile 時開著真正的音訊輸出（不是 null），介面還沒處理那個 StartFile：
+    /// 之後才收到的「改用 null」分不出是誰的（見 `take_fell_back_at_start`）
+    real_ao_at_start: bool,
     /// 測試用：影片軌一律當成這個杜比視界 profile（見 `set_fake_dolby_vision`）
     fake_dolby_vision: Option<i64>,
     /// 像素著色器：使用者的組合（app 給的；VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時是使用者原本的清單，不改）
@@ -973,6 +978,8 @@ impl Player {
             options_applied: HashMap::new(),
             watching_devices: false,
             fake_devices: false,
+            fell_back_at_start: false,
+            real_ao_at_start: false,
             fake_dolby_vision: None,
             shaders_applied: Some(shader_base.clone()),
             shader_user: shader_base,
@@ -1207,6 +1214,19 @@ impl Player {
     /// 音訊輸出開不起來，mpv 改用 null 輸出（沒有聲音；ao 本來就指定 null 的不算）
     pub fn audio_fell_back(&self) -> bool {
         !self.ao_null_wanted && self.state.current_ao.as_deref() == Some("null")
+    }
+
+    /// 開始下一個檔案（StartFile）的那一刻，上一個檔案的音訊輸出是不是改用了 null；讀過就清掉。
+    /// 事件是一次全部處理完才交給介面的：電腦慢的時候，新檔案也開不起來、改用 null 的通知可能在同一批裡，
+    /// 介面處理 StartFile 時再看 `audio_fell_back` 會把新檔案的當成上一個的（多重開一次音訊輸出）。
+    ///
+    /// 屬性的變化不跟事件排順序：mpv 先送完排著的事件（StartFile…），沒有事件了才送變了的屬性（client.c
+    /// `mpv_wait_event`），所以上一個檔案快結束時才改用 null 的話，那個通知也可能排在 StartFile 後面。
+    /// StartFile 時開著真正的輸出、同一批裡才變成 null 的分不出是誰的，當成上一個的（重開一次）：
+    /// 多重開一次只是再試一次裝置，沒重開的話新檔案沿用 null（同樣格式時 mpv 不重開），之後一直沒有聲音
+    pub(crate) fn take_fell_back_at_start(&mut self) -> bool {
+        self.real_ao_at_start = false;
+        std::mem::take(&mut self.fell_back_at_start)
     }
 
     /// 同 `audio_fell_back`，直接問 mpv（重開音訊輸出之後，觀察到的值可能還是重開前的）
@@ -2624,6 +2644,10 @@ impl Player {
             Event::StartFile => {
                 // 上一個檔案的跳轉目標不算這個檔案的位置
                 self.note_seek(None);
+                // 這時看到的音訊輸出是上一個檔案的（新檔案的音訊在這之後才開；同一批裡之後才送到的，見
+                // `take_fell_back_at_start`）
+                self.fell_back_at_start |= self.audio_fell_back();
+                self.real_ao_at_start = self.state.current_ao.as_deref().is_some_and(|ao| ao != "null");
                 self.state.loading = true;
                 self.state.loaded = false;
                 self.state.last_error = None;
@@ -2786,7 +2810,14 @@ impl Player {
                 s.audio_out_pcm = s.audio_spdif.is_none() && value.as_str().is_some_and(has_out_format);
             }
             "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
-            "current-ao" => s.current_ao = value.as_str().filter(|v| !v.is_empty()).map(str::to_owned),
+            "current-ao" => {
+                s.current_ao = value.as_str().filter(|v| !v.is_empty()).map(str::to_owned);
+                // StartFile 時開著真正的輸出、介面還沒處理那個 StartFile 就變成 null：分不出是上一個檔案的
+                // 還是新檔案的，當成上一個的（見 `take_fell_back_at_start`）。之後再變的是新檔案自己的
+                if std::mem::take(&mut self.real_ao_at_start) && self.audio_fell_back() {
+                    self.fell_back_at_start = true;
+                }
+            }
             // 關檔時 mpv 送「不可用」：跟著變回 false / None
             "paused-for-cache" => s.paused_for_cache = value.as_bool().unwrap_or(false),
             "cache-buffering-state" => s.cache_buffering = value.as_i64(),

@@ -1437,7 +1437,7 @@ impl VitascopeApp {
              (it only looks up the video; nothing is saved to your computer)"
         ));
         // 第一次打開這頁時才在背景找（不等）；重新找的時候顯示「搜尋中…」
-        let tools = self.ytdl.get();
+        let tools = self.ytdl_now();
         let searching = self.ytdl.searching();
         if searching {
             ui.label(tr!("yt-dlp：搜尋中…", "yt-dlp: searching…"));
@@ -1654,7 +1654,7 @@ impl VitascopeApp {
                     // 影戲下載的：版本舊、而且這段時間也沒檢查過更新才提醒（剛下載的最新版不提醒）
                     let managed_stale = y
                         .managed()
-                        .then(|| crate::ytdl::locate::managed_stale_days(v, self.ytdl.managed_modified(), now))
+                        .then(|| crate::ytdl::locate::managed_stale_days(v, self.ytdl_frame_snapshot().1, now))
                         .flatten();
                     if let Some(days) = managed_stale {
                         if self.can_install(Tool::Ytdl) {

@@ -691,16 +691,21 @@ impl Locator {
     /// 找到的結果；還沒找（或要重新找）時在背景開始找。不會等：
     /// 從來沒找完過時 None；重新找的時候先回傳上一次的結果（設定頁不會閃成「找不到」，要知道正在找用 [`Self::searching`]）
     pub fn get(&self) -> Option<Arc<Tools>> {
+        self.get_with_modified().0
+    }
+
+    /// 同 [`Self::get`]，加上那一份結果的 [`Self::managed_modified`]：同一次讀的，一定是同一份結果的
+    ///（分開讀的話背景的尋找可能剛好在中間做完）
+    pub fn get_with_modified(&self) -> (Option<Arc<Tools>>, Option<SystemTime>) {
         let mut s = self.lock();
+        let found = (s.done.as_ref().map(|(_, t)| t.clone()), s.managed_modified);
         let current = s.done.as_ref().is_some_and(|(g, _)| *g == s.generation);
         if !current && !s.running {
             s.running = true;
-            let previous = s.done.as_ref().map(|(_, t)| t.clone());
             drop(s);
             self.spawn_search();
-            return previous;
         }
-        s.done.as_ref().map(|(_, t)| t.clone())
+        found
     }
 
     /// 正在找（第一次，或設定改了之後重新找）

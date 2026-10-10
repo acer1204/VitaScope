@@ -82,6 +82,9 @@ struct Running {
     retry: Option<(String, Option<usize>)>,
 }
 
+/// 一幀讀一次的 `Locator` 結果：找到的工具、影戲下載的 yt-dlp 的修改時間（見 `ytdl_frame_snapshot`）
+pub(super) type YtdlSnapshot = (Option<Arc<crate::ytdl::Tools>>, Option<SystemTime>);
+
 /// 找到的 yt-dlp 是影戲下載的那一份
 pub(super) struct Managed {
     /// 多久沒更新（天）；不用提醒時 None
@@ -107,13 +110,33 @@ impl VitascopeApp {
         self.install.job.is_some()
     }
 
+    /// 找到的 yt-dlp、deno 與影戲下載的 yt-dlp 的修改時間，一幀只問一次 `Locator`：背景的尋找可能剛好在畫到一半時做完，
+    /// 同一幀前後讀到的不一樣時，起始畫面會同時寫「請更新 yt-dlp（yt-dlp -U…）」又放「更新 yt-dlp 再試一次」的按鈕
+    pub(super) fn ytdl_frame_snapshot(&self) -> YtdlSnapshot {
+        let mut seen = self.ytdl_frame.borrow_mut();
+        if let Some((frame, found)) = seen.as_ref()
+            && *frame == self.frames
+        {
+            return found.clone();
+        }
+        let found = self.ytdl.get_with_modified();
+        *seen = Some((self.frames, found.clone()));
+        found
+    }
+
+    /// 這一幀找到的 yt-dlp、deno（見 `ytdl_frame_snapshot`）
+    pub(super) fn ytdl_now(&self) -> Option<Arc<crate::ytdl::Tools>> {
+        self.ytdl_frame_snapshot().0
+    }
+
     /// 目前找到的 yt-dlp 是影戲下載的那一份：多久沒更新。不是（或還沒找過）時 None
     pub(super) fn managed_ytdl(&self) -> Option<Managed> {
-        let t = self.ytdl.get()?;
+        let (t, modified) = self.ytdl_frame_snapshot();
+        let t = t?;
         t.ytdl.as_ref().filter(|y| y.managed())?;
         let stale_days = t
             .ytdl_version
-            .and_then(|v| locate::managed_stale_days(v, self.ytdl.managed_modified(), SystemTime::now()));
+            .and_then(|v| locate::managed_stale_days(v, modified, SystemTime::now()));
         Some(Managed { stale_days })
     }
 
@@ -157,7 +180,7 @@ impl VitascopeApp {
         }
         if let Some(f) = &st.net_failure {
             let remedy = f.remedy();
-            let no_deno = self.ytdl.get().is_none_or(|t| t.deno.is_none());
+            let no_deno = self.ytdl_now().is_none_or(|t| t.deno.is_none());
             if remedy == Some(Remedy::GetDeno) && self.can_install(Tool::Deno) && no_deno {
                 out.push(ToolAction::Download(Tool::Deno));
             }
@@ -473,5 +496,94 @@ fn consent_text(tool: Tool) -> String {
              qualities. Downloads about {download} MB from GitHub (github.com/denoland/deno), about {disk} MB \
              once unpacked."
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Launch;
+    use crate::paths::Os;
+    use crate::player::{Options, Player};
+    use crate::settings::Settings;
+    use crate::ytdl::{Located, Locator, SearchEnv, Source, Tools, Version};
+
+    /// 背景的尋找剛好在一幀中間做完：這一幀讀到的（找到的工具、影戲下載的 yt-dlp 的修改時間）都不變，下一幀才換。
+    /// 不然起始畫面同一幀前後讀到的不一樣（同時寫「請更新 yt-dlp（yt-dlp -U…）」又放更新的按鈕）
+    #[test]
+    fn locator_results_stay_the_same_within_a_frame() {
+        let dir = std::env::temp_dir().join(format!("vitascope-ytdl-frame-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tools = dir.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        // 只看工具資料夾：影戲下載的 yt-dlp 的內容當成版本，不執行任何程式
+        let locator = Locator::with_finder(
+            Some(tools.clone()),
+            Arc::new(|env: &SearchEnv| {
+                let mut t = Tools::none(env);
+                if let Some(p) = env.managed_ytdl().filter(|p| p.is_file()) {
+                    t.ytdl_version = std::fs::read_to_string(&p).ok().and_then(|s| Version::parse(&s));
+                    t.ytdl = Some(Located::new(p, Source::Managed));
+                }
+                t
+            }),
+        );
+        let launch = Launch {
+            ytdl: Some(locator.clone()),
+            ..Default::default()
+        };
+        let player = Player::new(Options::headless()).unwrap();
+        let mut h = egui_kittest::Harness::builder()
+            .with_size([960.0, 600.0])
+            .build_eframe(move |cc| VitascopeApp::new(cc, player, Settings::default(), launch));
+        h.step();
+        h.state().ytdl_now();
+        let first = locator.wait(Duration::from_secs(30)).expect("第一次找完");
+        assert!(first.ytdl.is_none());
+        h.step();
+        assert!(h.state().managed_ytdl().is_none());
+
+        // 影戲下載了一份很舊的 yt-dlp（版本舊、檔案的時間也舊），重新找：這一幀先讀到上一次的結果
+        let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+        std::fs::write(&ytdl, "2020.01.01\n").unwrap();
+        let long_ago = SystemTime::now() - Duration::from_secs(90 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&ytdl)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+        locator.refresh();
+        assert!(h.state().managed_ytdl().is_none(), "還沒找完：上一次的結果");
+        // 背景找完了，還是同一幀：讀到的都不變
+        let found = locator.wait(Duration::from_secs(30)).expect("重新找完");
+        assert!(found.ytdl.as_ref().is_some_and(|y| y.managed()));
+        assert!(locator.managed_modified().is_some());
+        assert!(h.state().managed_ytdl().is_none(), "同一幀不變");
+        assert!(h.state().ytdl_now().is_some_and(|t| t.ytdl.is_none()), "同一幀不變");
+        // 下一幀才換成新的結果（連同修改時間：很久沒更新）
+        h.step();
+        let managed = h.state().managed_ytdl().expect("下一幀換成影戲下載的");
+        assert!(managed.stale_days.is_some_and(|d| d >= 90), "{:?}", managed.stale_days);
+
+        // 檢查過已經是最新版（檔案的時間更新），重新找：修改時間也是這一幀讀到的那一份，跟找到的工具一起換
+        std::fs::File::options()
+            .write(true)
+            .open(&ytdl)
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        locator.refresh();
+        assert!(h.state().managed_ytdl().is_some_and(|m| m.stale_days.is_some()));
+        locator.wait(Duration::from_secs(30)).expect("再找完");
+        assert!(
+            h.state().managed_ytdl().is_some_and(|m| m.stale_days.is_some()),
+            "同一幀不變：修改時間也是"
+        );
+        h.step();
+        let managed = h.state().managed_ytdl().expect("還是影戲下載的");
+        assert_eq!(managed.stale_days, None, "剛檢查過：不提醒");
+        drop(h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
