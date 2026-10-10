@@ -447,6 +447,8 @@ commands! {
     ExportClip => "export-clip", Files, once, ("儲存片段…", "Save clip…");
     /// 匯出視窗的「GIF」（預設沒有按鍵）
     ExportGif => "export-gif", Files, once, ("轉成 GIF…", "Make GIF…");
+    /// 匯出視窗的「縮圖總覽圖」（預設沒有按鍵）
+    ExportSheet => "export-sheet", Files, once, ("縮圖總覽圖…", "Thumbnail sheet…");
     BookmarkAdd => "bookmark-add", Bookmarks, once, ("新增書籤", "Add bookmark");
     BookmarkPrev => "bookmark-prev", Bookmarks, once, ("上一個書籤", "Previous bookmark");
     BookmarkNext => "bookmark-next", Bookmarks, once, ("下一個書籤", "Next bookmark");
@@ -1411,6 +1413,8 @@ mod tests {
         "export-clip",
         // D4
         "export-gif",
+        // D5
+        "export-sheet",
     ];
 
     #[test]
@@ -1543,6 +1547,7 @@ mod tests {
                 | C::OpenUrl
                 | C::ExportClip
                 | C::ExportGif
+                | C::ExportSheet
                 | C::BookmarkAdd
                 | C::BookmarkPrev
                 | C::BookmarkNext

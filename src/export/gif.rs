@@ -110,6 +110,18 @@ pub struct Tone {
     pub npl: u32,
 }
 
+impl Tone {
+    /// HDR 轉一般畫面的濾鏡（FFmpeg 的 zscale + tonemap；縮圖總覽圖也用）：轉成線性、參考白 `npl`、
+    /// 轉到 BT.709 的色域、壓亮部，再轉回 BT.709 的 gamma 與有限範圍
+    pub fn chain(&self) -> String {
+        format!(
+            "zscale=t=linear:npl={},format=gbrpf32le,zscale=p=bt709,tonemap=tonemap={}:desat=0,\
+             zscale=t=bt709:m=bt709:r=tv,format=yuv444p",
+            self.npl, self.curve
+        )
+    }
+}
+
 /// 「畫質 → HDR」的曲線 → FFmpeg tonemap 的曲線（它沒有 BT.2390，自動、BT.2390 用 Hable）
 pub fn tone_curve(c: ToneCurve) -> &'static str {
     match c {
@@ -164,7 +176,7 @@ pub struct Graph {
 }
 
 /// mpv 的 lavfi 濾鏡：濾鏡圖用長度標示（裡面的逗號、分號不會被 mpv 拆開）
-fn lavfi(graph: &str) -> String {
+pub(super) fn lavfi(graph: &str) -> String {
     format!("lavfi=graph=%{}%{graph}", graph.len())
 }
 
@@ -185,11 +197,7 @@ impl Graph {
         };
         let mut parts = vec![fps, format!("scale={}:{}:flags=lanczos", self.scale.0, self.scale.1)];
         if let Some(t) = self.tone {
-            parts.push(format!(
-                "zscale=t=linear:npl={},format=gbrpf32le,zscale=p=bt709,tonemap=tonemap={}:desat=0,\
-                 zscale=t=bt709:m=bt709:r=tv,format=yuv444p",
-                t.npl, t.curve
-            ));
+            parts.push(t.chain());
         }
         match (self.fixup.rotate % 360, self.transpose) {
             (90, true) => parts.push("transpose=clock".into()),
@@ -340,12 +348,23 @@ pub fn grid_shift(trim: f64, fps: u32) -> f64 {
 /// 往前讀的秒數依序試這些（片段輸出用的一樣），都落在 A 之後就從檔案開頭讀
 pub const LEAD_STEPS: [f64; 2] = [super::clip::PREROLL, super::clip::LONG_PREROLL];
 
+/// 收到的記錄裡有沒有表示 GIF 不能用的失敗：濾鏡失敗（mpv 停用它、照樣把原本的畫面編進去）、寫不進去。
+/// 濾鏡失敗一直記著（[`LogTail::graph_failed`]）：Shutdown 之後才收完的記錄裡，最近幾行可能早就沒有它
+pub(super) fn gif_failure(log: &LogTail) -> Option<Failure> {
+    if log.graph_failed() {
+        return Some(Failure::FilterFailed);
+    }
+    match super::map_mpv_error(&log.lines()) {
+        Some(
+            f @ (Failure::WriteFailed | Failure::NoPermission(_) | Failure::EncoderMissing | Failure::FormatMissing),
+        ) => Some(f),
+        _ => None,
+    }
+}
+
 /// mpv 停用了失敗的濾鏡、或轉不成能編碼的格式（之後的畫面沒有經過我們的濾鏡）
 pub fn graph_failed(lines: &[LogLine]) -> bool {
-    lines.iter().any(|l| {
-        matches!(l.level.as_str(), "error" | "fatal")
-            && (l.text.contains("Disabling filter") || l.text.contains("Cannot convert decoder/filter output"))
-    })
+    lines.iter().any(LogLine::is_graph_failure)
 }
 
 // ───────────── 字幕 ─────────────
@@ -549,7 +568,7 @@ pub fn container_aspect(dec_aspect: f64, dec_par: Option<f64>, container_par: Op
 
 /// 檔案原本在畫面上的比例（還沒轉正、含容器的像素比例）與檔案本身的旋轉。
 /// 還沒解出第一格（不知道檔案本身的旋轉、像素比例）時 None：開始的按鈕停用，請使用者稍候
-fn source_shape(player: &Player) -> Option<(f64, i64)> {
+pub(super) fn source_shape(player: &Player) -> Option<(f64, i64)> {
     let (aspect, rotate) = player.natural_shape()?;
     let raw = if rotate.rem_euclid(180) == 90 {
         1.0 / aspect
@@ -927,6 +946,36 @@ pub fn read_progress(pts: Option<f64>, eof: bool, a_at: f64, length: f64) -> (f3
     (fraction as f32, reading)
 }
 
+/// 另外開的 mpv（編碼用的、縮圖總覽圖的擷取）開檔、讀檔失敗的原因：看 mpv 的記錄（`log` 要先收完排著的事件），
+/// 寫檔、濾鏡的失敗優先；來源打不開時網址一律是「網址打不開」，本機檔案再看檔案還在不在、讀不讀得到
+pub(super) fn load_failure(log: &LogTail, source: &Source) -> Failure {
+    let mapped = log.failure();
+    if let Some(
+        f @ (Failure::EncoderMissing
+        | Failure::FormatMissing
+        | Failure::NoPermission(_)
+        | Failure::WriteFailed
+        | Failure::FilterFailed),
+    ) = mapped
+    {
+        return f;
+    }
+    match source {
+        // 網址：HTTP 403、連結過期、斷線在這裡都只有「Failed to open …」，細節只在主播放器的 FFmpeg 記錄裡
+        Source::Net(_) => match mapped {
+            Some(Failure::SourceUnreadable) => Failure::SourceUnreadable,
+            _ => Failure::SourceUnreachable,
+        },
+        Source::File(path) => match mapped {
+            Some(f @ (Failure::SourceMissing | Failure::SourceNoAccess | Failure::SourceUnreadable)) => f,
+            _ => match check_local(path) {
+                Err(f) => f,
+                Ok(()) => mapped.unwrap_or(Failure::SourceUnreadable),
+            },
+        },
+    }
+}
+
 /// 編碼用的 mpv 要選的影像、字幕編號（None = 影像讓 mpv 選、不要字幕）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ids {
@@ -1035,7 +1084,7 @@ impl Encoder {
                 }
                 _ => {}
             }
-            if graph_failed(&enc.log.lines()) {
+            if enc.log.graph_failed() {
                 enc.stop();
                 return Err(Failure::FilterFailed);
             }
@@ -1142,49 +1191,15 @@ impl Encoder {
         }
     }
 
-    /// 這些記錄裡有沒有表示 GIF 不能用的失敗：濾鏡失敗（mpv 停用它、照樣把原本的畫面編進去）、寫不進去
+    /// 收到的記錄裡有沒有表示 GIF 不能用的失敗（見 [`gif_failure`]）
     fn failed(&self) -> Option<Failure> {
-        let lines = self.log.lines();
-        if graph_failed(&lines) {
-            return Some(Failure::FilterFailed);
-        }
-        match super::map_mpv_error(&lines) {
-            Some(
-                f
-                @ (Failure::WriteFailed | Failure::NoPermission(_) | Failure::EncoderMissing | Failure::FormatMissing),
-            ) => Some(f),
-            _ => None,
-        }
+        gif_failure(&self.log)
     }
 
     /// 開檔、讀檔失敗的原因（來源打不開、寫不了 GIF）
     fn load_failure(&mut self, source: &Source) -> Failure {
         self.drain();
-        let mapped = self.log.failure();
-        if let Some(
-            f @ (Failure::EncoderMissing
-            | Failure::FormatMissing
-            | Failure::NoPermission(_)
-            | Failure::WriteFailed
-            | Failure::FilterFailed),
-        ) = mapped
-        {
-            return f;
-        }
-        match source {
-            // 網址：HTTP 403、連結過期、斷線在這裡都只有「Failed to open …」，細節只在主播放器的 FFmpeg 記錄裡
-            Source::Net(_) => match mapped {
-                Some(Failure::SourceUnreadable) => Failure::SourceUnreadable,
-                _ => Failure::SourceUnreachable,
-            },
-            Source::File(path) => match mapped {
-                Some(f @ (Failure::SourceMissing | Failure::SourceNoAccess | Failure::SourceUnreadable)) => f,
-                _ => match check_local(path) {
-                    Err(f) => f,
-                    Ok(()) => mapped.unwrap_or(Failure::SourceUnreadable),
-                },
-            },
-        }
+        load_failure(&self.log, source)
     }
 
     fn tracks(&self) -> Vec<Track> {
@@ -1893,5 +1908,28 @@ mod tests {
         )]));
         assert!(!graph_failed(&[line("error", "Something else.")]));
         assert!(!graph_failed(&[]));
+    }
+
+    #[test]
+    fn a_failed_filter_still_fails_the_gif_after_a_log_flood() {
+        let mut log = LogTail::default();
+        assert_eq!(gif_failure(&log), None);
+        log.push(LogLine::new(
+            "error",
+            "vf",
+            "Disabling filter lavfi.00 because it has failed.",
+        ));
+        // 之後收到一大堆別的警告、錯誤（別的 mpv 的 FFmpeg 記錄），最近幾行裡已經沒有它
+        for i in 0..(LogTail::CAP * 2) {
+            log.push(LogLine::new("warn", "ffmpeg/video", &format!("noise {i}")));
+        }
+        assert!(!graph_failed(&log.lines()));
+        assert_eq!(gif_failure(&log), Some(Failure::FilterFailed));
+        // 只有不相關的錯誤：不算 GIF 失敗；寫不進去才算
+        let mut log = LogTail::default();
+        log.push(LogLine::new("error", "cplayer", "Something else."));
+        assert_eq!(gif_failure(&log), None);
+        log.push(LogLine::new("error", "encode", "Failed writing packet."));
+        assert_eq!(gif_failure(&log), Some(Failure::WriteFailed));
     }
 }

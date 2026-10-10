@@ -1510,6 +1510,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3267,6 +3269,7 @@ dependencies = [
  "egui_kittest",
  "encoding_rs",
  "flate2",
+ "image",
  "libc",
  "libmpv2-sys",
  "objc2 0.6.5",

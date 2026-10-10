@@ -1,6 +1,8 @@
 //! 匯出（片段、GIF、縮圖總覽圖）：背景工作的取消與暫存檔、兩個工作同名不衝突、寫好之後重新打開檢查、
 //! mpv 的記錄對應到原因、片段（不重新編碼：關鍵影格對齊、各種格式、只有聲音、旋轉、磁碟快取、
-//! 網路影片）、GIF（EDL 的一段、TS 從 A 那一格開始、大小、轉正、HDR、燒進字幕、濾鏡失敗、取消）（headless：不出畫面、不出聲音，三個平台的 CI 都跑；網路只連本機的測試伺服器 127.0.0.1）。
+//! 網路影片）、GIF（EDL 的一段、TS 從 A 那一格開始、大小、轉正、HDR、燒進字幕、濾鏡失敗、取消）、
+//! 縮圖總覽圖（格線與大小、標頭、時間標記、TS 的每一格就是標記的那一格、只取 A-B、轉正、HDR、濾鏡失敗、取消、逾時、網路影片）
+//! （headless：不出畫面、不出聲音，三個平台的 CI 都跑；網路只連本機的測試伺服器 127.0.0.1）。
 //!
 //! 只看 mpv 自己的訊息：FFmpeg 的記錄只送到第一個建立的 mpv，這裡不檢查 FFmpeg 的文字
 
@@ -14,9 +16,10 @@ use support::fake_ytdl::{FakeResolver, site_video_json};
 use support::http::Server;
 use vitascope::export::clip::{self, ClipSpec, Container, Source, StreamPick};
 use vitascope::export::gif::{self, GifSpec};
+use vitascope::export::sheet::{self, SheetSpec};
 use vitascope::export::{
-    self, ClipFormat, Done, Expect, Failure, GifPrefs, Job, JobEvent, Kind, LogLine, LogTail, Note, Phase, Progress,
-    map_mpv_error, verify_media,
+    self, ClipFormat, Done, Expect, Failure, GifPrefs, ImageFormat, Job, JobEvent, Kind, LogLine, LogTail, Note, Phase,
+    Progress, SheetPrefs, map_mpv_error, verify_media,
 };
 use vitascope::geometry::Geometry;
 use vitascope::instance::Wake;
@@ -753,9 +756,13 @@ fn main_player_with(opts: Options, src: &str) -> (Player, EngineCaps) {
     p.open(src).unwrap();
     p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
         .unwrap_or_else(|e| panic!("打不開 {src}：{e}"));
-    // 等 mpv 選好軌道（慢的機器上軌道清單比選好的軌道早到）：預設的片段軌道是主播放器選的
+    // 等 mpv 選好軌道（慢的機器上軌道清單比選好的軌道早到）：預設的片段軌道是主播放器選的。
+    // 路徑也是另外送來的屬性，可能比 FileLoaded 晚到：匯出要從它找來源（沒有時是 NoData）
     p.wait_state(TIMEOUT, |s| {
-        s.duration.is_some() && (s.selected(TrackKind::Video).is_some() || s.selected(TrackKind::Audio).is_some())
+        s.loaded
+            && s.path.is_some()
+            && s.duration.is_some()
+            && (s.selected(TrackKind::Video).is_some() || s.selected(TrackKind::Audio).is_some())
     })
     .unwrap_or_else(|e| panic!("{src}：{e}"));
     (p, caps)
@@ -776,9 +783,13 @@ fn main_player_net(s: &NetSettings, src: &str) -> (Player, EngineCaps) {
     p.open(src).unwrap();
     p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
         .unwrap_or_else(|e| panic!("打不開 {src}：{e}"));
-    // 等 mpv 選好軌道（慢的機器上軌道清單比選好的軌道早到）：預設的片段軌道是主播放器選的
+    // 等 mpv 選好軌道（慢的機器上軌道清單比選好的軌道早到）：預設的片段軌道是主播放器選的。
+    // 路徑也是另外送來的屬性，可能比 FileLoaded 晚到：匯出要從它找來源（沒有時是 NoData）
     p.wait_state(TIMEOUT, |s| {
-        s.duration.is_some() && (s.selected(TrackKind::Video).is_some() || s.selected(TrackKind::Audio).is_some())
+        s.loaded
+            && s.path.is_some()
+            && s.duration.is_some()
+            && (s.selected(TrackKind::Video).is_some() || s.selected(TrackKind::Audio).is_some())
     })
     .unwrap_or_else(|e| panic!("{src}：{e}"));
     (p, caps)
@@ -1634,7 +1645,9 @@ fn clip_http_vod() {
     let caps = q.probe_caps();
     q.open(&server.url("/hlslive/net/hls_vod/index.m3u8")).unwrap();
     q.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
-    q.wait_state(TIMEOUT, |s| !s.tracks.is_empty()).unwrap();
+    // 路徑可能比 FileLoaded 晚到（沒有路徑時是 NoData，不是直播）
+    q.wait_state(TIMEOUT, |s| s.loaded && s.path.is_some() && !s.tracks.is_empty())
+        .unwrap();
     assert_eq!(clip::unavailable(&q, &caps), Some(Failure::Live));
     let (mut q, caps) = main_player(&server.url("/norange/general/mkv_h264_gop2.mkv"));
     q.wait_state(TIMEOUT, |s| s.duration.is_some()).unwrap();
@@ -2059,6 +2072,11 @@ fn gif_range_follows_the_start_time() {
     // EDL 是影片的時間戳，要加上主播放器的 demuxer-start-time，GIF 才是畫面上看到的那一段。
     // TS 跳轉不準：A 離開頭不到 5 秒，EDL 從影片的時間戳 0 開始讀，再精確跳到 EDL 的 0.5 + 開始時間（A）。
     // 沒有換算時跳到 0.5 秒，影片在 1.4 秒才開始：GIF 從頭開始，多了將近 1 秒
+    // Windows、macOS 的 CI 用的 FFmpeg 產生不了這個交錯式的樣本（其他用到它的測試也是略過）
+    if !sample("general").join("ts_mpeg2_interlaced.ts").exists() {
+        eprintln!("略過 gif_range_follows_the_start_time：沒有 general/ts_mpeg2_interlaced.ts（這個 FFmpeg 產生不了）");
+        return;
+    }
     let (p, caps) = main_player(&sample_str("general/ts_mpeg2_interlaced.ts"));
     if !gif_engine(&caps, "gif_range_follows_the_start_time") {
         return;
@@ -3011,7 +3029,9 @@ fn gif_http_vod_and_site_video() {
     let qcaps = q.probe_caps();
     q.open(&server.url("/hlslive/net/hls_vod/index.m3u8")).unwrap();
     q.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
-    q.wait_state(TIMEOUT, |s| !s.tracks.is_empty()).unwrap();
+    // 路徑可能比 FileLoaded 晚到（沒有路徑時是 NoData，不是直播）
+    q.wait_state(TIMEOUT, |s| s.loaded && s.path.is_some() && !s.tracks.is_empty())
+        .unwrap();
     assert_eq!(gif::unavailable(&q, &qcaps), Some(Failure::Unbounded));
 
     // 網站影片（yt-dlp：影像、聲音分開的 EDL）：EDL 裡再包一層 EDL，帶網站要的標頭
@@ -3039,6 +3059,874 @@ fn gif_http_vod_and_site_video() {
     assert_eq!(fake.calls(), 1, "轉 GIF 不再問一次 yt-dlp");
     let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
     assert!((9..=11).contains(&info.frames), "{} 格", info.frames);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+// ───────────── 縮圖總覽圖 ─────────────
+
+fn sheet_prefs(columns: u32, rows: u32, width: u32, format: ImageFormat) -> SheetPrefs {
+    SheetPrefs {
+        columns,
+        rows,
+        width,
+        timestamps: true,
+        header: true,
+        format,
+        jpeg_quality: 90,
+    }
+}
+
+/// 從主播放器準備一張總覽圖（設定用預設的：HDR、去交錯）。先等第一格解出來
+fn sheet_spec_with(
+    p: &Player,
+    caps: &EngineCaps,
+    prefs: SheetPrefs,
+    geometry: &Geometry,
+    range: Option<(f64, f64)>,
+    dirs: &(PathBuf, PathBuf),
+) -> Result<SheetSpec, Failure> {
+    wait_first_frame(p);
+    let tone = ToneSettings::default();
+    let choice = sheet::Choice {
+        prefs,
+        geometry,
+        tone: &tone,
+        deinterlace: Deinterlace::Auto,
+        range,
+        title: None,
+    };
+    SheetSpec::from_player(p, caps, &choice, dirs.0.clone(), dirs.1.clone())
+}
+
+fn sheet_spec(p: &Player, caps: &EngineCaps, prefs: SheetPrefs, dirs: &(PathBuf, PathBuf)) -> SheetSpec {
+    sheet_spec_with(p, caps, prefs, &Geometry::default(), None, dirs).unwrap_or_else(|f| panic!("不能做總覽圖：{f:?}"))
+}
+
+/// 做這張總覽圖，等到結束（收集進度）
+fn export_sheet(spec: SheetSpec) -> (Vec<Progress>, Result<Done, Failure>) {
+    finish_gif(&sheet::spawn(spec, no_wake()))
+}
+
+/// 取完的格子：第幾格、目標、實際的時間（主播放器的時間；取不到時 None）
+type SeenCells = Arc<Mutex<Vec<(usize, f64, Option<f64>)>>>;
+
+/// 記下每一格的目標與實際的時間
+fn seen_cells(spec: &mut SheetSpec) -> SeenCells {
+    let seen: SeenCells = Arc::default();
+    let s = seen.clone();
+    spec.test.on_cell = Some(Arc::new(move |i, t, at| s.lock().unwrap().push((i, t, at))));
+    seen
+}
+
+/// 讀存好的總覽圖（RGBA）
+fn read_sheet(path: &Path) -> vitascope::screenshot::Image {
+    if path.extension().is_some_and(|e| e == "png") {
+        return vitascope::screenshot::decode_png(path).unwrap();
+    }
+    let img = image::load_from_memory_with_format(&std::fs::read(path).unwrap(), image::ImageFormat::Jpeg)
+        .unwrap()
+        .to_rgba8();
+    vitascope::screenshot::Image {
+        w: img.width() as usize,
+        h: img.height() as usize,
+        rgba: img.into_raw(),
+    }
+}
+
+/// 圖的一塊
+fn crop(img: &vitascope::screenshot::Image, x: u32, y: u32, w: u32, h: u32) -> vitascope::screenshot::Image {
+    let (x, y, w, h) = (x as usize, y as usize, w as usize, h as usize);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in y..y + h {
+        rgba.extend_from_slice(&img.rgba[(row * img.w + x) * 4..][..w * 4]);
+    }
+    vitascope::screenshot::Image { w, h, rgba }
+}
+
+/// 第 `i` 格
+fn sheet_cell(img: &vitascope::screenshot::Image, l: &sheet::Layout, i: usize) -> vitascope::screenshot::Image {
+    let (x, y) = l.cell_pos(i);
+    crop(img, x, y, l.cell.0, l.cell.1)
+}
+
+/// 平均亮度（RGB 的平均）
+fn mean_luma(img: &vitascope::screenshot::Image) -> f64 {
+    let sum: u64 = img
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|p| (u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2])) / 3)
+        .sum();
+    sum as f64 / (img.w * img.h) as f64
+}
+
+/// 這張總覽圖的時間標記的方塊（每格右下角；跟 `sheet::compose` 一樣的算法，寬鬆一點）
+fn stamp_region(l: &sheet::Layout, i: usize, text: &str) -> (u32, u32, u32, u32) {
+    let mut painter = vitascope::export::text::TextPainter::new();
+    let (w, h) = painter.measure(text, l.stamp_px);
+    let pad = sheet::STAMP_PAD;
+    let (bw, bh) = ((w + 2.0 * pad).ceil() as u32, (h + 2.0 * pad).ceil() as u32);
+    let (x, y) = l.cell_pos(i);
+    (x + l.cell.0 - bw - pad as u32, y + l.cell.1 - bh - pad as u32, bw, bh)
+}
+
+#[test]
+fn sheet_grid_and_stamps() {
+    // 20 秒、640×360 的影片：3 欄 × 2 列、1280 寬、JPEG，有標頭與時間標記
+    let (p, caps) = main_player(&sample_str("common/mkv_multitrack.mkv"));
+    let dirs = clip_dirs("sheet-grid");
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(3, 2, 1280, ImageFormat::Jpeg), &dirs);
+    assert_eq!(spec.stem, "mkv_multitrack 縮圖");
+    assert_eq!(spec.wanted(), dirs.0.join("mkv_multitrack 縮圖.jpg"));
+    // 整部：0 到主播放器的總長度（20 秒多一點）
+    let range = spec.range;
+    assert_eq!(range, (0.0, p.state.duration.unwrap()));
+    assert!((range.1 - 20.0).abs() < 0.1, "{range:?}");
+    assert_eq!(spec.layout, sheet::layout(1280, 3, 2, 640.0 / 360.0, spec.header.len()));
+    assert_eq!(spec.render, spec.layout.cell);
+    // 標頭：檔名、大小／長度／格式、影像、聲音（沒有中文字型的電腦用英文：中文會變成方塊）
+    let header = spec.header.join("\n");
+    assert_eq!(spec.header[0], "mkv_multitrack.mkv");
+    if vitascope::fonts::has_cjk() {
+        for part in [
+            "長度：00:20",
+            "格式：Matroska",
+            "影像：H.264",
+            "640×360",
+            "24 fps",
+            "音訊：AAC",
+            "48 kHz",
+        ] {
+            assert!(header.contains(part), "標頭沒有「{part}」：{header}");
+        }
+    } else {
+        for part in [
+            "Length: 00:20",
+            "Format: Matroska",
+            "Video: H.264",
+            "640×360",
+            "Audio: AAC",
+        ] {
+            assert!(header.contains(part), "標頭沒有「{part}」：{header}");
+        }
+    }
+    let layout = spec.layout.clone();
+    let seen = seen_cells(&mut spec);
+    let (progress, done) = export_sheet(spec);
+    let done = done.unwrap_or_else(|f| panic!("{f:?}"));
+    assert_eq!(done.kind, Kind::Sheet);
+    assert_eq!(done.path, dirs.0.join("mkv_multitrack 縮圖.jpg"));
+    assert_eq!(names(&dirs.0), ["mkv_multitrack 縮圖.jpg"], "不留暫存檔");
+    assert_eq!(done.bytes, std::fs::metadata(&done.path).unwrap().len());
+    // 進度：擷取 0/6 … 6/6（只往前走），合成，檢查
+    let grabbed: Vec<u32> = progress
+        .iter()
+        .filter_map(|p| match p.phase {
+            Phase::Grabbing { done, total: 6 } => Some(done),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grabbed.first(), Some(&0));
+    assert_eq!(grabbed.last(), Some(&6));
+    assert!(grabbed.windows(2).all(|w| w[0] <= w[1]), "{grabbed:?}");
+    let phases: Vec<Phase> = progress.iter().map(|p| p.phase).collect();
+    let composing = phases.iter().position(|p| *p == Phase::Composing).expect("沒有合成");
+    let checking = phases.iter().position(|p| *p == Phase::Checking).expect("沒有檢查");
+    assert!(composing < checking);
+    // 每一格都取到了：實際的時間在目標的半個間隔以內、依序
+    let cells = seen.lock().unwrap().clone();
+    assert_eq!(cells.len(), 6);
+    let gap = sheet::spacing(range, 6);
+    let mut last = -1.0;
+    for &(i, t, at) in &cells {
+        let at = at.unwrap_or_else(|| panic!("第 {i} 格取不到"));
+        assert!((at - t).abs() <= gap / 2.0 + 0.001, "第 {i} 格：目標 {t}，實際 {at}");
+        assert!(at > last, "時間要依序：{cells:?}");
+        last = at;
+    }
+    // 圖：大小照版面；每一格都有畫面（不是黑的、不是背景）；標頭有字
+    let img = read_sheet(&done.path);
+    assert_eq!((img.w as u32, img.h as u32), layout.size);
+    for i in 0..6 {
+        let luma = mean_luma(&sheet_cell(&img, &layout, i));
+        assert!(luma > 40.0, "第 {i} 格太暗：{luma}");
+    }
+    let band = crop(&img, 0, layout.margin, layout.size.0, layout.header_h - layout.margin);
+    let lit = band.rgba.as_chunks::<4>().0.iter().filter(|p| p[0] > 160).count();
+    assert!(lit > 300, "標頭沒有字：{lit}");
+    assert!(
+        mean_luma(&crop(
+            &img,
+            0,
+            layout.size.1 - layout.margin,
+            layout.size.0,
+            layout.margin
+        )) < 30.0,
+        "背景是暗的"
+    );
+
+    // 同樣的格子不要時間標記、標頭（PNG）：只有右下角的時間標記不一樣，其他地方是同一格畫面
+    let mut prefs = sheet_prefs(3, 2, 1280, ImageFormat::Png);
+    prefs.timestamps = false;
+    prefs.header = false;
+    let mut plain = sheet_spec(&p, &caps, prefs, &dirs);
+    assert!(plain.header.is_empty());
+    plain.stem = "plain".into();
+    let plain_layout = plain.layout.clone();
+    let (_, plain_done) = export_sheet(plain);
+    let plain_img = read_sheet(&plain_done.unwrap().path);
+    assert_eq!(plain_layout.cell, layout.cell);
+    for &(i, t, at) in &cells {
+        let text = sheet::stamp_text(at.unwrap(), gap < sheet::TENTHS_BELOW);
+        let (sx, sy, sw, sh) = stamp_region(&layout, i, &text);
+        let (px, py) = plain_layout.cell_pos(i);
+        let (cx, cy) = layout.cell_pos(i);
+        let with = crop(&img, sx, sy, sw, sh);
+        let without = crop(&plain_img, sx - cx + px, sy - cy + py, sw, sh);
+        let stamp = mean_diff(&with.rgba, &without.rgba);
+        assert!(stamp > 20.0, "第 {i} 格（{t} 秒）的時間標記看不出來：{stamp}");
+        // 左上角：同一格畫面（JPEG 有一點差）
+        let a = crop(&img, cx, cy, layout.cell.0 / 2, layout.cell.1 / 2);
+        let b = crop(&plain_img, px, py, layout.cell.0 / 2, layout.cell.1 / 2);
+        let same = mean_diff(&a.rgba, &b.rgba);
+        assert!(same < 6.0, "第 {i} 格的畫面不一樣：{same}");
+    }
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn sheet_png_rotated_hdr() {
+    let dirs = clip_dirs("sheet-rotate");
+    // 手機直拍（檔案標示旋轉 90°）：每格是直的
+    let (mut p, caps) = main_player(&sample_str("common/mov_hevc_aac_rot90.mov"));
+    p.wait_state(TIMEOUT, |s| s.video_size.is_some()).unwrap();
+    let spec = sheet_spec(&p, &caps, sheet_prefs(4, 2, 1280, ImageFormat::Png), &dirs);
+    assert_eq!(spec.fixup.rotate, 90);
+    let l = spec.layout.clone();
+    assert!(l.cell.1 > l.cell.0, "直的格子：{l:?}");
+    assert_eq!(spec.render, (l.cell.1, l.cell.0), "擷取時還沒轉正");
+    assert_eq!(spec.wanted().extension().unwrap(), "png");
+    let (_, done) = export_sheet(spec);
+    let img = read_sheet(&done.unwrap().path);
+    assert_eq!((img.w as u32, img.h as u32), l.size);
+    for i in 0..l.count() {
+        assert!(mean_luma(&sheet_cell(&img, &l, i)) > 30.0, "第 {i} 格太暗");
+    }
+
+    // 使用者轉了 90°（跟 Ctrl+E 截圖一樣，是畫面上看到的方向）：順時針轉，翻轉在旋轉之後
+    let (mut q, caps) = main_player(&sample_str("common/mp4_h264_aac.mp4"));
+    q.wait_state(TIMEOUT, |s| s.video_size.is_some()).unwrap();
+    let make = |geometry: Geometry, stem: &str| {
+        let mut prefs = sheet_prefs(2, 1, 1280, ImageFormat::Png);
+        prefs.timestamps = false;
+        prefs.header = false;
+        let mut spec = sheet_spec_with(&q, &caps, prefs, &geometry, None, &dirs).unwrap();
+        spec.stem = stem.into();
+        let l = spec.layout.clone();
+        let (_, done) = export_sheet(spec);
+        (l, read_sheet(&done.unwrap().path))
+    };
+    let (pl, plain) = make(Geometry::default(), "plain");
+    let (rl, turned) = make(
+        Geometry {
+            rotate: 90,
+            ..Default::default()
+        },
+        "turned",
+    );
+    let (fl, flipped) = make(
+        Geometry {
+            rotate: 90,
+            hflip: true,
+            ..Default::default()
+        },
+        "flipped",
+    );
+    assert!(pl.cell.0 > pl.cell.1 && rl.cell.1 > rl.cell.0, "{pl:?} {rl:?}");
+    let small = |img: &vitascope::screenshot::Image| shrink(img, 24, 32);
+    let base = sheet_cell(&plain, &pl, 0);
+    let fix = |rotate: u32, hflip: bool| vitascope::screenshot::Fixup {
+        rotate,
+        hflip,
+        vflip: false,
+    };
+    let want_cw = small(&base.clone().fixed(fix(90, false)));
+    let want_ccw = small(&base.clone().fixed(fix(270, false)));
+    let got = small(&sheet_cell(&turned, &rl, 0));
+    let (cw, ccw) = (mean_diff(&want_cw, &got), mean_diff(&want_ccw, &got));
+    assert!(cw < 10.0 && ccw > cw * 2.0, "順時針 {cw}、逆時針 {ccw}");
+    let want_flip = small(&base.fixed(fix(90, true)));
+    let d = mean_diff(&want_flip, &small(&sheet_cell(&flipped, &fl, 0)));
+    assert!(d < 10.0, "先轉再翻：{d}");
+
+    // HDR：轉成一般畫面（目標亮度 203 nits、Hable，跟轉成 GIF 一樣）
+    let (mut h, caps) = main_player(&sample_str("general/mkv_hevc10_hdr10_mid.mkv"));
+    h.wait_state(TIMEOUT, |s| s.video_hdr).unwrap();
+    let mut prefs = sheet_prefs(2, 1, 1280, ImageFormat::Png);
+    prefs.timestamps = false;
+    let spec = sheet_spec_with(&h, &caps, prefs, &Geometry::default(), None, &dirs).unwrap();
+    if !(caps.zscale && caps.tonemap) {
+        assert_eq!(spec.tone, None);
+        assert_eq!(spec.notes, [Note::HdrClipped]);
+        eprintln!("略過 sheet_png_rotated_hdr 的色調映射：播放引擎沒有 zscale、tonemap");
+    } else {
+        assert_eq!(
+            spec.tone,
+            Some(gif::Tone {
+                curve: "hable",
+                npl: 203
+            })
+        );
+        assert!(spec.vf().contains("tonemap=tonemap=hable"), "{}", spec.vf());
+        let mut raw = spec.clone();
+        raw.tone = None;
+        raw.stem = "raw".into();
+        let l = spec.layout.clone();
+        let (_, mapped) = export_sheet(spec);
+        let mapped = read_sheet(&mapped.unwrap().path);
+        let (_, raw) = export_sheet(raw);
+        let raw = read_sheet(&raw.unwrap().path);
+        let cell = sheet_cell(&mapped, &l, 0);
+        let luma = mean_luma(&cell);
+        let changed = mean_diff(&cell.rgba, &sheet_cell(&raw, &l, 0).rgba);
+        eprintln!("總覽圖 HDR → 一般畫面：平均亮度 {luma:.1}（跟沒轉的差 {changed:.1}）");
+        assert!((20.0..=200.0).contains(&luma), "平均亮度 {luma}");
+        assert!(changed > 8.0, "有轉跟沒轉差不多：{changed}");
+    }
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// 另外開一個擷取用的 mpv（同樣的濾鏡、大小），從檔案開頭精確跳到每個時間取一格：
+/// 跟總覽圖同一條路（顏色一樣），但每一格都是確實的那一格
+fn grabber_frames(
+    rel: &str,
+    render: (u32, u32),
+    vf: String,
+    deinterlace: &'static str,
+    times: Vec<f64>,
+) -> Vec<(f64, vitascope::screenshot::Image)> {
+    use vitascope::export::grab::{Grab, Grabber, Seek, Setup};
+    let path = sample(rel);
+    let out: Arc<Mutex<Vec<(f64, vitascope::screenshot::Image)>>> = Arc::default();
+    let o = out.clone();
+    let job = Job::spawn(Kind::Sheet, no_wake(), move |ctl| {
+        let setup = Setup {
+            source: Source::File(path),
+            size: render,
+            vf,
+            vid: None,
+            deinterlace,
+        };
+        let mut g = Grabber::open(ctl, &setup)?;
+        for t in times {
+            let offset = t + g.start_time() + 1.0;
+            match g.grab(ctl, t, Seek::Exact { demuxer_offset: offset }, TIMEOUT)? {
+                Grab::Frame(f) => o.lock().unwrap().push((f.time, f.image)),
+                other => panic!("精確跳到 {t}：{other:?}"),
+            }
+        }
+        g.finish()?;
+        Err(Failure::Cancelled)
+    });
+    assert_eq!(wait_job(&job).map(|d| d.path), Err(Failure::Cancelled));
+    out.lock().map(|frames| frames.clone()).unwrap()
+}
+
+/// 畫面跟誰比
+#[derive(Clone, Copy, PartialEq)]
+enum Reference {
+    /// 主播放器精確跳轉後的截圖
+    Main,
+    /// 另外開的擷取用的 mpv（[`grabber_frames`]）。SMPTE-C 原色的 DVD：繪圖時轉成 sRGB 的原色，
+    /// 主播放器的截圖不轉，顏色本來就差一截，比不出是不是同一格
+    Grabber,
+}
+
+/// 跳轉不準的格式（TS、M2TS、MPEG-PS）：每一格是時間標記的那一格（實際的時間在目標的半個間隔以內，
+/// 不是後面的關鍵影格、檔尾），畫面跟精確跳到那個時間的一樣，跟晚半秒的不一樣
+fn check_ts_sheet(rel: &str, columns: u32, rows: u32, reference: Reference) -> sheet::Layout {
+    let name = format!("sheet-ts-{}", rel.replace(['/', '.'], "-"));
+    let (mut p, caps) = ts_main_player(rel);
+    let dirs = clip_dirs(&name);
+    let mut prefs = sheet_prefs(columns, rows, 1280, ImageFormat::Png);
+    prefs.timestamps = false;
+    prefs.header = false;
+    let mut spec = sheet_spec(&p, &caps, prefs, &dirs);
+    assert!(spec.approx_seek, "{rel}：跳轉不準的格式");
+    let l = spec.layout.clone();
+    let range = spec.range;
+    let (render, vf, deinterlace) = (spec.render, spec.vf(), spec.deinterlace);
+    let seen = seen_cells(&mut spec);
+    let (_, done) = export_sheet(spec);
+    let img = read_sheet(&done.unwrap_or_else(|f| panic!("{rel}：{f:?}")).path);
+    let gap = sheet::spacing(range, l.count());
+    let cells = seen.lock().unwrap().clone();
+    assert_eq!(cells.len(), l.count());
+    for (i, t, at) in cells {
+        let at = at.unwrap_or_else(|| panic!("{rel}：第 {i} 格取不到"));
+        assert!(
+            (at - t).abs() <= gap / 2.0 + 0.001,
+            "{rel}：第 {i} 格的目標 {t}，實際 {at}（間隔 {gap}）"
+        );
+        // 跟精確跳到標記的時間的畫面比（縮小一點比，縮放的演算法不同）
+        let late_t = if at + 0.5 < range.1 { at + 0.5 } else { at - 0.5 };
+        let ((_, want), (late_at, late)) = match reference {
+            Reference::Main => (main_frame(&mut p, at, &dirs.1), main_frame(&mut p, late_t, &dirs.1)),
+            Reference::Grabber => {
+                let mut f = grabber_frames(rel, render, vf.clone(), deinterlace, vec![at, late_t]).into_iter();
+                let (want, late) = (f.next().unwrap(), f.next().unwrap());
+                assert!((want.0 - at).abs() < 0.002, "{rel}：精確跳到 {at}，拿到 {}", want.0);
+                (want, late)
+            }
+        };
+        let (w, h) = (l.cell.0 as usize / 4, l.cell.1 as usize / 4);
+        let cell = shrink(&sheet_cell(&img, &l, i), w, h);
+        let same = mean_diff(&cell, &shrink(&want, w, h));
+        let other = mean_diff(&cell, &shrink(&late, w, h));
+        assert!(
+            same < 8.0 && other > same * 2.0,
+            "{rel}：第 {i} 格（{at} 秒）跟主播放器同一格差 {same}、跟 {late_at} 秒的差 {other}"
+        );
+    }
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+    l
+}
+
+#[test]
+fn sheet_ts_cells_are_the_frames_at_their_timestamps() {
+    // 每 10 秒一個關鍵影格的 TS（20 秒）：跳到關鍵影格常落在 0 秒、10 秒或檔尾，精確跳轉落在後面的關鍵影格，
+    // 要讓分離器從更前面開始
+    check_ts_sheet("general/ts_h264_gop10.ts", 5, 2, Reference::Main);
+    // 只有開頭一個關鍵影格的 TS（5 秒，點很密）、每 0.5 秒一個關鍵影格的 TS
+    check_ts_sheet("general/ts_h264_aac.ts", 3, 2, Reference::Main);
+    check_ts_sheet("general/ts_h264_gop05.ts", 4, 2, Reference::Main);
+    // M2TS（藍光）、MPEG-PS（DVD 的 VOB，720×480 存成、16:9 顯示）：格子照顯示的比例（不是被壓扁的 3:2）
+    check_ts_sheet("general/m2ts_h264_ac3.m2ts", 3, 2, Reference::Main);
+    let vob = check_ts_sheet("general/vob_mpeg2_ac3_anamorphic.vob", 3, 2, Reference::Grabber);
+    let aspect = f64::from(vob.cell.0) / f64::from(vob.cell.1);
+    assert!(
+        (aspect - 16.0 / 9.0).abs() < 0.03,
+        "VOB 的格子 {:?}（{aspect}）不是 16:9",
+        vob.cell
+    );
+}
+
+/// 跳轉不準的格式：跳到關鍵影格常落在檔尾（沒有新的影格，mpv 照樣送出「跳轉完成」，畫面還是上一格、
+/// 時間是檔尾）。那不是一格：不能拿上一格的畫面配檔尾的時間（之後精確跳轉逾時時，總覽圖會用它）
+#[test]
+fn sheet_grab_at_the_end_of_file_is_not_the_previous_picture() {
+    use vitascope::export::grab::{Grab, Grabber, Seek, Setup};
+    for rel in ["general/ts_h264_aac.ts", "general/ts_h264_gop10.ts"] {
+        let path = sample(rel);
+        let job = Job::spawn(Kind::Sheet, no_wake(), move |ctl| {
+            let setup = Setup {
+                source: Source::File(path),
+                size: (160, 90),
+                vf: String::new(),
+                vid: None,
+                deinterlace: "no",
+            };
+            let mut g = Grabber::open(ctl, &setup)?;
+            let d = g.duration().expect("知道總長度");
+            let timeout = Duration::from_secs(20);
+            let mut empty = 0;
+            // 上一次取到的那一格（開檔後的第一次還沒有：開檔時那一格可能在跳轉之後才畫到）
+            let mut prev: Option<vitascope::export::grab::Frame> = None;
+            for k in 1..=4 {
+                let t = d * f64::from(k) / 5.0;
+                match g.grab(ctl, t, Seek::Keyframe, timeout)? {
+                    // 真的停在一格上（TS 常落在目標後面的關鍵影格）：不是檔尾的時間，畫面跟上一格一樣時時間也一樣
+                    Grab::Frame(f) => {
+                        assert!(f.time < d - 0.001, "{rel}：跳到 {t}，拿到檔尾的時間 {}", f.time);
+                        if let Some(p) = prev.as_ref().filter(|p| p.image == f.image) {
+                            assert!(
+                                (p.time - f.time).abs() < 0.05,
+                                "{rel}：跳到 {t}，拿到上一格（{} 秒）的畫面配 {} 秒",
+                                p.time,
+                                f.time
+                            );
+                        }
+                    }
+                    Grab::Empty => empty += 1,
+                    Grab::TimedOut => panic!("{rel}：跳到 {t} 逾時"),
+                }
+                // 從檔案開頭精確跳轉：取到目標那一格（下一次跳轉之前畫面上是它）
+                match g.grab(
+                    ctl,
+                    t,
+                    Seek::Exact {
+                        demuxer_offset: t + 10.0,
+                    },
+                    timeout,
+                )? {
+                    Grab::Frame(f) => {
+                        assert!((f.time - t).abs() < 0.1, "{rel}：精確跳到 {t}，拿到 {} 秒", f.time);
+                        prev = Some(f);
+                    }
+                    other => panic!("{rel}：精確跳到 {t}：{other:?}"),
+                }
+            }
+            g.finish()?;
+            assert!(empty > 0, "{rel}：跳到關鍵影格都沒有落在檔尾（這個樣本測不到）");
+            Err(Failure::Cancelled)
+        });
+        assert_eq!(wait_job(&job).map(|d| d.path), Err(Failure::Cancelled), "{rel}");
+    }
+}
+
+#[test]
+fn sheet_ab_range() {
+    // 只取 A-B 段落：每一格都在 A-B 裡
+    let (p, caps) = main_player(&sample_str("general/mkv_h264_gop2.mkv"));
+    let dirs = clip_dirs("sheet-ab");
+    let mut prefs = sheet_prefs(3, 1, 1280, ImageFormat::Jpeg);
+    prefs.header = false;
+    let mut spec = sheet_spec_with(&p, &caps, prefs, &Geometry::default(), Some((4.0, 8.0)), &dirs).unwrap();
+    assert_eq!(spec.range, (4.0, 8.0));
+    let seen = seen_cells(&mut spec);
+    let (_, done) = export_sheet(spec);
+    done.unwrap();
+    let cells = seen.lock().unwrap().clone();
+    let targets: Vec<f64> = cells.iter().map(|c| c.1).collect();
+    assert_eq!(targets, [5.0, 6.0, 7.0]);
+    for (i, t, at) in cells {
+        let at = at.unwrap();
+        // 每 2 秒一個關鍵影格：5 秒、7 秒跳到關鍵影格落在 4、6 秒（離目標 1 秒，超過半個間隔）：精確跳轉
+        assert!((at - t).abs() <= 0.5, "第 {i} 格：目標 {t}，實際 {at}");
+        assert!((4.0..8.0).contains(&at));
+    }
+    // 範圍太短、在影片外面：不能做
+    let short = sheet_spec_with(&p, &caps, prefs, &Geometry::default(), Some((4.0, 4.1)), &dirs);
+    assert_eq!(short.map(|s| s.range), Err(Failure::RangeTooShort));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// 在沒有時間標記的總覽圖的第 `i` 格右下角畫上 `text` 的時間標記（跟 `sheet` 一樣的畫法），回傳那個方塊
+fn stamp_on(
+    plain: &vitascope::screenshot::Image,
+    l: &sheet::Layout,
+    i: usize,
+    text: &str,
+    region: (u32, u32, u32, u32),
+) -> vitascope::screenshot::Image {
+    use vitascope::export::text::{Canvas, TextPainter};
+    let mut canvas = Canvas::new(plain.w, plain.h, [0, 0, 0]);
+    canvas.blit(0, 0, plain);
+    let mut painter = TextPainter::new();
+    let pad = sheet::STAMP_PAD;
+    let (w, h) = painter.measure(text, l.stamp_px);
+    let (bw, bh) = ((w + 2.0 * pad).ceil(), (h + 2.0 * pad).ceil());
+    let (x, y) = l.cell_pos(i);
+    let bx = (x + l.cell.0) as f32 - bw - pad;
+    let by = (y + l.cell.1) as f32 - bh - pad;
+    canvas.blend_rounded(bx as i64, by as i64, bw as i64, bh as i64, sheet::STAMP_BOX, pad);
+    painter.draw(&mut canvas, bx + pad, by + pad, text, l.stamp_px, sheet::STAMP_COLOR);
+    let rgba = canvas
+        .rgb
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .flat_map(|p| [p[0], p[1], p[2], 255])
+        .collect();
+    let img = vitascope::screenshot::Image {
+        w: canvas.w,
+        h: canvas.h,
+        rgba,
+    };
+    let (rx, ry, rw, rh) = region;
+    crop(&img, rx, ry, rw, rh)
+}
+
+#[test]
+fn sheet_stamps_show_the_actual_time_of_each_picture() {
+    // 每 2 秒一個關鍵影格、12 秒取 3 張（目標 3、6、9 秒）：跳到關鍵影格落在 2、8 秒，在半個間隔（1.5 秒）以內就用它。
+    // 時間標記要寫實際取到的那一格的時間（00:02），不是目標（00:03）：圖跟時間要對得上
+    let (p, caps) = main_player(&sample_str("general/mkv_h264_gop2.mkv"));
+    let dirs = clip_dirs("sheet-stamp-actual");
+    let mut prefs = sheet_prefs(3, 1, 1280, ImageFormat::Png);
+    prefs.header = false;
+    let mut spec = sheet_spec(&p, &caps, prefs, &dirs);
+    let l = spec.layout.clone();
+    let tenths = sheet::spacing(spec.range, l.count()) < sheet::TENTHS_BELOW;
+    let seen = seen_cells(&mut spec);
+    let (_, done) = export_sheet(spec);
+    let stamped = read_sheet(&done.unwrap_or_else(|f| panic!("{f:?}")).path);
+    // 同樣的格子、沒有時間標記（PNG：畫面一模一樣）
+    let mut plain_prefs = prefs;
+    plain_prefs.timestamps = false;
+    let mut plain = sheet_spec(&p, &caps, plain_prefs, &dirs);
+    plain.stem = "plain".into();
+    assert_eq!(plain.layout, l);
+    let (_, plain_done) = export_sheet(plain);
+    let plain = read_sheet(&plain_done.unwrap_or_else(|f| panic!("{f:?}")).path);
+    let cells = seen.lock().unwrap().clone();
+    assert_eq!(cells.len(), 3);
+    let mut differs = 0;
+    for (i, t, at) in cells {
+        let at = at.unwrap_or_else(|| panic!("第 {i} 格取不到"));
+        let (real, target) = (sheet::stamp_text(at, tenths), sheet::stamp_text(t, tenths));
+        // 兩個字串的方塊取大的那個
+        let (ra, rb) = (stamp_region(&l, i, &real), stamp_region(&l, i, &target));
+        let region = if ra.2 >= rb.2 { ra } else { rb };
+        let got = crop(&stamped, region.0, region.1, region.2, region.3);
+        let want = stamp_on(&plain, &l, i, &real, region);
+        let d_real = mean_diff(&got.rgba, &want.rgba);
+        assert!(
+            d_real < 1.0,
+            "第 {i} 格（實際 {at} 秒）的時間標記不是「{real}」：差 {d_real}"
+        );
+        if real != target {
+            differs += 1;
+            let d_target = mean_diff(&got.rgba, &stamp_on(&plain, &l, i, &target, region).rgba);
+            assert!(
+                d_target > d_real + 3.0,
+                "第 {i} 格：「{real}」差 {d_real}、目標的「{target}」差 {d_target}"
+            );
+        }
+    }
+    assert!(differs > 0, "每一格都剛好落在目標上（這個樣本測不到）");
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn sheet_failing_filter_is_an_error_not_a_file() {
+    // mpv 停用失敗的濾鏡、照樣把畫面送出去：只有記錄裡的「Disabling filter」看得出來
+    let (p, caps) = main_player(&sample_str("common/mp4_h264_aac.mp4"));
+    let dirs = clip_dirs("sheet-fail");
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(2, 1, 1280, ImageFormat::Jpeg), &dirs);
+    let bad = "crop=w=9999:h=9999";
+    spec.test.extra_vf = Some(format!("lavfi=graph=%{}%{bad}", bad.len()));
+    let (_, done) = export_sheet(spec);
+    assert_eq!(done.map(|d| d.path), Err(Failure::FilterFailed));
+    assert!(names(&dirs.0).is_empty(), "失敗時不留檔案：{:?}", names(&dirs.0));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn grabber_remembers_a_failed_filter_past_later_log_lines() {
+    use vitascope::export::grab::{Grab, Grabber, Seek, Setup};
+    // mpv 停用失敗的濾鏡之後，記錄裡又來了一大堆別的錯誤（FFmpeg 的記錄全部送到同一個 mpv：
+    // 匯出用的 mpv 可能收到別的 mpv 的警告）：濾鏡失敗不能被擠出最近的那幾行
+    let path = sample("common/mp4_h264_aac.mp4");
+    let dir = scratch("grab-flood");
+    let missing = dir.join("沒有這個字幕.srt").to_string_lossy().into_owned();
+    // 失敗的話只印出結果的種類（不印整張圖）
+    type Got = (Result<String, Failure>, Result<String, Failure>, Result<(), Failure>);
+    let kind = |r: Result<Grab, Failure>| {
+        r.map(|g| match g {
+            Grab::Frame(f) => format!("畫面 {:.3} 秒", f.time),
+            other => format!("{other:?}"),
+        })
+    };
+    let got: Arc<Mutex<Option<Got>>> = Arc::default();
+    let out = got.clone();
+    let job = Job::spawn(Kind::Sheet, no_wake(), move |ctl| {
+        let bad = "crop=w=9999:h=9999";
+        let setup = Setup {
+            source: Source::File(path),
+            size: (320, 180),
+            vf: format!("lavfi=graph=%{}%{bad}", bad.len()),
+            vid: None,
+            deinterlace: "no",
+        };
+        let mut g = Grabber::open(ctl, &setup)?;
+        let first = g.grab(ctl, 1.0, Seek::Keyframe, TIMEOUT);
+        // 每一次都打不開、記下錯誤：比最近幾行多很多
+        for _ in 0..LogTail::CAP * 2 {
+            let _ = g.mpv().command(&["sub-add", &missing]);
+        }
+        let second = g.grab(ctl, 2.0, Seek::Keyframe, TIMEOUT);
+        let finish = g.finish();
+        *out.lock().unwrap() = Some((kind(first), kind(second), finish));
+        Err(Failure::Cancelled)
+    });
+    assert_eq!(wait_job(&job).map(|d| d.path), Err(Failure::Cancelled));
+    let (first, second, finish) = got.lock().unwrap().take().expect("擷取沒有跑完");
+    assert_eq!(first, Err(Failure::FilterFailed), "第一次跳轉就看得到");
+    assert_eq!(second, Err(Failure::FilterFailed), "之後的錯誤把濾鏡失敗擠掉了");
+    assert_eq!(finish, Err(Failure::FilterFailed));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn grabber_reads_a_queued_filter_failure_before_returning_a_frame() {
+    use vitascope::export::grab::{Grab, Grabber, Setup};
+    // 跳轉完成時「Disabling filter」還排在事件後面（mpv 先送事件、最後才送記錄）：
+    // 要收完排著的記錄再決定，不能拿沒經過濾鏡的畫面當成取到的那一格
+    let path = sample("common/mp4_h264_aac.mp4");
+    let got: Arc<Mutex<Option<Result<String, Failure>>>> = Arc::default();
+    let out = got.clone();
+    let job = Job::spawn(Kind::Sheet, no_wake(), move |ctl| {
+        let bad = "crop=w=9999:h=9999";
+        let setup = Setup {
+            source: Source::File(path),
+            size: (320, 180),
+            vf: format!("lavfi=graph=%{}%{bad}", bad.len()),
+            vid: None,
+            deinterlace: "no",
+        };
+        let mut g = Grabber::open(ctl, &setup)?;
+        // 開檔之後解出的第一格到了輸出端（濾鏡已經失敗、記錄已經送出），但還沒有人收記錄
+        let deadline = Instant::now() + TIMEOUT;
+        while g.mpv().get_property::<i64>("video-out-params/w").is_err() {
+            assert!(Instant::now() < deadline, "第一格一直沒有送到輸出端");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let r = g.settle(true).map(|g| match g {
+            Grab::Frame(f) => format!("畫面 {:.3} 秒", f.time),
+            other => format!("{other:?}"),
+        });
+        *out.lock().unwrap() = Some(r);
+        let _ = g.finish();
+        Err(Failure::Cancelled)
+    });
+    assert_eq!(wait_job(&job).map(|d| d.path), Err(Failure::Cancelled));
+    let r = got.lock().unwrap().take().expect("擷取沒有跑完");
+    assert_eq!(r, Err(Failure::FilterFailed));
+}
+
+#[test]
+fn sheet_cancel_and_read_timeout_leave_nothing() {
+    let (p, caps) = main_player(&sample_str("common/mp4_long.mp4"));
+    let dirs = clip_dirs("sheet-cancel");
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(4, 5, 1280, ImageFormat::Jpeg), &dirs);
+    // 取完第一格之後停住，等測試取消
+    let barrier = Arc::new(Barrier::new(2));
+    let b = barrier.clone();
+    spec.test.on_cell = Some(Arc::new(move |i, _, _| {
+        if i == 0 {
+            b.wait();
+            b.wait();
+        }
+    }));
+    let job = sheet::spawn(spec, no_wake());
+    barrier.wait();
+    job.cancel();
+    barrier.wait();
+    assert_eq!(wait_job(&job).map(|d| d.path), Err(Failure::Cancelled));
+    drop(job);
+    assert!(names(&dirs.0).is_empty(), "取消後不留檔案：{:?}", names(&dirs.0));
+
+    // 每一格都等不到（網路磁碟卡住）：連續兩格取不到就放棄，不留檔案
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(4, 5, 1280, ImageFormat::Jpeg), &dirs);
+    spec.test.cell_timeout = Some(Duration::ZERO);
+    let seen = seen_cells(&mut spec);
+    let (_, done) = export_sheet(spec);
+    assert_eq!(done.map(|d| d.path), Err(Failure::ReadTimeout));
+    assert_eq!(seen.lock().unwrap().len(), 2, "連續兩格取不到就停");
+    assert!(names(&dirs.0).is_empty(), "{:?}", names(&dirs.0));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn sheet_is_unavailable_without_video() {
+    let dirs = clip_dirs("sheet-unavailable");
+    // 只有聲音（專輯封面不算影像）
+    let (p, _) = main_player(&sample_str("general/audio_mp3_cover.mp3"));
+    assert_eq!(sheet::unavailable(&p), Some(Failure::NoVideo));
+    let (q, _) = main_player(&sample_str("common/mp4_long.mp4"));
+    assert_eq!(sheet::unavailable(&q), None);
+    // 使用者開的 EDL：時間跟檔案對不上
+    let src = sample_str("general/mkv_h264_gop2.mkv");
+    let entry = format!("%{}%{src}", src.len());
+    let edl = dirs.1.join("list.edl");
+    std::fs::write(&edl, format!("# mpv EDL v0\n{entry},0,3\n{entry},6,3\n")).unwrap();
+    let (r, _) = main_player(&edl.to_string_lossy());
+    assert_eq!(sheet::unavailable(&r), Some(Failure::Timeline));
+    // 影片檔不見了：開始時說明
+    let tmp = dirs.1.join("gone.mp4");
+    std::fs::copy(sample("common/mp4_h264_aac.mp4"), &tmp).unwrap();
+    let (s, caps) = main_player(&tmp.to_string_lossy());
+    let spec = sheet_spec(&s, &caps, sheet_prefs(2, 1, 1280, ImageFormat::Jpeg), &dirs);
+    drop(s);
+    std::fs::remove_file(&tmp).unwrap();
+    let (_, done) = export_sheet(spec);
+    assert_eq!(done.map(|d| d.path), Err(Failure::SourceMissing));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn sheet_checks_the_timeline_after_loading() {
+    // 擷取用的 mpv 開好後再比一次總長度：靜態的檢查沒抓到的章節連結之類（主播放器的時間線比檔案長），
+    // 目標、時間標記會對到別的地方：說明，不做
+    let (p, caps) = main_player(&sample_str("common/mp4_long.mp4"));
+    let dirs = clip_dirs("sheet-timeline");
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(2, 1, 1280, ImageFormat::Jpeg), &dirs);
+    let real = spec.main_duration.expect("主播放器知道總長度");
+    assert!((real - p.state.duration.unwrap()).abs() < 1e-9);
+    spec.main_duration = Some(real + 30.0);
+    let seen = seen_cells(&mut spec);
+    let (_, done) = export_sheet(spec);
+    assert_eq!(done.map(|d| d.path), Err(Failure::Timeline));
+    assert!(seen.lock().unwrap().is_empty(), "一格都不取");
+    assert!(names(&dirs.0).is_empty(), "{:?}", names(&dirs.0));
+    // 差不多（1 秒以內）：照常做
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(2, 1, 1280, ImageFormat::Jpeg), &dirs);
+    spec.main_duration = Some(real + 0.5);
+    let (_, done) = export_sheet(spec);
+    done.unwrap();
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn sheet_http_vod() {
+    let server = Server::start();
+    // 能跳轉的網路影片：用同樣的連線設定開檔、跳轉
+    let url = server.file_url("general/mkv_h264_gop2.mkv");
+    let net_settings = NetSettings {
+        user_agent: "VitaScope-Sheet/1.0".into(),
+        ..NetSettings::default()
+    };
+    let (mut p, caps) = main_player_net(&net_settings, &url);
+    p.wait_state(TIMEOUT, |s| s.seekable).unwrap();
+    let dirs = clip_dirs("sheet-http");
+    let mut spec = sheet_spec(&p, &caps, sheet_prefs(3, 1, 1280, ImageFormat::Jpeg), &dirs);
+    assert!(matches!(&spec.source, Source::Net(s) if s.open == url));
+    assert_eq!(spec.header[0], "mkv_h264_gop2.mkv");
+    let seen = seen_cells(&mut spec);
+    let before = server.requests_to("/f/general/mkv_h264_gop2.mkv").len();
+    let (_, done) = export_sheet(spec);
+    let done = done.unwrap_or_else(|f| panic!("{f:?}"));
+    let reqs = server.requests_to("/f/general/mkv_h264_gop2.mkv");
+    assert!(reqs.len() > before, "擷取用的 mpv 要自己讀");
+    for r in &reqs[before..] {
+        assert_eq!(r.header("User-Agent"), Some("VitaScope-Sheet/1.0"), "{r:#?}");
+    }
+    assert!(seen.lock().unwrap().iter().all(|c| c.2.is_some()));
+    assert!(done.path.exists());
+    // 直播：不能做
+    let mut q = Player::new(Options {
+        extra: vec![("pause".into(), "yes".into())],
+        ..Options::headless()
+    })
+    .unwrap();
+    q.open(&server.url("/hlslive/net/hls_vod/index.m3u8")).unwrap();
+    q.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    // 路徑可能比 FileLoaded 晚到（沒有路徑時是 NoData，不是直播）
+    q.wait_state(TIMEOUT, |s| s.loaded && s.path.is_some() && !s.tracks.is_empty())
+        .unwrap();
+    assert_eq!(sheet::unavailable(&q), Some(Failure::Unbounded));
     for d in [&dirs.0, &dirs.1] {
         std::fs::remove_dir_all(d).unwrap();
     }

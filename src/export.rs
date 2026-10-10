@@ -7,13 +7,18 @@
 //!   介面執行緒呼叫 `message()`，切換語言後也是對的語言。
 //! - 檔名、預設資料夾、磁碟空間、寫好之後重新打開檢查（[`verify_media`]）、mpv 記錄對應到原因（[`map_mpv_error`]）。
 //!
-//! 匯出都在另外開的 mpv 裡做（不動正在播放的那一個）。FFmpeg 的記錄只送到第一個建立的 mpv（主播放器），
-//! 所以這裡判斷失敗只看 mpv 自己的訊息（「Failed writing packet」「Disabling filter」之類）。
+//! 匯出都在另外開的 mpv 裡做（不動正在播放的那一個）。判斷失敗只看 mpv 自己的訊息（「Failed writing packet」
+//! 「Disabling filter」之類）：FFmpeg 的記錄全部送到同一個 mpv（第一個建立的，平常是主播放器；它結束後換下一個新建立的），
+//! 匯出用的 mpv 平常收不到自己的 FFmpeg 記錄，也可能收到別的 mpv 的（例如測試裡沒有主播放器時）。
 //!
-//! 各種匯出在子模組：[`clip`]（片段）、[`gif`]（轉成 GIF）。
+//! 各種匯出在子模組：[`clip`]（片段）、[`gif`]（轉成 GIF）、[`sheet`]（縮圖總覽圖；擷取畫面在 [`grab`]、
+//! 文字與畫布在 [`text`]）。
 
 pub mod clip;
 pub mod gif;
+pub mod grab;
+pub mod sheet;
+pub mod text;
 
 use crate::geometry::Geometry;
 use crate::instance::Wake;
@@ -1165,12 +1170,22 @@ impl LogLine {
     fn is_error(&self) -> bool {
         matches!(self.level.as_str(), "error" | "fatal")
     }
+
+    /// mpv 停用了失敗的濾鏡、或轉不成能輸出的格式（之後的畫面沒有經過我們的濾鏡）
+    pub fn is_graph_failure(&self) -> bool {
+        self.is_error()
+            && (self.text.contains("Disabling filter") || self.text.contains("Cannot convert decoder/filter output"))
+    }
 }
 
 /// 最近的警告、錯誤（匯出用的 mpv 要 `request_log_messages("warn")`）
 #[derive(Debug, Clone, Default)]
 pub struct LogTail {
     lines: VecDeque<LogLine>,
+    /// 第一行濾鏡失敗的記錄：一直留著，不會被後來的記錄擠掉。
+    /// FFmpeg 的記錄全部送到同一個 mpv（第一個建立的；它結束後換下一個新建立的），
+    /// 匯出用的 mpv 可能收到別的 mpv 的一大堆警告，最近幾行裡早就沒有它了
+    graph_failure: Option<LogLine>,
 }
 
 impl LogTail {
@@ -1188,6 +1203,9 @@ impl LogTail {
         if !matches!(line.level.as_str(), "warn" | "error" | "fatal") {
             return;
         }
+        if self.graph_failure.is_none() && line.is_graph_failure() {
+            self.graph_failure = Some(line.clone());
+        }
         if self.lines.len() >= Self::CAP {
             self.lines.pop_front();
         }
@@ -1198,19 +1216,32 @@ impl LogTail {
         self.lines.iter().cloned().collect()
     }
 
+    /// 收過濾鏡失敗的記錄沒有（清掉之前收過的都算，不管後來又收了多少行）
+    pub fn graph_failed(&self) -> bool {
+        self.graph_failure.is_some()
+    }
+
     /// 清掉收過的（只看接下來的記錄，例如寫檔那一段）
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.graph_failure = None;
     }
 
-    /// 從收到的記錄判斷原因（見 `map_mpv_error`）
+    /// 從收到的記錄判斷原因（見 `map_mpv_error`；被擠掉的濾鏡失敗也算進去，重要性照原本的順序）
     pub fn failure(&self) -> Option<Failure> {
-        map_mpv_error(&self.lines())
+        let mut lines = self.lines();
+        if let Some(l) = &self.graph_failure
+            && !lines.contains(l)
+        {
+            lines.push(l.clone());
+        }
+        map_mpv_error(&lines)
     }
 }
 
 /// mpv 自己的訊息 → 原因（依重要性：先找已知的訊息，都沒有時用第一行錯誤的原文；沒有錯誤時 None）。
-/// 只看 mpv 的訊息：FFmpeg 的記錄只送到第一個建立的 mpv（主播放器），匯出用的 mpv 收不到
+/// 認得的都是 mpv 自己的訊息：FFmpeg 的記錄全部送到同一個 mpv（第一個建立的，平常是主播放器），
+/// 匯出用的 mpv 收到的 FFmpeg 記錄可能是別的 mpv 的（見模組說明），用原文的那一種也可能拿到它們
 pub fn map_mpv_error(lines: &[LogLine]) -> Option<Failure> {
     /// 一種原因：mpv 的訊息（任何一個出現在錯誤記錄裡就算；`*` 代表中間任意的文字）、
     /// 從符合的那一行得出原因。依重要性排列：同時出現時前面的優先
@@ -1708,6 +1739,39 @@ mod tests {
         assert_eq!(tail.failure(), Some(Failure::Engine("line 4".into())));
         tail.push(line("error", "Failed writing packet."));
         assert_eq!(tail.failure(), Some(Failure::WriteFailed));
+    }
+
+    #[test]
+    fn log_tail_never_forgets_a_failed_filter() {
+        let mut tail = LogTail::default();
+        assert!(!tail.graph_failed());
+        // 警告等級的同一句、別的錯誤：不算
+        tail.push(line("warn", "Disabling filter lavfi.00 because it has failed."));
+        tail.push(line("error", "Something else."));
+        assert!(!tail.graph_failed());
+        tail.push(line("error", "Disabling filter lavfi.00 because it has failed."));
+        assert!(tail.graph_failed());
+        // 之後收到一大堆別的記錄（別的 mpv 的 FFmpeg 警告），最近幾行裡已經沒有它：還是記得
+        for i in 0..(LogTail::CAP * 4) {
+            tail.push(line("warn", &format!("[ffmpeg/video] h264: noise {i}")));
+            tail.push(line("error", &format!("noise {i}")));
+        }
+        assert!(!tail.lines().iter().any(LogLine::is_graph_failure));
+        assert!(tail.graph_failed());
+        assert_eq!(tail.failure(), Some(Failure::FilterFailed));
+        // 比濾鏡失敗重要的原因照樣優先
+        tail.push(line("error", "Failed writing packet."));
+        assert_eq!(tail.failure(), Some(Failure::WriteFailed));
+        // 清掉之後只看接下來的
+        tail.clear();
+        assert!(!tail.graph_failed());
+        assert_eq!(tail.failure(), None);
+        tail.push(line(
+            "fatal",
+            "Cannot convert decoder/filter output to any format supported by the output.",
+        ));
+        assert!(tail.graph_failed());
+        assert_eq!(tail.failure(), Some(Failure::FilterFailed));
     }
 
     #[test]

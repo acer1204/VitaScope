@@ -504,7 +504,7 @@ impl Source {
         }
     }
 
-    fn is_network(&self) -> bool {
+    pub(super) fn is_network(&self) -> bool {
         matches!(self, Source::Net(_))
     }
 

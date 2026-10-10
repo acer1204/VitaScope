@@ -41,6 +41,9 @@ url = "2.5.8"
 # 按需求下載的 yt-dlp、deno：核對 SHA-256（ring，rustls 本來就用它）、解開 deno 的 zip（flate2，ureq 本來就用它）
 ring = "0.17.14"
 flate2 = "1.1.10"
+# 縮圖總覽圖存成 JPEG（image 本來就在相依樹裡：arboard 用的）。jpeg 用的 zune-jpeg、zune-core：macOS 上 arboard 的 tiff 已經用到，
+# Windows、Linux 是新加的（MIT / Apache-2.0 / Zlib）
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 # Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
 [target.'cfg(windows)'.dependencies]

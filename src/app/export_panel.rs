@@ -1,4 +1,4 @@
-//! 匯出視窗（右鍵選單「匯出 ▸」、快捷鍵）：把 A-B 段落存成片段（不重新編碼）、轉成 GIF。
+//! 匯出視窗（右鍵選單「匯出 ▸」、快捷鍵）：把 A-B 段落存成片段（不重新編碼）、轉成 GIF，整部影片做成縮圖總覽圖。
 //!
 //! - 不擋住操作的小視窗（跟控制面板一樣），影片照樣播；關掉視窗不會取消正在做的匯出，再打開看得到進度。
 //! - 範圍就是 A-B 重播：欄位顯示 mpv 現在的 A、B，改欄位、按「目前位置」、按 L 都是改同一個 A-B
@@ -6,17 +6,18 @@
 //! - 片段只放一條影像、一條聲音，不放字幕（目前的播放引擎寫不出字幕軌與語言標籤，視窗上註明）。
 //! - GIF：長邊、格率、要不要燒進字幕（記住上次的選擇）；旋轉、翻轉跟畫面一樣，最長 30 秒。
 //!   預設跟截圖放在一起（「設定 → 截圖與匯出」可以另外指定 GIF 資料夾）。
+//! - 縮圖總覽圖：格線（欄、列）、寬度（旁邊顯示實際的大小；太大時列數變少）、時間標記、標頭、JPEG / PNG，
+//!   整部影片或只取 A-B 段落（只記到換檔案）。跟 GIF 放在同一個資料夾（預設跟截圖放一起）。
 //! - 一次只做一個匯出。背景工作送回來的是列舉（進度、`Done`、`Failure`），文字在這裡用目前的語言組。
 //! - 關閉影戲時丟掉 `Job`：取消、等一下、刪掉暫存檔（介面測試丟掉整個 App 也一樣）。
-//!
-//! 縮圖總覽圖的分頁之後加（`ExportTab`）。
 
 use super::{Action, DialogKind, Pick, VitascopeApp, menu_item};
 use crate::export::clip::{self, ClipSpec, Container, Picks, StreamPick};
 use crate::export::gif::{self, GifSpec};
+use crate::export::sheet::{self, SheetSpec};
 use crate::export::{
-    self, ClipFormat, Done, Failure, GIF_FPS, GIF_LONG_SIDES, GIF_MAX_SECS, Job, JobEvent, Progress, format_time,
-    parse_time,
+    self, ClipFormat, Done, Failure, GIF_FPS, GIF_LONG_SIDES, GIF_MAX_SECS, ImageFormat, JPEG_QUALITY, Job, JobEvent,
+    Progress, SHEET_COLUMNS, SHEET_WIDTHS, format_time, parse_time,
 };
 use crate::instance::Wake;
 use crate::keymap::Command;
@@ -34,15 +35,18 @@ pub(super) enum ExportTab {
     Clip,
     /// 轉成 GIF
     Gif,
+    /// 縮圖總覽圖
+    Sheet,
 }
 
 impl ExportTab {
-    const ALL: [ExportTab; 2] = [ExportTab::Clip, ExportTab::Gif];
+    const ALL: [ExportTab; 3] = [ExportTab::Clip, ExportTab::Gif, ExportTab::Sheet];
 
     fn title(self) -> &'static str {
         match self {
             ExportTab::Clip => tr!("片段", "Clip"),
             ExportTab::Gif => "GIF",
+            ExportTab::Sheet => tr!("縮圖總覽圖", "Thumbnail sheet"),
         }
     }
 }
@@ -52,7 +56,7 @@ impl ExportTab {
 pub(super) enum ExportDir {
     /// 片段（預設是「影片」資料夾裡的 VitaScope）
     Clip,
-    /// GIF（之後還有縮圖總覽圖；預設跟截圖放在一起）
+    /// GIF 與縮圖總覽圖（預設跟截圖放在一起；介面上沿用「GIF 資料夾」的名稱）
     Image,
 }
 
@@ -83,9 +87,14 @@ pub(super) struct ExportUi {
     /// 只有聲音時選的格式（自動、MKA）。設定裡的「片段的格式」是有影像的片段用的，只有聲音時不改它；
     /// 這個只記到關閉影戲
     audio_format: ClipFormat,
-    /// 檔名（不含副檔名）；沒改過時照來源與範圍產生
+    /// 片段、GIF 的檔名（不含副檔名）；沒改過時照來源與範圍產生
     name: String,
     name_edited: bool,
+    /// 縮圖總覽圖的檔名（不含副檔名）；沒改過時照來源產生（「第1集 縮圖」）
+    sheet_name: String,
+    sheet_name_edited: bool,
+    /// 縮圖總覽圖只取 A-B 段落（不存進設定，換檔案時取消）
+    sheet_ab: bool,
     /// 正在做的匯出（同時只有一個）
     job: Option<Job>,
     progress: Option<Progress>,
@@ -95,6 +104,8 @@ pub(super) struct ExportUi {
     test: clip::TestHooks,
     /// 測試用：GIF 的編碼用的 mpv 的觀察點（見 `gif::TestHooks`）
     gif_test: gif::TestHooks,
+    /// 測試用：縮圖總覽圖的觀察點（見 `sheet::TestHooks`）
+    sheet_test: sheet::TestHooks,
 }
 
 impl ExportUi {
@@ -236,6 +247,12 @@ impl VitascopeApp {
                         ExportTab::Gif,
                         gif::unavailable(&self.player, &self.caps),
                     ),
+                    (
+                        tr!("縮圖總覽圖…", "Thumbnail sheet…"),
+                        Command::ExportSheet,
+                        ExportTab::Sheet,
+                        sheet::unavailable(&self.player),
+                    ),
                 ];
                 for (label, cmd, tab, why) in items {
                     let mut button = egui::Button::new(label);
@@ -256,6 +273,7 @@ impl VitascopeApp {
                     action = Some(Action::OpenExportDir(ExportDir::Clip));
                 }
                 ui.weak(self.export_dir(ExportDir::Clip).display().to_string());
+                // 縮圖總覽圖也在這裡（名稱沿用「GIF 資料夾」）
                 if menu_item(ui, true, tr!("開啟 GIF 資料夾", "Open the GIF folder"), "") {
                     action = Some(Action::OpenExportDir(ExportDir::Image));
                 }
@@ -306,6 +324,8 @@ impl VitascopeApp {
             ex.video_touched = false;
             ex.audio_touched = false;
             ex.name_edited = false;
+            ex.sheet_name_edited = false;
+            ex.sheet_ab = false;
             ex.range_bad = [false; 2];
             ex.picks_for = Some(self.file_gen);
         }
@@ -443,6 +463,7 @@ impl VitascopeApp {
                         match self.export.tab {
                             ExportTab::Clip => self.clip_tab(ui),
                             ExportTab::Gif => self.gif_tab(ui),
+                            ExportTab::Sheet => self.sheet_tab(ui),
                         }
                         self.export_status(ui);
                     });
@@ -469,7 +490,8 @@ impl VitascopeApp {
         self.clip_notes(ui, &picks, container.as_ref().ok().copied());
         ui.add_space(8.0);
         let ext = container.as_ref().ok().map(|c| c.ext());
-        self.output_rows(ui, points, ExportDir::Clip, ext);
+        let generated = self.range_name(points);
+        self.output_rows(ui, ExportDir::Clip, ext, &generated, false);
         if let [Some(a), Some(b)] = points
             && let Some(bytes) = self.estimated_bytes(b - a, &picks)
         {
@@ -724,8 +746,17 @@ impl VitascopeApp {
         }
     }
 
-    /// 存到哪裡、檔名（片段、GIF 共用一個檔名：都是照來源與範圍產生）；`ext` = 副檔名（不知道時不顯示）
-    fn output_rows(&mut self, ui: &mut egui::Ui, points: [Option<f64>; 2], which: ExportDir, ext: Option<&str>) {
+    /// 片段、GIF 產生的檔名：照來源與範圍（沒有範圍時是空的）
+    fn range_name(&self, points: [Option<f64>; 2]) -> String {
+        match points {
+            [Some(a), Some(b)] => self.export_stem(a, b),
+            _ => String::new(),
+        }
+    }
+
+    /// 存到哪裡、檔名；`ext` = 副檔名（不知道時不顯示）、`generated` = 沒改過時的檔名。
+    /// 片段、GIF 共用一個檔名（都是照來源與範圍產生），縮圖總覽圖（`sheet`）另外一個
+    fn output_rows(&mut self, ui: &mut egui::Ui, which: ExportDir, ext: Option<&str>, generated: &str, sheet: bool) {
         let dir = self.export_dir(which);
         let mut choose = false;
         egui::Grid::new("export_output")
@@ -740,25 +771,23 @@ impl VitascopeApp {
                 ui.end_row();
                 let label = ui.label(tr!("檔名", "File name"));
                 ui.horizontal(|ui| {
-                    let generated = match points {
-                        [Some(a), Some(b)] => self.export_stem(a, b),
-                        _ => String::new(),
+                    let ex = &mut self.export;
+                    let (name, edited) = if sheet {
+                        (&mut ex.sheet_name, &mut ex.sheet_name_edited)
+                    } else {
+                        (&mut ex.name, &mut ex.name_edited)
                     };
-                    let id = Id::new("export_name");
-                    // 沒改過檔名：照來源與範圍產生（範圍改了跟著變）
-                    if !self.export.name_edited && !ui.memory(|m| m.has_focus(id)) {
-                        self.export.name = generated;
+                    let id = Id::new(("export_name", sheet));
+                    // 沒改過檔名：照來源（與範圍）產生（範圍改了跟著變）
+                    if !*edited && !ui.memory(|m| m.has_focus(id)) {
+                        *name = generated.to_owned();
                     }
                     let r = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut self.export.name)
-                                .id(id)
-                                .desired_width(300.0),
-                        )
+                        .add(egui::TextEdit::singleline(name).id(id).desired_width(300.0))
                         .labelled_by(label.id);
                     if r.changed() {
                         // 清空 = 回到自動產生的名稱
-                        self.export.name_edited = !self.export.name.trim().is_empty();
+                        *edited = !name.trim().is_empty();
                     }
                     if let Some(ext) = ext {
                         ui.label(format!(".{ext}"));
@@ -883,7 +912,8 @@ impl VitascopeApp {
         ui.add_space(8.0);
         self.gif_rows(ui);
         ui.add_space(8.0);
-        self.output_rows(ui, points, ExportDir::Image, Some("gif"));
+        let generated = self.range_name(points);
+        self.output_rows(ui, ExportDir::Image, Some("gif"), &generated, false);
         ui.add_space(8.0);
         let why = self.gif_start_blocked(points);
         let r = ui
@@ -1067,6 +1097,290 @@ impl VitascopeApp {
         }
     }
 
+    /// 縮圖總覽圖產生的檔名：「第1集 縮圖」（網路串流有標題時用標題）
+    fn sheet_stem(&self) -> String {
+        let st = &self.player.state;
+        let path = st.path.clone().unwrap_or_default();
+        let title = self.titles.get(&path).map(String::as_str).or(st.title.as_deref());
+        let source = match path.get(..7) {
+            Some(head) if head.eq_ignore_ascii_case("file://") => {
+                crate::m3u::file_url_to_path(&path[7..]).to_string_lossy().into_owned()
+            }
+            _ => path.clone(),
+        };
+        export::sheet_stem(&source, title)
+    }
+
+    /// 網路影片的標題（縮圖總覽圖的標頭第一行；本機檔案用檔名）
+    fn sheet_title(&self) -> Option<String> {
+        let st = &self.player.state;
+        let path = st.path.as_deref()?;
+        if !crate::net::is_network(path) {
+            return None;
+        }
+        self.titles.get(path).cloned().or_else(|| st.title.clone())
+    }
+
+    /// 縮圖總覽圖的範圍：只取 A-B 段落時是 A-B（沒設定好時 None：不能開始），不然整部
+    fn sheet_points(&self) -> Option<Option<(f64, f64)>> {
+        if !self.export.sheet_ab {
+            return Some(None);
+        }
+        match self.player.ab_loop_points() {
+            [Some(a), Some(b)] if b > a => Some(Some((a, b))),
+            _ => None,
+        }
+    }
+
+    /// 「縮圖總覽圖」分頁：格線、寬度（實際的大小）、時間標記、標頭、範圍、圖檔格式、存到哪裡、檔名、開始
+    fn sheet_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.player.state.loaded {
+            ui.weak(tr!("沒有開啟的影片", "No video is open"));
+            return;
+        }
+        self.sheet_rows(ui);
+        ui.add_space(8.0);
+        let generated = self.sheet_stem();
+        let ext = self.settings.export.sheet.format.ext();
+        self.output_rows(ui, ExportDir::Image, Some(ext), &generated, true);
+        ui.add_space(8.0);
+        let why = self.sheet_start_blocked();
+        let r = ui
+            .add_enabled(why.is_none(), egui::Button::new(tr!("開始匯出", "Start export")))
+            .on_disabled_hover_text(why.unwrap_or_default());
+        if r.clicked() {
+            self.start_sheet_export();
+        }
+    }
+
+    /// 縮圖總覽圖的選擇：欄、列、寬度、時間標記、標頭、只取 A-B、圖檔格式與品質；HDR 與轉正的說明。
+    /// 改了就存進設定（記住上次的選擇；「只取 A-B 段落」不存）
+    fn sheet_rows(&mut self, ui: &mut egui::Ui) {
+        let mut prefs = self.settings.export.sheet;
+        let title = self.sheet_title();
+        let header_lines = if prefs.header {
+            sheet::header_for(&self.player, title.as_deref()).len()
+        } else {
+            0
+        };
+        let aspect = sheet::shown_aspect(&self.player, &self.geometry);
+        let layout = aspect.map(|a| sheet::layout(prefs.width, prefs.columns, prefs.rows, a, header_lines));
+        // 這個寬度、欄數、比例最多幾列（太大的圖：高度、總像素有上限）；選單只列放得下的
+        let max_rows = aspect.map_or(*export::SHEET_ROWS.end(), |a| {
+            sheet::max_rows(prefs.width, prefs.columns, a, header_lines)
+        });
+        let rows_now = prefs.rows.min(max_rows);
+        egui::Grid::new("export_sheet")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                let label = ui.label(tr!("欄數", "Columns"));
+                egui::ComboBox::from_id_salt("export_sheet_columns")
+                    .selected_text(prefs.columns.to_string())
+                    .show_ui(ui, |ui| {
+                        for n in SHEET_COLUMNS {
+                            ui.selectable_value(&mut prefs.columns, n, n.to_string());
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+                ui.end_row();
+                let label = ui.label(tr!("列數", "Rows"));
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("export_sheet_rows")
+                        .selected_text(rows_now.to_string())
+                        .show_ui(ui, |ui| {
+                            for n in 1..=max_rows {
+                                if ui.selectable_label(rows_now == n, n.to_string()).clicked() {
+                                    prefs.rows = n;
+                                }
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    let total = prefs.columns * rows_now;
+                    ui.label(tf!("共 {total} 張", "{total} pictures"));
+                });
+                ui.end_row();
+                let label = ui.label(tr!("寬度", "Width"));
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("export_sheet_width")
+                        .selected_text(format!("{} px", prefs.width))
+                        .show_ui(ui, |ui| {
+                            for w in SHEET_WIDTHS {
+                                ui.selectable_value(&mut prefs.width, w, format!("{w} px"));
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    if let Some(l) = &layout {
+                        ui.label(format!("→ {}×{}", l.size.0, l.size.1));
+                    }
+                });
+                ui.end_row();
+            });
+        if let Some(l) = &layout {
+            let (cw, ch) = l.cell;
+            ui.weak(tf!("每張 {cw}×{ch}", "Each picture {cw}×{ch}"));
+        }
+        if prefs.rows > max_rows {
+            ui.weak(tf!(
+                "這個寬度、欄數最多 {max_rows} 列（整張圖太大）",
+                "At most {max_rows} rows with this width and number of columns (the image would be too large)"
+            ));
+        }
+        ui.checkbox(&mut prefs.timestamps, tr!("時間標記", "Timestamps"));
+        ui.checkbox(
+            &mut prefs.header,
+            tr!("標頭（檔名、大小、長度、格式）", "Header (name, size, length, format)"),
+        );
+        // 只取 A-B 段落：A、B 都設定好才能勾（只記到換檔案）
+        let ab = match self.player.ab_loop_points() {
+            [Some(a), Some(b)] if b > a => Some((a, b)),
+            _ => None,
+        };
+        if ab.is_none() {
+            self.export.sheet_ab = false;
+        }
+        let label = match ab {
+            Some((a, b)) => {
+                let (a, b) = (format_time(a), format_time(b));
+                tf!("只取 A-B 段落（{a} – {b}）", "Only the A-B range ({a} – {b})")
+            }
+            None => tr!("只取 A-B 段落", "Only the A-B range").to_owned(),
+        };
+        ui.add_enabled(ab.is_some(), egui::Checkbox::new(&mut self.export.sheet_ab, label))
+            .on_disabled_hover_text(tr!(
+                "先設定 A-B 重播的起點和終點",
+                "Set the start and end of the A-B loop first"
+            ));
+        ui.horizontal(|ui| {
+            let label = ui.label(tr!("圖檔格式", "Image format"));
+            egui::ComboBox::from_id_salt("export_sheet_format")
+                .selected_text(prefs.format.ext().to_uppercase().replace("JPG", "JPEG"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut prefs.format, ImageFormat::Jpeg, "JPEG");
+                    ui.selectable_value(&mut prefs.format, ImageFormat::Png, "PNG");
+                })
+                .response
+                .labelled_by(label.id);
+            if prefs.format == ImageFormat::Jpeg {
+                let label = ui.label(tr!("品質", "Quality"));
+                ui.add(egui::DragValue::new(&mut prefs.jpeg_quality).range(JPEG_QUALITY))
+                    .labelled_by(label.id);
+            }
+        });
+        // HDR：跟轉成 GIF 一樣轉成一般畫面，或說明為什麼不轉
+        let st = &self.player.state;
+        let dv = st.selected(TrackKind::Video).and_then(|t| t.dolby_vision_profile);
+        let user = self.settings.video.tone;
+        let (tone, note) = gif::hdr_plan(
+            gif::source_hdr(&self.player),
+            dv,
+            self.caps.zscale && self.caps.tonemap,
+            &user,
+        );
+        if let Some(t) = tone {
+            let npl = t.npl;
+            let curve = user.curve.label();
+            if t.curve == user.curve.mpv() {
+                ui.weak(tf!(
+                    "HDR 影片會轉成一般畫面（{curve}，目標亮度 {npl} nits，跟「畫質 → HDR」一樣）",
+                    "HDR video is converted to SDR ({curve}, target {npl} nits, as in Video quality → HDR)"
+                ));
+            } else {
+                // 自動、BT.2390：FFmpeg 的 tonemap 沒有，跟 GIF 一樣用 Hable（不說「一樣」）
+                ui.weak(tf!(
+                    "HDR 影片會轉成一般畫面（Hable，目標亮度 {npl} nits）；「畫質 → HDR」的曲線「{curve}」總覽圖做不到，改用 Hable",
+                    "HDR video is converted to SDR (Hable, target {npl} nits); thumbnail sheets can't use the \"{curve}\" curve from Video quality → HDR, so they use Hable"
+                ));
+            }
+        } else if let Some(n) = note {
+            ui.weak(n.message());
+        }
+        ui.weak(tr!(
+            "旋轉、翻轉跟畫面一樣；影像調整、像素著色器、縮放、裁切不會套用。時間標記是每張實際的時間。",
+            "Rotation and flips follow the picture; image adjustments, shaders, zoom and crop are not applied. \
+             Each timestamp is the picture's actual time."
+        ));
+        if prefs != self.settings.export.sheet {
+            self.settings.export.sheet = prefs;
+            self.save_settings();
+        }
+    }
+
+    /// 縮圖總覽圖現在不能開始的原因（None = 可以開始）
+    fn sheet_start_blocked(&self) -> Option<String> {
+        if self.export.job.is_some() {
+            return Some(
+                tr!(
+                    "正在匯出，請等這一個做完",
+                    "An export is running; wait for it to finish"
+                )
+                .into(),
+            );
+        }
+        if let Some(f) = sheet::unavailable(&self.player) {
+            return Some(f.message());
+        }
+        if self.sheet_points().is_none() {
+            return Some(tr!("先設定起點和終點", "Set the start and the end first").into());
+        }
+        if sheet::shown_aspect(&self.player, &self.geometry).is_none() {
+            return Some(
+                tr!(
+                    "還不知道畫面的大小，請稍候",
+                    "The picture size isn't known yet; wait a moment"
+                )
+                .into(),
+            );
+        }
+        None
+    }
+
+    /// 縮圖總覽圖的「開始匯出」：從主播放器準備好（格線、寬度、範圍、轉正、HDR、標頭、資料夾、檔名），在背景開始
+    fn start_sheet_export(&mut self) {
+        if self.export.job.is_some() {
+            return;
+        }
+        let Some(range) = self.sheet_points() else { return };
+        let dir = self.export_dir(ExportDir::Image);
+        // 換不成正式名稱留下的檔案登記在快取資料夾；沒有快取資料夾（自動測試、`--shot`）時用系統的暫存資料夾
+        let cache = self
+            .export_cache_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("vitascope-export"));
+        let title = self.sheet_title();
+        let choice = sheet::Choice {
+            prefs: self.settings.export.sheet,
+            geometry: &self.geometry,
+            tone: &self.settings.video.tone,
+            deinterlace: self.settings.video.deinterlace,
+            range,
+            title: title.as_deref(),
+        };
+        match SheetSpec::from_player(&self.player, &self.caps, &choice, dir, cache) {
+            Ok(mut spec) => {
+                let generated = self.sheet_stem();
+                let edited = if self.export.sheet_name_edited {
+                    self.export.sheet_name.as_str()
+                } else {
+                    ""
+                };
+                spec.stem = export::chosen_stem(edited, &generated);
+                spec.test = self.export.sheet_test.clone();
+                let ctx = self.egui_ctx.clone();
+                let wake: Wake = Arc::new(move || ctx.request_repaint());
+                self.export.job = Some(sheet::spawn(spec, wake));
+                self.export.progress = None;
+                self.export.result = None;
+            }
+            Err(f) => {
+                self.osd(f.osd());
+                self.export.result = Some(Err(f));
+            }
+        }
+    }
+
     /// 視窗下方：進度與取消（寫檔中不能取消）、完成的檔案與實際範圍、失敗的原因
     fn export_status(&mut self, ui: &mut egui::Ui) {
         let mut open_file = None;
@@ -1228,9 +1542,11 @@ impl VitascopeApp {
         });
         let max = GIF_MAX_SECS;
         ui.weak(tf!(
-            "預設：跟截圖放在一起（上面的截圖資料夾）。GIF 最長 {max:.0} 秒；大小、格率在匯出視窗裡選，會記住上次的選擇。",
-            "Default: together with the screenshots (the screenshot folder above). GIFs can be at most {max:.0} seconds; \
-             choose the size and frame rate in the Export window, and the last choice is remembered."
+            "預設：跟截圖放在一起（上面的截圖資料夾）。縮圖總覽圖也存在這裡。GIF 最長 {max:.0} 秒；\
+             GIF 的大小、格率與縮圖總覽圖的格線、寬度在匯出視窗裡選，會記住上次的選擇。",
+            "Default: together with the screenshots (the screenshot folder above). Thumbnail sheets are saved here too. \
+             GIFs can be at most {max:.0} seconds; choose the GIF size and frame rate and the sheet grid and width \
+             in the Export window, and the last choice is remembered."
         ));
         changed
     }
@@ -1257,6 +1573,12 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn set_export_gif_test_hooks(&mut self, hooks: gif::TestHooks) {
         self.export.gif_test = hooks;
+    }
+
+    /// 測試用：之後開始的縮圖總覽圖用這些觀察點
+    #[doc(hidden)]
+    pub fn set_export_sheet_test_hooks(&mut self, hooks: sheet::TestHooks) {
+        self.export.sheet_test = hooks;
     }
 }
 

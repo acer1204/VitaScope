@@ -15907,3 +15907,387 @@ fn export_gif_command_menu_shortcut_and_english() {
         "HDR video is converted to SDR (Hable, target 203 nits); GIFs can't use the \"Auto\" curve from Video quality → HDR, so they use Hable",
     );
 }
+
+// ───────────── 匯出：縮圖總覽圖 ─────────────
+
+/// 右鍵選單「匯出 ▸ 縮圖總覽圖…」，等匯出視窗打開在縮圖總覽圖分頁
+fn open_sheet_window(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "匯出");
+    wait_menu_item(h, "縮圖總覽圖…");
+    h.get_by_label("縮圖總覽圖…").click();
+    step_until_app(h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("欄數");
+}
+
+/// 縮圖總覽圖的觀察點：取完第一格之後停住，等測試放行（`hook` 收到空的路徑）
+fn sheet_gate_after_first_cell(hook: GateHook) -> vitascope::export::sheet::TestHooks {
+    vitascope::export::sheet::TestHooks {
+        on_cell: Some(Arc::new(move |i, _, _| {
+            if i == 0 {
+                hook(PathBuf::new());
+            }
+        })),
+        ..Default::default()
+    }
+}
+
+/// 下拉選單裡選 `item`（選單打開時才有的項目）
+fn pick_combo(h: &mut Harness<'_, VitascopeApp>, combo: &str, item: &str) {
+    combo_in_view(h, combo);
+    wait_menu_item(h, item);
+    h.query_all_by_label(item)
+        .find(|n| n.accesskit_node().role() != egui::accesskit::Role::ComboBox)
+        .unwrap_or_else(|| panic!("下拉選單「{combo}」裡沒有「{item}」"))
+        .click();
+    h.run_steps(3);
+}
+
+#[test]
+fn export_sheet_end_to_end_and_choices_are_remembered() {
+    let (_dir, gifs, path, mut h) = gif_harness("export-sheet", "common/mkv_multitrack.mkv");
+    open_sheet_window(&mut h);
+    // 預設：4 欄 × 5 列、1920 寬、時間標記、標頭、JPEG；旁邊顯示實際的大小（標頭：檔名、大小／長度／格式、影像、聲音）
+    assert_eq!(combo_value(&h, "欄數"), "4");
+    assert_eq!(combo_value(&h, "列數"), "5");
+    assert_eq!(combo_value(&h, "寬度"), "1920 px");
+    assert_eq!(combo_value(&h, "圖檔格式"), "JPEG");
+    h.get_by_label("共 20 張");
+    let header = vitascope::export::sheet::header_for(h.state().player(), None);
+    assert_eq!(header.len(), 4, "{header:?}");
+    let l = vitascope::export::sheet::layout(1920, 4, 5, 640.0 / 360.0, 4);
+    h.get_by_label(&format!("→ {}×{}", l.size.0, l.size.1));
+    h.get_by_label(&format!("每張 {}×{}", l.cell.0, l.cell.1));
+    for on in ["時間標記", "標頭（檔名、大小、長度、格式）"] {
+        assert_eq!(
+            h.get_by_label(on).accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::True),
+            "{on}"
+        );
+    }
+    // 沒有 A-B：「只取 A-B 段落」停用並說明
+    let ab = "只取 A-B 段落";
+    assert!(h.get_by_label(ab).accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, ab, "先設定 A-B 重播的起點和終點");
+    // 檔名照來源產生（不含範圍），存在 GIF 資料夾
+    assert_eq!(field_value(&h, "檔名"), "mkv_multitrack 縮圖");
+    h.get_by_label(".jpg");
+    h.get_by_label_contains("時間標記是每張實際的時間");
+    // 改欄、列、寬度、格式：存進設定（記住上次的選擇），大小跟著變
+    pick_combo(&mut h, "欄數", "3");
+    pick_combo(&mut h, "列數", "2");
+    pick_combo(&mut h, "寬度", "1280 px");
+    pick_combo(&mut h, "圖檔格式", "PNG");
+    click_in_view(&mut h, "標頭（檔名、大小、長度、格式）");
+    let sheet = h.state().settings().export.sheet;
+    assert_eq!((sheet.columns, sheet.rows, sheet.width), (3, 2, 1280));
+    assert_eq!(sheet.format, vitascope::export::ImageFormat::Png);
+    assert!(!sheet.header && sheet.timestamps);
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    assert_eq!(saved(&path)["export"]["sheet"]["columns"], 3);
+    assert_eq!(saved(&path)["export"]["sheet"]["format"], "png");
+    assert_eq!(saved(&path)["export"]["sheet"]["header"], false);
+    let l = vitascope::export::sheet::layout(1280, 3, 2, 640.0 / 360.0, 0);
+    h.get_by_label(&format!("→ {}×{}", l.size.0, l.size.1));
+    h.get_by_label(".png");
+    assert!(h.query_by_label("品質").is_none(), "PNG 沒有品質");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert_eq!(osd, "已儲存縮圖總覽圖：mkv_multitrack 縮圖.png");
+    let first = gifs.join("mkv_multitrack 縮圖.png");
+    let img = vitascope::screenshot::decode_png(&first).unwrap();
+    assert_eq!((img.w as u32, img.h as u32), l.size);
+    h.get_by_label_contains("完成：mkv_multitrack 縮圖.png");
+    assert!(h.query_by_label_contains("實際範圍").is_none());
+    h.get_by_label("開啟檔案");
+    h.get_by_label("在資料夾中顯示");
+
+    // 設定了 A-B：可以只取 A-B 段落（不存進設定）；再存一次不覆蓋
+    h.state().player().set_ab_loop(Some(2.0), Some(6.0)).unwrap();
+    wait_ab(&mut h, "A-B 2–6 秒", [Some(2.0), Some(6.0)]);
+    h.run_steps(2);
+    let ab_label = "只取 A-B 段落（00:00:02.000 – 00:00:06.000）";
+    assert!(!h.get_by_label(ab_label).accesskit_node().is_disabled());
+    click_in_view(&mut h, ab_label);
+    assert_eq!(
+        h.get_by_label(ab_label).accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    assert!(saved(&path)["export"]["sheet"].get("ab").is_none());
+    // 勾選從介面一路傳到背景工作：3 × 2 = 6 格都取 A-B 裡的點（2 + 4/7 秒起），取到的也在那附近
+    type Seen = std::sync::Mutex<Vec<(usize, f64, Option<f64>)>>;
+    let seen: Arc<Seen> = Arc::default();
+    let s = seen.clone();
+    h.state_mut()
+        .set_export_sheet_test_hooks(vitascope::export::sheet::TestHooks {
+            on_cell: Some(Arc::new(move |i, t, at| s.lock().unwrap().push((i, t, at)))),
+            ..Default::default()
+        });
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert_eq!(osd, "已儲存縮圖總覽圖：mkv_multitrack 縮圖 (2).png");
+    let cells = seen.lock().unwrap().clone();
+    assert_eq!(cells.len(), 6, "{cells:?}");
+    let gap = 4.0 / 7.0;
+    for (n, &(i, t, at)) in cells.iter().enumerate() {
+        assert_eq!(i, n);
+        assert!(
+            (t - (2.0 + gap * (n + 1) as f64)).abs() < 1e-6,
+            "第 {i} 格的目標 {t}：{cells:?}"
+        );
+        let at = at.unwrap_or_else(|| panic!("第 {i} 格取不到：{cells:?}"));
+        assert!((at - t).abs() <= gap / 2.0 + 0.01, "第 {i} 格：目標 {t}，實際 {at}");
+    }
+    assert_eq!(
+        dir_names(&gifs),
+        ["mkv_multitrack 縮圖 (2).png", "mkv_multitrack 縮圖.png"]
+    );
+    // 分頁：GIF（範圍、大小）、片段都還在
+    h.get_by_label("GIF").click();
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+    assert!(h.query_by_label("欄數").is_none());
+    h.get_by_label("縮圖總覽圖").click();
+    h.run_steps(3);
+    h.get_by_label("欄數");
+
+    // 換檔：「只取 A-B」回到沒勾（新的檔案設定了 A-B 也一樣，要再勾一次）
+    let ab_label = "只取 A-B 段落";
+    assert_eq!(
+        h.query_all_by_label_contains(ab_label)
+            .next()
+            .unwrap()
+            .accesskit_node()
+            .toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "換檔前還勾著"
+    );
+    let next = sample("common/mp4_h264_aac.mp4");
+    h.state_mut().player_mut().open(&next.to_string_lossy()).unwrap();
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.state().player().set_ab_loop(Some(1.0), Some(3.0)).unwrap();
+    wait_ab(&mut h, "新的檔案 A-B 1–3 秒", [Some(1.0), Some(3.0)]);
+    h.run_steps(2);
+    let ab_label = "只取 A-B 段落（00:00:01.000 – 00:00:03.000）";
+    assert!(!h.get_by_label(ab_label).accesskit_node().is_disabled());
+    assert_eq!(
+        h.get_by_label(ab_label).accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False),
+        "換檔後不再只取 A-B"
+    );
+    assert_eq!(field_value(&h, "檔名"), "mp4_h264_aac 縮圖");
+}
+
+#[test]
+fn export_sheet_hdr_note_names_the_curve_it_uses() {
+    // 預設的「自動」：FFmpeg 的 tonemap 沒有，總覽圖用 Hable（跟 GIF 一樣，不說跟「畫質 → HDR」一樣）
+    let hdr = "general/mkv_hevc10_hdr10_mid.mkv";
+    let (_dir, _gifs, _path, mut h) = gif_harness("export-sheet-hdr-auto", hdr);
+    let caps = h.state().engine_caps();
+    if !(caps.zscale && caps.tonemap) {
+        eprintln!("略過：這個播放引擎沒有 zscale、tonemap");
+        return;
+    }
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    open_sheet_window(&mut h);
+    h.get_by_label(
+        "HDR 影片會轉成一般畫面（Hable，目標亮度 203 nits）；「畫質 → HDR」的曲線「自動」總覽圖做不到，改用 Hable",
+    );
+    assert!(h.query_by_label_contains("跟「畫質 → HDR」一樣").is_none());
+    drop(h);
+    // FFmpeg 也有的曲線（Mobius）：照設定，說一樣
+    let dir = TempDir::new("export-sheet-hdr-mobius");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.image_dir = Some(dir.0.join("gifs"));
+    settings.video.tone.curve = vitascope::picture::ToneCurve::Mobius;
+    settings.video.tone.target_peak = Some(100);
+    let mut h = harness_with(Some(sample(hdr)), settings);
+    settle(&mut h, "mkv_hevc10_hdr10_mid.mkv");
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    open_sheet_window(&mut h);
+    h.get_by_label("HDR 影片會轉成一般畫面（Mobius，目標亮度 100 nits，跟「畫質 → HDR」一樣）");
+    assert!(h.query_by_label_contains("做不到").is_none());
+}
+
+#[test]
+fn export_sheet_rows_are_capped_and_disabled_reasons() {
+    // 直拍影片、一欄、3840 寬：每格最高 1280，整張圖最高 16384 → 列數變少，說明為什麼
+    let dir = TempDir::new("export-sheet-caps");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.image_dir = Some(dir.0.join("gifs"));
+    settings.export.sheet.columns = 1;
+    settings.export.sheet.rows = 20;
+    settings.export.sheet.width = 3840;
+    let mut h = harness_with(Some(sample("common/mov_hevc_aac_rot90.mov")), settings);
+    settle(&mut h, "mov_hevc_aac_rot90.mov");
+    open_sheet_window(&mut h);
+    let rows: u32 = combo_value(&h, "列數").parse().unwrap();
+    assert!((2..20).contains(&rows), "列數 {rows}");
+    h.get_by_label_contains(&format!("這個寬度、欄數最多 {rows} 列"));
+    let size = h
+        .query_all_by_label_contains("→ ")
+        .find_map(|n| {
+            let node = n.accesskit_node();
+            node.label()
+                .map(|l| l.to_string())
+                .or_else(|| node.value().map(|v| v.to_string()))
+        })
+        .expect("沒有顯示大小");
+    let (w, hgt) = size.trim_start_matches("→ ").split_once('×').unwrap();
+    let (w, hgt): (u32, u32) = (w.parse().unwrap(), hgt.parse().unwrap());
+    assert!(hgt <= vitascope::export::sheet::MAX_HEIGHT && w < 3840, "{size}");
+    // 設定裡的列數不變（換成多欄時還是 20 列）
+    assert_eq!(h.state().settings().export.sheet.rows, 20);
+    pick_combo(&mut h, "欄數", "10");
+    assert_eq!(combo_value(&h, "列數"), "20");
+    assert!(h.query_by_label_contains("這個寬度、欄數最多").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // 只有聲音的檔案：「縮圖總覽圖…」停用並說明
+    drop_file(&mut h, sample("general/audio_mp3_cover.mp3"));
+    step_until(&mut h, "開始播放 mp3", |s| {
+        playing(s, "audio_mp3_cover.mp3") && !s.tracks.is_empty()
+    });
+    h.run_steps(5);
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "縮圖總覽圖…");
+    assert!(h.get_by_label("縮圖總覽圖…").accesskit_node().is_disabled());
+    h.get_by_label("縮圖總覽圖…").hover();
+    let start = Instant::now();
+    while h.query_by_label("這個檔案沒有影像").is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「縮圖總覽圖…」上沒有出現說明");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn export_sheet_cancel_one_at_a_time_and_exit() {
+    let (_dir, gifs, _path, mut h) = gif_harness("export-sheet-cancel", "common/mp4_long.mp4");
+    let (mut first, hook) = gate();
+    h.state_mut()
+        .set_export_sheet_test_hooks(sheet_gate_after_first_cell(hook));
+    open_sheet_window(&mut h);
+    click_in_view(&mut h, "開始匯出");
+    first.wait(&mut h);
+    assert!(h.state().export_busy());
+    // 進度：擷取畫面（第一格取完、還沒回報）
+    h.get_by_label_contains("擷取畫面 0/20");
+    // 一次只做一個：縮圖總覽圖、GIF 的開始都停用
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "正在匯出，請等這一個做完");
+    h.get_by_label("GIF").click();
+    h.run_steps(3);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    // 擷取中可以取消
+    assert!(!h.get_by_label("取消匯出").accesskit_node().is_disabled());
+    click_in_view(&mut h, "取消匯出");
+    first.release();
+    wait_export_done(&mut h);
+    assert_eq!(h.state().osd_text(), Some("已取消匯出"));
+    assert!(dir_names(&gifs).is_empty(), "取消後不留檔案：{:?}", dir_names(&gifs));
+
+    // 關閉影戲（丟掉整個 App）時還在擷取：取消（停在下一格之前），不會留下檔案
+    let (mut second, hook) = gate();
+    let gated = sheet_gate_after_first_cell(hook).on_cell.unwrap();
+    let cells = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // 背景工作的執行緒結束時，它帶著的觀察點（和這個）跟著丟掉：看得出工作真的結束了
+    let alive = Arc::new(());
+    let job_alive = Arc::downgrade(&alive);
+    let counted = cells.clone();
+    h.state_mut()
+        .set_export_sheet_test_hooks(vitascope::export::sheet::TestHooks {
+            on_cell: Some(Arc::new(move |i, t, at| {
+                let _ = &alive;
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                gated(i, t, at);
+            })),
+            ..Default::default()
+        });
+    h.get_by_label("縮圖總覽圖").click();
+    h.run_steps(3);
+    click_in_view(&mut h, "開始匯出");
+    second.wait(&mut h);
+    drop(h);
+    second.release();
+    // 等背景工作結束（慢的電腦也夠久），途中、結束後都沒有檔案，而且第一格之後一格都沒再取
+    let start = Instant::now();
+    while job_alive.upgrade().is_some() {
+        assert!(start.elapsed() < EXPORT_TIMEOUT, "關閉後背景工作沒有結束");
+        assert!(dir_names(&gifs).is_empty(), "關閉後留下檔案：{:?}", dir_names(&gifs));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(dir_names(&gifs).is_empty(), "關閉後留下檔案：{:?}", dir_names(&gifs));
+    assert_eq!(
+        cells.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "關閉時沒有取消：又取了別的格子"
+    );
+}
+
+#[test]
+fn export_sheet_command_menu_shortcut_and_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("export-sheet".into(), vec!["F10".into()]);
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    // 選單上的按鍵從快捷鍵對照表來
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "縮圖總覽圖… F10");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 快捷鍵打開在縮圖總覽圖分頁
+    h.key_press(egui::Key::F10);
+    step_until_app(&mut h, "F10 打開匯出視窗", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("欄數");
+    // 「設定 → 截圖與匯出」：縮圖總覽圖也存在 GIF 資料夾
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_settings_page(&mut h, "截圖與匯出");
+    h.get_by_label_contains("縮圖總覽圖也存在這裡");
+
+    // 英文介面
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Thumbnail sheet…");
+    h.get_by_label("Thumbnail sheet…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    for label in [
+        "Columns",
+        "Rows",
+        "Width",
+        "Timestamps",
+        "Header (name, size, length, format)",
+        "Only the A-B range",
+        "Image format",
+        "Quality",
+        "Start export",
+        "Thumbnail sheet",
+    ] {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("找不到 {label}"));
+    }
+    h.get_by_label("20 pictures");
+    // 整句（一個空格接下一句，不是一大段空白）
+    h.get_by_label(
+        "Rotation and flips follow the picture; image adjustments, shaders, zoom and crop are not applied. \
+         Each timestamp is the picture's actual time.",
+    );
+    assert_eq!(field_value(&h, "File name"), "mp4_h264_aac thumbnails");
+}

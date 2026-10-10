@@ -245,12 +245,13 @@ fn bad_hook_continue_never_reaches_mpv() {
     // 對照組：mpv 的錯誤紀錄確實會從 wait_event 收到（不然下面「沒有紀錄」的檢查一定通過）
     mpv.command(&["loadfile", "av://lavfi:no_such_filter_vitascope"])
         .unwrap();
-    wait_event(
-        &mpv,
-        "error log",
-        |e| matches!(e, Event::Log { level, .. } if level == "error"),
-    );
-    wait_event(&mpv, "EndFile", |e| matches!(e, Event::EndFile { .. }));
+    // 兩個都要收到，先後不一定（mpv 先送排著的事件、最後才送記錄：EndFile 常常比錯誤紀錄早到）
+    let (mut error_log, mut end_file) = (false, false);
+    wait_event(&mpv, "error log 與 EndFile", |e| {
+        error_log |= matches!(e, Event::Log { level, .. } if level == "error");
+        end_file |= matches!(e, Event::EndFile { .. });
+        error_log && end_file
+    });
 
     mpv.hook_add(7, "on_load", 0).unwrap();
     mpv.command(&["loadfile", LAVFI]).unwrap();
