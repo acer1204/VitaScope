@@ -2713,6 +2713,7 @@ impl VitascopeApp {
             Command::BookmarkNext => Action::BookmarkStep(1),
             Command::BookmarkList => Action::ToggleBookmarks,
             Command::ExportClip => Action::ShowExport(export_panel::ExportTab::Clip),
+            Command::ExportGif => Action::ShowExport(export_panel::ExportTab::Gif),
         }
     }
 

@@ -268,6 +268,17 @@ def samples() -> list[Sample]:
         # 每 10 秒一個關鍵影格的 TS：用時間跳轉常落在關鍵影格之後（片段匯出要從更前面重讀）
         S("ts_h264_gop10", "general", "ts", X264 + ["-g", "240", "-keyint_min", "240", "-sc_threshold", "0"], AAC,
           "h264", "aac", fmt=["-f", "mpegts"], dur=20, note="20 秒、每 10 秒一個關鍵影格的 TS（片段匯出）"),
+        # 每 0.5 秒一個關鍵影格的 TS（像電視錄影）：用時間跳轉常落在下一個關鍵影格（GIF 要從 A 前面讀）
+        S("ts_h264_gop05", "general", "ts", X264 + ["-g", "12", "-keyint_min", "12", "-sc_threshold", "0"], AAC,
+          "h264", "aac", fmt=["-f", "mpegts"], dur=20, note="20 秒、每 0.5 秒一個關鍵影格的 TS（轉成 GIF）"),
+        # 影像比聲音晚 1.6 秒開始的 TS（電視錄影從 GOP 中間開始）：A 選在影像出來之前時，GIF 不算太短
+        S("ts_h264_late_video", "general", "ts", X264, AAC, "h264", "aac", dur=6,
+          note="影像比聲音晚 1.6 秒開始的 TS（轉成 GIF）", custom=[
+              "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24:duration=4.4",
+              "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=6",
+              "-map", "0:v", "-map", "1:a", "-vf", "setpts=PTS+1.6/TB", "-fps_mode", "passthrough",
+              *X264, *AAC, "-f", "mpegts",
+          ]),
         # 每 30 秒一個關鍵影格：A 之前的關鍵影格在讀取起點前面很遠（片段匯出往前讀的秒數）
         S("mkv_h264_gop30", "general", "mkv", X264 + ["-g", "720", "-keyint_min", "720", "-sc_threshold", "0"], AAC,
           "h264", "aac", dur=75, note="75 秒、每 30 秒一個關鍵影格（片段匯出）"),

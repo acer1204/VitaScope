@@ -613,12 +613,12 @@ fn any_picks(state: &crate::player::State) -> Picks {
     }
 }
 
-/// 從主播放器看到的：要開什麼
-struct Inspected {
-    source: Source,
+/// 從主播放器看到的：要開什麼（片段、GIF 共用）
+pub(super) struct Inspected {
+    pub(super) source: Source,
     /// 來源的路徑（本機檔案是檔案的路徑，`file://` 已經換成路徑）或網址
-    path: String,
-    file_format: String,
+    pub(super) path: String,
+    pub(super) file_format: String,
 }
 
 /// `file://` 網址 → 本機的路徑；其他的照原樣
@@ -633,6 +633,12 @@ fn inspect(player: &Player, caps: &EngineCaps) -> Result<Inspected, Failure> {
     if !caps.dump_cache {
         return Err(Failure::NoDump);
     }
+    inspect_source(player)
+}
+
+/// 主播放器目前的檔案要怎麼另外打開（不管播放引擎的功能）：直播、不能跳轉的網路影片、
+/// 時間跟檔案對不上的來源（章節連結、EDL、CUE）回傳原因
+pub(super) fn inspect_source(player: &Player) -> Result<Inspected, Failure> {
     let st = &player.state;
     let path = st.path.clone().filter(|_| st.loaded).ok_or(Failure::NoData)?;
     let file_format = player.get_string("file-format").unwrap_or_default();
@@ -941,7 +947,7 @@ pub fn run(ctl: &Ctl, spec: ClipSpec) -> Result<Done, Failure> {
 }
 
 /// 本機檔案還在、讀得到（網路磁碟可能很慢：在背景執行緒）
-fn check_local(path: &Path) -> Result<(), Failure> {
+pub(super) fn check_local(path: &Path) -> Result<(), Failure> {
     // mpv 自己開的其他路徑（av://、bd://…）不檢查；file:// 網址換成路徑
     let text = path.to_string_lossy();
     if text.contains("://") && !text.to_ascii_lowercase().starts_with("file://") {

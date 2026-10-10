@@ -1,6 +1,6 @@
 //! 匯出（片段、GIF、縮圖總覽圖）：背景工作的取消與暫存檔、兩個工作同名不衝突、寫好之後重新打開檢查、
 //! mpv 的記錄對應到原因、片段（不重新編碼：關鍵影格對齊、各種格式、只有聲音、旋轉、磁碟快取、
-//! 網路影片）（headless：不出畫面、不出聲音，三個平台的 CI 都跑；網路只連本機的測試伺服器 127.0.0.1）。
+//! 網路影片）、GIF（EDL 的一段、TS 從 A 那一格開始、大小、轉正、HDR、燒進字幕、濾鏡失敗、取消）（headless：不出畫面、不出聲音，三個平台的 CI 都跑；網路只連本機的測試伺服器 127.0.0.1）。
 //!
 //! 只看 mpv 自己的訊息：FFmpeg 的記錄只送到第一個建立的 mpv，這裡不檢查 FFmpeg 的文字
 
@@ -13,15 +13,19 @@ use std::time::{Duration, Instant};
 use support::fake_ytdl::{FakeResolver, site_video_json};
 use support::http::Server;
 use vitascope::export::clip::{self, ClipSpec, Container, Source, StreamPick};
+use vitascope::export::gif::{self, GifSpec};
 use vitascope::export::{
-    self, ClipFormat, Done, Expect, Failure, Job, JobEvent, Kind, LogLine, LogTail, Note, Phase, Progress,
+    self, ClipFormat, Done, Expect, Failure, GifPrefs, Job, JobEvent, Kind, LogLine, LogTail, Note, Phase, Progress,
     map_mpv_error, verify_media,
 };
+use vitascope::geometry::Geometry;
 use vitascope::instance::Wake;
 use vitascope::mpv::{Event, Mpv};
 use vitascope::net::{self, NetSettings};
+use vitascope::picture::{Deinterlace, ToneSettings};
 use vitascope::player::{EngineCaps, Options, Player, PlayerEvent, Track, TrackKind};
 use vitascope::save;
+use vitascope::settings::SubStyle;
 use vitascope::ytdl::Resolve;
 
 /// CI 的機器比開發的電腦慢很多：等條件成立，給足時間
@@ -1708,4 +1712,1334 @@ fn write_error_maps_to_disk_full() {
         assert!(msg.contains("磁碟空間") && msg.contains("無法寫入"), "{msg}");
     }
     assert_eq!(clip::dump_result(Ok(()), &[]), Ok(()));
+}
+
+// ───────────── GIF ─────────────
+
+/// 播放引擎能不能轉 GIF（Linux 的系統 libmpv 不一定有 gif 編碼器、palettegen）：不能時略過這個測試
+fn gif_engine(caps: &EngineCaps, test: &str) -> bool {
+    if caps.gif && caps.palettegen {
+        return true;
+    }
+    eprintln!(
+        "略過 {test}：播放引擎不能轉 GIF（gif 編碼器 {}、palettegen {}）",
+        caps.gif, caps.palettegen
+    );
+    false
+}
+
+fn gif_prefs(long_side: u32, fps: u32, subtitles: bool) -> GifPrefs {
+    GifPrefs {
+        long_side,
+        fps,
+        subtitles,
+    }
+}
+
+/// 等主播放器解出第一格（之前不知道檔案本身的旋轉、像素比例，不能轉 GIF）。直接問 mpv，不用等屬性通知
+fn wait_first_frame(p: &Player) {
+    let start = Instant::now();
+    while p.natural_shape().is_none() {
+        assert!(start.elapsed() < TIMEOUT, "主播放器一直沒有解出第一格");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// 從主播放器準備一個 GIF（設定用預設的：HDR、字幕外觀、去交錯）。先等第一格解出來
+fn gif_spec_with(
+    p: &Player,
+    caps: &EngineCaps,
+    a: f64,
+    b: f64,
+    prefs: GifPrefs,
+    geometry: &Geometry,
+    dirs: &(PathBuf, PathBuf),
+) -> Result<GifSpec, Failure> {
+    wait_first_frame(p);
+    let tone = ToneSettings::default();
+    let style = SubStyle::default();
+    let choice = gif::Choice {
+        prefs,
+        geometry,
+        tone: &tone,
+        style: &style,
+        deinterlace: Deinterlace::Auto,
+    };
+    GifSpec::from_player(p, caps, a, b, &choice, dirs.0.clone(), dirs.1.clone())
+}
+
+fn gif_spec(p: &Player, caps: &EngineCaps, a: f64, b: f64, prefs: GifPrefs, dirs: &(PathBuf, PathBuf)) -> GifSpec {
+    gif_spec_with(p, caps, a, b, prefs, &Geometry::default(), dirs).unwrap_or_else(|f| panic!("不能轉 GIF：{f:?}"))
+}
+
+/// 轉這個 GIF，等到結束
+fn export_gif(spec: GifSpec) -> Result<Done, Failure> {
+    wait_job(&gif::spawn(spec, no_wake()))
+}
+
+/// 等到工作結束（片段、GIF 的工作很慢：CI 的機器上給足時間）
+fn wait_job(job: &Job) -> Result<Done, Failure> {
+    let deadline = Instant::now() + CLIP_TIMEOUT;
+    loop {
+        assert!(Instant::now() < deadline, "等不到匯出結束");
+        match job.try_recv() {
+            Some(JobEvent::Finished(r)) => return r,
+            Some(JobEvent::Progress(_)) => {}
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// GIF 的一格（RGBA，畫到整張畫布上之後的樣子）
+struct GifFrames {
+    w: usize,
+    h: usize,
+    frames: Vec<Vec<u8>>,
+}
+
+/// LZW 解壓縮（GIF 的影像資料：從低位元開始讀、碼長從最小碼長 + 1 開始、最長 12 位元）
+fn lzw_decode(min_code: u8, data: &[u8]) -> Vec<u8> {
+    let clear = 1usize << min_code;
+    let eoi = clear + 1;
+    let reset = || -> Vec<Vec<u8>> {
+        let mut d: Vec<Vec<u8>> = (0..clear).map(|i| vec![i as u8]).collect();
+        d.push(Vec::new());
+        d.push(Vec::new());
+        d
+    };
+    let mut dict = reset();
+    let mut size = min_code as u32 + 1;
+    let (mut bits, mut nbits, mut pos) = (0u32, 0u32, 0usize);
+    let mut prev: Option<usize> = None;
+    let mut out = Vec::new();
+    loop {
+        while nbits < size {
+            let Some(&b) = data.get(pos) else { return out };
+            bits |= u32::from(b) << nbits;
+            nbits += 8;
+            pos += 1;
+        }
+        let code = (bits & ((1 << size) - 1)) as usize;
+        bits >>= size;
+        nbits -= size;
+        if code == clear {
+            dict = reset();
+            size = min_code as u32 + 1;
+            prev = None;
+            continue;
+        }
+        if code == eoi {
+            return out;
+        }
+        let entry = match (code < dict.len(), prev) {
+            (true, _) => dict[code].clone(),
+            (false, Some(p)) if code == dict.len() => {
+                let mut e = dict[p].clone();
+                e.push(dict[p][0]);
+                e
+            }
+            _ => return out,
+        };
+        out.extend_from_slice(&entry);
+        if let Some(p) = prev
+            && dict.len() < 4096
+        {
+            let mut e = dict[p].clone();
+            e.push(entry[0]);
+            dict.push(e);
+        }
+        if dict.len() == 1 << size && size < 12 {
+            size += 1;
+        }
+        prev = Some(code);
+    }
+}
+
+/// 解開整個 GIF（每一格都畫到畫布上，處理透明色與處置方式）
+fn decode_gif(data: &[u8]) -> GifFrames {
+    assert!(data.starts_with(b"GIF89a"), "不是 GIF89a");
+    let w = u16::from_le_bytes([data[6], data[7]]) as usize;
+    let h = u16::from_le_bytes([data[8], data[9]]) as usize;
+    let mut i = 13;
+    let palette = |at: usize, flags: u8| -> Vec<[u8; 3]> {
+        let n = 1usize << ((flags & 7) + 1);
+        (0..n)
+            .map(|k| [data[at + k * 3], data[at + k * 3 + 1], data[at + k * 3 + 2]])
+            .collect()
+    };
+    let global = if data[10] & 0x80 != 0 {
+        let p = palette(13, data[10]);
+        i += p.len() * 3;
+        p
+    } else {
+        Vec::new()
+    };
+    let sub_blocks = |mut i: usize| -> (Vec<u8>, usize) {
+        let mut v = Vec::new();
+        while data[i] != 0 {
+            let n = data[i] as usize;
+            v.extend_from_slice(&data[i + 1..i + 1 + n]);
+            i += n + 1;
+        }
+        (v, i + 1)
+    };
+    let mut canvas = vec![0u8; w * h * 4];
+    let mut frames = Vec::new();
+    let (mut transparent, mut disposal) = (None, 0u8);
+    loop {
+        match data[i] {
+            0x21 => {
+                if data[i + 1] == 0xF9 {
+                    let flags = data[i + 3];
+                    disposal = (flags >> 2) & 7;
+                    transparent = (flags & 1 != 0).then_some(data[i + 6]);
+                }
+                i = sub_blocks(i + 2).1;
+            }
+            0x2c => {
+                let x = u16::from_le_bytes([data[i + 1], data[i + 2]]) as usize;
+                let y = u16::from_le_bytes([data[i + 3], data[i + 4]]) as usize;
+                let fw = u16::from_le_bytes([data[i + 5], data[i + 6]]) as usize;
+                let fh = u16::from_le_bytes([data[i + 7], data[i + 8]]) as usize;
+                let flags = data[i + 9];
+                assert_eq!(flags & 0x40, 0, "交錯的 GIF（FFmpeg 不會寫）");
+                i += 10;
+                let colors = if flags & 0x80 != 0 {
+                    let p = palette(i, flags);
+                    i += p.len() * 3;
+                    p
+                } else {
+                    global.clone()
+                };
+                let min_code = data[i];
+                let (lzw, next) = sub_blocks(i + 1);
+                i = next;
+                let before = canvas.clone();
+                let indices = lzw_decode(min_code, &lzw);
+                for (k, &idx) in indices.iter().enumerate().take(fw * fh) {
+                    if Some(idx) == transparent {
+                        continue;
+                    }
+                    let (px, py) = (x + k % fw, y + k / fw);
+                    if px < w && py < h {
+                        let c = colors[idx as usize];
+                        canvas[(py * w + px) * 4..][..4].copy_from_slice(&[c[0], c[1], c[2], 255]);
+                    }
+                }
+                frames.push(canvas.clone());
+                match disposal {
+                    2 => {
+                        for py in y..(y + fh).min(h) {
+                            for px in x..(x + fw).min(w) {
+                                canvas[(py * w + px) * 4..][..4].fill(0);
+                            }
+                        }
+                    }
+                    3 => canvas = before,
+                    _ => {}
+                }
+                transparent = None;
+                disposal = 0;
+            }
+            0x3b => break,
+            b => panic!("GIF 格式不對：位置 {i} 是 0x{b:02x}"),
+        }
+    }
+    GifFrames { w, h, frames }
+}
+
+fn read_gif(path: &Path) -> GifFrames {
+    decode_gif(&std::fs::read(path).unwrap())
+}
+
+/// 一格裡某些列的平均亮度（0–255）
+fn band_luma(g: &GifFrames, frame: usize, rows: std::ops::Range<usize>) -> f64 {
+    let f = &g.frames[frame];
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for y in rows {
+        for x in 0..g.w {
+            let p = &f[(y * g.w + x) * 4..][..3];
+            sum += 0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2]);
+            n += 1.0;
+        }
+    }
+    sum / n
+}
+
+/// 兩個一樣大的 GIF 的同一格，某些列裡差很多（亮度差 64 以上）的像素有多少比例
+fn band_changed(a: &GifFrames, b: &GifFrames, frame: usize, rows: std::ops::Range<usize>) -> f64 {
+    assert_eq!((a.w, a.h), (b.w, b.h));
+    let luma = |p: &[u8]| 0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2]);
+    let mut changed = 0.0;
+    let mut n = 0.0;
+    for y in rows {
+        for x in 0..a.w {
+            let k = (y * a.w + x) * 4;
+            if (luma(&a.frames[frame][k..k + 3]) - luma(&b.frames[frame][k..k + 3])).abs() > 64.0 {
+                changed += 1.0;
+            }
+            n += 1.0;
+        }
+    }
+    changed / n
+}
+
+/// 兩張一樣大的圖每個像素的平均差（0–255）
+fn mean_diff(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let sum: f64 = a
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(b.as_chunks::<4>().0)
+        .map(|(p, q)| (0..3).map(|c| (f64::from(p[c]) - f64::from(q[c])).abs()).sum::<f64>() / 3.0)
+        .sum();
+    sum / (a.len() / 4) as f64
+}
+
+#[test]
+fn gif_range_size_and_edl() {
+    let (p, caps) = main_player(&sample_str("common/mkv_multitrack.mkv"));
+    if !gif_engine(&caps, "gif_range_size_and_edl") {
+        return;
+    }
+    let dirs = clip_dirs("gif-range");
+    let mut spec = gif_spec(&p, &caps, 1.0, 2.5, gif_prefs(320, 10, false), &dirs);
+    assert_eq!(spec.out, (320, 180));
+    assert_eq!(spec.graph.palette, gif::PaletteMode::Global);
+    assert!(spec.sub.is_none() && !spec.graph.subtitles);
+    // 編碼用的 mpv 開的是只有這一段的 EDL：長度就是 B − A（讀到 B 就結束，不會一路解碼到檔尾）
+    let seen: Arc<Mutex<Option<(f64, String)>>> = Arc::default();
+    let s = seen.clone();
+    spec.test.on_ready = Some(Arc::new(move |mpv: &Mpv| {
+        *s.lock().unwrap() = Some((
+            mpv.get_property::<f64>("duration").unwrap_or(-1.0),
+            mpv.get_string("path").unwrap_or_default(),
+        ));
+    }));
+    let done = export_gif(spec).unwrap();
+    let (duration, path) = seen.lock().unwrap().clone().expect("編碼用的 mpv 沒有開好");
+    assert!((duration - 1.5).abs() < 0.05, "EDL 的長度 {duration}");
+    assert!(path.starts_with("edl://"), "{path}");
+    assert_eq!(done.kind, Kind::Gif);
+    assert_eq!(done.path, dirs.0.join("mkv_multitrack 00.00.01-00.00.02.gif"));
+    assert_eq!(done.actual, None);
+    assert!(done.notes.is_empty(), "{:?}", done.notes);
+    let data = std::fs::read(&done.path).unwrap();
+    assert_eq!(done.bytes, data.len() as u64);
+    let info = gif::gif_info(&data).expect("不是完整的 GIF");
+    assert!(data.starts_with(b"GIF89a"));
+    assert_eq!((info.width, info.height), (320, 180));
+    assert!((14..=16).contains(&info.frames), "{} 格", info.frames);
+    assert!((info.seconds() - 1.5).abs() <= 0.15, "總長 {} 秒", info.seconds());
+    // 每一格都有畫面（testsrc2 不是全黑）
+    let g = decode_gif(&data);
+    assert_eq!(g.frames.len(), info.frames);
+    for k in 0..g.frames.len() {
+        assert!(band_luma(&g, k, 0..g.h) > 20.0, "第 {k} 格是黑的");
+    }
+    assert_eq!(names(&dirs.0), ["mkv_multitrack 00.00.01-00.00.02.gif"], "不留暫存檔");
+    // 每格一個色盤（畫面很大、很長時）：一樣是完整的 GIF
+    let mut spec = gif_spec(&p, &caps, 1.0, 2.0, gif_prefs(320, 10, false), &dirs);
+    spec.graph.palette = gif::PaletteMode::PerFrame;
+    spec.stem = "per-frame".into();
+    let done = export_gif(spec).unwrap();
+    let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
+    assert_eq!((info.width, info.height), (320, 180));
+    assert!((9..=11).contains(&info.frames), "{} 格", info.frames);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_range_follows_the_start_time() {
+    // TS 的時間戳不是從 0 開始（FFmpeg 寫 TS 時從 1.4 秒左右開始）：A、B 是主播放器的播放時間，
+    // EDL 是影片的時間戳，要加上主播放器的 demuxer-start-time，GIF 才是畫面上看到的那一段。
+    // TS 跳轉不準：A 離開頭不到 5 秒，EDL 從影片的時間戳 0 開始讀，再精確跳到 EDL 的 0.5 + 開始時間（A）。
+    // 沒有換算時跳到 0.5 秒，影片在 1.4 秒才開始：GIF 從頭開始，多了將近 1 秒
+    let (p, caps) = main_player(&sample_str("general/ts_mpeg2_interlaced.ts"));
+    if !gif_engine(&caps, "gif_range_follows_the_start_time") {
+        return;
+    }
+    let offset = p.demuxer_start_time();
+    assert!(offset > 0.5, "TS 的開始時間 {offset}：測不到換算");
+    let dirs = clip_dirs("gif-start-time");
+    let mut spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    assert!(spec.approx_seek, "TS 的跳轉不準");
+    let seen = seen_plan(&mut spec);
+    let done = export_gif(spec);
+    let plan = seen.lock().unwrap().clone().expect("編碼用的 mpv 沒有開好");
+    assert_eq!(plan.edl_start(), 0.0, "從頭讀：{}", plan.path);
+    let start = plan.start.unwrap_or_else(|| panic!("沒有精確跳到 A：{plan:?}"));
+    assert!(
+        (start - (0.5 + offset)).abs() < 1e-3,
+        "跳到 EDL 的 {start}，應該是 0.5 + {offset}"
+    );
+    let info = gif::gif_info(&std::fs::read(done.unwrap().path).unwrap()).unwrap();
+    // 從 A 開始、到 B 結束：1 秒、10 fps
+    assert!((9..=11).contains(&info.frames), "{} 格", info.frames);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// 編碼用的 mpv 怎麼開的（開好時讀的）
+#[derive(Debug, Clone)]
+struct SeenPlan {
+    path: String,
+    /// `start` 選項（精確跳到 A；None = 不跳）
+    start: Option<f64>,
+    duration: f64,
+    /// 濾鏡（`vf`）
+    vf: String,
+}
+
+impl SeenPlan {
+    /// EDL 從影片的哪個時間戳開始
+    fn edl_start(&self) -> f64 {
+        self.path
+            .rsplit_once(",start=")
+            .and_then(|(_, rest)| rest.split(',').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("EDL 沒有 start：{}", self.path))
+    }
+}
+
+/// 記下編碼用的 mpv 怎麼開的
+fn seen_plan(spec: &mut GifSpec) -> Arc<Mutex<Option<SeenPlan>>> {
+    let seen: Arc<Mutex<Option<SeenPlan>>> = Arc::default();
+    let s = seen.clone();
+    spec.test.on_ready = Some(Arc::new(move |mpv: &Mpv| {
+        *s.lock().unwrap() = Some(SeenPlan {
+            path: mpv.get_string("path").unwrap_or_default(),
+            start: mpv.get_string("start").ok().and_then(|v| v.parse().ok()),
+            duration: mpv.get_property::<f64>("duration").unwrap_or(-1.0),
+            vf: mpv.get_string("vf").unwrap_or_default(),
+        });
+    }));
+    seen
+}
+
+/// 主播放器精確跳到 `t` 秒（等停住的那一格解好），回傳畫面上那一格的時間與截圖（原始大小的 RGBA）
+fn main_frame(p: &mut Player, t: f64, dir: &Path) -> (f64, vitascope::screenshot::Image) {
+    p.seek_to(t, true).unwrap();
+    // 等這次跳轉做完、停住的那一格解好：跳轉中的 time-pos 是目標，不是畫面上的那一格；
+    // 之前排著的 PlaybackRestart（開檔、上一次跳轉）也不算，所以每次都問 mpv 還在不在跳轉
+    let start = Instant::now();
+    let pos = loop {
+        let left = TIMEOUT.saturating_sub(start.elapsed());
+        p.wait_for(left, |e| *e == PlayerEvent::PlaybackRestart)
+            .unwrap_or_else(|e| panic!("主播放器跳不到 {t}：{e}"));
+        let seeking = p.get_string("seeking").map_or(true, |v| v != "no");
+        let pos = p.get_f64("time-pos").unwrap_or(f64::NAN);
+        if !seeking && pos >= t - 0.01 && pos < t + 0.1 {
+            break pos;
+        }
+    };
+    std::fs::create_dir_all(dir).unwrap();
+    let png = dir.join(format!("main-{t}.png"));
+    let id = 7000 + (t * 1000.0) as u64;
+    p.screenshot_to_file(id, &png.to_string_lossy(), false).unwrap();
+    match p.wait_for(
+        TIMEOUT,
+        |e| matches!(e, PlayerEvent::CommandReply { id: i, .. } if *i == id),
+    ) {
+        Ok(PlayerEvent::CommandReply { error: None, .. }) => {}
+        other => panic!("主播放器截圖失敗：{other:?}"),
+    }
+    let img = vitascope::screenshot::decode_png(&png).unwrap();
+    std::fs::remove_file(&png).unwrap();
+    (pos, img)
+}
+
+/// 開 TS 的主播放器（參考用）：主播放器自己精確跳轉時也一樣會落在 A 之後的關鍵影格、檔尾（沒有快取時），
+/// 參考的畫面要準，分離器一律從開頭之前讀起（測試的檔案都很短）
+fn ts_main_player(rel: &str) -> (Player, EngineCaps) {
+    let opts = Options {
+        extra: vec![
+            ("pause".into(), "yes".into()),
+            ("hr-seek-demuxer-offset".into(), "60".into()),
+        ],
+        ..Options::headless()
+    };
+    main_player_with(opts, &sample_str(rel))
+}
+
+/// 縮成 `w`×`h`（每個像素取對應範圍的平均）：主播放器的截圖是原始大小，GIF 縮小過
+fn shrink(img: &vitascope::screenshot::Image, w: usize, h: usize) -> Vec<u8> {
+    if (img.w, img.h) == (w, h) {
+        return img.rgba.clone();
+    }
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let (y0, y1) = (y * img.h / h, ((y + 1) * img.h / h).max(y * img.h / h + 1));
+        for x in 0..w {
+            let (x0, x1) = (x * img.w / w, ((x + 1) * img.w / w).max(x * img.w / w + 1));
+            let mut sum = [0u64; 4];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        *s += u64::from(img.rgba[(sy * img.w + sx) * 4 + c]);
+                    }
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u64;
+            for c in 0..4 {
+                out[(y * w + x) * 4 + c] = (sum[c] / n) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// 跳轉不準的格式（TS、M2TS、MPEG-PS）轉 GIF：第一格是主播放器在 A 的那一格（不是 A 之後的關鍵影格、
+/// 也不是下一格），長度是 B − A。每個 `(t, lead)` 轉一個 1 秒的 GIF：`t` = 要的 A（主播放器精確跳過去，
+/// A 是停住的那一格的時間），`lead` = EDL 從 A 前面幾秒開始（None = 從頭讀）。`out` = GIF 的大小（長邊 320）
+fn check_ts_gif(rel: &str, out: (u32, u32), cases: &[(f64, Option<f64>)]) {
+    let name = format!("gif-ts-{}", rel.replace(['/', '.'], "-"));
+    let (mut p, caps) = ts_main_player(rel);
+    if !gif_engine(&caps, &name) {
+        return;
+    }
+    let dirs = clip_dirs(&name);
+    let offset = p.demuxer_start_time();
+    for (k, &(t, lead)) in cases.iter().enumerate() {
+        // 主播放器在 A 的畫面、下一格（GIF 的格率對齊沒有從 A 算起時的樣子）、
+        // 晚半秒的（關鍵影格隔 0.5 秒時，跳轉落在下一個關鍵影格的樣子）
+        let (late_at, late) = main_frame(&mut p, t + 0.5, &dirs.1);
+        let (a, want) = main_frame(&mut p, t, &dirs.1);
+        let (next_at, next) = main_frame(&mut p, a + 0.02, &dirs.1);
+        let (_, end) = main_frame(&mut p, a + 0.9, &dirs.1);
+        let mut spec = gif_spec(&p, &caps, a, a + 1.0, gif_prefs(320, 10, false), &dirs);
+        assert!(spec.approx_seek, "{rel}：跳轉不準的格式");
+        assert_eq!(spec.out, out, "{rel}");
+        spec.stem = format!("case-{k}");
+        let seen = seen_plan(&mut spec);
+        let (progress, done) = finish_gif(&gif::spawn(spec, no_wake()));
+        let done = done.unwrap_or_else(|f| panic!("{rel} 在 {a}：{f:?}"));
+        let plan = seen.lock().unwrap().clone().expect("編碼用的 mpv 沒有開好");
+        let at = match lead {
+            // 從 A 前面幾秒開始讀（試跳過，落在 A 之前），再精確跳到 A
+            Some(secs) => {
+                assert!((plan.edl_start() - (a - secs + offset)).abs() < 1e-3, "{rel}：{plan:?}");
+                secs
+            }
+            // 從頭讀（A 離開頭很近，或往前試了還是落在 A 之後）
+            None => {
+                assert_eq!(plan.edl_start(), 0.0, "{rel}：{plan:?}");
+                a + offset
+            }
+        };
+        assert!(plan.start.is_some_and(|s| (s - at).abs() < 1e-3), "{rel}：{plan:?}");
+        // 格率從 A 算起（fps 的 start_time）：A 之前多讀的畫面在濾鏡裡就丟掉，不進色盤
+        assert!(
+            plan.vf
+                .contains(&format!(":start_time={:.6}:", at + gif::HR_SEEK_TOLERANCE)),
+            "{rel}：{}",
+            plan.vf
+        );
+        assert!(plan.duration > 1.0, "{rel}：EDL 的長度 {}", plan.duration);
+        // 進度只往前走（A 之前多讀的部分算 0）
+        let fractions: Vec<f32> = progress
+            .iter()
+            .filter(|p| p.phase == Phase::Converting)
+            .filter_map(|p| p.fraction)
+            .collect();
+        assert!(
+            fractions.windows(2).all(|w| w[0] <= w[1]),
+            "{rel}：進度倒退 {fractions:?}"
+        );
+        let data = std::fs::read(&done.path).unwrap();
+        let info = gif::gif_info(&data).unwrap();
+        assert!((9..=11).contains(&info.frames), "{rel} 在 {a}：{} 格", info.frames);
+        assert!(
+            (info.seconds() - 1.0).abs() <= 0.15,
+            "{rel} 在 {a}：總長 {} 秒",
+            info.seconds()
+        );
+        let g = decode_gif(&data);
+        assert_eq!((g.w, g.h), (out.0 as usize, out.1 as usize));
+        // 色盤只有 256 色：跟同一格也有一點差；下一格差兩倍左右、晚半秒的差更多
+        let first = mean_diff(&g.frames[0], &shrink(&want, g.w, g.h));
+        let vs_next = mean_diff(&g.frames[0], &shrink(&next, g.w, g.h));
+        let vs_late = mean_diff(&g.frames[0], &shrink(&late, g.w, g.h));
+        assert!(
+            first < 8.0 && vs_next > first * 1.3 && vs_late > first * 2.0,
+            "{rel}：第一格跟 A（{a}）的畫面差 {first}、跟下一格（{next_at}）差 {vs_next}、跟 {late_at} 秒的差 {vs_late}"
+        );
+        // 最後一格是 B 前面的畫面（不是更早就結束）
+        let last = mean_diff(&g.frames[g.frames.len() - 1], &shrink(&end, g.w, g.h));
+        assert!(last < 12.0, "{rel}：最後一格跟 {} 秒的畫面差 {last}", a + 0.9);
+    }
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// 等 GIF 的工作結束，收集進度（GIF 比片段慢：給足時間）
+fn finish_gif(job: &Job) -> (Vec<Progress>, Result<Done, Failure>) {
+    let deadline = Instant::now() + CLIP_TIMEOUT;
+    let mut progress = Vec::new();
+    loop {
+        assert!(Instant::now() < deadline, "等不到匯出結束");
+        match job.try_recv() {
+            Some(JobEvent::Progress(p)) => progress.push(p),
+            Some(JobEvent::Finished(r)) => return (progress, r),
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+#[test]
+fn gif_ts_starts_at_the_frame_at_a() {
+    // 只有開頭一個關鍵影格的 TS、M2TS：在 A 跳轉會落到檔尾（以前整個失敗）。A 離開頭很近：從頭讀。
+    // A 在影片時間戳的各種位置（每秒 24 格、GIF 每秒 10 格：1.5 到 1.7 秒是 0.1 秒格線上的五種相位），
+    // 格率沒有從 A 算起時，有一半的位置第一格是 A 的下一格（以前只測到剛好對齊的 1.5 秒）
+    let phases: Vec<(f64, Option<f64>)> = [1.5, 1.55, 1.6, 1.65, 1.7].iter().map(|&t| (t, None)).collect();
+    check_ts_gif("general/ts_h264_aac.ts", (320, 240), &phases);
+    check_ts_gif("general/m2ts_h264_ac3.m2ts", (320, 240), &[(1.5, None), (1.55, None)]);
+}
+
+#[test]
+fn gif_ts_long_gop_reads_from_far_enough_back() {
+    check_ts_gif(
+        "general/ts_h264_gop10.ts",
+        (320, 240),
+        &[
+            // 每 10 秒一個關鍵影格：A = 0 也要從頭讀（剛好跳到第一個時間戳會落到下一個關鍵影格，以前從 10 秒開始）；
+            // 0.05 秒：不在 GIF 的格線上
+            (0.0, None),
+            (0.05, None),
+            // A = 12：在 7 秒試跳，落在開頭的關鍵影格（A 之前），從 A 前面 5 秒讀
+            (12.0, Some(5.0)),
+            // A = 15：在 10 秒試跳，落到檔尾（11.5 秒的關鍵影格之後沒有了）；往前 30 秒已經在開頭之前：從頭讀
+            (15.0, None),
+        ],
+    );
+}
+
+#[test]
+fn gif_ts_short_gop_does_not_lose_a_gop() {
+    // 每 0.5 秒一個關鍵影格（像電視錄影）：在 A 跳轉常落在 A 之後的關鍵影格，以前少了最多 0.5 秒、長度檢查看不出來。
+    // A 在關鍵影格中間：從 A 前面 5 秒讀，再精確跳到 A
+    check_ts_gif("general/ts_h264_gop05.ts", (320, 240), &[(10.3, Some(5.0))]);
+}
+
+#[test]
+fn gif_mpeg_ps_starts_at_the_frame_at_a() {
+    // MPEG-PS（.mpg）、DVD 的 VOB：FFmpeg 一樣用時間戳搜尋（file-format 是 mpeg），走 TS 的做法。
+    // A 離開頭很近：從頭讀。VOB 是 16:9 的變形寬螢幕（720×480）：GIF 是 320×180
+    check_ts_gif("general/mpg_mpeg1_mp2.mpg", (320, 240), &[(1.5, None), (1.62, None)]);
+    check_ts_gif("general/vob_mpeg2_ac3_anamorphic.vob", (320, 180), &[(1.5, None)]);
+}
+
+#[test]
+fn gif_ts_external_subtitles_follow_the_edl_start() {
+    // TS 從頭讀時 EDL 的 0 秒是影片的時間戳 0（主播放器的 −1.46 秒），不是 A：外掛字幕的延遲跟著換算，
+    // GIF 的第 2 格（影片的 1.6 秒）才有字幕檔 1.5 秒起的那一句
+    let (mut p, caps) = ts_main_player("general/ts_h264_gop05.ts");
+    if !gif_engine(&caps, "gif_ts_external_subtitles_follow_the_edl_start") {
+        return;
+    }
+    p.add_subtitle(&sample_str("common/extsub_srt_utf8.srt")).unwrap();
+    p.wait_state(TIMEOUT, |s| s.selected(TrackKind::Sub).is_some_and(|t| t.external))
+        .unwrap();
+    let dirs = clip_dirs("gif-ts-extsub");
+    let spec = gif_spec(&p, &caps, 1.5, 2.5, gif_prefs(320, 10, true), &dirs);
+    assert!(matches!(spec.sub, Some(gif::GifSub::External { .. })), "{:?}", spec.sub);
+    let mut none = spec.clone();
+    none.sub = None;
+    none.graph.subtitles = false;
+    none.stem = "ts-ext-none".into();
+    let mut with = spec;
+    with.stem = "ts-ext".into();
+    let seen = seen_plan(&mut with);
+    let with = read_gif(&export_gif(with).unwrap().path);
+    let without = read_gif(&export_gif(none).unwrap().path);
+    assert_eq!(
+        seen.lock().unwrap().as_ref().map(SeenPlan::edl_start),
+        Some(0.0),
+        "從頭讀"
+    );
+    let h = with.h;
+    let bottom = band_changed(&with, &without, 1, h * 3 / 4..h);
+    let top = band_changed(&with, &without, 1, 0..h / 4);
+    assert!(
+        bottom > 0.01 && bottom > top * 4.0,
+        "外掛字幕：下方 {bottom}、上方 {top}"
+    );
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_ts_subtitles_follow_the_trimmed_grid() {
+    // 從 A 前面讀時 fps 從 A 算起，送出的時間是 1/10 秒的整數倍，比畫面晚一點（最多一格）：字幕延遲跟著加上。
+    // A = 1.443：EDL 的 A 是 1.443 + 1.462 + 0.005 = 2.91，第一格標 3.0 秒（晚 0.09 秒），畫面是主播放器 1.448 秒的。
+    // 字幕檔第二句 1.5 秒開始：第一格沒有字幕、第二格（1.548 秒）有。沒有加上時第一格照 1.538 秒找字幕，早一格出現
+    let (mut p, caps) = ts_main_player("general/ts_h264_gop05.ts");
+    if !gif_engine(&caps, "gif_ts_subtitles_follow_the_trimmed_grid") {
+        return;
+    }
+    let offset = p.demuxer_start_time();
+    assert!((offset - 1.462).abs() < 0.01, "樣本的開始時間 {offset}");
+    p.add_subtitle(&sample_str("common/extsub_srt_utf8.srt")).unwrap();
+    p.wait_state(TIMEOUT, |s| s.selected(TrackKind::Sub).is_some_and(|t| t.external))
+        .unwrap();
+    let dirs = clip_dirs("gif-ts-grid-subs");
+    // 第一格的 EDL 時間剛好在 1/10 秒格線後面 0.01 秒（不管開始時間是多少）
+    let a = 2.91 - offset - gif::HR_SEEK_TOLERANCE;
+    let spec = gif_spec(&p, &caps, a, a + 1.0, gif_prefs(320, 10, true), &dirs);
+    let mut none = spec.clone();
+    none.sub = None;
+    none.graph.subtitles = false;
+    none.stem = "grid-none".into();
+    let mut with = spec;
+    with.stem = "grid-subs".into();
+    let seen = seen_plan(&mut with);
+    let with = read_gif(&export_gif(with).unwrap().path);
+    let without = read_gif(&export_gif(none).unwrap().path);
+    let plan = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(plan.edl_start(), 0.0, "從頭讀：{plan:?}");
+    let h = with.h;
+    let first = band_changed(&with, &without, 0, h * 3 / 4..h);
+    let second = band_changed(&with, &without, 1, h * 3 / 4..h);
+    assert!(
+        first < 0.002 && second > 0.01,
+        "第一格（1.448 秒）不該有字幕：下方變了 {first}；第二格（1.548 秒）該有：{second}"
+    );
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_ts_a_between_frames_keeps_the_frame_on_screen() {
+    // A 在兩格之間（每秒 24 格的 TS，A 在第 2 格之後 0.02 秒）：第一格是 A 那一刻畫面上的那一格
+    // （A 之前的最後一格，是 B 影格），不是開頭的關鍵影格
+    let (mut p, caps) = ts_main_player("general/ts_h264_gop05.ts");
+    if !gif_engine(&caps, "gif_ts_a_between_frames_keeps_the_frame_on_screen") {
+        return;
+    }
+    let dirs = clip_dirs("gif-ts-between");
+    let (shown_at, shown) = main_frame(&mut p, 0.06, &dirs.1);
+    let (first_at, first) = main_frame(&mut p, 0.0, &dirs.1);
+    assert!(shown_at - first_at > 0.03, "樣本的影格 {first_at}、{shown_at}");
+    let a = shown_at + 0.02;
+    let spec = gif_spec(&p, &caps, a, a + 1.0, gif_prefs(320, 10, false), &dirs);
+    let g = read_gif(&export_gif(spec).unwrap().path);
+    let vs_shown = mean_diff(&g.frames[0], &shown.rgba);
+    let vs_first = mean_diff(&g.frames[0], &first.rgba);
+    assert!(
+        vs_shown < 8.0 && vs_first > vs_shown * 1.3,
+        "第一格跟 A 那一刻的畫面（{shown_at}）差 {vs_shown}、跟開頭那一格（{first_at}）差 {vs_first}"
+    );
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_ts_video_starting_after_a_is_not_too_short() {
+    // 電視錄影常從 GOP 中間開始：聲音先開始，影像到第一個關鍵影格（這個樣本晚 1.6 秒）才有。
+    // 主播放器的時間從聲音算起，A 選在影像出來之前（離開頭超過 1 秒，長度檢查不多給）：
+    // fps 從 A 算起，第一格補到 A（影像的第一格），GIF 是完整的 1 秒，不算失敗（以前只有 0.6 秒、TooShort）
+    let (p, caps) = ts_main_player("general/ts_h264_late_video.ts");
+    if !gif_engine(&caps, "gif_ts_video_starting_after_a_is_not_too_short") {
+        return;
+    }
+    let dirs = clip_dirs("gif-ts-late-video");
+    let spec = gif_spec(&p, &caps, 1.2, 2.2, gif_prefs(320, 10, false), &dirs);
+    assert!(spec.approx_seek);
+    assert!(spec.slack < 0.5, "不在檔案的頭尾：{}", spec.slack);
+    let done = export_gif(spec).unwrap_or_else(|f| panic!("影像晚開始：{f:?}"));
+    let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
+    assert!((9..=11).contains(&info.frames), "{} 格", info.frames);
+    assert!((info.seconds() - 1.0).abs() <= 0.15, "總長 {} 秒", info.seconds());
+    // 影像出來之前的幾格都是影像的第一格
+    let g = read_gif(&done.path);
+    assert!(mean_diff(&g.frames[0], &g.frames[3]) < 1.0, "補的格子不一樣");
+    assert!(mean_diff(&g.frames[0], &g.frames[9]) > 4.0, "影像出來之後還是同一格");
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_late_start_is_too_short_and_leaves_no_file() {
+    // 開頭晚了（跳轉落在 A 之後的關鍵影格）的 GIF 算失敗、不留檔案：寫好之後的長度檢查照影片的格率，只容許幾格。
+    // 故意走 EDL 從 A 開始的做法（以前 TS 的做法）：每 0.5 秒一個關鍵影格，A 在關鍵影格之後一點，
+    // 跳轉最好也落在下一個關鍵影格，少了將近 0.5 秒（以前的寬鬆檢查容許少一半，看不出來）
+    let (p, caps) = ts_main_player("general/ts_h264_gop05.ts");
+    if !gif_engine(&caps, "gif_late_start_is_too_short_and_leaves_no_file") {
+        return;
+    }
+    let dirs = clip_dirs("gif-late-start");
+    let mut spec = gif_spec(&p, &caps, 10.05, 11.05, gif_prefs(320, 10, false), &dirs);
+    assert!(spec.approx_seek);
+    assert!(spec.slack < 0.5, "不在檔案的頭尾：{}", spec.slack);
+    spec.approx_seek = false;
+    match export_gif(spec) {
+        Err(Failure::TooShort { got, want }) => {
+            assert!(got < 0.75 && (want - 1.0).abs() < 1e-9, "{got} / {want}");
+        }
+        other => panic!("開頭晚了的 GIF 要算太短：{other:?}"),
+    }
+    assert!(names(&dirs.0).is_empty(), "不留檔案：{:?}", names(&dirs.0));
+    for d in [&dirs.0, &dirs.1] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn gif_rotated_is_portrait() {
+    let dirs = clip_dirs("gif-rotate");
+    // 手機直拍（檔案標示旋轉 90°）：GIF 是直的
+    let (mut p, caps) = main_player(&sample_str("common/mov_hevc_aac_rot90.mov"));
+    if !gif_engine(&caps, "gif_rotated_is_portrait") {
+        return;
+    }
+    p.wait_state(TIMEOUT, |s| s.video_size.is_some()).unwrap();
+    let spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    assert_eq!(spec.graph.fixup.rotate, 90);
+    assert_eq!(spec.out, (240, 320), "320×240 轉 90°");
+    let done = export_gif(spec).unwrap();
+    let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
+    assert_eq!((info.width, info.height), (240, 320));
+
+    // 使用者轉了 90°（跟 Ctrl+E 截圖一樣，GIF 是畫面上看到的方向）：順時針轉
+    let (mut q, caps) = main_player(&sample_str("common/mp4_h264_aac.mp4"));
+    q.wait_state(TIMEOUT, |s| s.video_size.is_some()).unwrap();
+    let plain = gif_spec(&q, &caps, 0.5, 1.0, gif_prefs(320, 10, false), &dirs);
+    let turned = Geometry {
+        rotate: 90,
+        ..Default::default()
+    };
+    let mut rotated = gif_spec_with(&q, &caps, 0.5, 1.0, gif_prefs(320, 10, false), &turned, &dirs).unwrap();
+    assert_eq!((plain.out, rotated.out), ((320, 240), (240, 320)));
+    rotated.stem = "rotated".into();
+    let a = read_gif(&export_gif(plain).unwrap().path);
+    let b = read_gif(&export_gif(rotated).unwrap().path);
+    // 把沒轉的那一格順時針轉 90° 應該跟轉好的一樣，逆時針轉的不一樣
+    let img = |g: &GifFrames| vitascope::screenshot::Image {
+        w: g.w,
+        h: g.h,
+        rgba: g.frames[2].clone(),
+    };
+    let fix = |rotate: u32| vitascope::screenshot::Fixup {
+        rotate,
+        ..Default::default()
+    };
+    let cw = mean_diff(&img(&a).fixed(fix(90)).rgba, &b.frames[2]);
+    let ccw = mean_diff(&img(&a).fixed(fix(270)).rgba, &b.frames[2]);
+    assert!(cw < 12.0 && ccw > cw * 2.0, "順時針 {cw}、逆時針 {ccw}");
+    // 左右翻轉：在旋轉之後（畫面上的方向）
+    let flipped = Geometry {
+        rotate: 90,
+        hflip: true,
+        ..Default::default()
+    };
+    let mut spec = gif_spec_with(&q, &caps, 0.5, 1.0, gif_prefs(320, 10, false), &flipped, &dirs).unwrap();
+    spec.stem = "flipped".into();
+    let c = read_gif(&export_gif(spec).unwrap().path);
+    let want = img(&a).fixed(vitascope::screenshot::Fixup {
+        rotate: 90,
+        hflip: true,
+        vflip: false,
+    });
+    let d = mean_diff(&want.rgba, &c.frames[2]);
+    assert!(d < 12.0, "先轉再翻：{d}");
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_hdr_tone_mapped() {
+    let (mut p, caps) = main_player(&sample_str("general/mkv_hevc10_hdr10_mid.mkv"));
+    if !gif_engine(&caps, "gif_hdr_tone_mapped") {
+        return;
+    }
+    p.wait_state(TIMEOUT, |s| s.video_hdr).unwrap();
+    let dirs = clip_dirs("gif-hdr");
+    let spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    if !(caps.zscale && caps.tonemap) {
+        // 沒有色調映射的濾鏡：不轉，完成時說明亮部會變白
+        assert_eq!(spec.graph.tone, None);
+        assert_eq!(spec.notes, [Note::HdrClipped]);
+        eprintln!("略過 gif_hdr_tone_mapped 的色調映射：播放引擎沒有 zscale、tonemap");
+        return;
+    }
+    // 自動的目標亮度 = 203 nits，曲線 Hable
+    assert_eq!(
+        spec.graph.tone,
+        Some(gif::Tone {
+            curve: "hable",
+            npl: 203
+        })
+    );
+    assert!(spec.notes.is_empty());
+    // 比較：沒轉（PQ 的數值直接當成一般畫面）、目標亮度 100 nits（「畫質 → HDR」選 100：畫面比較亮）
+    let mut plain = spec.clone();
+    plain.graph.tone = None;
+    plain.stem = "plain".into();
+    let mut low = spec.clone();
+    low.graph.tone = Some(gif::Tone {
+        curve: "hable",
+        npl: 100,
+    });
+    low.stem = "npl100".into();
+    let mapped = read_gif(&export_gif(spec).unwrap().path);
+    let raw = read_gif(&export_gif(plain).unwrap().path);
+    let n100 = read_gif(&export_gif(low).unwrap().path);
+    let mid = mapped.frames.len() / 2;
+    let luma = band_luma(&mapped, mid, 0..mapped.h);
+    let luma100 = band_luma(&n100, mid, 0..n100.h);
+    let changed = mean_diff(&mapped.frames[mid], &raw.frames[mid]);
+    eprintln!("HDR → 一般畫面：平均亮度 {luma:.1}（100 nits：{luma100:.1}；跟沒轉的差 {changed:.1}）");
+    assert!((20.0..=200.0).contains(&luma), "平均亮度 {luma}");
+    assert!(changed > 8.0, "有轉跟沒轉差不多：{changed}");
+    // 目標亮度跟播放時一樣（數字越小越亮）
+    assert!(luma100 > luma + 8.0, "100 nits {luma100}、203 nits {luma}");
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_burns_subtitles() {
+    // 內嵌的字幕（1.5–2.6 秒「影戲播放器測試」）：燒進畫面的下方
+    let (mut p, caps) = main_player(&sample_str("common/mkv_multitrack.mkv"));
+    if !gif_engine(&caps, "gif_burns_subtitles") {
+        return;
+    }
+    p.wait_state(TIMEOUT, |s| s.sid.is_some()).unwrap();
+    let dirs = clip_dirs("gif-subs");
+    let spec = gif_spec(&p, &caps, 1.5, 2.5, gif_prefs(480, 10, true), &dirs);
+    assert!(matches!(spec.sub, Some(gif::GifSub::Embedded(_))), "{:?}", spec.sub);
+    assert_eq!(spec.sub_delay, 0.0, "內嵌的字幕延遲照舊");
+    let mut none = spec.clone();
+    none.sub = None;
+    none.graph.subtitles = false;
+    none.stem = "no-subs".into();
+    let with = read_gif(&export_gif(spec).unwrap().path);
+    let without = read_gif(&export_gif(none).unwrap().path);
+    let mid = with.frames.len() / 2;
+    let (h, w) = (with.h, with.w);
+    let bottom = band_changed(&with, &without, mid, h * 3 / 4..h);
+    let top = band_changed(&with, &without, mid, 0..h / 4);
+    assert!(
+        bottom > 0.01 && bottom > top * 4.0,
+        "下方 {bottom}、上方 {top}（{w}×{h}）"
+    );
+
+    // 外掛的字幕（自動載入的 .srt）：外掛字幕照播放時間走，延遲要減掉 A，GIF 的開頭才有字
+    let (mut q, caps) = main_player(&sample_str("common/extsub_unlabeled_content.mkv"));
+    q.wait_state(TIMEOUT, |s| s.selected(TrackKind::Sub).is_some_and(|t| t.external))
+        .unwrap();
+    let spec = gif_spec(&q, &caps, 1.5, 2.5, gif_prefs(320, 10, true), &dirs);
+    match &spec.sub {
+        Some(gif::GifSub::External { embedded, .. }) => assert_eq!(*embedded, 0),
+        other => panic!("應該是外掛字幕：{other:?}"),
+    }
+    assert!((spec.sub_delay + 1.5).abs() < 1e-9, "{}", spec.sub_delay);
+    let mut none = spec.clone();
+    none.sub = None;
+    none.graph.subtitles = false;
+    let mut with = spec;
+    with.stem = "ext".into();
+    none.stem = "ext-none".into();
+    let with = read_gif(&export_gif(with).unwrap().path);
+    let without = read_gif(&export_gif(none).unwrap().path);
+    // 第 2 格（GIF 的 0.1 秒 = 影片的 1.6 秒）：字幕檔 1.5 秒起的那一句。沒有減掉 A 的話是字幕檔的 0.1 秒，那時沒有字幕
+    let h = with.h;
+    let bottom = band_changed(&with, &without, 1, h * 3 / 4..h);
+    let top = band_changed(&with, &without, 1, 0..h / 4);
+    assert!(
+        bottom > 0.01 && bottom > top * 4.0,
+        "外掛字幕：下方 {bottom}、上方 {top}"
+    );
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_restarts_when_the_subtitle_id_does_not_match() {
+    let (mut p, caps) = main_player(&sample_str("common/mkv_multitrack.mkv"));
+    if !gif_engine(&caps, "gif_restarts_when_the_subtitle_id_does_not_match") {
+        return;
+    }
+    p.wait_state(TIMEOUT, |s| s.sid.is_some()).unwrap();
+    let dirs = clip_dirs("gif-sid");
+    let mut spec = gif_spec(&p, &caps, 1.5, 2.0, gif_prefs(320, 10, true), &dirs);
+    let want = spec.sub.as_ref().unwrap().predicted_id();
+    // 第一次用錯的編號（沒有這條字幕）：發現選到的不對，用對的編號重開
+    spec.test.initial_sid = Some(Some(9));
+    let sid: Arc<Mutex<Option<String>>> = Arc::default();
+    let s = sid.clone();
+    spec.test.on_ready = Some(Arc::new(move |mpv: &Mpv| {
+        *s.lock().unwrap() = mpv.get_string("sid").ok();
+    }));
+    let done = export_gif(spec).unwrap();
+    assert_eq!(sid.lock().unwrap().as_deref(), Some(want.to_string().as_str()));
+    assert_eq!(names(&dirs.0), [file_name_of(&done.path)], "重開時不留暫存檔");
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+#[test]
+fn gif_failing_filter_is_an_error_not_a_file() {
+    // mpv 停用失敗的濾鏡、照樣把畫面送出去（我們的濾鏡還在，大小也對）：只有記錄裡的「Disabling filter」看得出來
+    let (p, caps) = main_player(&sample_str("common/mp4_h264_aac.mp4"));
+    if !gif_engine(&caps, "gif_failing_filter_is_an_error_not_a_file") {
+        return;
+    }
+    let dirs = clip_dirs("gif-fail");
+    let mut spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    let bad = "crop=w=9999:h=9999";
+    spec.test.extra_vf = Some(format!("lavfi=graph=%{}%{bad}", bad.len()));
+    let late = spec.clone();
+    assert_eq!(export_gif(spec).map(|d| d.path), Err(Failure::FilterFailed));
+    assert!(names(&dirs.0).is_empty(), "失敗時不留檔案：{:?}", names(&dirs.0));
+    // 「Disabling filter」在 Shutdown 之後才收到（mpv 先送排著的事件、最後才送記錄）：一樣要算失敗。
+    // 讓編碼用的 mpv 自己跑完、寫完 GIF 才開始收事件：Shutdown 排在所有記錄前面
+    let mut spec = late;
+    spec.test.on_ready = Some(Arc::new(|mpv: &Mpv| wait_until_encoded(mpv)));
+    assert_eq!(export_gif(spec).map(|d| d.path), Err(Failure::FilterFailed));
+    assert!(names(&dirs.0).is_empty(), "失敗時不留檔案：{:?}", names(&dirs.0));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_cancel_leaves_nothing() {
+    let (p, caps) = main_player(&sample_str("common/mp4_long.mp4"));
+    if !gif_engine(&caps, "gif_cancel_leaves_nothing") {
+        return;
+    }
+    let dirs = clip_dirs("gif-cancel");
+    let mut spec = gif_spec(&p, &caps, 1.0, 20.0, gif_prefs(320, 10, false), &dirs);
+    // 每格一個色盤：畫面一開始就寫進暫存檔（整段一個色盤要讀完才寫，取消時還沒有檔案）
+    spec.graph.palette = gif::PaletteMode::PerFrame;
+    // 編碼用的 mpv 開好之後停住（mpv 照樣在編碼），等測試取消
+    let barrier = Arc::new(Barrier::new(2));
+    let b = barrier.clone();
+    spec.test.on_ready = Some(Arc::new(move |_: &Mpv| {
+        b.wait();
+        b.wait();
+    }));
+    let job = gif::spawn(spec, no_wake());
+    barrier.wait();
+    // 暫存檔已經寫了一部分（不然「不留檔案」什麼都沒測到）
+    let start = Instant::now();
+    while parts(&dirs.0).is_empty() {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "編碼用的 mpv 一直沒有寫暫存檔：{:?}",
+            names(&dirs.0)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(names(&dirs.0).len(), 1, "{:?}", names(&dirs.0));
+    job.cancel();
+    barrier.wait();
+    assert_eq!(wait_job(&job).map(|d| d.path), Err(Failure::Cancelled));
+    drop(job);
+    assert!(names(&dirs.0).is_empty(), "取消後不留檔案：{:?}", names(&dirs.0));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// 測試的觀察點：讓編碼用的 mpv 自己播完這一段才放行（工作在這之前不收事件、記錄）。
+/// 播完之後 mpv 寫完 GIF、很快就送出 Shutdown：排著的事件都比記錄先送來，測「Shutdown 之後才收到的記錄」
+fn wait_until_encoded(mpv: &Mpv) {
+    let start = Instant::now();
+    // 播完了：`path` 沒有了（idle=once：之後寫完 GIF 就結束）
+    while mpv.get_string("path").is_ok() && start.elapsed() < CLIP_TIMEOUT {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 讓 mpv 寫完 GIF、送出 Shutdown。不是證明：來不及時測試照樣通過，只是比較抓不到漏收的記錄
+    std::thread::sleep(Duration::from_millis(500));
+}
+
+#[test]
+fn gif_ends_promptly_when_the_encoder_stops_with_an_error() {
+    // 編碼用的 mpv 讀到一半出錯就結束（EndFile 是 Error、接著 Shutdown）：收完排著的事件時收到的 Shutdown 也要算，
+    // 不能一直等到逾時（2 分鐘以上）再回報「讀取逾時」
+    let (p, caps) = main_player(&sample_str("common/mp4_h264_aac.mp4"));
+    if !gif_engine(&caps, "gif_ends_promptly_when_the_encoder_stops_with_an_error") {
+        return;
+    }
+    let dirs = clip_dirs("gif-error-end");
+    let mut spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    // 一格都不送出去（fps 丟掉 start_time 之前的畫面；播放引擎沒有 select、trim）：mpv 播完時什麼都沒播到，
+    // 結束的原因是錯誤，記錄裡沒有濾鏡失敗、寫不進去這些會讓工作馬上停下來的句子
+    let none = "fps=fps=10:start_time=100000";
+    spec.test.extra_vf = Some(format!("lavfi=graph=%{}%{none}", none.len()));
+    spec.test.on_ready = Some(Arc::new(|mpv: &Mpv| wait_until_encoded(mpv)));
+    let start = Instant::now();
+    let r = export_gif(spec).map(|d| d.path);
+    assert!(r.is_err(), "{r:?}");
+    assert_ne!(r, Err(Failure::ReadTimeout), "等不到 Shutdown，一直等到逾時");
+    assert!(
+        start.elapsed() < Duration::from_secs(60),
+        "結束得太慢：{:?}",
+        start.elapsed()
+    );
+    assert!(names(&dirs.0).is_empty(), "失敗時不留檔案：{:?}", names(&dirs.0));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_waits_for_the_first_frame() {
+    // 還沒解出第一格（例如網路很慢）：不知道檔案本身的旋轉、像素比例，不能開始（不能猜成橫的：手機直拍會轉成躺著的 GIF）。
+    // 解碼器丟掉所有的畫面：檔案開好、選好影像，但一直沒有第一格（不靠時間）
+    let opts = Options {
+        extra: vec![
+            ("pause".into(), "yes".into()),
+            ("vd-lavc-skipframe".into(), "all".into()),
+            ("keep-open".into(), "always".into()),
+        ],
+        ..Options::headless()
+    };
+    let (p, caps) = main_player_with(opts, &sample_str("common/mov_hevc_aac_rot90.mov"));
+    if !gif_engine(&caps, "gif_waits_for_the_first_frame") {
+        return;
+    }
+    assert!(p.natural_shape().is_none(), "測試的前提：還沒解出第一格");
+    assert!(p.state.loaded && p.state.selected(TrackKind::Video).is_some());
+    assert_eq!(gif::unavailable(&p, &caps), None);
+    assert_eq!(gif::sizes_for(&p, &Geometry::default(), 320), None);
+    let dirs = clip_dirs("gif-first-frame");
+    let tone = ToneSettings::default();
+    let style = SubStyle::default();
+    let geometry = Geometry::default();
+    let choice = gif::Choice {
+        prefs: gif_prefs(320, 10, false),
+        geometry: &geometry,
+        tone: &tone,
+        style: &style,
+        deinterlace: Deinterlace::Auto,
+    };
+    let r = GifSpec::from_player(&p, &caps, 0.5, 1.5, &choice, dirs.0.clone(), dirs.1.clone());
+    assert_eq!(r.map(|s| s.out), Err(Failure::NoData));
+    drop(p);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_follows_the_container_pixel_aspect() {
+    // 容器標示的像素比例（MP4 的 pasp）跟影像資料的不同：mpv 照容器的顯示，GIF 也要一樣
+    let dirs = clip_dirs("gif-par");
+    let mut data = std::fs::read(sample("common/mp4_h264_aac.mp4")).unwrap();
+    let Some(at) = data.windows(4).position(|w| w == b"pasp") else {
+        eprintln!("略過 gif_follows_the_container_pixel_aspect：這個平台的 ffmpeg 沒有寫 pasp");
+        return;
+    };
+    // pasp：水平、垂直的間距（各 4 位元組）→ 像素寬 2 倍（320×240 的方形像素 → 畫面上 640×240）
+    data[at + 4..at + 8].copy_from_slice(&2u32.to_be_bytes());
+    data[at + 8..at + 12].copy_from_slice(&1u32.to_be_bytes());
+    let file = dirs.1.join("wide-pixels.mp4");
+    std::fs::write(&file, &data).unwrap();
+    let (p, caps) = main_player(&file.to_string_lossy());
+    if !gif_engine(&caps, "gif_follows_the_container_pixel_aspect") {
+        return;
+    }
+    // 測試的前提：主播放器照容器的比例顯示（8:3），影像資料本身是 4:3
+    let start = Instant::now();
+    while p.get_f64("video-params/aspect").is_err() {
+        assert!(start.elapsed() < TIMEOUT, "主播放器一直沒有畫面");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let shown = p.get_f64("video-params/aspect").unwrap();
+    assert!((shown - 8.0 / 3.0).abs() < 0.01, "畫面上的比例 {shown}");
+    let spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    assert_eq!(spec.out, (320, 120));
+    let done = export_gif(spec).unwrap();
+    let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
+    assert_eq!((info.width, info.height), (320, 120));
+    drop(p);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_uses_the_selected_video_track() {
+    // 有好幾條影像的檔案（多畫質）：GIF 用主播放器選的那一條，不是 mpv 預設的。
+    // 本專案的引擎：本機的 DASH 每個畫質一條影像；系統的 libmpv 0.37：HLS 也是（新版的 HLS 是 edition）
+    let candidates = ["net/dash_multi/manifest.mpd", "net/hls_multi/master.m3u8"];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/generated");
+    let mut found = None;
+    for rel in candidates {
+        let path = root.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        let (p, caps) = main_player(&path.to_string_lossy());
+        if p.state.tracks_of(TrackKind::Video).count() >= 2 {
+            found = Some((p, caps));
+            break;
+        }
+    }
+    let Some((mut p, caps)) = found else {
+        eprintln!("略過 gif_uses_the_selected_video_track：沒有兩條影像的樣本（{candidates:?}）");
+        return;
+    };
+    if !gif_engine(&caps, "gif_uses_the_selected_video_track") {
+        return;
+    }
+    // 換成沒被選的那一條（另一個畫質，寬度不同）
+    let current = p.state.selected(TrackKind::Video).unwrap().clone();
+    let other = p
+        .state
+        .tracks_of(TrackKind::Video)
+        .find(|t| t.id != current.id)
+        .cloned()
+        .unwrap();
+    let width = other.width.expect("影像軌道沒有寬度");
+    assert_ne!(current.width, Some(width), "兩條影像的大小要不同");
+    p.select_track(TrackKind::Video, Some(other.id)).unwrap();
+    p.wait_state(TIMEOUT, |s| {
+        s.selected(TrackKind::Video).map(|t| t.id) == Some(other.id)
+    })
+    .unwrap();
+    let dirs = clip_dirs("gif-vid");
+    let mut spec = gif_spec(&p, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    assert!(spec.video.is_some());
+    let seen: Arc<Mutex<Option<i64>>> = Arc::default();
+    let s = seen.clone();
+    spec.test.on_ready = Some(Arc::new(move |mpv: &Mpv| {
+        *s.lock().unwrap() = mpv.get_property::<i64>("current-tracks/video/demux-w").ok();
+    }));
+    let done = export_gif(spec).unwrap();
+    assert_eq!(*seen.lock().unwrap(), Some(width), "編碼用的 mpv 選了別的影像");
+    assert!(gif::gif_info(&std::fs::read(&done.path).unwrap()).is_some());
+    drop(p);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_is_unavailable_without_video_or_engine_support() {
+    let dirs = clip_dirs("gif-unavailable");
+    // 只有聲音（專輯封面不算影像）
+    let (p, caps) = main_player(&sample_str("general/audio_mp3_cover.mp3"));
+    assert_eq!(gif::unavailable(&p, &caps), Some(Failure::NoVideo));
+    // 播放引擎沒有 gif 編碼器、palettegen
+    let (q, caps) = main_player(&sample_str("common/mp4_long.mp4"));
+    for no in [
+        EngineCaps { gif: false, ..caps },
+        EngineCaps {
+            palettegen: false,
+            ..caps
+        },
+    ] {
+        assert_eq!(gif::unavailable(&q, &no), Some(Failure::EncoderMissing));
+    }
+    if !gif_engine(&caps, "gif_is_unavailable_without_video_or_engine_support") {
+        return;
+    }
+    assert_eq!(gif::unavailable(&q, &caps), None);
+    // 長度：最長 30 秒、最短 0.2 秒
+    let len = |a: f64, b: f64| {
+        gif_spec_with(&q, &caps, a, b, gif_prefs(320, 10, false), &Geometry::default(), &dirs).map(|s| s.b)
+    };
+    assert_eq!(len(1.0, 31.5), Err(Failure::GifTooLong));
+    assert_eq!(len(1.0, 1.1), Err(Failure::RangeTooShort));
+    assert_eq!(len(1.0, 31.0), Ok(31.0));
+    // 使用者開的 EDL：時間跟檔案對不上
+    let src = sample_str("general/mkv_h264_gop2.mkv");
+    let entry = format!("%{}%{src}", src.len());
+    let edl = dirs.1.join("list.edl");
+    std::fs::write(&edl, format!("# mpv EDL v0\n{entry},0,3\n{entry},6,3\n")).unwrap();
+    let (r, caps) = main_player(&edl.to_string_lossy());
+    assert_eq!(gif::unavailable(&r, &caps), Some(Failure::Timeline));
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn gif_http_vod_and_site_video() {
+    let server = Server::start();
+    // 能跳轉的網路影片：用同樣的連線設定再讀這一段
+    let url = server.file_url("general/mkv_h264_gop2.mkv");
+    let net_settings = NetSettings {
+        user_agent: "VitaScope-Gif/1.0".into(),
+        ..NetSettings::default()
+    };
+    let (mut p, caps) = main_player_net(&net_settings, &url);
+    if !gif_engine(&caps, "gif_http_vod_and_site_video") {
+        return;
+    }
+    p.wait_state(TIMEOUT, |s| s.seekable).unwrap();
+    let dirs = clip_dirs("gif-http");
+    let spec = gif_spec(&p, &caps, 3.0, 4.0, gif_prefs(320, 10, false), &dirs);
+    assert!(matches!(&spec.source, Source::Net(s) if s.open == url));
+    let before = server.requests_to("/f/general/mkv_h264_gop2.mkv").len();
+    let done = export_gif(spec).unwrap();
+    let reqs = server.requests_to("/f/general/mkv_h264_gop2.mkv");
+    assert!(reqs.len() > before, "編碼用的 mpv 要自己讀");
+    for r in &reqs[before..] {
+        assert_eq!(r.header("User-Agent"), Some("VitaScope-Gif/1.0"), "{r:#?}");
+    }
+    let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
+    assert!((9..=11).contains(&info.frames), "{} 格", info.frames);
+    // 直播：不能轉
+    let mut q = Player::new(Options {
+        extra: vec![("pause".into(), "yes".into())],
+        ..Options::headless()
+    })
+    .unwrap();
+    let qcaps = q.probe_caps();
+    q.open(&server.url("/hlslive/net/hls_vod/index.m3u8")).unwrap();
+    q.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    q.wait_state(TIMEOUT, |s| !s.tracks.is_empty()).unwrap();
+    assert_eq!(gif::unavailable(&q, &qcaps), Some(Failure::Unbounded));
+
+    // 網站影片（yt-dlp：影像、聲音分開的 EDL）：EDL 裡再包一層 EDL，帶網站要的標頭
+    let page = server.url("/watch?v=gif1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "gif1")).arc();
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    let opts = Options {
+        net_hooks: true,
+        net_resolver: Some(resolver),
+        net_sites: vec!["127.0.0.1".into()],
+        extra: vec![("pause".into(), "yes".into())],
+        ..Options::headless()
+    };
+    let (mut s, caps) = main_player_with(opts, &page);
+    s.wait_state(TIMEOUT, |s| s.seekable).unwrap();
+    let spec = gif_spec(&s, &caps, 0.5, 1.5, gif_prefs(320, 10, false), &dirs);
+    assert!(matches!(&spec.source, Source::Net(n) if n.site && n.open.starts_with("edl://")));
+    let before = server.requests_to("/f/net/video_only.mp4").len();
+    let done = export_gif(spec).unwrap();
+    let reqs = server.requests_to("/f/net/video_only.mp4");
+    assert!(reqs.len() > before, "編碼用的 mpv 要自己讀");
+    for r in &reqs[before..] {
+        assert_eq!(r.header("User-Agent"), Some(support::fake_ytdl::SITE_UA), "{r:#?}");
+    }
+    assert_eq!(fake.calls(), 1, "轉 GIF 不再問一次 yt-dlp");
+    let info = gif::gif_info(&std::fs::read(&done.path).unwrap()).unwrap();
+    assert!((9..=11).contains(&info.frames), "{} 格", info.frames);
+    for d in [&dirs.0, &dirs.1] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
 }

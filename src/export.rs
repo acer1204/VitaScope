@@ -10,9 +10,10 @@
 //! 匯出都在另外開的 mpv 裡做（不動正在播放的那一個）。FFmpeg 的記錄只送到第一個建立的 mpv（主播放器），
 //! 所以這裡判斷失敗只看 mpv 自己的訊息（「Failed writing packet」「Disabling filter」之類）。
 //!
-//! 各種匯出在子模組：[`clip`]（片段）。
+//! 各種匯出在子模組：[`clip`]（片段）、[`gif`]（轉成 GIF）。
 
 pub mod clip;
+pub mod gif;
 
 use crate::geometry::Geometry;
 use crate::instance::Wake;
@@ -394,6 +395,14 @@ pub enum Failure {
     Timeline,
     /// 直播不能匯出片段
     Live,
+    /// 直播、長度不明的串流（GIF、縮圖總覽圖要知道長度）
+    Unbounded,
+    /// 這個檔案沒有影像（只有聲音、專輯封面）
+    NoVideo,
+    /// GIF 太長（最長 `GIF_MAX_SECS` 秒）
+    GifTooLong,
+    /// 範圍太短（GIF 至少 0.2 秒）
+    RangeTooShort,
     /// 網路影片有總長度、但不能跳轉（伺服器不支援 Range）：匯出用的 mpv 讀不到中間的段落
     NotSeekable,
     /// 播放引擎沒有匯出片段要的指令（dump-cache）
@@ -514,6 +523,23 @@ impl Failure {
             )
             .into(),
             Failure::Live => tr!("直播不能匯出片段", "Clips can't be saved from live streams").into(),
+            Failure::Unbounded => tr!(
+                "直播或長度不明的串流不能使用",
+                "Not available for live streams or streams of unknown length"
+            )
+            .into(),
+            Failure::NoVideo => tr!("這個檔案沒有影像", "This file has no video").into(),
+            Failure::GifTooLong => {
+                let max = GIF_MAX_SECS;
+                tf!(
+                    "GIF 最長 {max:.0} 秒，請縮短 A-B 段落",
+                    "GIFs can be at most {max:.0} seconds; shorten the A-B range"
+                )
+            }
+            Failure::RangeTooShort => {
+                let min = gif::MIN_SECS;
+                tf!("範圍太短（至少 {min} 秒）", "The range is too short (at least {min} s)")
+            }
             Failure::NotSeekable => tr!(
                 "這個網路影片不能跳轉（伺服器不支援）",
                 "This online video isn't seekable (the server doesn't support it)"
@@ -1236,6 +1262,7 @@ pub fn map_mpv_error(lines: &[LogLine]) -> Option<Failure> {
                 "filter failed to initialize",
                 "parsing the filter graph failed",
                 "not found or failed to allocate",
+                "failed to configure the filter graph",
             ],
             |_| Failure::FilterFailed,
         ),
@@ -1577,7 +1604,7 @@ mod tests {
 
     #[test]
     fn map_mpv_error_known_lines() {
-        let cases: [(&str, Failure); 22] = [
+        let cases: [(&str, Failure); 23] = [
             ("Failed writing packet.", Failure::WriteFailed),
             ("Writing trailer failed.", Failure::WriteFailed),
             ("Failed opening output file.", Failure::NoPermission(None)),
@@ -1585,6 +1612,8 @@ mod tests {
             ("Can't mux one of the input streams.", Failure::CantMux),
             ("Writing header failed.", Failure::CantMux),
             ("Disabling filter lavfi because it has failed.", Failure::FilterFailed),
+            // filters/f_lavfi.c：濾鏡圖接不起來（zscale 轉不了這種顏色之類）
+            ("failed to configure the filter graph", Failure::FilterFailed),
             (
                 "Cannot convert decoder/filter output to any format supported by the output.",
                 Failure::FilterFailed,

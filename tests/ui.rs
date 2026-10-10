@@ -15465,3 +15465,445 @@ fn export_in_english() {
     h.get_by_label("Change the clips folder…");
     h.get_by_label("Clip format");
 }
+
+// ───────────── 匯出：轉成 GIF ─────────────
+
+/// 開 `file`、等它開始播；GIF 存到暫存資料夾的 gifs，片段存到 clips，設定存在暫存資料夾的 settings.json。
+/// 回傳（暫存資料夾、GIF 資料夾、設定檔、介面）
+fn gif_harness(name: &str, file: &str) -> (TempDir, PathBuf, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let gifs = dir.0.join("gifs");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.export.clip_dir = Some(dir.0.join("clips"));
+    settings.export.image_dir = Some(gifs.clone());
+    let mut h = harness_with(Some(sample(file)), settings);
+    let file_name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+    settle(&mut h, &file_name);
+    (dir, gifs, path, h)
+}
+
+/// 這個播放引擎能不能轉 GIF（Linux 的系統 libmpv 不一定有 gif 編碼器、palettegen）
+fn gif_engine(h: &Harness<'_, VitascopeApp>, test: &str) -> bool {
+    let caps = h.state().engine_caps();
+    let ok = caps.gif && caps.palettegen;
+    if !ok {
+        eprintln!("略過 {test}：播放引擎不能轉 GIF");
+    }
+    ok
+}
+
+/// 右鍵選單「匯出 ▸ 轉成 GIF…」，等匯出視窗打開在 GIF 分頁
+fn open_gif_window(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "匯出");
+    wait_menu_item(h, "轉成 GIF…");
+    h.get_by_label("轉成 GIF…").click();
+    step_until_app(h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+}
+
+#[test]
+fn export_gif_end_to_end_and_choices_are_remembered() {
+    let (_dir, gifs, path, mut h) = gif_harness("export-gif", "common/mkv_multitrack.mkv");
+    if !gif_engine(&h, "export_gif_end_to_end_and_choices_are_remembered") {
+        return;
+    }
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    step_until(&mut h, "顯示字幕", |s| s.sid.is_some());
+    open_gif_window(&mut h);
+    // 預設：長邊 480、15 fps、包含字幕；640×360 的影片 → 480×270
+    assert_eq!(combo_value(&h, "大小（長邊）"), "480 px");
+    assert_eq!(combo_value(&h, "格率"), "15 fps");
+    h.get_by_label("→ 480×270");
+    h.get_by_label_contains("旋轉、翻轉跟畫面一樣");
+    // 範圍就是 A-B 重播（跟片段的分頁一樣）
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "2.5");
+    wait_ab(&mut h, "範圍 1–2.5 秒", [Some(1.0), Some(2.5)]);
+    h.run_steps(2);
+    assert_eq!(field_value(&h, "檔名"), "mkv_multitrack 00.00.01-00.00.02");
+    h.get_by_label(".gif");
+    // 改大小、格率、不含字幕：存進設定（記住上次的選擇）
+    combo_in_view(&mut h, "大小（長邊）");
+    h.get_by_label("320 px").click();
+    h.run_steps(3);
+    combo_in_view(&mut h, "格率");
+    h.get_by_label("10 fps").click();
+    h.run_steps(3);
+    let subs = "包含字幕（目前顯示的字幕，含外觀與延遲）";
+    assert!(!h.get_by_label(subs).accesskit_node().is_disabled());
+    click_in_view(&mut h, subs);
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    let gif = h.state().settings().export.gif;
+    assert_eq!((gif.long_side, gif.fps, gif.subtitles), (320, 10, false));
+    assert_eq!(saved(&path)["export"]["gif"]["long_side"], 320);
+    assert_eq!(saved(&path)["export"]["gif"]["fps"], 10);
+    assert_eq!(saved(&path)["export"]["gif"]["subtitles"], false);
+    h.get_by_label("→ 320×180");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存 GIF：mkv_multitrack 00.00.01-00.00.02.gif（"),
+        "{osd}"
+    );
+    let saved_gif = gifs.join("mkv_multitrack 00.00.01-00.00.02.gif");
+    let info = vitascope::export::gif::gif_info(&std::fs::read(&saved_gif).unwrap()).expect("不是完整的 GIF");
+    assert_eq!((info.width, info.height), (320, 180));
+    assert!((14..=16).contains(&info.frames), "{} 格", info.frames);
+    h.get_by_label_contains("完成：mkv_multitrack 00.00.01-00.00.02.gif");
+    assert!(h.query_by_label_contains("實際範圍").is_none(), "GIF 沒有對齊關鍵影格");
+    h.get_by_label("開啟檔案");
+    h.get_by_label("在資料夾中顯示");
+    assert_eq!(dir_names(&gifs), ["mkv_multitrack 00.00.01-00.00.02.gif"]);
+    // 分頁：回到片段（範圍一樣），再回到 GIF
+    h.get_by_label("片段").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("大小（長邊）").is_none());
+    h.get_by_label_contains("片段只包含影像與一條音軌");
+    h.get_by_label("GIF").click();
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+}
+
+#[test]
+fn export_gif_length_cap_and_disabled_reasons() {
+    let (_dir, _gifs, _path, mut h) = gif_harness("export-gif-cap", "common/mp4_long.mp4");
+    if !gif_engine(&h, "export_gif_length_cap_and_disabled_reasons") {
+        return;
+    }
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_gif_window(&mut h);
+    // 沒有字幕：「包含字幕」停用並說明
+    let subs = "包含字幕（目前顯示的字幕，含外觀與延遲）";
+    assert!(h.get_by_label(subs).accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, subs, "目前沒有顯示字幕");
+    // 超過 30 秒：開始停用，說明要縮短
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "45");
+    wait_ab(&mut h, "範圍 1–45 秒", [Some(1.0), Some(45.0)]);
+    h.run_steps(2);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "GIF 最長 30 秒，請縮短 A-B 段落");
+    // 剛好 30 秒：可以開始
+    type_export_field(&mut h, "終點", "31");
+    wait_ab(&mut h, "範圍 1–31 秒", [Some(1.0), Some(31.0)]);
+    h.run_steps(2);
+    assert!(!h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // 只有聲音的檔案：「轉成 GIF…」停用並說明（儲存片段照樣能用）
+    drop_file(&mut h, sample("general/audio_mp3_cover.mp3"));
+    step_until(&mut h, "開始播放 mp3", |s| {
+        playing(s, "audio_mp3_cover.mp3") && !s.tracks.is_empty()
+    });
+    h.run_steps(5);
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "轉成 GIF…");
+    assert!(h.get_by_label("轉成 GIF…").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("儲存片段…").accesskit_node().is_disabled());
+    // 選單裡的項目：直接把滑鼠移過去（捲動會讓子選單關掉）
+    h.get_by_label("轉成 GIF…").hover();
+    let start = Instant::now();
+    while h.query_by_label("這個檔案沒有影像").is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「轉成 GIF…」上沒有出現說明");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// GIF 的觀察點：編碼用的 mpv 開好之後，等它把畫面寫進 GIF 資料夾裡的暫存檔（每格一個色盤：一開始就寫；
+/// 整段一個色盤要讀完才寫），再把暫存檔交給 `hook`（停在那裡等測試放行）。等不到時交出空的路徑（測試會失敗）
+fn gif_gate_after_first_write(gifs: &std::path::Path, hook: GateHook) -> vitascope::export::gif::TestHooks {
+    let gifs = gifs.to_path_buf();
+    vitascope::export::gif::TestHooks {
+        palette: Some(vitascope::export::gif::PaletteMode::PerFrame),
+        on_ready: Some(Arc::new(move |_: &vitascope::mpv::Mpv| {
+            let start = Instant::now();
+            let part = loop {
+                let found = dir_names(&gifs)
+                    .into_iter()
+                    .find(|n| vitascope::save::is_part(n))
+                    .map(|n| gifs.join(n))
+                    .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0));
+                match found {
+                    Some(p) => break p,
+                    None if start.elapsed() > EXPORT_TIMEOUT => break PathBuf::new(),
+                    None => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            hook(part)
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn export_gif_follows_the_rotation_and_the_hdr_settings() {
+    // 畫面轉了 90°、「畫質 → HDR」選了曲線與目標亮度：GIF 是直的，照這些設定轉成一般畫面（從介面一路傳到背景工作）
+    let hdr = "general/mkv_hevc10_hdr10_mid.mkv";
+    // 預設的「自動」：FFmpeg 沒有，GIF 用 Hable（不說跟「畫質 → HDR」一樣）
+    let (_auto_dir, _gifs, _path, mut h) = gif_harness("export-gif-hdr-auto", hdr);
+    if !gif_engine(&h, "export_gif_follows_the_rotation_and_the_hdr_settings") {
+        return;
+    }
+    let caps = h.state().engine_caps();
+    let tonemap = caps.zscale && caps.tonemap;
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    open_gif_window(&mut h);
+    if tonemap {
+        h.get_by_label(
+            "HDR 影片會轉成一般畫面（Hable，目標亮度 203 nits）；「畫質 → HDR」的曲線「自動」GIF 做不到，改用 Hable",
+        );
+        assert!(h.query_by_label_contains("跟「畫質 → HDR」一樣").is_none());
+    } else {
+        h.get_by_label_contains("亮部");
+    }
+    drop(h);
+
+    let dir = TempDir::new("export-gif-hdr");
+    let gifs = dir.0.join("gifs");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.image_dir = Some(gifs.clone());
+    settings.export.gif.long_side = 320;
+    settings.export.gif.fps = 10;
+    settings.video.tone.curve = vitascope::picture::ToneCurve::Mobius;
+    settings.video.tone.target_peak = Some(100);
+    let mut h = harness_with(Some(sample(hdr)), settings);
+    settle(&mut h, "mkv_hevc10_hdr10_mid.mkv");
+    let vf: Arc<std::sync::Mutex<String>> = Arc::default();
+    let seen = vf.clone();
+    h.state_mut()
+        .set_export_gif_test_hooks(vitascope::export::gif::TestHooks {
+            on_ready: Some(Arc::new(move |mpv: &vitascope::mpv::Mpv| {
+                *seen.lock().unwrap() = mpv.get_string("vf").unwrap_or_default();
+            })),
+            ..Default::default()
+        });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    // Alt+K：畫面轉 90°（320×240 → 直的）
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
+    step_until(&mut h, "Alt+K：轉 90°，變直的", |s| {
+        s.video_size == Some([240, 320])
+    });
+    open_gif_window(&mut h);
+    h.get_by_label("→ 240×320");
+    if tonemap {
+        h.get_by_label("HDR 影片會轉成一般畫面（Mobius，目標亮度 100 nits，跟「畫質 → HDR」一樣）");
+    }
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "1.5");
+    wait_ab(&mut h, "範圍 0.5–1.5 秒", [Some(0.5), Some(1.5)]);
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let saved = dir_names(&gifs);
+    assert_eq!(saved.len(), 1, "{saved:?}，{:?}", h.state().osd_text());
+    let info = vitascope::export::gif::gif_info(&std::fs::read(gifs.join(&saved[0])).unwrap()).expect("不是完整的 GIF");
+    assert_eq!((info.width, info.height), (240, 320), "轉了 90° 的畫面是直的");
+    let vf = vf.lock().unwrap().clone();
+    assert!(
+        vf.contains("transpose=clock") || vf.contains("rotate=PI/2"),
+        "沒有順時針轉 90°：{vf}"
+    );
+    if tonemap {
+        assert!(vf.contains("npl=100") && vf.contains("tonemap=tonemap=mobius"), "{vf}");
+    }
+}
+
+#[test]
+fn export_gif_cancel_and_one_export_at_a_time() {
+    let (_dir, gifs, _path, mut h) = gif_harness("export-gif-cancel", "common/mp4_long.mp4");
+    if !gif_engine(&h, "export_gif_cancel_and_one_export_at_a_time") {
+        return;
+    }
+    let (mut gate, hook) = gate();
+    h.state_mut()
+        .set_export_gif_test_hooks(gif_gate_after_first_write(&gifs, hook));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_gif_window(&mut h);
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "20");
+    wait_ab(&mut h, "範圍 1–20 秒", [Some(1.0), Some(20.0)]);
+    click_in_view(&mut h, "開始匯出");
+    // 編碼用的 mpv 開好、寫了一部分的暫存檔，停在觀察點
+    let temp = gate.wait(&mut h);
+    assert!(temp.exists(), "暫存檔：{temp:?}，資料夾：{:?}", dir_names(&gifs));
+    assert_eq!(dir_names(&gifs).len(), 1, "{:?}", dir_names(&gifs));
+    assert!(h.state().export_busy());
+    // 一次只做一個：GIF、片段的開始都停用
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "正在匯出，請等這一個做完");
+    h.get_by_label("片段").click();
+    h.run_steps(3);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    // 轉 GIF 時可以取消
+    assert!(!h.get_by_label("取消匯出").accesskit_node().is_disabled());
+    click_in_view(&mut h, "取消匯出");
+    gate.release();
+    wait_export_done(&mut h);
+    assert_eq!(h.state().osd_text(), Some("已取消匯出"));
+    assert!(dir_names(&gifs).is_empty(), "取消後不留檔案：{:?}", dir_names(&gifs));
+}
+
+#[test]
+fn exit_during_gif_export_cleans_up() {
+    // 關閉影戲（丟掉整個 App）時 GIF 轉到一半：取消、刪掉暫存檔，也不會變成正式的檔案
+    let (_dir, gifs, _path, mut h) = gif_harness("export-gif-exit", "common/mp4_long.mp4");
+    if !gif_engine(&h, "exit_during_gif_export_cleans_up") {
+        return;
+    }
+    let (mut gate, hook) = gate();
+    h.state_mut()
+        .set_export_gif_test_hooks(gif_gate_after_first_write(&gifs, hook));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_gif_window(&mut h);
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "20");
+    wait_ab(&mut h, "範圍 1–20 秒", [Some(1.0), Some(20.0)]);
+    click_in_view(&mut h, "開始匯出");
+    let temp = gate.wait(&mut h);
+    // 暫存檔在 GIF 資料夾裡、已經寫了一部分（還沒換成正式的名稱）
+    assert!(temp.exists(), "暫存檔：{temp:?}，資料夾：{:?}", dir_names(&gifs));
+    assert!(vitascope::save::is_part(&temp.file_name().unwrap().to_string_lossy()));
+    assert_eq!(dir_names(&gifs).len(), 1, "{:?}", dir_names(&gifs));
+    drop(h);
+    gate.release();
+    // 放行之後背景工作發現已經取消、叫 mpv 停下來：暫存檔刪掉，不會留下任何檔案
+    let start = Instant::now();
+    while !dir_names(&gifs).is_empty() {
+        assert!(
+            start.elapsed() < EXPORT_TIMEOUT,
+            "關閉後留下檔案：{:?}",
+            dir_names(&gifs)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // 之後也不會再出現
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        assert!(dir_names(&gifs).is_empty(), "{:?}", dir_names(&gifs));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn export_settings_page_changes_the_gif_folder() {
+    let dir = TempDir::new("export-gif-settings");
+    let path = dir.0.join("settings.json");
+    let shots = dir.0.join("截圖");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.screenshot_dir = Some(shots.clone());
+    let mut h = harness_with(None, settings);
+    let chosen = dir.0.join("我的 GIF");
+    let answer = chosen.clone();
+    let seen = record_dialogs(&mut h, move |kind| {
+        (kind == DialogKind::ExportImageDir).then(|| vec![answer.clone()])
+    });
+    open_settings_page(&mut h, "截圖與匯出");
+    h.get_by_label("GIF 資料夾");
+    // 預設跟截圖放在一起（截圖資料夾改了也跟著）
+    assert!(h.query_all_by_label(shots.to_string_lossy().as_ref()).count() >= 2);
+    assert!(h.get_by_label("用預設的 GIF 資料夾").accesskit_node().is_disabled());
+    click_in_view(&mut h, "變更 GIF 資料夾…");
+    assert_eq!(
+        dialogs_done(&mut h, &seen),
+        [(DialogKind::ExportImageDir, Pick::Folder)]
+    );
+    assert_eq!(h.state().settings().export.image_dir.as_deref(), Some(chosen.as_path()));
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    assert_eq!(saved(&path)["export"]["image_dir"], chosen.to_string_lossy().as_ref());
+    h.get_by_label(chosen.to_string_lossy().as_ref());
+    // 片段的資料夾沒有跟著改
+    assert_eq!(h.state().settings().export.clip_dir, None);
+    click_in_view(&mut h, "用預設的 GIF 資料夾");
+    assert_eq!(h.state().settings().export.image_dir, None);
+    assert_eq!(saved(&path)["export"]["image_dir"], serde_json::Value::Null);
+}
+
+#[test]
+fn export_gif_command_menu_shortcut_and_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("export-gif".into(), vec!["F10".into()]);
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    // 選單上的按鍵從快捷鍵對照表來；GIF 資料夾的項目
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "轉成 GIF… F10");
+    h.get_by_label("開啟 GIF 資料夾");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 快捷鍵打開在 GIF 分頁
+    h.key_press(egui::Key::F10);
+    step_until_app(&mut h, "F10 打開匯出視窗", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+
+    // 英文介面
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Make GIF…");
+    h.get_by_label("Open the GIF folder");
+    h.get_by_label("Make GIF…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    for label in ["Size (long side)", "Frame rate", "Start export", "GIF", "Clip"] {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("找不到 {label}"));
+    }
+    h.get_by_label_contains("Rotation and flips follow the picture");
+    h.get_by_label("Include subtitles (as shown, with style and delay)");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Screenshots and export").click();
+    h.run_steps(2);
+    h.get_by_label("GIF folder");
+    h.get_by_label("Change the GIF folder…");
+    h.get_by_label("Use the default GIF folder");
+
+    // HDR 影片、「畫質 → HDR」是自動：英文的說明（GIF 用 Hable）
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("general/mkv_hevc10_hdr10_mid.mkv")), settings);
+    settle(&mut h, "mkv_hevc10_hdr10_mid.mkv");
+    let caps = h.state().engine_caps();
+    if !(caps.gif && caps.palettegen && caps.zscale && caps.tonemap) {
+        eprintln!("略過英文的 HDR 說明：播放引擎沒有 GIF 或色調映射的濾鏡");
+        return;
+    }
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Make GIF…");
+    h.get_by_label("Make GIF…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label(
+        "HDR video is converted to SDR (Hable, target 203 nits); GIFs can't use the \"Auto\" curve from Video quality → HDR, so they use Hable",
+    );
+}

@@ -1,17 +1,23 @@
-//! 匯出視窗（右鍵選單「匯出 ▸」、快捷鍵）：把 A-B 段落存成片段（不重新編碼）。
+//! 匯出視窗（右鍵選單「匯出 ▸」、快捷鍵）：把 A-B 段落存成片段（不重新編碼）、轉成 GIF。
 //!
 //! - 不擋住操作的小視窗（跟控制面板一樣），影片照樣播；關掉視窗不會取消正在做的匯出，再打開看得到進度。
 //! - 範圍就是 A-B 重播：欄位顯示 mpv 現在的 A、B，改欄位、按「目前位置」、按 L 都是改同一個 A-B
 //!   （進度條上的標記、重播一起變，等於預覽）。
 //! - 片段只放一條影像、一條聲音，不放字幕（目前的播放引擎寫不出字幕軌與語言標籤，視窗上註明）。
+//! - GIF：長邊、格率、要不要燒進字幕（記住上次的選擇）；旋轉、翻轉跟畫面一樣，最長 30 秒。
+//!   預設跟截圖放在一起（「設定 → 截圖與匯出」可以另外指定 GIF 資料夾）。
 //! - 一次只做一個匯出。背景工作送回來的是列舉（進度、`Done`、`Failure`），文字在這裡用目前的語言組。
 //! - 關閉影戲時丟掉 `Job`：取消、等一下、刪掉暫存檔（介面測試丟掉整個 App 也一樣）。
 //!
-//! GIF、縮圖總覽圖的分頁之後加（`ExportTab`）。
+//! 縮圖總覽圖的分頁之後加（`ExportTab`）。
 
 use super::{Action, DialogKind, Pick, VitascopeApp, menu_item};
 use crate::export::clip::{self, ClipSpec, Container, Picks, StreamPick};
-use crate::export::{self, ClipFormat, Done, Failure, Job, JobEvent, Progress, format_time, parse_time};
+use crate::export::gif::{self, GifSpec};
+use crate::export::{
+    self, ClipFormat, Done, Failure, GIF_FPS, GIF_LONG_SIDES, GIF_MAX_SECS, Job, JobEvent, Progress, format_time,
+    parse_time,
+};
 use crate::instance::Wake;
 use crate::keymap::Command;
 use crate::player::{Track, TrackKind};
@@ -26,14 +32,17 @@ pub(super) enum ExportTab {
     /// 片段（不重新編碼）
     #[default]
     Clip,
+    /// 轉成 GIF
+    Gif,
 }
 
 impl ExportTab {
-    const ALL: [ExportTab; 1] = [ExportTab::Clip];
+    const ALL: [ExportTab; 2] = [ExportTab::Clip, ExportTab::Gif];
 
     fn title(self) -> &'static str {
         match self {
             ExportTab::Clip => tr!("片段", "Clip"),
+            ExportTab::Gif => "GIF",
         }
     }
 }
@@ -43,6 +52,8 @@ impl ExportTab {
 pub(super) enum ExportDir {
     /// 片段（預設是「影片」資料夾裡的 VitaScope）
     Clip,
+    /// GIF（之後還有縮圖總覽圖；預設跟截圖放在一起）
+    Image,
 }
 
 /// 匯出視窗與正在做的工作
@@ -82,6 +93,8 @@ pub(super) struct ExportUi {
     result: Option<Result<Done, Failure>>,
     /// 測試用：匯出用的 mpv 的觀察點（見 `clip::TestHooks`）
     test: clip::TestHooks,
+    /// 測試用：GIF 的編碼用的 mpv 的觀察點（見 `gif::TestHooks`）
+    gif_test: gif::TestHooks,
 }
 
 impl ExportUi {
@@ -153,13 +166,21 @@ impl VitascopeApp {
     fn export_dir(&self, which: ExportDir) -> PathBuf {
         match which {
             ExportDir::Clip => self.settings.export.clip_folder(),
+            // 沒有另外指定時跟截圖放在一起（截圖資料夾改了也跟著）
+            ExportDir::Image => self
+                .settings
+                .export
+                .image_folder(self.settings.screenshot_dir.as_deref()),
         }
     }
 
     pub(super) fn open_export_dir(&mut self, which: ExportDir) {
         let dir = self.export_dir(which);
         if let Err(e) = crate::screenshot::open_folder(&dir) {
-            self.osd(tf!("無法開啟片段資料夾：{e}", "Cannot open the clips folder: {e}"));
+            self.osd(match which {
+                ExportDir::Clip => tf!("無法開啟片段資料夾：{e}", "Cannot open the clips folder: {e}"),
+                ExportDir::Image => tf!("無法開啟 GIF 資料夾：{e}", "Cannot open the GIF folder: {e}"),
+            });
         }
     }
 
@@ -168,6 +189,10 @@ impl VitascopeApp {
             ExportDir::Clip => (
                 DialogKind::ExportClipDir,
                 tr!("選擇片段資料夾", "Choose the clips folder"),
+            ),
+            ExportDir::Image => (
+                DialogKind::ExportImageDir,
+                tr!("選擇 GIF 資料夾", "Choose the GIF folder"),
             ),
         };
         let dialog = self
@@ -184,33 +209,57 @@ impl VitascopeApp {
                 self.osd(tf!("片段資料夾：{}", "Clips folder: {}", dir.display()));
                 self.settings.export.clip_dir = Some(dir);
             }
+            ExportDir::Image => {
+                self.osd(tf!("GIF 資料夾：{}", "GIF folder: {}", dir.display()));
+                self.settings.export.image_dir = Some(dir);
+            }
         }
         self.save_settings();
     }
 
-    /// 右鍵選單「匯出 ▸」：沒開檔時整個停用；存不了片段（直播、章節連結…）時項目停用，滑鼠停在上面說明原因
+    /// 右鍵選單「匯出 ▸」：沒開檔時整個停用；存不了片段、轉不了 GIF（直播、章節連結、沒有影像…）時
+    /// 那一項停用，滑鼠停在上面說明原因
     pub(super) fn export_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let mut action = None;
         ui.add_enabled_ui(self.player.state.loaded, |ui| {
             ui.menu_button(tr!("匯出", "Export"), |ui| {
-                let why = clip::unavailable(&self.player, &self.caps);
-                let mut button = egui::Button::new(tr!("儲存片段…", "Save clip…"));
-                let hint = self.keymap.hint(Command::ExportClip);
-                if !hint.is_empty() {
-                    button = button.shortcut_text(hint);
-                }
-                let mut r = ui.add_enabled(why.is_none(), button);
-                if let Some(f) = &why {
-                    r = r.on_disabled_hover_text(f.message());
-                }
-                if r.clicked() {
-                    action = Some(Action::ShowExport(ExportTab::Clip));
+                let items = [
+                    (
+                        tr!("儲存片段…", "Save clip…"),
+                        Command::ExportClip,
+                        ExportTab::Clip,
+                        clip::unavailable(&self.player, &self.caps),
+                    ),
+                    (
+                        tr!("轉成 GIF…", "Make GIF…"),
+                        Command::ExportGif,
+                        ExportTab::Gif,
+                        gif::unavailable(&self.player, &self.caps),
+                    ),
+                ];
+                for (label, cmd, tab, why) in items {
+                    let mut button = egui::Button::new(label);
+                    let hint = self.keymap.hint(cmd);
+                    if !hint.is_empty() {
+                        button = button.shortcut_text(hint);
+                    }
+                    let mut r = ui.add_enabled(why.is_none(), button);
+                    if let Some(f) = &why {
+                        r = r.on_disabled_hover_text(f.message());
+                    }
+                    if r.clicked() {
+                        action = Some(Action::ShowExport(tab));
+                    }
                 }
                 ui.separator();
                 if menu_item(ui, true, tr!("開啟片段資料夾", "Open the clips folder"), "") {
                     action = Some(Action::OpenExportDir(ExportDir::Clip));
                 }
                 ui.weak(self.export_dir(ExportDir::Clip).display().to_string());
+                if menu_item(ui, true, tr!("開啟 GIF 資料夾", "Open the GIF folder"), "") {
+                    action = Some(Action::OpenExportDir(ExportDir::Image));
+                }
+                ui.weak(self.export_dir(ExportDir::Image).display().to_string());
             });
         });
         action
@@ -393,6 +442,7 @@ impl VitascopeApp {
                     .show(ui, |ui| {
                         match self.export.tab {
                             ExportTab::Clip => self.clip_tab(ui),
+                            ExportTab::Gif => self.gif_tab(ui),
                         }
                         self.export_status(ui);
                     });
@@ -418,7 +468,14 @@ impl VitascopeApp {
         let container = self.clip_plan(format, &picks);
         self.clip_notes(ui, &picks, container.as_ref().ok().copied());
         ui.add_space(8.0);
-        self.output_rows(ui, points, &picks, container.as_ref().ok().copied());
+        let ext = container.as_ref().ok().map(|c| c.ext());
+        self.output_rows(ui, points, ExportDir::Clip, ext);
+        if let [Some(a), Some(b)] = points
+            && let Some(bytes) = self.estimated_bytes(b - a, &picks)
+        {
+            let size = crate::mediainfo::fmt_size(bytes);
+            ui.weak(tf!("預估大小：約 {size}", "Estimated size: about {size}"));
+        }
         ui.add_space(8.0);
         let why = self.clip_start_blocked(points, &picks, &container);
         let r = ui
@@ -667,15 +724,9 @@ impl VitascopeApp {
         }
     }
 
-    /// 存到哪裡、檔名、預估大小
-    fn output_rows(
-        &mut self,
-        ui: &mut egui::Ui,
-        points: [Option<f64>; 2],
-        picks: &Picks,
-        container: Option<Container>,
-    ) {
-        let dir = self.export_dir(ExportDir::Clip);
+    /// 存到哪裡、檔名（片段、GIF 共用一個檔名：都是照來源與範圍產生）；`ext` = 副檔名（不知道時不顯示）
+    fn output_rows(&mut self, ui: &mut egui::Ui, points: [Option<f64>; 2], which: ExportDir, ext: Option<&str>) {
+        let dir = self.export_dir(which);
         let mut choose = false;
         egui::Grid::new("export_output")
             .num_columns(2)
@@ -709,20 +760,14 @@ impl VitascopeApp {
                         // 清空 = 回到自動產生的名稱
                         self.export.name_edited = !self.export.name.trim().is_empty();
                     }
-                    if let Some(c) = container {
-                        ui.label(format!(".{}", c.ext()));
+                    if let Some(ext) = ext {
+                        ui.label(format!(".{ext}"));
                     }
                 });
                 ui.end_row();
             });
-        if let [Some(a), Some(b)] = points
-            && let Some(bytes) = self.estimated_bytes(b - a, picks)
-        {
-            let size = crate::mediainfo::fmt_size(bytes);
-            ui.weak(tf!("預估大小：約 {size}", "Estimated size: about {size}"));
-        }
         if choose {
-            self.choose_export_dir(ExportDir::Clip);
+            self.choose_export_dir(which);
         }
     }
 
@@ -827,6 +872,201 @@ impl VitascopeApp {
         }
     }
 
+    /// 「GIF」分頁：範圍、大小、格率、字幕、說明、存到哪裡、檔名、開始
+    fn gif_tab(&mut self, ui: &mut egui::Ui) {
+        if !self.player.state.loaded {
+            ui.weak(tr!("沒有開啟的影片", "No video is open"));
+            return;
+        }
+        let points = self.player.ab_loop_points();
+        self.range_rows(ui, points);
+        ui.add_space(8.0);
+        self.gif_rows(ui);
+        ui.add_space(8.0);
+        self.output_rows(ui, points, ExportDir::Image, Some("gif"));
+        ui.add_space(8.0);
+        let why = self.gif_start_blocked(points);
+        let r = ui
+            .add_enabled(why.is_none(), egui::Button::new(tr!("開始匯出", "Start export")))
+            .on_disabled_hover_text(why.unwrap_or_default());
+        if r.clicked() {
+            self.start_gif_export();
+        }
+    }
+
+    /// GIF 的選擇：長邊（與算出來的大小）、格率、字幕；HDR 與轉正的說明。改了就存進設定（記住上次的選擇）
+    fn gif_rows(&mut self, ui: &mut egui::Ui) {
+        let mut prefs = self.settings.export.gif;
+        let sizes = gif::sizes_for(&self.player, &self.geometry, prefs.long_side);
+        egui::Grid::new("export_gif")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                let label = ui.label(tr!("大小（長邊）", "Size (long side)"));
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("export_gif_size")
+                        .selected_text(format!("{} px", prefs.long_side))
+                        .show_ui(ui, |ui| {
+                            for side in GIF_LONG_SIDES {
+                                ui.selectable_value(&mut prefs.long_side, side, format!("{side} px"));
+                            }
+                        })
+                        .response
+                        .labelled_by(label.id);
+                    if let Some(s) = sizes {
+                        ui.label(format!("→ {}×{}", s.out.0, s.out.1));
+                    }
+                });
+                ui.end_row();
+                let label = ui.label(tr!("格率", "Frame rate"));
+                egui::ComboBox::from_id_salt("export_gif_fps")
+                    .selected_text(format!("{} fps", prefs.fps))
+                    .show_ui(ui, |ui| {
+                        for fps in GIF_FPS {
+                            ui.selectable_value(&mut prefs.fps, fps, format!("{fps} fps"));
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+                ui.end_row();
+            });
+        // 字幕：主播放器顯示著字幕時才能勾（勾選的狀態照樣記著）
+        let st = &self.player.state;
+        let shown = st.selected(TrackKind::Sub).is_some();
+        let mut on = prefs.subtitles && shown;
+        let r = ui
+            .add_enabled(
+                shown,
+                egui::Checkbox::new(
+                    &mut on,
+                    tr!(
+                        "包含字幕（目前顯示的字幕，含外觀與延遲）",
+                        "Include subtitles (as shown, with style and delay)"
+                    ),
+                ),
+            )
+            .on_disabled_hover_text(tr!("目前沒有顯示字幕", "No subtitles are shown"));
+        if r.changed() {
+            prefs.subtitles = on;
+        }
+        // HDR：會轉成一般畫面（目標亮度、曲線照「畫質 → HDR」；FFmpeg 沒有的曲線改用 Hable），或說明為什麼不轉
+        let dv = st.selected(TrackKind::Video).and_then(|t| t.dolby_vision_profile);
+        let user = self.settings.video.tone;
+        let (tone, note) = gif::hdr_plan(
+            gif::source_hdr(&self.player),
+            dv,
+            self.caps.zscale && self.caps.tonemap,
+            &user,
+        );
+        if let Some(t) = tone {
+            let npl = t.npl;
+            if t.curve == user.curve.mpv() {
+                let curve = user.curve.label();
+                ui.weak(tf!(
+                    "HDR 影片會轉成一般畫面（{curve}，目標亮度 {npl} nits，跟「畫質 → HDR」一樣）",
+                    "HDR video is converted to SDR ({curve}, target {npl} nits, as in Video quality → HDR)"
+                ));
+            } else {
+                // 自動、BT.2390：FFmpeg 的 tonemap 沒有，GIF 用 Hable（不說「一樣」）
+                let curve = user.curve.label();
+                ui.weak(tf!(
+                    "HDR 影片會轉成一般畫面（Hable，目標亮度 {npl} nits）；「畫質 → HDR」的曲線「{curve}」GIF 做不到，改用 Hable",
+                    "HDR video is converted to SDR (Hable, target {npl} nits); GIFs can't use the \"{curve}\" curve from Video quality → HDR, so they use Hable"
+                ));
+            }
+        } else if let Some(n) = note {
+            ui.weak(n.message());
+        }
+        let max = GIF_MAX_SECS;
+        ui.weak(tf!(
+            "旋轉、翻轉跟畫面一樣；影像調整、像素著色器、縮放、裁切不會套用。GIF 最長 {max:.0} 秒。",
+            "Rotation and flips follow the picture; image adjustments, shaders, zoom and crop are not applied. \
+             GIFs can be at most {max:.0} seconds."
+        ));
+        if prefs != self.settings.export.gif {
+            self.settings.export.gif = prefs;
+            self.save_settings();
+        }
+    }
+
+    /// GIF 現在不能開始的原因（None = 可以開始）
+    fn gif_start_blocked(&self, points: [Option<f64>; 2]) -> Option<String> {
+        if self.export.job.is_some() {
+            return Some(
+                tr!(
+                    "正在匯出，請等這一個做完",
+                    "An export is running; wait for it to finish"
+                )
+                .into(),
+            );
+        }
+        if let Some(f) = gif::unavailable(&self.player, &self.caps) {
+            return Some(f.message());
+        }
+        let [Some(a), Some(b)] = points else {
+            return Some(tr!("先設定起點和終點", "Set the start and the end first").into());
+        };
+        if b <= a {
+            return Some(tr!("終點要在起點之後", "The end must come after the start").into());
+        }
+        if let Err(f) = gif::check_length(b - a) {
+            return Some(f.message());
+        }
+        if gif::sizes_for(&self.player, &self.geometry, self.settings.export.gif.long_side).is_none() {
+            return Some(
+                tr!(
+                    "還不知道畫面的大小，請稍候",
+                    "The picture size isn't known yet; wait a moment"
+                )
+                .into(),
+            );
+        }
+        None
+    }
+
+    /// GIF 的「開始匯出」：從主播放器準備好（範圍、大小、格率、字幕、轉正、HDR、資料夾、檔名），在背景開始
+    fn start_gif_export(&mut self) {
+        let [Some(a), Some(b)] = self.player.ab_loop_points() else {
+            return;
+        };
+        if self.export.job.is_some() {
+            return;
+        }
+        let dir = self.export_dir(ExportDir::Image);
+        // 換不成正式名稱留下的檔案登記在快取資料夾；沒有快取資料夾（自動測試、`--shot`）時用系統的暫存資料夾
+        let cache = self
+            .export_cache_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("vitascope-export"));
+        let choice = gif::Choice {
+            prefs: self.settings.export.gif,
+            geometry: &self.geometry,
+            tone: &self.settings.video.tone,
+            style: &self.settings.subtitle,
+            deinterlace: self.settings.video.deinterlace,
+        };
+        match GifSpec::from_player(&self.player, &self.caps, a, b, &choice, dir, cache) {
+            Ok(mut spec) => {
+                let generated = self.export_stem(a, b);
+                let edited = if self.export.name_edited {
+                    self.export.name.as_str()
+                } else {
+                    ""
+                };
+                spec.stem = export::chosen_stem(edited, &generated);
+                spec.test = self.export.gif_test.clone();
+                let ctx = self.egui_ctx.clone();
+                let wake: Wake = Arc::new(move || ctx.request_repaint());
+                self.export.job = Some(gif::spawn(spec, wake));
+                self.export.progress = None;
+                self.export.result = None;
+            }
+            Err(f) => {
+                self.osd(f.osd());
+                self.export.result = Some(Err(f));
+            }
+        }
+    }
+
     /// 視窗下方：進度與取消（寫檔中不能取消）、完成的檔案與實際範圍、失敗的原因
     fn export_status(&mut self, ui: &mut egui::Ui) {
         let mut open_file = None;
@@ -907,7 +1147,7 @@ impl VitascopeApp {
         }
     }
 
-    /// 片段的設定（「設定 → 截圖與匯出」）：資料夾、格式。回傳設定有沒有改（呼叫的地方存檔）
+    /// 匯出的設定（「設定 → 截圖與匯出」）：片段的資料夾、格式，GIF 的資料夾。回傳設定有沒有改（呼叫的地方存檔）
     pub(super) fn export_settings_section(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) -> bool {
         let mut changed = false;
         ui.strong(tr!("匯出", "Export"));
@@ -963,6 +1203,35 @@ impl VitascopeApp {
              track, without subtitles. A format that can't hold the chosen tracks falls back to Automatic. \
              Export the A-B loop range from the right-click menu: Export ▸ Save clip…."
         ));
+        ui.add_space(6.0);
+        ui.label(tr!("GIF 資料夾", "GIF folder"));
+        ui.add(
+            egui::Label::new(RichText::new(self.export_dir(ExportDir::Image).display().to_string()).monospace()).wrap(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(tr!("變更 GIF 資料夾…", "Change the GIF folder…")).clicked() {
+                *action = Some(Action::ChooseExportDir(ExportDir::Image));
+            }
+            if ui.button(tr!("開啟 GIF 資料夾", "Open the GIF folder")).clicked() {
+                *action = Some(Action::OpenExportDir(ExportDir::Image));
+            }
+            if ui
+                .add_enabled(
+                    self.settings.export.image_dir.is_some(),
+                    egui::Button::new(tr!("用預設的 GIF 資料夾", "Use the default GIF folder")),
+                )
+                .clicked()
+            {
+                self.settings.export.image_dir = None;
+                changed = true;
+            }
+        });
+        let max = GIF_MAX_SECS;
+        ui.weak(tf!(
+            "預設：跟截圖放在一起（上面的截圖資料夾）。GIF 最長 {max:.0} 秒；大小、格率在匯出視窗裡選，會記住上次的選擇。",
+            "Default: together with the screenshots (the screenshot folder above). GIFs can be at most {max:.0} seconds; \
+             choose the size and frame rate in the Export window, and the last choice is remembered."
+        ));
         changed
     }
 
@@ -982,6 +1251,12 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn set_export_test_hooks(&mut self, hooks: clip::TestHooks) {
         self.export.test = hooks;
+    }
+
+    /// 測試用：之後開始的 GIF 用這些觀察點
+    #[doc(hidden)]
+    pub fn set_export_gif_test_hooks(&mut self, hooks: gif::TestHooks) {
+        self.export.gif_test = hooks;
     }
 }
 
