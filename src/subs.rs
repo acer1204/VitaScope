@@ -223,26 +223,12 @@ impl ExternalSub {
     }
 }
 
-/// 轉碼後字幕的暫存資料夾。放在使用者自己的快取資料夾，不放共用的 /tmp：
-/// 多使用者的電腦上，別人無法搶先建立同名資料夾、也無法放入假字幕
+/// 轉碼後字幕的暫存資料夾：快取資料夾（[`crate::paths::cache_root`]）底下的 `subs`
 /// - Windows：`%LOCALAPPDATA%\VitaScope\subs`
 /// - macOS：`~/Library/Caches/VitaScope/subs`
 /// - Linux：`$XDG_CACHE_HOME/vitascope/subs`（預設 `~/.cache/vitascope/subs`）
 pub fn cache_dir() -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
-    let base = if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("VitaScope"))
-    } else if cfg!(target_os = "macos") {
-        home().map(|h| h.join("Library/Caches/VitaScope"))
-    } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home().map(|h| h.join(".cache")))
-            .map(|d| d.join("vitascope"))
-    };
-    // 找不到使用者資料夾時才退回系統暫存資料夾，仍放在自己的子資料夾裡（clean_cache 只清這裡）
-    base.unwrap_or_else(|| std::env::temp_dir().join("vitascope"))
-        .join("subs")
+    crate::paths::cache_root().join("subs")
 }
 
 /// 清掉超過一天的暫存字幕

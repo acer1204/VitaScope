@@ -3179,6 +3179,16 @@ fn url_dialog_in_english() {
     h.get_by_label(&format!("Open URL… {cmd}+U"));
 }
 
+#[test]
+fn ytdl_search_is_lazy_and_never_uses_the_users_tools_folder() {
+    // 自動測試的 Launch 沒有工具資料夾：不找、不碰使用者下載的 yt-dlp；開啟播放器也不會開始找（第一次需要時才在背景找）
+    let mut h = harness(Some(sample("general/audio_flac.flac")));
+    h.run_steps(3);
+    let loc = h.state().ytdl_locator();
+    assert_eq!(loc.tools_dir(), None);
+    assert!(!loc.started(), "開啟播放器時不找 yt-dlp");
+}
+
 // ───────────── 網路播放：連線中、緩衝中、直播、續播、網路上的播放清單、設定 → 網路 ─────────────
 
 /// 網路測試等久一點（CI 的電腦比較慢；連線、緩衝的時間跟網路的速度有關）

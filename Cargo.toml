@@ -43,6 +43,7 @@ url = "2.5.8"
 [target.'cfg(windows)'.dependencies]
 # 單一執行個體：具名管道、使用者 SID（只讓同一個使用者連線）、把前景交給已開啟的視窗
 # 流暢播放：螢幕的精確更新率（QueryDisplayConfig）、電源（GetSystemPowerStatus）
+# 網站影片：yt-dlp 放進 Job Object（取消、結束影戲時連它開的子程序一起結束）
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
@@ -53,6 +54,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_Power",

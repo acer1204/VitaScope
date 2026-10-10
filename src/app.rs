@@ -281,6 +281,8 @@ pub struct VitascopeApp {
     history: History,
     /// 每個檔案的書籤（背景執行緒存檔）
     bookmarks: Bookmarks,
+    /// 找 yt-dlp、deno（背景，找到後記住）
+    ytdl: crate::ytdl::Locator,
     /// 書籤分頁上選取的書籤（編號）
     bookmark_selected: Option<u64>,
     /// 書籤分頁上正在改名的書籤
@@ -555,6 +557,9 @@ pub struct Launch {
     pub wayland: Option<bool>,
     /// 網址的標題（網址 → 標題）：還原的播放清單裡 `#EXTINF` 寫的
     pub titles: HashMap<String, String>,
+    /// 外部工具的資料夾（影戲下載的 yt-dlp、deno）；預設 None（自動測試不找、不碰使用者的工具），
+    /// 播放器用 `paths::tools_dir()`
+    pub tools_dir: Option<PathBuf>,
 }
 
 impl VitascopeApp {
@@ -660,6 +665,10 @@ impl VitascopeApp {
         // 存檔失敗的回覆要叫醒介面（顯示提示）
         let ctx = cc.egui_ctx.clone();
         bookmarks.set_wake(Arc::new(move || ctx.request_repaint()));
+        // yt-dlp、deno：第一次需要時才在背景找（網站影片、網路設定），找完叫醒介面
+        let ytdl = crate::ytdl::Locator::new(launch.tools_dir);
+        let ctx = cc.egui_ctx.clone();
+        ytdl.set_wake(Arc::new(move || ctx.request_repaint()));
         let mut app = Self {
             player,
             video,
@@ -687,6 +696,7 @@ impl VitascopeApp {
             engine_lgpl: false,
             history: launch.history,
             bookmarks,
+            ytdl,
             bookmark_selected: None,
             bookmark_edit: None,
             bookmarks_clear: None,
@@ -830,6 +840,11 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn player_mut(&mut self) -> &mut Player {
         &mut self.player
+    }
+
+    /// 找 yt-dlp、deno 的狀態（之後的網站影片、網路設定頁用；介面測試用來確認沒有碰使用者的工具）
+    pub fn ytdl_locator(&self) -> &crate::ytdl::Locator {
+        &self.ytdl
     }
 
     /// 播放紀錄（介面測試用）
