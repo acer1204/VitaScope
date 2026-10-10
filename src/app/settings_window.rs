@@ -26,18 +26,21 @@ pub(super) enum Page {
     /// 音效（輸出裝置、獨佔模式、轉成立體聲、音訊直通）
     Sound,
     Subtitles,
+    /// 網路（開啟網址的串流設定；之後加網站影片 yt-dlp）
+    Network,
     Screenshot,
     System,
     Shortcuts,
 }
 
 impl Page {
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 9] = [
         Page::General,
         Page::Playback,
         Page::Picture,
         Page::Sound,
         Page::Subtitles,
+        Page::Network,
         Page::Screenshot,
         Page::System,
         Page::Shortcuts,
@@ -50,6 +53,7 @@ impl Page {
             Page::Picture => tr!("畫質", "Video quality"),
             Page::Sound => tr!("音效", "Sound"),
             Page::Subtitles => tr!("字幕", "Subtitles"),
+            Page::Network => tr!("網路", "Network"),
             Page::Screenshot => tr!("截圖", "Screenshots"),
             Page::System => tr!("系統", "System"),
             Page::Shortcuts => tr!("快捷鍵", "Shortcuts"),
@@ -64,6 +68,8 @@ impl VitascopeApp {
             self.shader_info.clear();
             // 錄到一半的按鍵、還沒回答的詢問都取消
             self.keys_ui.close();
+            // 「網路 → 進階」打到一半的文字（關掉視窗時輸入框不一定收到「離開欄位」）
+            self.commit_net_draft();
             return;
         }
         let mut open = true;
@@ -97,6 +103,7 @@ impl VitascopeApp {
                                 Page::Picture => self.picture_page(ui, &mut action),
                                 Page::Sound => self.sound_page(ui, &mut action),
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
+                                Page::Network => self.network_page(ui),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
                                 Page::System => changed |= self.system_page(ui),
                                 Page::Shortcuts => self.shortcuts_page(ui),
@@ -114,6 +121,10 @@ impl VitascopeApp {
         // 錄到一半的按鍵、還沒回答的詢問、還原的確認：只在快捷鍵分頁開著時才有
         if !self.settings_open || self.settings_page != Page::Shortcuts {
             self.keys_ui.close();
+        }
+        // 換到別頁、關掉視窗：「網路 → 進階」打到一半的文字寫回設定
+        if !self.settings_open || self.settings_page != Page::Network {
+            self.commit_net_draft();
         }
         self.shortcuts_reset_modal(ctx);
         if let Some(a) = action {

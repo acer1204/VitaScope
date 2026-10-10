@@ -22,6 +22,7 @@ use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
 use crate::keymap::{Chord, Command, Keymap, MouseInput, Platform, WheelMode};
+use crate::mpv::EndReason;
 use crate::picture::{
     Adjust, AdjustKind, ChromaScaler, Deinterlace, Downscaler, Gamut, PictureDefaults, Quality, Strength, ToneCurve,
     Upscaler,
@@ -88,6 +89,8 @@ enum Action {
     Open,
     /// 「開啟網址」對話框（Ctrl+U）
     OpenUrl,
+    /// 取消正在連線的網址（Esc、連線中畫面的「取消」）
+    CancelLoading,
     About,
     /// 播放清單的上一個 / 下一個檔案
     PrevFile,
@@ -293,6 +296,12 @@ pub struct VitascopeApp {
     url_dialog: Option<network::UrlDialog>,
     /// 打開「開啟網址」時等讀剪貼簿的結果多久（介面測試改成確定的值，不靠電腦快慢）
     url_prefill_wait: Duration,
+    /// 目前的檔案是直播：網路串流、載入時沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類（`net::is_live`）
+    net_live: bool,
+    /// 這個檔案已經提示過「直播已結束」
+    live_end_shown: bool,
+    /// 「設定 → 網路 → 進階」正在編輯的文字（離開欄位才寫回設定）
+    net_draft: Option<network::NetDraft>,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
     was_eof: bool,
     /// 滑鼠滾輪還沒湊滿一格的量（觸控板的捲動是連續的）
@@ -685,6 +694,9 @@ impl VitascopeApp {
             titles,
             url_dialog: None,
             url_prefill_wait: network::PREFILL_WAIT,
+            net_live: false,
+            live_end_shown: false,
+            net_draft: None,
             was_eof: false,
             wheel: 0.0,
             right_controls_width: 0.0,
@@ -1115,11 +1127,18 @@ impl VitascopeApp {
         let (Some(path), Some(duration)) = (st.path.clone(), st.duration) else {
             return;
         };
-        if is_url(&path) {
+        // 本機檔案用路徑，網路串流用續播的代號；mpv 自己的網址（av:// 之類）不記
+        let Some(key) = network::history_key(&path) else {
+            return;
+        };
+        // 網路串流：能跳轉的影片才記（直播、伺服器不支援 Range 的檔案不能跳轉）；不記網址、網址裡有密碼之類的不記
+        if crate::net::is_network(&path)
+            && !(st.seekable && self.settings.net.remember_urls && crate::net::storable(&path))
+        {
             return;
         }
         let time = st.time_pos;
-        self.update_history(|h| h.remember(&path, time, duration));
+        self.update_history(|h| h.remember(&key, time, duration));
         self.last_autosave = Instant::now();
     }
 
@@ -1239,6 +1258,8 @@ impl VitascopeApp {
                 self.remember_position();
                 let _ = self.player.stop();
             }
+            // 還在連線、載入：停止 = 取消
+            Action::Stop | Action::CancelLoading if self.player.loading_now() => self.cancel_loading(),
             Action::Seek(delta) if loaded && st.seekable => {
                 let duration = st.duration.unwrap_or(0.0);
                 let target = (st.time_pos + delta).clamp(0.0, duration);
@@ -1288,6 +1309,7 @@ impl VitascopeApp {
             Action::ExitFullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false)),
             Action::Open => self.open_dialog(),
             Action::OpenUrl => self.open_url_dialog(ctx),
+            Action::CancelLoading => {}
             Action::About => self.about_open = true,
             Action::TogglePlaylist => self.toggle_side(ctx, SideTab::Playlist),
             Action::ToggleBookmarks => self.toggle_side(ctx, SideTab::Bookmarks),
@@ -1989,6 +2011,8 @@ impl VitascopeApp {
                 self.pacing.start_file(self.file_gen);
                 self.audio_seen = None;
                 self.audio_restore = None;
+                self.net_live = false;
+                self.live_end_shown = false;
                 // 上一個檔案的音訊輸出開不起來、改用 null：mpv 換檔時沿用同一個輸出，不重開的話之後的檔案都沒有聲音
                 if self.player.audio_fell_back() {
                     self.retry_audio_output();
@@ -2050,10 +2074,20 @@ impl VitascopeApp {
                 }
             }
             PlayerEvent::Seek => self.pacing.seeked(),
-            PlayerEvent::EndFile { error, .. } => {
+            PlayerEvent::EndFile { reason, error } => {
                 self.fit_window_pending = false;
                 self.seek_drag = None;
                 self.seek_released = false;
+                match reason {
+                    // 網路上的播放清單讀完了：展開成播放清單、照一般的開檔重新開
+                    EndReason::Redirect => {
+                        if let Some(list) = self.player.take_remote_playlist() {
+                            self.adopt_remote_playlist(list);
+                        }
+                    }
+                    EndReason::Eof => self.live_file_ended(),
+                    _ => {}
+                }
                 if let Some(e) = error {
                     eprintln!("[vitascope] {e}");
                     // 開檔失敗：不會直通，濾鏡鏈設回來
@@ -2076,8 +2110,9 @@ impl VitascopeApp {
         let Ok(path) = self.player.get_string("path") else {
             return;
         };
-        // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到
-        self.bookmarks.refresh(&path);
+        // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到（網路串流用續播的代號，跟 `media_key` 一樣）
+        self.bookmarks
+            .refresh(&network::history_key(&path).unwrap_or_else(|| path.clone()));
         // 書籤分頁上選取的是上一個檔案的書籤
         self.bookmark_selected = None;
         if let Some((video, subs)) = self.pending_subs.take()
@@ -2093,6 +2128,7 @@ impl VitascopeApp {
         if is_url(&path) {
             if crate::net::is_network(&path) {
                 self.remember_url(&path);
+                self.net_file_loaded(&path);
             }
             self.adjust_reminder();
             return;
@@ -2175,7 +2211,7 @@ impl VitascopeApp {
     /// 1. 播完後的倒數（之後的批次加在最前面）；2. 「設定 → 快捷鍵」正在錄按鍵（[`Self::capture_key`]）；
     /// 3. 「關於」、對話框（`egui::Modal`）開著、正在輸入文字時，按鍵都不當快捷鍵；
     /// 4. Esc 依序關掉開著的視窗（[`ESC_WINDOWS`]）；
-    /// 5. 全螢幕時 Esc 離開全螢幕；
+    /// 5. 全螢幕時 Esc 離開全螢幕；一般視窗裡正在連線的網址，Esc 取消（全螢幕時不取消）；
     /// 6. 快捷鍵對照表（`keymap`）。貼上（Ctrl+V、Shift+Insert）開剪貼簿裡的網址或路徑（[`Self::paste_text`]）。
     ///    固定的按鍵：側邊面板開著時，只按 Delete 一定是移除選取的項目（播放清單分頁移出清單、
     ///    書籤分頁刪掉書籤；排在對照表前面，自己指定的按鍵拿不走）；Shift／Alt+Delete 排在對照表後面，對照表沒用到才移除
@@ -2219,8 +2255,18 @@ impl VitascopeApp {
             return;
         }
         let mut actions = Vec::new();
-        if !menu_open && is_fullscreen(ctx) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        let fullscreen = is_fullscreen(ctx);
+        if !menu_open && fullscreen && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             actions.push(Action::ExitFullscreen);
+        }
+        // 一般視窗裡正在連線的網址：Esc 取消。全螢幕時 Esc 照樣是離開全螢幕（全螢幕看網路上的清單時，
+        // 接下一個的那幾秒按 Esc 不會停掉）；要取消用連線中畫面的「取消」或停止
+        if !menu_open
+            && !fullscreen
+            && self.player.net_loading().is_some()
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+        {
+            actions.push(Action::CancelLoading);
         }
         let side_open = self.settings.show_playlist;
         // 移除的是目前分頁上選取的項目
@@ -3071,10 +3117,14 @@ impl VitascopeApp {
             audio_info(ui, rect, st);
         }
         if !st.loaded
-            && !st.loading
+            && !self.player.loading_now()
             && let Some(path) = self.placeholder(ui, rect)
         {
             self.open_recent(&path);
+        }
+        // 網路串流：連線中（可以取消）、緩衝中
+        if self.loading_overlay(ui, rect) {
+            self.run(ui.ctx(), Action::CancelLoading);
         }
 
         self.video_mouse(ui.ctx(), &response);
@@ -3295,7 +3345,9 @@ impl VitascopeApp {
         if self.cmd_item(ui, loaded, pause_label, Command::TogglePause) {
             action = Some(Action::TogglePause);
         }
-        if self.cmd_item(ui, loaded, crate::tr!("停止", "Stop"), Command::Stop) {
+        // 還在連線、載入時也能按（= 取消）
+        let can_stop = loaded || self.player.loading_now();
+        if self.cmd_item(ui, can_stop, crate::tr!("停止", "Stop"), Command::Stop) {
             action = Some(Action::Stop);
         }
         if self.cmd_item(
@@ -3583,16 +3635,21 @@ impl VitascopeApp {
             {
                 self.run(ui.ctx(), Action::NextFile);
             }
+            // 還在連線、載入時也能按（= 取消）
             if ui
-                .add_enabled(loaded, icon_button("⏹"))
+                .add_enabled(loaded || self.player.loading_now(), icon_button("⏹"))
                 .on_hover_text(crate::tr!("停止", "Stop"))
                 .clicked()
             {
                 self.run(ui.ctx(), Action::Stop);
             }
+            let live = self.live_now();
             let st = &self.player.state;
             let pos = self.seek_drag.unwrap_or(st.time_pos);
-            let time = if loaded {
+            let time = if loaded && live {
+                // 直播：沒有總長度
+                format!("{} / {}", fmt_time(pos), crate::tr!("直播", "Live"))
+            } else if loaded {
                 format!("{} / {}", fmt_time(pos), fmt_time(st.duration.unwrap_or(0.0)))
             } else {
                 "--:-- / --:--".to_owned()
@@ -4206,6 +4263,8 @@ impl eframe::App for VitascopeApp {
                 self.open_paths(files, false);
             }
         }
+        // 直播播到結尾：先提示（自動接下一個時，下一個的提示蓋過它）
+        self.live_tick();
         self.auto_next();
         self.autosave();
         self.refresh_deint_osd();

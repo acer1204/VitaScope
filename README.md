@@ -30,6 +30,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）與 OpenSSL 3（libssl3，桌面系統都有）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
+  tar.gz 用系統的 libmpv 播 DASH 網址（`.mpd`）只能盡力而為：載入中按停止、換檔時可能會卡住（系統的 FFmpeg 沒有這個修正；
+  AppImage 與 Windows、macOS 版用影戲自己建置的播放引擎，已經修正）。
 
 播放器的「關於」（控制列的 ℹ 或 F1）可以檢查更新，有新版本時會開啟 Releases 頁面。各版本的改動見 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -158,7 +160,12 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 - [x] 書籤：P 在目前的位置新增、Shift+PgUp / PgDn 跳到上一個 / 下一個，進度條上有標記，右鍵選單「書籤 ▸」；
   H 打開側邊面板的「書籤」分頁（播放清單旁邊）：點一下跳過去、雙擊改名、右鍵選單、Delete 刪除、「全部刪除…」。
   存在設定資料夾的 `bookmarks.json`
-- [ ] 開啟網址（HTTP、HLS、DASH）、網站影片（yt-dlp）
+- [x] 開啟網址（HTTP、HLS、DASH）：Ctrl（⌘）+ U、在播放器上貼上（Ctrl（⌘）+ V）、命令列、本機與網路上的 .m3u 播放清單
+  （IPTV 的清單網址會展開成播放清單）。連線中、緩衝中的畫面（Esc 或「取消」中斷；全螢幕時 Esc 照樣是離開全螢幕），
+  直播顯示「直播」、結束時提示；網址記進最近開啟（顯示標題），能跳轉、一分鐘以上的影片從上次的位置繼續（書籤也是）。
+  「設定 → 網路」可以改 HLS / DASH 的起始畫質、重新連線、快取、逾時、憑證檢查、記不記網址，以及 User-Agent、Referer、標頭、proxy。
+  從瀏覽器拖曳連結進來沒有作用（系統只把檔案交給程式），請複製網址後按 Ctrl（⌘）+ V
+- [ ] 網站影片（yt-dlp）
 - [ ] 線上搜尋字幕
 - [ ] 片段輸出、轉成 GIF、縮圖總覽圖
 - [ ] 播放清單：隨機、重複、播完後動作
@@ -198,7 +205,7 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 | ↑ / ↓ | 音量 ±5 |
 | M | 靜音 |
 | F、Enter、雙擊畫面 | 全螢幕 |
-| Esc | 離開全螢幕（控制面板、設定、媒體資訊開著時先關掉它們） |
+| Esc | 離開全螢幕（控制面板、設定、媒體資訊開著時先關掉它們）；一般視窗裡正在連線的網址按 Esc 取消 |
 | Ctrl（macOS：⌘）+ O | 開啟檔案 |
 | Ctrl（macOS：⌘）+ U | 開啟網址（HTTP、HLS、DASH；好幾個網址用空白分開，照順序變成播放清單） |
 | Ctrl（macOS：⌘）+ V（Windows 也可以 Shift + Insert） | 開啟剪貼簿裡的網址或檔案路徑（播放清單開著時加到最後；不能改）。複製的是檔案本身（檔案總管、Finder 裡選檔案按複製）時打不開，請用「複製路徑」或直接拖放 |
@@ -303,7 +310,7 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 |---|---|
 | `tests/formats.rs` | 格式測試矩陣：每個樣本檢查編碼、解碼、字幕文字、旋轉 / HDR 中繼資料、跳轉、播到結尾 |
 | `tests/smoke.rs` | libmpv 載入、開檔、錯誤訊息 |
-| `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、貼上、「開啟網址」對話框（本機的 HTTP 伺服器）、播放清單面板、截圖、設定視窗、「關於」與檢查更新 |
+| `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、貼上、「開啟網址」對話框與網路播放（本機的 HTTP 伺服器：連線中與取消、緩衝中、直播、續播、網路上的播放清單、「設定 → 網路」）、播放清單面板、截圖、設定視窗、「關於」與檢查更新 |
 | `tests/instance.rs` | 單一執行個體：同時啟動好幾個程式，檔案都送到同一個視窗；第一個關掉後由下一個接手 |
 | `tests/mediainfo.rs`、`tests/thumbs.rs` | 媒體資訊、進度條預覽縮圖 |
 | `tests/hwdec.rs` | 硬體解碼確實走 GPU，Hi10P 自動退回軟解 |
@@ -312,8 +319,8 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/sound.rs` | 音效選項：介面上每個值 mpv 都接受、預設設定跟 mpv 原本的值一樣、只送有變的選項；AC-3、E-AC-3、DTS、TrueHD 實際直通；等化器、夜間模式、音量放大、轉成立體聲用 `ao=pcm` 寫出 WAV 實際量測；等化器與音量放大在跳轉後照樣有效 |
 | `tests/async_opts.rs` | 非同步設定 mpv 選項（回覆依種類分派、先後順序、失敗時的處理）、偵測播放引擎的功能、L3 加的播放狀態 |
 | `tests/engine_build.rs` | 播放引擎的建置內容：用到的解碼器、分離器、協定、濾鏡都在，L3 元件（DASH、片段輸出、轉 GIF、音訊濾鏡）實際可用 |
-| `tests/net.rs` | 網路功能：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單）；用本機的測試伺服器（`tests/support/http.rs`，只聽 127.0.0.1）播 HTTP 的檔案、HLS、DASH（多畫質一開始選哪個），User-Agent、Referer、自訂標頭真的送到伺服器，網路設定 mpv 讀回來是設定的值 |
-| `tests/net_errors.rs` | 開網址失敗的說明：HTTP 404 / 403 / 500、網頁不是影片、連線逾時（不重試）、找不到伺服器。要看 FFmpeg 的記錄（只送到第一個建立的 mpv），所以自己一個測試程式、一次只有一個播放器 |
+| `tests/net.rs` | 網路功能：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單）；用本機的測試伺服器（`tests/support/http.rs`，只聽 127.0.0.1）播 HTTP 的檔案、HLS、DASH（多畫質一開始選哪個），User-Agent、Referer、自訂標頭真的送到伺服器，網路設定 mpv 讀回來是設定的值；網路上的播放清單展開時拿掉本機檔案的項目、取消連線 |
+| `tests/net_errors.rs` | 開網址失敗的說明：HTTP 404 / 403 / 500、網頁不是影片、連線逾時（不重試）、找不到伺服器，起始畫面寫出原因。要看 FFmpeg 的記錄（只送到第一個建立的 mpv），所以自己一個測試程式、一次只有一個播放器 |
 | `tests/pacing.rs` | 流暢播放在播放引擎這一層的行為（`vo-null-fps` 當假的螢幕更新率） |
 | `tests/pacing_window.rs` | 流暢播放與畫面輸出節奏的實機量測（會開全螢幕視窗，預設不跑；見下方） |
 

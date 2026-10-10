@@ -465,7 +465,23 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   macOS 的 Backspace 規則（每個平台都檢查）、英文介面）
   - [ ] 手動確認：網路磁碟上的影片加書籤不卡畫面；兩個影戲同時開著加書籤，兩邊的都留下
   - [ ] 手動確認：macOS 的 Backspace（滑鼠在清單上才移除；在畫面上不移除；PotPlayer 風格是從頭播放）
-- [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；播放引擎已含 libxml2，本機的 DASH 有自動測試）
+- [x] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；播放引擎已含 libxml2，本機的 DASH 有自動測試）。
+  入口：Ctrl（⌘）+ U 的「開啟網址」對話框、在播放器上貼上、🗁 按右鍵、命令列、本機的 .m3u（`#EXTINF` 標題）。
+  網路設定（`net`）：HLS / DASH 起始畫質、重新連線（不含 `reconnect_on_network_error`：連不上的網址不重試）、快取、逾時、憑證檢查
+  （系統的 libmpv 也明確打開）、記住網址、User-Agent / Referer / 標頭（換行不能進標頭）/ proxy，在「設定 → 網路」改，
+  `VITASCOPE_MPV_OPTS` 指定的停用。播放時：300 毫秒後才出現的「正在連線：主機…」（Esc 只在一般視窗取消，全螢幕時 Esc 照樣離開全螢幕；
+  「取消」、停止也可以）、「緩衝中… N%」（`paused-for-cache`、`cache-buffering-state`），都畫成深色；直播（載入時沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類：
+  直播的 HLS 也有 FFmpeg 估的很短的總長度；伺服器不支援 Range 的一般檔案不能跳轉但不是直播）顯示「直播」、播完提示。續播與書籤用同一個代號（網址去掉 `#` 之後的部分；之後網站影片是
+  `ytdl://擷取器/代號`），只記能跳轉、一分鐘以上、記得住的網址（含帳號密碼、token 的不記）。網路上的播放清單（IPTV 的 .m3u 網址）：
+  mpv 結束這個網址（redirect）時讀出它展開的項目（清單的網址看 `playlist-path`），只留網路串流，換成影戲的播放清單、照一般的開檔重新開，
+  mpv 自己的清單又只有一個。媒體資訊的「來源」（標題、網址、串流種類、預先讀了幾秒、下載速度、緩衝中），截圖檔名用標題。
+  Linux tar.gz（系統的 FFmpeg 6.1）的 DASH 只能盡力：載入中停止、換檔時可能卡住，只有影戲自己建置的引擎修正了（DASH 的測試只在這個引擎跑）
+  （自動：net 單元測試（網址的檢查與補全、各來源能開的網址、能不能記、續播的代號、展開的清單、標頭、失敗的說明）；
+  headless 播 HTTP / HLS / DASH、標頭送到伺服器、設定讀回、網路上的清單拿掉 `file:///`、取消連線；FFmpeg 記錄的說明（404 / 403 / 逾時 /
+  找不到伺服器，起始畫面寫出原因）一次只有一個播放器；kittest 對話框、貼上、連線中與 Esc / 取消 / 停止、全螢幕的 Esc、緩衝中（伺服器送到 5% 就停）、
+  直播（沒有結尾標記的 HLS）、不支援 Range 的伺服器上的檔案不是直播、續播與書籤的代號（不記網址、有 token 的網址、不能跳轉的不續播）、網路上的清單、「設定 → 網路」、`VITASCOPE_MPV_OPTS` 停用、英文介面）
+  - [ ] 手動確認：真的網路上的 HLS 直播、DASH、IPTV 的 m3u 網址（Windows、macOS、Linux AppImage 與 tar.gz 各一次）；
+    Windows 上網路擋住憑證撤銷檢查時的說明與「檢查網站憑證」開關；HTTP proxy；從瀏覽器拖曳連結沒有反應、Ctrl（⌘）+ V 可以
 - [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
 - [ ] 線上搜尋字幕（OpenSubtitles API）
 - [ ] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF
@@ -786,3 +802,10 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **產生的正弦波 WAV 可能被當成 MPEG-TS**：48 kHz 的 1 kHz 浮點正弦波每 192 位元組重複一次，剛好是 M2TS 的封包長度，
   FFmpeg 的偵測給 MPEG-TS 滿分、開不起來。測試指定 `demuxer-lavf-format=wav`。本專案建置的引擎也沒有 FFmpeg 的 `sine` 來源，
   測試用的聲音都在測試裡產生。
+- **直播的 HLS 也有「總長度」**：沒有結尾標記（`#EXT-X-ENDLIST`）的 HLS，FFmpeg 用開頭讀到的那一段估了一個總長度（不到一秒），
+  mpv 之後跟著已經讀到的長度變長；用「沒有總長度」判斷直播不準。改看載入時能不能跳轉（直播的 HLS、RTSP、RTMP 都不能）。
+  但只看「不能跳轉」也不對：伺服器不支援 Range（沒有 `Accept-Ranges`，很多小型伺服器、NAS）的一般檔案，FFmpeg 當成串流、mpv 也說不能跳轉，
+  總長度卻是真的。所以有總長度又不能跳轉時，只有 HLS / DASH 與 RTSP、RTMP 之類算直播（`net::is_live`）。
+- **網路上的播放清單讀完後，mpv 馬上就開第一個項目**：結束那個網址（redirect）的事件處理到的時候，`path` 可能已經是第一個項目；
+  清單本身的網址要看項目的 `playlist-path`（mpv 0.37 起）。mpv 也會把清單裡的 `file://` 換成本機路徑（Windows 是 `\etc\passwd`），
+  篩選時本機路徑一樣拿掉。

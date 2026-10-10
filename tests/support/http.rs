@@ -5,6 +5,12 @@
 //! - `/slow`：收下請求、永遠不回應（測連線逾時）
 //! - `/html`：一個網頁（不是影片）
 //! - `/m3u`：網路上的播放清單：兩個 `/f/` 的網址，中間夾一個 `file:///` 的項目（匯入時要拿掉）
+//! - `/hlslive/<路徑>`：像直播一樣的 HLS：`.m3u8` 拿掉結尾的 `#EXT-X-ENDLIST`（和 VOD 的標記），片段照常送。
+//!   播放器當成直播（沒有總長度、不能跳轉），一直重新讀清單等新的片段
+//! - `/stall/<百分比>/<路徑>`：跟 `/f/` 一樣，但檔案前面這個百分比之後的資料永遠不送（連線開著、一直等），
+//!   從那之後開始的請求也一樣；從檔案後半開始的請求（MP4 放在最後的 moov）照常送。播放到那裡就會「緩衝中」
+//! - `/norange/<路徑>`：跟 `/f/` 一樣的檔案，但不支援 `Range`（不管有沒有都送整個檔案、沒有 `Accept-Ranges`），
+//!   像很多小型伺服器、NAS。播放器只能從頭讀（不能跳轉），但總長度照樣知道：不是直播
 //!
 //! 每個請求的方法、路徑、標頭都記下來（`requests()`），測試用來確認播放器送了什麼。
 //! 一個連線一個執行緒；每個回應之後關閉連線（`Connection: close`）。
@@ -157,9 +163,31 @@ fn serve(conn: TcpStream, s: &Shared) -> std::io::Result<()> {
     s.log.lock().unwrap().push(req.clone());
     let mut out = conn;
     let head = req.method == "HEAD";
-    let route = req.path.split('?').next().unwrap_or("");
+    // 查詢字串、網頁裡的位置（`#…`，播放器不一定會拿掉）不算路徑
+    let route = req.path.split(['?', '#']).next().unwrap_or("");
     if let Some(rel) = route.strip_prefix("/f/") {
-        return send_file(&mut out, &s.root, rel, req.header("Range"), head);
+        return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
+    }
+    if let Some(rel) = route.strip_prefix("/norange/") {
+        return send_file(&mut out, &s.root, rel, None, head, None);
+    }
+    if let Some(rel) = route.strip_prefix("/hlslive/") {
+        if !rel.ends_with(".m3u8") {
+            return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
+        }
+        let Some(text) = sample_path(&s.root, rel).and_then(|p| std::fs::read_to_string(p).ok()) else {
+            return send(&mut out, 404, "text/plain", b"not found\n", head);
+        };
+        let live: String = text
+            .lines()
+            .filter(|l| !l.starts_with("#EXT-X-ENDLIST") && !l.starts_with("#EXT-X-PLAYLIST-TYPE"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        return send(&mut out, 200, content_type(Path::new(rel)), live.as_bytes(), head);
+    }
+    if let Some((pct, rel)) = route.strip_prefix("/stall/").and_then(|r| r.split_once('/')) {
+        let pct: u64 = pct.parse().unwrap_or(50);
+        return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, Some((pct, s)));
     }
     if let Some(code) = route.strip_prefix("/status/") {
         let code: u16 = code.parse().unwrap_or(500);
@@ -263,18 +291,31 @@ fn parse_range(range: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
     Some(if r.0 >= len { Err(()) } else { Ok(r) })
 }
 
-fn send_file(out: &mut TcpStream, root: &Path, rel: &str, range: Option<&str>, head: bool) -> std::io::Result<()> {
+/// 樣本資料夾裡的檔案（路徑裡有 `..`、空的一段的不算）
+fn sample_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    (!rel.split('/').any(|seg| seg == ".." || seg.is_empty())).then(|| root.join(rel))
+}
+
+/// `range` = 請求的 `Range`：外面的 None 是不支援 Range（不送 `Accept-Ranges`），`Some(None)` 是支援但這次沒有要求。
+/// `stall` = (百分比, 伺服器)：檔案前面這個百分比之後的資料不送，連線開著等到伺服器關掉
+fn send_file(
+    out: &mut TcpStream,
+    root: &Path,
+    rel: &str,
+    range: Option<Option<&str>>,
+    head: bool,
+    stall: Option<(u64, &Shared)>,
+) -> std::io::Result<()> {
     // 只服務樣本資料夾裡的檔案
-    if rel.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+    let Some(path) = sample_path(root, rel) else {
         return send(out, 404, "text/plain", b"not found\n", head);
-    }
-    let path = root.join(rel);
+    };
     let Ok(mut file) = std::fs::File::open(&path) else {
         return send(out, 404, "text/plain", b"not found\n", head);
     };
     let len = file.metadata()?.len();
     let ctype = content_type(&path);
-    let (code, start, end) = match range.and_then(|r| parse_range(r, len)) {
+    let (code, start, end) = match range.flatten().and_then(|r| parse_range(r, len)) {
         Some(Ok((a, b))) => (206, a, b),
         Some(Err(())) => {
             write!(
@@ -288,9 +329,12 @@ fn send_file(out: &mut TcpStream, root: &Path, rel: &str, range: Option<&str>, h
     };
     let count = if len == 0 { 0 } else { end - start + 1 };
     let mut head_text = format!(
-        "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {count}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {count}\r\nConnection: close\r\n",
         reason(code)
     );
+    if range.is_some() {
+        head_text += "Accept-Ranges: bytes\r\n";
+    }
     if code == 206 {
         head_text += &format!("Content-Range: bytes {start}-{end}/{len}\r\n");
     }
@@ -300,7 +344,19 @@ fn send_file(out: &mut TcpStream, root: &Path, rel: &str, range: Option<&str>, h
         return out.flush();
     }
     file.seek(SeekFrom::Start(start))?;
+    // 卡住：從檔案後半開始的請求照常送（MP4 放在最後的 moov），其他的送到卡住的位置就停
+    let limit = stall
+        .filter(|_| start < len / 2)
+        .map(|(pct, _)| (len * pct / 100).saturating_sub(start).min(count));
     // 播放器跳轉時會中途關掉連線：寫不出去就結束
-    std::io::copy(&mut file.take(count), out)?;
-    out.flush()
+    std::io::copy(&mut file.take(limit.unwrap_or(count)), out)?;
+    out.flush()?;
+    if let (Some(_), Some((_, s))) = (limit, stall) {
+        // 不關連線、也不再送：播放器一直等（直到逾時、跳轉關掉連線、或伺服器關掉）
+        let begin = Instant::now();
+        while !s.stop.load(Ordering::SeqCst) && begin.elapsed() < SLOW_LIMIT {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(())
 }

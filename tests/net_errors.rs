@@ -6,11 +6,16 @@
 
 mod support;
 
+use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use support::http::Server;
+use vitascope::app::{Launch, VitascopeApp};
+use vitascope::i18n::Lang;
 use vitascope::net::{self, NetSettings};
 use vitascope::player::{Options, Player, PlayerEvent};
+use vitascope::settings::Settings;
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -119,4 +124,45 @@ fn dns_failure_is_explained() {
         "記錄：{:#?}",
         p.recent_errors()
     );
+}
+
+/// 介面：網址開不了時，起始畫面寫出原因（HTTP 404；英文介面也是）
+#[test]
+fn start_screen_explains_a_404() {
+    let _one = lock();
+    let server = Server::start();
+    let url = server.url("/status/404");
+    for (lang, want) in [
+        (Lang::ZhTw, "無法開啟網址：找不到這個網址的內容（HTTP 404）"),
+        (Lang::En, "Can't open the URL: Nothing found at this address (HTTP 404)"),
+    ] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let player = Player::new(Options {
+            keep_open: true,
+            ..Options::headless()
+        })
+        .expect("建立 mpv 失敗");
+        let launch = Launch {
+            files: vec![std::path::PathBuf::from(&url)],
+            ..Default::default()
+        };
+        let mut h = Harness::builder()
+            .with_size([960.0, 600.0])
+            .build_eframe(move |cc| VitascopeApp::new(cc, player, settings, launch));
+        // 詳細的原因（FFmpeg 的記錄）比開檔失敗晚到，說明會跟著更新
+        let start = Instant::now();
+        while h.query_by_label(want).is_none() {
+            assert!(
+                start.elapsed() < TIMEOUT,
+                "起始畫面沒有寫出原因：{:?}（記錄：{:#?}）",
+                h.state().player().state.last_error,
+                h.state().player().recent_errors()
+            );
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    vitascope::i18n::set_lang(Lang::ZhTw);
 }

@@ -728,6 +728,9 @@ pub struct Player {
     failed_after: Option<Duration>,
     /// 已經放行的 hook 數（自動測試用）
     hooks_continued: u64,
+    /// 網路上的播放清單（IPTV 的 .m3u 網址）讀完時展開的項目：mpv 結束那個網址（redirect）的當下讀出來，
+    /// 等介面拿去變成播放清單（見 `take_remote_playlist`）
+    remote_playlist: Option<net::RemotePlaylist>,
     /// VITASCOPE_DEBUG：印出這個等級（`log_rank`）以內的 mpv 記錄；沒設定時不印
     debug_print: Option<usize>,
 }
@@ -853,6 +856,7 @@ impl Player {
             load_started: None,
             failed_after: None,
             hooks_continued: 0,
+            remote_playlist: None,
             debug_print: debug.as_deref().map(|v| log_rank(debug_log_level(Some(v)))),
         })
         .inspect(|_| subs::clean_cache())
@@ -1277,6 +1281,41 @@ impl Player {
 
     pub fn stop(&self) -> mpv::Result<()> {
         self.mpv.command(&["stop"])
+    }
+
+    /// 正在開檔：已經送出開檔（或 mpv 開始了下一個檔案），還沒載入完成也還沒結束
+    pub fn loading_now(&self) -> bool {
+        self.state.loading || self.load_started.is_some()
+    }
+
+    /// 正在連線的網路串流（網址, 從什麼時候開始）：連線中的畫面、Esc 取消用。
+    /// 舊的檔案還在播（換檔途中）時不算
+    pub fn net_loading(&self) -> Option<(&str, Instant)> {
+        let since = self.load_started?;
+        let url = self.opening.as_deref().filter(|u| net::is_network(u))?;
+        (!self.state.loaded).then_some((url, since))
+    }
+
+    /// 取消正在進行的開檔（Esc、連線中畫面的「取消」、停止）：跟停止一樣，mpv 中斷連線，
+    /// 結束的原因是 stop、沒有錯誤（之後網站影片等 yt-dlp 時，等待中的 hook 也要在這裡放行）
+    pub fn cancel_loading(&mut self) -> mpv::Result<()> {
+        self.stop()?;
+        // 馬上不算載入中（連線中的畫面馬上消失）。mpv 還沒開始的檔案（loadfile 之後馬上停止）不會再有 EndFile，
+        // 不清掉的話會一直算「載入中」
+        self.load_started = None;
+        self.state.loading = false;
+        Ok(())
+    }
+
+    /// 讀 mpv 現在的播放清單，只留網路串流（網路上的播放清單展開後；見 `net::remote_playlist`）
+    pub fn import_playlist(&self) -> net::RemotePlaylist {
+        let json = self.mpv.get_string("playlist").unwrap_or_default();
+        net::remote_playlist(self.opening.as_deref().unwrap_or_default(), &json)
+    }
+
+    /// 網路上的播放清單剛展開（EndFile 的原因是 redirect）：拿走展開的項目（只有一次）
+    pub fn take_remote_playlist(&mut self) -> Option<net::RemotePlaylist> {
+        self.remote_playlist.take()
     }
 
     pub fn set_pause(&self, paused: bool) -> mpv::Result<()> {
@@ -1940,6 +1979,15 @@ impl Player {
             Event::EndFile { reason, error } => {
                 self.state.loading = false;
                 self.state.loaded = false;
+                // 網路上的播放清單（IPTV 的 .m3u 網址）：mpv 讀完清單、把項目放進自己的播放清單，接著就會自己開第一個。
+                // 這時就讀出來（mpv 接著會開別的項目）；介面照一般的開檔重新開，mpv 的清單回到只有一個
+                if reason == EndReason::Redirect {
+                    let list = self.import_playlist();
+                    // 本機的清單（.pls 之類交給 mpv 讀的）照舊由 mpv 播：項目可以是本機檔案
+                    if net::is_network(&list.source) {
+                        self.remote_playlist = Some(list);
+                    }
+                }
                 self.failed_after = self.load_started.take().map(|t| t.elapsed());
                 let error = error.map(|e| {
                     let base = failure_reason(e.code);

@@ -588,7 +588,10 @@ fn fixed_rows(platform: keymap::Platform, backspace_free: bool) -> Vec<(String, 
     vec![
         (
             "Esc".to_owned(),
-            tr!("關閉視窗、離開全螢幕", "Close a window, leave fullscreen"),
+            tr!(
+                "關閉視窗、離開全螢幕、取消正在連線的網址",
+                "Close a window, leave fullscreen, cancel a URL that's connecting"
+            ),
         ),
         (
             if mac && backspace_free {

@@ -134,8 +134,11 @@ impl History {
         self.recent.retain(|p| !same_path(p, path));
     }
 
+    /// 「最近開啟的檔案 → 清除清單」：連網址的續播位置一起清掉（記下的網址都清除；「設定 → 網路」這樣說明）。
+    /// 本機檔案的續播位置留著
     pub fn clear_recent(&mut self) {
         self.recent.clear();
+        self.positions.retain(|p| !crate::m3u::is_url(&p.path));
     }
 
     /// 記下「開啟網址」輸入的網址（放到最前面；一字不差的才算同一個）
@@ -236,6 +239,23 @@ mod tests {
             "最新的在前面"
         );
         assert_eq!(h.resume_point("0.mkv"), None, "最舊的被丟掉");
+    }
+
+    #[test]
+    fn clearing_recent_forgets_url_positions() {
+        let mut h = History::default();
+        let url = "https://x.example/v.mp4";
+        h.add_recent(url);
+        h.add_recent("C:\\影片\\a.mkv");
+        h.remember(url, 100.0, 1000.0);
+        h.remember("ytdl://youtube/BaW_jenozKc", 100.0, 1000.0);
+        h.remember("C:\\影片\\a.mkv", 100.0, 1000.0);
+        h.clear_recent();
+        assert!(h.recent.is_empty());
+        // 記下的網址都清掉；本機檔案的續播位置留著
+        assert_eq!(h.resume_point(url), None);
+        assert_eq!(h.resume_point("ytdl://youtube/BaW_jenozKc"), None);
+        assert_eq!(h.resume_point("C:\\影片\\a.mkv"), Some(100.0));
     }
 
     #[test]

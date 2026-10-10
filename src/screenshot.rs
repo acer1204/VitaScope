@@ -106,9 +106,13 @@ pub fn sanitize_stem(s: &str) -> String {
     }
 }
 
-/// 截圖檔名：「影片名稱 01.23.45.678.png」
-pub fn file_name(source: &str, time: f64) -> String {
-    let stem = if crate::m3u::is_url(source) {
+/// 截圖檔名：「影片名稱 01.23.45.678.png」。網路串流知道標題（`title`：m3u 的 `#EXTINF`、影片本身的標題）時用標題，
+/// 不然用網址的最後一段；本機檔案一律用檔名
+pub fn file_name(source: &str, title: Option<&str>, time: f64) -> String {
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    let stem = if let Some(t) = title.filter(|_| crate::net::is_network(source)) {
+        t.to_owned()
+    } else if crate::m3u::is_url(source) {
         source
             .rsplit('/')
             .find(|s| !s.is_empty())
@@ -421,10 +425,28 @@ mod tests {
 
     #[test]
     fn file_names_are_safe_and_unique() {
-        assert_eq!(file_name("C:/影片/第1集.mkv", 3723.456), "第1集 01.02.03.456.png");
+        assert_eq!(file_name("C:/影片/第1集.mkv", None, 3723.456), "第1集 01.02.03.456.png");
         assert_eq!(
-            file_name("https://x.com/live/stream.m3u8", 0.0),
+            file_name("https://x.com/live/stream.m3u8", None, 0.0),
             "stream.m3u8 00.00.00.000.png"
+        );
+        // 網路串流有標題時用標題（檔名不能用的字元換掉）；本機檔案照樣用檔名
+        assert_eq!(
+            file_name("https://x.com/live/stream.m3u8", Some(" 新聞台: 直播 "), 61.0),
+            "新聞台_ 直播 00.01.01.000.png"
+        );
+        assert_eq!(
+            file_name("https://x.com/live/stream.m3u8", Some("  "), 0.0),
+            "stream.m3u8 00.00.00.000.png"
+        );
+        assert_eq!(
+            file_name("C:/影片/第1集.mkv", Some("標題"), 0.0),
+            "第1集 00.00.00.000.png"
+        );
+        assert_eq!(
+            file_name("av://lavfi:testsrc", Some("標題"), 0.0),
+            "lavfi_testsrc 00.00.00.000.png",
+            "mpv 自己的網址不是網路串流"
         );
         assert_eq!(sanitize_stem("a:b?c*"), "a_b_c_");
         assert_eq!(sanitize_stem("CON"), "_CON");

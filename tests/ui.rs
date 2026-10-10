@@ -3179,6 +3179,604 @@ fn url_dialog_in_english() {
     h.get_by_label(&format!("Open URL… {cmd}+U"));
 }
 
+// ───────────── 網路播放：連線中、緩衝中、直播、續播、網路上的播放清單、設定 → 網路 ─────────────
+
+/// 網路測試等久一點（CI 的電腦比較慢；連線、緩衝的時間跟網路的速度有關）
+const NET_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 一直跑介面幀，直到畫面上有含 `text` 的文字
+fn step_until_label(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    let start = Instant::now();
+    loop {
+        h.step();
+        if h.query_by_label_contains(text).is_some() {
+            return;
+        }
+        assert!(
+            start.elapsed() < NET_TIMEOUT,
+            "等不到畫面上的「{text}」\n目前狀態：{:#?}",
+            h.state().player().state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 同 `step_until_app`，等久一點
+fn step_until_net(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&VitascopeApp) -> bool) {
+    let start = Instant::now();
+    while !cond(h.state()) {
+        assert!(
+            start.elapsed() < NET_TIMEOUT,
+            "等待逾時：{what}\n目前狀態：{:#?}",
+            h.state().player().state
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 按控制列的停止鍵（播放中的影片）。先等影片尺寸出來、視窗配合影片改好大小：網址載入後馬上跳轉時，
+/// 第一格畫面（視窗跟著改大小）可能在跳轉之後才到（CI 比較慢）。測試環境照 InnerSize 改畫面大小，
+/// 改的那一幀之前讀到的按鈕位置已經不對，會按不到
+fn click_stop(h: &mut Harness<'_, VitascopeApp>) {
+    step_until_net(h, "知道影片尺寸", |app| app.player().state.video_size.is_some());
+    // 停止鍵的位置連續幾幀不變（視窗改完大小）
+    let start = Instant::now();
+    let (mut last, mut same) = (None, 0);
+    while same < 3 {
+        h.step();
+        let rect = h.get_by_label("⏹").rect();
+        if last == Some(rect) {
+            same += 1;
+        } else {
+            (last, same) = (Some(rect), 0);
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "停止鍵的位置一直在變");
+    }
+    h.get_by_label("⏹").click();
+}
+
+/// 貼上一直不回應的網址（`/slow`），等到「正在連線」出現
+fn connecting(server: &Server, settings: Settings) -> Harness<'static, VitascopeApp> {
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/slow")));
+    step_until_label(&mut h, "正在連線：127.0.0.1…");
+    assert!(h.state().player().net_loading().is_some());
+    h
+}
+
+fn no_auto_next() -> Settings {
+    let mut s = Settings::default();
+    s.auto_next = false;
+    s
+}
+
+/// 網址連線中：一開始（300 毫秒內）不顯示，之後顯示「正在連線：主機…」與「按 Esc 取消」，停止鍵可以按（不用等連上）。
+/// Esc 取消：提示「已取消」，沒有錯誤（不是「無法開啟」），回到起始畫面；伺服器只收到一次請求（沒有重試）
+#[test]
+fn escape_cancels_a_connecting_url() {
+    let server = Server::start();
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/slow")));
+    h.step();
+    assert!(
+        h.query_by_label_contains("正在連線").is_none(),
+        "剛開始連線不顯示（本機檔案、很快就連上的網址不會閃一下）"
+    );
+    step_until_label(&mut h, "正在連線：127.0.0.1…");
+    h.get_by_label("按 Esc 取消");
+    assert!(!h.get_by_label("⏹").accesskit_node().is_disabled(), "連線中可以按停止");
+    // 等 mpv 真的送出請求（CI 比較慢，300 毫秒內不一定送了），之後才能確認取消後沒有重試
+    server.wait_request("/slow", NET_TIMEOUT).expect("連到伺服器");
+    h.key_press(egui::Key::Escape);
+    step_until_net(&mut h, "取消連線", |app| !app.player().loading_now());
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), Some("已取消"));
+    let st = &h.state().player().state;
+    assert!(!st.loaded && st.last_error.is_none(), "取消不是錯誤：{st:#?}");
+    assert!(h.query_by_label_contains("正在連線").is_none());
+    h.get_by_label_contains("拖放到這裡");
+    assert_eq!(server.requests_to("/slow").len(), 1);
+}
+
+/// 連線中畫面的「取消」、控制列的停止鍵都會取消；英文介面的文字
+#[test]
+fn cancel_button_and_stop_cancel_a_connecting_url() {
+    let server = Server::start();
+    let mut h = connecting(&server, no_auto_next());
+    h.get_by_label("取消").click();
+    step_until_net(&mut h, "按「取消」", |app| !app.player().loading_now());
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("已取消"));
+    assert!(h.state().player().state.last_error.is_none());
+
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/slow")));
+    step_until_label(&mut h, "Connecting to 127.0.0.1…");
+    h.get_by_label("Press Esc to cancel");
+    h.get_by_label("Cancel");
+    h.get_by_label("⏹").click();
+    step_until_net(&mut h, "按停止", |app| !app.player().loading_now());
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Cancelled"));
+    assert!(h.state().player().state.last_error.is_none());
+}
+
+/// 全螢幕時正在連線：Esc 照樣是離開全螢幕，不會取消（全螢幕看網路上的清單時，接下一個的那幾秒按 Esc 不會停掉）；
+/// 連線中畫面不寫「按 Esc 取消」，「取消」照樣能按
+#[test]
+fn escape_in_fullscreen_while_connecting_leaves_fullscreen() {
+    let server = Server::start();
+    let mut h = harness(None);
+    h.step();
+    set_fullscreen(&mut h, true);
+    h.event(egui::Event::Paste(server.url("/slow")));
+    step_until_label(&mut h, "正在連線：127.0.0.1…");
+    assert!(h.query_by_label("按 Esc 取消").is_none());
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(5);
+    assert!(h.state().player().net_loading().is_some(), "沒有取消");
+    assert_ne!(h.state().osd_text(), Some("已取消"));
+    h.get_by_label("取消").click();
+    step_until_net(&mut h, "按「取消」", |app| !app.player().loading_now());
+}
+
+/// 快取不夠、等資料（伺服器送到檔案的 5% 就不再送）：影片上顯示「緩衝中… N%」（N 是 mpv 的 cache-buffering-state），
+/// 媒體資訊的「來源」也寫緩衝中
+#[test]
+fn buffering_shows_on_the_video() {
+    let server = Server::start();
+    let url = server.url("/stall/5/common/mp4_long.mp4");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "開始播放", |app| playing_url(&app.player().state, &url));
+    step_until_net(&mut h, "播到沒有資料、等快取", |app| {
+        app.player().state.paused_for_cache
+    });
+    let start = Instant::now();
+    loop {
+        h.step();
+        let pct = h.state().player().state.cache_buffering;
+        if let Some(p) = pct
+            && h.query_by_label(&format!("緩衝中… {p}%")).is_some()
+        {
+            break;
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "沒有「緩衝中… {pct:?}%」");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label("來源");
+    h.get_by_label_contains("· 緩衝中");
+}
+
+/// 直播（不能跳轉；這裡是沒有結尾標記的 HLS，FFmpeg 照樣估了一個很短的總長度）：時間寫「直播」；播到結尾（停在最後一格）時提示「直播已結束或連線中斷」；
+/// 媒體資訊的「來源」寫網址、HLS 串流、直播；不記續播的位置
+#[test]
+fn live_streams_are_labelled_and_their_end_is_announced() {
+    if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/hls_vod/index.m3u8")
+        .exists()
+    {
+        eprintln!("略過：沒有 net/hls_vod/index.m3u8（python scripts/gen_samples.py）");
+        return;
+    }
+    let server = Server::start();
+    let url = server.url("/hlslive/net/hls_vod/index.m3u8");
+    // 直播的清單一直沒有新的片段時，FFmpeg 預設要重新讀 1000 次才結束：測試改成 2 次
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("demuxer-lavf-o".into(), "m3u8_hold_counters=2".into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch::default(),
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "開始播放", |app| playing_url(&app.player().state, &url));
+    step_until_label(&mut h, " / 直播");
+    assert!(!h.state().player().state.seekable, "不能跳轉");
+    step_until_net(&mut h, "直播結束的提示", |app| {
+        app.osd_text() == Some("直播已結束或連線中斷")
+    });
+    assert!(h.state().player().state.loaded, "停在最後一格");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label("來源");
+    h.get_by_label(&url);
+    h.get_by_label("HLS 串流 · 直播");
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert!(h.state().history().positions.is_empty(), "直播不記續播的位置");
+}
+
+/// 能跳轉、一分鐘以上的網路影片：從上次的位置繼續。代號是網址去掉 `#` 之後的部分，書籤也用同一個代號；
+/// 「記住開啟過的網址」關掉時不記、不續播；mpv 自己的網址（av://）不記
+#[test]
+fn network_videos_resume_by_key() {
+    let server = Server::start();
+    let key = server.file_url("common/mp4_long.mp4"); // 90 秒
+    let with_fragment = format!("{key}#from-a-page");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(with_fragment.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &with_fragment) && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    h.state_mut().player_mut().seek_to(30.0, true).unwrap();
+    step_until_net(&mut h, "跳到 30 秒", |app| {
+        (app.player().state.time_pos - 30.0).abs() < 2.0
+    });
+    // 書籤跟續播用同一個代號
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks().marks(&key).len(), 1);
+    assert!(h.state().bookmarks().marks(&with_fragment).is_empty());
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    let at = h.state().history().resume_point(&key).expect("記下續播的位置");
+    assert!((at - 30.0).abs() < 3.0, "{at}");
+    assert_eq!(h.state().history().resume_point(&with_fragment), None);
+    // 不帶 # 的同一個網址：從上次的位置繼續，書籤也看得到
+    h.event(egui::Event::Paste(key.clone()));
+    step_until_net(&mut h, "從上次的位置繼續", |app| {
+        let s = &app.player().state;
+        playing_url(s, &key) && s.time_pos > at - 3.0
+    });
+    assert!(
+        h.state().osd_text().is_some_and(|t| t.starts_with("從 00:3")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().bookmarks().marks(&key).len(), 1);
+
+    // 不記網址：不記位置，也不續播
+    h.state_mut().change_net(|n| n.remember_urls = false);
+    h.state_mut().player_mut().seek_to(50.0, true).unwrap();
+    step_until_net(&mut h, "跳到 50 秒", |app| {
+        (app.player().state.time_pos - 50.0).abs() < 2.0
+    });
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert_eq!(h.state().history().resume_point(&key), Some(at), "沒有記新的位置");
+    h.event(egui::Event::Paste(key.clone()));
+    step_until_net(&mut h, "再開一次", |app| playing_url(&app.player().state, &key));
+    h.run_steps(2);
+    // 續播的提示在載入完成時（同一幀）就出現；之後播了一段還在開頭：沒有跳過去
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.starts_with("從")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    step_until_net(&mut h, "播了一段", |app| app.player().state.time_pos > 2.0);
+    assert!(h.state().player().state.time_pos < 20.0, "不續播");
+
+    // mpv 自己的網址：不記（播到 10 秒以上才記得到，用 4 倍速）
+    let lavfi = PathBuf::from("av://lavfi:testsrc2=size=160x90:rate=10:duration=100");
+    let mut h = harness(Some(lavfi));
+    step_until(&mut h, "開始播放", |s| s.loaded);
+    h.state_mut().player_mut().set_speed(4.0).unwrap();
+    step_until_net(&mut h, "播到 12 秒", |app| app.player().state.time_pos > 12.0);
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert!(
+        h.state().history().positions.is_empty(),
+        "{:?}",
+        h.state().history().positions
+    );
+}
+
+/// 網址裡有 token 之類的（記不得的網址）：不記續播的位置，以前記下的也不拿來續播（只會在舊版的紀錄裡）
+#[test]
+fn unstorable_network_urls_are_not_resumed() {
+    let server = Server::start();
+    let url = format!("{}?token=abc123", server.file_url("common/mp4_long.mp4"));
+    let mut history = vitascope::history::History::default();
+    history.positions.push(vitascope::history::Position {
+        path: url.clone(),
+        time: 30.0,
+    });
+    let mut h = harness_launch(
+        Launch {
+            history,
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &url) && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    h.run_steps(2);
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.starts_with("從")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    step_until_net(&mut h, "播了一段", |app| app.player().state.time_pos > 2.0);
+    assert!(h.state().player().state.time_pos < 20.0, "不續播");
+    h.state_mut().player_mut().seek_to(50.0, true).unwrap();
+    step_until_net(&mut h, "跳到 50 秒", |app| {
+        (app.player().state.time_pos - 50.0).abs() < 2.0
+    });
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert_eq!(h.state().history().resume_point(&url), Some(30.0), "沒有記新的位置");
+    assert!(!h.state().history().recent.contains(&url));
+}
+
+/// 伺服器不支援 Range（很多小型伺服器、NAS）：不能跳轉，但有總長度，不是直播（時間照常寫總長度、媒體資訊不寫直播）；
+/// 不能跳轉的網路影片不續播（紀錄留著）、也不記位置
+#[test]
+fn unseekable_network_files_are_not_live_and_not_resumed() {
+    let server = Server::start();
+    let url = server.url("/norange/common/mkv_multitrack.mkv"); // 20 秒
+    // 以前記下的位置（例如那時候伺服器支援 Range）
+    let mut history = vitascope::history::History::default();
+    history.positions.push(vitascope::history::Position {
+        path: url.clone(),
+        time: 30.0,
+    });
+    let mut h = harness_launch(
+        Launch {
+            history,
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &url) && s.duration.is_some_and(|d| d > 19.0)
+    });
+    step_until_net(&mut h, "播了一段", |app| app.player().state.time_pos > 1.0);
+    assert!(!h.state().player().state.seekable, "伺服器不支援 Range：不能跳轉");
+    step_until_label(&mut h, " / 00:20");
+    assert!(h.query_by_label_contains("直播").is_none(), "不是直播");
+    // 不能跳轉：這次不跳，紀錄也不丟（不是因為總長度不合而忘掉）
+    assert_eq!(h.state().history().resume_point(&url), Some(30.0));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label("來源");
+    let node = h.get_by_label_contains("HTTP · Matroska");
+    let node = node.accesskit_node();
+    let facts = node.label().or_else(|| node.value()).unwrap_or_default();
+    assert!(facts.contains("00:20"), "有總長度：{facts}");
+    assert!(h.query_by_label_contains("直播").is_none());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+
+    // 能跳轉、一分鐘以上、播到 30 秒，但 mpv 說不能跳轉（直播之類）：停止時不記。
+    // 用假的狀態（mpv 的 seekable 已經送到之後才改，之後不會再送）：不靠找得到一分鐘以上又不能跳轉的樣本
+    let long = server.file_url("common/mp4_long.mp4");
+    h.event(egui::Event::Paste(long.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &long) && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    h.state_mut().player_mut().state.seekable = false;
+    h.state_mut().player_mut().seek_to(30.0, true).unwrap();
+    step_until_net(&mut h, "跳到 30 秒", |app| {
+        (app.player().state.time_pos - 30.0).abs() < 2.0
+    });
+    assert!(!h.state().player().state.seekable);
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert_eq!(h.state().history().resume_point(&long), None, "不能跳轉的不記");
+}
+
+/// 網路上的播放清單（IPTV 的 .m3u 網址）：展開成播放清單，標題照 #EXTINF，本機檔案的項目拿掉；
+/// 照一般的開檔播第一個，mpv 自己的清單只剩一個；清單的網址記進最近開啟
+#[test]
+fn remote_m3u_url_becomes_the_playlist() {
+    let server = Server::start();
+    let list = server.url("/m3u");
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_h264_aac_srt.mkv");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(list.clone()));
+    step_until_net(&mut h, "展開清單", |app| {
+        app.osd_text().is_some_and(|t| t.starts_with("播放清單：2 個項目"))
+    });
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播放清單：2 個項目（略過 1 個不能開的項目）")
+    );
+    step_until_net(&mut h, "播第一個", |app| playing_url(&app.player().state, &a));
+    assert_eq!(playlist_items(h.state()), [a.clone(), b.clone()]);
+    assert_eq!(h.state().url_title(&a), Some("第一個"));
+    assert_eq!(
+        h.state().player().get_i64("playlist-count").unwrap(),
+        1,
+        "mpv 的清單只剩一個"
+    );
+    assert!(
+        h.state().history().recent.contains(&list),
+        "{:?}",
+        h.state().history().recent
+    );
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 第一個");
+    h.get_by_label("2. 第二個");
+    assert!(h.query_by_label_contains("本機檔案").is_none());
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（2/2）：第二個"));
+    step_until_net(&mut h, "播第二個", |app| playing_url(&app.player().state, &b));
+}
+
+/// 網址的輸入框（設定頁「進階」）：`label` 旁邊的那一個
+fn net_text_field<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .find(|n| {
+            matches!(
+                n.accesskit_node().role(),
+                egui::accesskit::Role::TextInput | egui::accesskit::Role::MultilineTextInput
+            )
+        })
+        .unwrap_or_else(|| panic!("找不到輸入框 {label}"))
+}
+
+/// 設定 → 網路：改了馬上送到 mpv、存檔。HLS / DASH 畫質、快取、逾時、重新連線、憑證、記住網址；
+/// 「進階」的 User-Agent、標頭離開欄位才套用（看不懂的標頭說明哪一行、不送出），換頁時打到一半的也套用；SOCKS proxy 的說明
+#[test]
+fn network_settings_page_changes_reach_mpv() {
+    let dir = TempDir::new("net-settings");
+    let path = dir.0.join("settings.json");
+    let mut h = harness_with(None, Settings::load_from(path.clone()));
+    h.step();
+    open_settings_page(&mut h, "網路");
+    h.get_by_label("串流");
+    combo_box(&h, "HLS / DASH 畫質").click();
+    h.run_steps(2);
+    h.get_by_label("最低").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "hls-bitrate", "min");
+    combo_box(&h, "網路快取").click();
+    h.run_steps(2);
+    h.get_by_label("400 MB").click();
+    h.run_steps(2);
+    step_until_app(&mut h, "快取 400 MB", |app| {
+        app.player().get_i64("demuxer-max-bytes").ok() == Some(400 << 20)
+            && app.player().get_i64("demuxer-max-back-bytes").ok() == Some(133 << 20)
+    });
+    // 逾時：點進去打數字、Enter
+    h.query_all_by_label("連線逾時")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+        .expect("逾時的數字欄")
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text("45".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    step_until_app(&mut h, "逾時 45 秒", |app| {
+        app.player().get_f64("network-timeout").ok() == Some(45.0)
+    });
+    h.get_by_label("連線中斷時自動重新連線").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "stream-lavf-o", "reconnect=0");
+    h.get_by_label("檢查網站憑證（建議）").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "tls-verify", "no");
+    h.get_by_label("記住開啟過的網址（最近開啟、續播）").click();
+    h.run_steps(2);
+    let net = h.state().settings().net.clone();
+    assert_eq!(net.hls_bitrate, vitascope::net::HlsBitrate::Min);
+    assert_eq!((net.cache_mb, net.timeout_secs), (400, 45));
+    assert!(!net.reconnect && !net.tls_verify && !net.remember_urls);
+    assert_eq!(Settings::load_from(path.clone()).net, net, "馬上存檔");
+
+    // 進階（預設收起來）
+    assert!(h.query_by_label("User-Agent").is_none());
+    h.get_by_label("進階").click();
+    h.run_steps(2);
+    net_text_field(&h, "User-Agent").focus();
+    h.run_steps(2);
+    net_text_field(&h, "User-Agent").type_text("UA-Test/2 (x, y) ");
+    h.run_steps(2);
+    assert_ne!(prop(&h, "user-agent"), "UA-Test/2 (x, y)", "打字時還沒套用");
+    net_text_field(&h, "其他 HTTP 標頭").focus();
+    h.run_steps(2);
+    wait_prop(&mut h, "user-agent", "UA-Test/2 (x, y)");
+    net_text_field(&h, "其他 HTTP 標頭").type_text("X-A: 1, 2\nbad line");
+    h.run_steps(2);
+    h.get_by_label("第 2 行不是「名稱: 值」，不會送出");
+    net_text_field(&h, "Proxy").focus();
+    h.run_steps(2);
+    step_until_app(&mut h, "標頭送到 mpv", |app| {
+        app.player()
+            .mpv()
+            .get_string_list("http-header-fields")
+            .is_ok_and(|l| l == ["X-A: 1, 2"])
+    });
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("不會送出").is_none(), "看不懂的那一行拿掉了");
+    net_text_field(&h, "Proxy").type_text("socks5://127.0.0.1:1080");
+    h.run_steps(2);
+    h.get_by_label("播放引擎只支援 HTTP proxy，SOCKS 只有 yt-dlp 會用");
+    // 輸入框還在編輯中就換到別頁：網路頁不畫了，輸入框收不到「離開欄位」，打到一半的也要寫回去
+    h.get_by_label("系統").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("串流").is_none(), "換到系統頁");
+    wait_prop(&mut h, "http-proxy", "socks5://127.0.0.1:1080");
+    let net = h.state().settings().net.clone();
+    assert_eq!(net.user_agent, "UA-Test/2 (x, y)");
+    assert_eq!(net.headers, ["X-A: 1, 2"]);
+    assert_eq!(net.proxy, "socks5://127.0.0.1:1080");
+    assert_eq!(Settings::load_from(path.clone()).net, net, "存檔");
+    assert_eq!(h.state().osd_text(), None, "都設定成功，沒有「無法套用」的提示");
+}
+
+/// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定的網路選項：設定頁停用那一項並說明，其他照樣能改
+#[test]
+fn network_options_set_by_mpv_opts_are_disabled() {
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("user-agent".into(), "x".into()), ("tls-verify".into(), "no".into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch::default(),
+        no_auto_next(),
+    );
+    h.step();
+    assert_eq!(prop(&h, "user-agent"), "x");
+    open_settings_page(&mut h, "網路");
+    assert!(h.get_by_label("檢查網站憑證（建議）").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("連線中斷時自動重新連線").accesskit_node().is_disabled());
+    h.get_by_label("進階").click();
+    h.run_steps(2);
+    assert!(net_text_field(&h, "User-Agent").accesskit_node().is_disabled());
+    assert!(!net_text_field(&h, "Referer").accesskit_node().is_disabled());
+    net_text_field(&h, "User-Agent").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    assert_eq!(prop(&h, "tls-verify"), "no", "啟動時不能蓋掉");
+}
+
+/// 英文介面的「設定 → 網路」
+#[test]
+fn network_settings_page_in_english() {
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    open_settings_page(&mut h, "Network");
+    h.get_by_label("Streams");
+    combo_box(&h, "HLS / DASH quality");
+    combo_box(&h, "Network cache");
+    h.get_by_label("Check website certificates (recommended)");
+    h.get_by_label("Remember URLs I open (recent list, resume)");
+    h.get_by_label("Advanced").click();
+    h.run_steps(2);
+    net_text_field(&h, "Other HTTP headers").focus();
+    h.run_steps(2);
+    net_text_field(&h, "Other HTTP headers").type_text(
+        "bad
+X-A: 1
+worse",
+    );
+    h.run_steps(2);
+    h.get_by_label("Lines 1, 3 aren't \"Name: value\" and won't be sent");
+}
+
 // ───────────── 媒體資訊 ─────────────
 
 #[test]
@@ -11021,6 +11619,32 @@ fn bookmarks_from_another_window_show_up_when_the_file_opens() {
         app.bookmarks().marks(&key).len() == 1
     });
     assert_eq!(mark_times(&h), [2.0]);
+}
+
+/// 網路串流也一樣：開檔時依續播的代號（網址去掉 `#` 之後的部分，跟加書籤用的一樣）讀回另一個視窗加的書籤
+#[test]
+fn bookmarks_from_another_window_show_up_for_a_url_by_its_key() {
+    let dir = TempDir::new("bookmarks-other-window-url");
+    let store = dir.0.join("bookmarks.json");
+    let server = Server::start();
+    let key = server.file_url("common/mp4_h264_aac.mp4");
+    let url = format!("{key}#from-a-page");
+    let ours = vitascope::bookmarks::Bookmarks::load_from(store.clone());
+    // 這邊讀完書籤檔之後，另一個視窗在同一個網址（不含 #）加了一個
+    let mut other = vitascope::bookmarks::Bookmarks::load_from(store);
+    other.add(&key, 2.0).unwrap();
+    assert!(other.flush(TIMEOUT));
+    assert!(ours.marks(&key).is_empty());
+    let launch = Launch {
+        files: vec![PathBuf::from(&url)],
+        bookmarks: ours,
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, no_auto_next());
+    step_until_net(&mut h, "讀回另一個視窗加的書籤", |app| {
+        playing_url(&app.player().state, &url) && app.bookmarks().marks(&key).len() == 1
+    });
+    assert!(h.state().bookmarks().marks(&url).is_empty());
 }
 
 // ───────────── 書籤分頁（側邊面板） ─────────────

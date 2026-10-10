@@ -99,7 +99,8 @@ impl VitascopeApp {
                             return;
                         }
                         let source = st.path.clone().unwrap_or_default();
-                        let name = screenshot::file_name(&source, st.time_pos);
+                        let name =
+                            screenshot::file_name(&source, self.titles.get(&source).map(String::as_str), st.time_pos);
                         // 還在寫的截圖還沒出現在資料夾裡：連按（例如暫停時）檔名也不能重複
                         let taken: Vec<PathBuf> = self
                             .capture
@@ -205,7 +206,8 @@ impl VitascopeApp {
         // 所以這個對話框照樣在介面的執行緒上開（開著時本來就暫停）
         let was_playing = self.pause_for_dialog();
         let time = self.player.get_f64("time-pos").unwrap_or(self.player.state.time_pos);
-        let name = screenshot::file_name(self.player.state.path.as_deref().unwrap_or_default(), time);
+        let source = self.player.state.path.clone().unwrap_or_default();
+        let name = screenshot::file_name(&source, self.titles.get(&source).map(String::as_str), time);
         let dialog = self
             .file_dialog()
             .set_title(crate::tr!("另存截圖", "Save screenshot as"))

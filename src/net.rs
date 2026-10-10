@@ -112,6 +112,16 @@ fn clean_line(text: &str) -> Option<String> {
     (!t.chars().any(char::is_control)).then(|| t.to_owned())
 }
 
+/// 「設定 → 網路 → 進階」的一行標頭能不能送出（是「名稱: 值」、沒有控制字元）；空白行不算錯
+pub fn header_line_ok(line: &str) -> bool {
+    line.trim().is_empty() || clean_header(line).is_some()
+}
+
+/// proxy 是 SOCKS（播放引擎只支援 HTTP proxy）
+pub fn is_socks_proxy(proxy: &str) -> bool {
+    proxy.trim().get(..5).is_some_and(|p| p.eq_ignore_ascii_case("socks"))
+}
+
 /// 一行 HTTP 標頭「名稱: 值」整理成固定的寫法；名稱不是合法的標頭名稱、沒有冒號、有控制字元時 None
 fn clean_header(line: &str) -> Option<String> {
     let line = clean_line(line)?;
@@ -479,6 +489,98 @@ pub fn storable(url: &str) -> bool {
     !(segs.len() >= 4
         && ["live", "movie", "series"].contains(&segs[0].to_ascii_lowercase().as_str())
         && segs[1..].iter().all(|s| !s.is_empty()))
+}
+
+/// 續播、書籤用的代號（播放紀錄的鍵）：網路串流的網址去掉 `#` 之後的部分（只是網頁裡的位置，伺服器收不到）。
+/// `site` = 網站影片的（擷取器, 影片代號），之後 yt-dlp 解析出來時傳入：同一部影片的不同網址
+/// （`youtu.be/x`、`watch?v=x&t=90`）是同一個代號 `ytdl://擷取器/代號`。
+/// 不是網路串流（本機檔案、`av://` 之類）時 None：本機檔案用路徑本身，mpv 自己的網址不續播
+pub fn resume_key(url: &str, site: Option<(&str, &str)>) -> Option<String> {
+    if let Some((extractor, id)) = site.filter(|(e, i)| !e.is_empty() && !i.is_empty()) {
+        return Some(format!("ytdl://{}/{id}", extractor.to_ascii_lowercase()));
+    }
+    if !is_network(url) {
+        return None;
+    }
+    Some(url.split_once('#').map_or(url, |(base, _)| base).to_owned())
+}
+
+/// 只能即時收看的串流協定（RTSP、RTMP、MMS、RTP）：不能跳轉就是直播
+const LIVE_SCHEMES: [&str; 11] = [
+    "mms", "mmsh", "mmshttp", "mmst", "rtmp", "rtmps", "rtmpt", "rtmpts", "rtsp", "rtsps", "rtp",
+];
+
+/// 網路串流載入時判斷是不是直播。`duration` = mpv 的總長度（沒有、不是正數時 None），`seekable` = 能不能跳轉，
+/// `file_format` = mpv 的 `file-format`（`hls`、`dash`、`mkv`…）。
+/// - 沒有總長度：直播（網路電台、直播的 RTSP 之類）。
+/// - 有總長度但不能跳轉：只有 HLS、DASH 與 RTSP、RTMP 之類才是直播。直播的 HLS 也有 FFmpeg 用開頭那一段估的很短的總長度，
+///   只能靠「不能跳轉」分辨。一般的 HTTP 檔案不能跳轉是伺服器不支援 Range（很多小型伺服器、NAS），總長度是真的：不是直播
+pub fn is_live(url: &str, duration: Option<f64>, seekable: bool, file_format: Option<&str>) -> bool {
+    if duration.is_none_or(|d| !d.is_finite() || d <= 0.0) {
+        return true;
+    }
+    if seekable {
+        return false;
+    }
+    let adaptive = file_format
+        .and_then(|f| f.split(',').next())
+        .is_some_and(|f| matches!(f.trim(), "hls" | "applehttp" | "dash"));
+    adaptive || scheme(url).is_some_and(|sc| LIVE_SCHEMES.contains(&sc.as_str()))
+}
+
+/// 網路上的播放清單（IPTV 的 `.m3u` 網址之類）展開後的項目：mpv 讀完清單、結束這個網址（EndFile 的原因是 redirect）時，
+/// 從 mpv 的 `playlist` 讀出來、只留網路串流（[`Origin::Remote`]）
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RemotePlaylist {
+    /// 播放清單本身的網址
+    pub source: String,
+    /// （網址, 清單寫的標題），照清單的順序
+    pub entries: Vec<(String, Option<String>)>,
+    /// 從第幾個開始播（mpv 選的那一個；它被拿掉了就是它後面第一個留下的）
+    pub start: usize,
+    /// 拿掉了幾個（本機檔案、`edl://` 之類不能從網路上的清單開的）
+    pub dropped: usize,
+}
+
+/// mpv 的 `playlist`（JSON：`[{filename, title, current, playlist-path}]`）→ 留下能開的項目。看不懂的 JSON 當成空的清單。
+/// 清單本身的網址看項目的 `playlist-path`（mpv 0.37 起有）：mpv 讀完清單馬上就開第一個項目，
+/// 處理到開始的事件時讀的 `path` 可能已經是第一個項目。沒有 `playlist-path` 時用 `fallback`
+pub fn remote_playlist(fallback: &str, playlist_json: &str) -> RemotePlaylist {
+    #[derive(Deserialize)]
+    struct Entry {
+        filename: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        current: bool,
+        #[serde(default, rename = "playlist-path")]
+        playlist_path: Option<String>,
+    }
+    let all: Vec<Entry> = serde_json::from_str(playlist_json).unwrap_or_default();
+    let current = all.iter().position(|e| e.current).unwrap_or(0);
+    let source = all
+        .get(current)
+        .and_then(|e| e.playlist_path.clone())
+        .or_else(|| all.iter().find_map(|e| e.playlist_path.clone()))
+        .unwrap_or_else(|| fallback.to_owned());
+    let mut out = RemotePlaylist {
+        source,
+        ..Default::default()
+    };
+    let mut start = None;
+    for (i, e) in all.into_iter().enumerate() {
+        if !allowed(&e.filename, Origin::Remote) {
+            out.dropped += 1;
+            continue;
+        }
+        if i >= current && start.is_none() {
+            start = Some(out.entries.len());
+        }
+        let title = e.title.filter(|t| !t.trim().is_empty());
+        out.entries.push((e.filename, title));
+    }
+    out.start = start.unwrap_or(0);
+    out
 }
 
 /// 標題最長幾個字（太長的截掉；選單、清單放不下）
@@ -1197,6 +1299,130 @@ mod tests {
         assert_eq!(classify_failure("HTTP error 404 Not Found", "C:\\a.mp4"), None);
         assert_eq!(http_error("HTTP error 4044"), None);
         assert_eq!(http_error("HTTP error abc\nHTTP error 410 Gone"), Some(410));
+    }
+
+    #[test]
+    fn live_streams() {
+        let http = "https://x.example/a.mkv";
+        // 沒有總長度：直播（網路電台之類）
+        assert!(is_live(http, None, false, Some("mp3")));
+        assert!(is_live(http, Some(0.0), true, None));
+        assert!(is_live(http, Some(f64::NAN), true, None));
+        // 直播的 HLS / DASH：FFmpeg 估了很短的總長度，但不能跳轉
+        let hls = "https://x.example/live/index.m3u8";
+        assert!(is_live(hls, Some(0.9), false, Some("hls")));
+        assert!(is_live(hls, Some(0.9), false, Some("hls,applehttp")));
+        assert!(is_live(hls, Some(0.9), false, Some("applehttp")));
+        assert!(is_live("https://x.example/a.mpd", Some(4.0), false, Some("dash")));
+        assert!(!is_live(hls, Some(120.0), true, Some("hls")), "HLS 的 VOD 能跳轉");
+        // RTSP、RTMP 之類不能跳轉：直播
+        assert!(is_live("rtsp://cam.local/stream", Some(3.0), false, Some("rtsp")));
+        assert!(is_live("RTMP://x.example/app/key", Some(3.0), false, Some("flv")));
+        // 伺服器不支援 Range 的一般檔案：不能跳轉，但總長度是真的，不是直播
+        assert!(!is_live(http, Some(90.0), false, Some("mkv")));
+        assert!(!is_live(http, Some(90.0), false, Some("mov,mp4,m4a,3gp,3g2,mj2")));
+        assert!(!is_live(http, Some(90.0), false, None));
+        assert!(!is_live(http, Some(90.0), true, Some("mkv")));
+    }
+
+    #[test]
+    fn resume_keys() {
+        // 網路串流：去掉 # 之後的部分（大小寫、查詢字串照舊：YouTube 的影片代號分大小寫）
+        assert_eq!(
+            resume_key("https://x.example/v.mp4?id=AbC#t=90", None).as_deref(),
+            Some("https://x.example/v.mp4?id=AbC")
+        );
+        assert_eq!(
+            resume_key("https://x.example/v.mp4", None).as_deref(),
+            Some("https://x.example/v.mp4")
+        );
+        assert_ne!(
+            resume_key("https://x.example/v?id=abc", None),
+            resume_key("https://x.example/v?id=ABC", None)
+        );
+        // 網站影片：同一部影片的不同網址是同一個代號
+        let a = resume_key("https://youtu.be/BaW_jenozKc", Some(("Youtube", "BaW_jenozKc")));
+        let b = resume_key(
+            "https://www.youtube.com/watch?v=BaW_jenozKc&t=90",
+            Some(("Youtube", "BaW_jenozKc")),
+        );
+        assert_eq!(a.as_deref(), Some("ytdl://youtube/BaW_jenozKc"));
+        assert_eq!(a, b);
+        assert_eq!(
+            resume_key("https://x.example/v.mp4", Some(("", ""))).as_deref(),
+            Some("https://x.example/v.mp4"),
+            "沒有代號時照網址"
+        );
+        // 不是網路串流：沒有代號（本機檔案用路徑，mpv 自己的網址不續播）
+        for p in [
+            "av://lavfi:testsrc",
+            "C:\\a.mp4",
+            "/home/a.mp4",
+            "edl://x",
+            "memory://x",
+        ] {
+            assert_eq!(resume_key(p, None), None, "{p}");
+        }
+    }
+
+    #[test]
+    fn remote_playlists_keep_only_network_entries() {
+        let json = r#"[
+            {"filename": "http://h/1.mp4", "title": "第一台", "id": 1},
+            {"filename": "file:///etc/passwd", "title": "本機", "current": true, "playing": true, "id": 2},
+            {"filename": "edl://%3%abc", "id": 3},
+            {"filename": "https://h/2.m3u8", "title": "  ", "id": 4},
+            {"filename": "rtmp://h/live", "title": "第三台", "id": 5}
+        ]"#;
+        let p = remote_playlist("http://h/list.m3u", json);
+        assert_eq!(p.source, "http://h/list.m3u", "沒有 playlist-path 時用給的網址");
+        assert_eq!(
+            p.entries,
+            [
+                ("http://h/1.mp4".to_owned(), Some("第一台".to_owned())),
+                ("https://h/2.m3u8".to_owned(), None),
+                ("rtmp://h/live".to_owned(), Some("第三台".to_owned())),
+            ]
+        );
+        assert_eq!(p.dropped, 2);
+        assert_eq!(p.start, 1, "mpv 選的被拿掉了：從它後面第一個留下的開始");
+        let first = r#"[{"filename": "http://h/1.mp4", "current": true}, {"filename": "http://h/2.mp4"}]"#;
+        assert_eq!(remote_playlist("u", first).start, 0);
+        let second = r#"[{"filename": "http://h/1.mp4"}, {"filename": "http://h/2.mp4", "current": true}]"#;
+        assert_eq!(remote_playlist("u", second).start, 1);
+        // 最後幾個都被拿掉：從第一個開始
+        let tail = r#"[{"filename": "http://h/1.mp4"}, {"filename": "file:///x", "current": true}]"#;
+        let p = remote_playlist("u", tail);
+        assert_eq!((p.entries.len(), p.start, p.dropped), (1, 0, 1));
+        assert_eq!(
+            remote_playlist(
+                "u",
+                r#"[{"filename": "http://h/1.mp4", "current": true, "playlist-path": "http://h/real.m3u"}]"#
+            )
+            .source,
+            "http://h/real.m3u",
+            "清單本身的網址：mpv 記在每個項目的 playlist-path"
+        );
+        // mpv 把 file:// 換成本機路徑（Windows 是 \etc\passwd）：一樣拿掉
+        let local = r#"[{"filename": "\\etc\\passwd", "current": true}, {"filename": "/etc/passwd"}, {"filename": "http://h/1.mp4"}]"#;
+        let p = remote_playlist("u", local);
+        assert_eq!(p.entries, [("http://h/1.mp4".to_owned(), None)]);
+        assert_eq!((p.start, p.dropped), (0, 2));
+        assert_eq!(
+            remote_playlist("u", "not json"),
+            RemotePlaylist {
+                source: "u".into(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn header_lines_and_socks() {
+        assert!(header_line_ok("X-A: 1, 2") && header_line_ok("  ") && header_line_ok(""));
+        assert!(!header_line_ok("no colon") && !header_line_ok("Bad Name: 1") && !header_line_ok("X: a\u{0}b"));
+        assert!(is_socks_proxy("socks5://127.0.0.1:1080") && is_socks_proxy(" SOCKS5H://h:1"));
+        assert!(!is_socks_proxy("http://h:3128") && !is_socks_proxy("") && !is_socks_proxy("sock"));
     }
 
     #[test]

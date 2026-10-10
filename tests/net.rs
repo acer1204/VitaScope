@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use support::http::Server;
-use vitascope::mpv::{Event, Mpv, Node};
+use vitascope::mpv::{EndReason, Event, Mpv, Node};
 use vitascope::net::{self, HlsBitrate, NetSettings};
 use vitascope::player::{Options, Player, PlayerEvent, TrackKind};
 
@@ -705,4 +705,68 @@ fn hooks_continue_for_local_files() {
     q.open(&sample("common/mp4_h264_aac.mp4")).unwrap();
     q.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
     assert_eq!(q.hooks_continued(), 0);
+}
+
+/// 網路上的播放清單（IPTV 的 .m3u 網址）：mpv 讀完清單、結束這個網址（原因是 redirect）時，展開的項目只留網路串流
+/// （清單裡的 file:/// 拿掉），標題照 #EXTINF。照一般的開檔重新開第一個之後，mpv 自己的清單只剩一個
+#[test]
+fn remote_m3u_import_filters_unsafe_entries() {
+    let server = Server::start();
+    let mut p = net_player(&NetSettings::default(), &[("pause", "yes")]);
+    let list = server.url("/m3u");
+    p.open(&list).unwrap();
+    match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
+        Ok(PlayerEvent::EndFile {
+            reason: EndReason::Redirect,
+            error: None,
+        }) => {}
+        other => panic!("網路上的清單應該是 redirect：{other:?}"),
+    }
+    let imported = p.take_remote_playlist().expect("展開的項目");
+    assert!(p.take_remote_playlist().is_none(), "只拿一次");
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_h264_aac_srt.mkv");
+    assert_eq!(imported.source, list);
+    assert_eq!(
+        imported.entries,
+        [(a.clone(), Some("第一個".to_owned())), (b, Some("第二個".to_owned()))]
+    );
+    assert_eq!((imported.start, imported.dropped), (0, 1), "file:/// 拿掉了");
+    loaded(&mut p, &a);
+    assert_eq!(p.get_i64("playlist-count").unwrap(), 1, "mpv 自己的清單只剩一個");
+    // 一般的網址結束（不是 redirect）不展開
+    p.stop().unwrap();
+    p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. }))
+        .unwrap();
+    assert!(p.take_remote_playlist().is_none());
+}
+
+/// 取消正在連線的網址：mpv 中斷連線，結束的原因是 stop、沒有錯誤；之後不再是「載入中」
+#[test]
+fn cancel_loading_stops_cleanly() {
+    let server = Server::start();
+    let mut p = net_player(&NetSettings::default(), &[]);
+    let url = server.url("/slow");
+    p.open(&url).unwrap();
+    assert!(p.loading_now());
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::StartFile).unwrap();
+    server.wait_request("/slow", TIMEOUT).expect("連到伺服器");
+    let (loading, _) = p.net_loading().expect("網址連線中");
+    assert_eq!(loading, url);
+    p.cancel_loading().unwrap();
+    assert!(!p.loading_now(), "取消後馬上不算載入中");
+    match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
+        Ok(PlayerEvent::EndFile {
+            reason: EndReason::Stop,
+            error: None,
+        }) => {}
+        other => panic!("取消 = 停止、沒有錯誤：{other:?}"),
+    }
+    assert!(p.state.last_error.is_none());
+    assert!(p.net_loading().is_none());
+    // 本機檔案不算「網址連線中」
+    p.open(&sample("common/mp4_h264_aac.mp4")).unwrap();
+    assert!(p.net_loading().is_none());
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert!(!p.loading_now());
 }

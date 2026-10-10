@@ -44,8 +44,10 @@ impl VitascopeApp {
             let live = mediainfo::read_live(&self.player);
             // 「使用中」的說明（每格幾次更新、影片快多少）也用這次讀到的數字
             self.set_sync_numbers(&live);
+            let mut info = mediainfo::read(&self.player, self.audio_device.clone());
+            info.source = self.info_source();
             self.info_cache = Some(InfoCache {
-                info: mediainfo::read(&self.player, self.audio_device.clone()),
+                info,
                 live,
                 read_at: Instant::now(),
                 lang,

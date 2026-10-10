@@ -218,6 +218,19 @@ impl Playlist {
         self.items.len() - before
     }
 
+    /// 目前那一項換成 `items`（網路上的播放清單展開成裡面的項目），回傳第一個換進來的在清單上的位置；
+    /// 沒有目前的項目時不動、回傳 None。換完之後目前的是第一個換進來的（之後由開檔選要播的那一個）
+    pub fn replace_current(&mut self, items: Vec<PathBuf>) -> Option<usize> {
+        let at = self.current_index()?;
+        self.manual = true;
+        self.items.splice(at..=at, items);
+        if self.items.is_empty() {
+            self.index = 0;
+            self.current_removed = true;
+        }
+        Some(at)
+    }
+
     /// 依檔名自然排序，目前的檔案維持是目前的
     pub fn sort(&mut self) {
         self.manual = true;
@@ -467,6 +480,27 @@ mod tests {
         list.extend(["第0集".into()]);
         list.sort();
         assert_eq!(list.next(), Some(Path::new("第10集")));
+    }
+
+    #[test]
+    fn remote_playlist_replaces_its_own_entry() {
+        // 本機的清單裡第 2 項是網路上的播放清單：展開成裡面的項目，前後不動
+        let mut list = Playlist::from_files(vec!["a".into(), "http://h/list.m3u".into(), "c".into()]);
+        assert!(list.select_index(1));
+        let at = list.replace_current(vec!["http://h/1.mp4".into(), "http://h/2.mp4".into()]);
+        assert_eq!(at, Some(1));
+        assert_eq!(names(&list), ["a", "http://h/1.mp4", "http://h/2.mp4", "c"]);
+        assert!(list.is_manual());
+        assert_eq!(list.current(), Some(Path::new("http://h/1.mp4")));
+        // 沒有目前的項目：不動
+        let mut restored = Playlist::restored(vec!["a".into()], Some(0));
+        assert_eq!(restored.replace_current(vec!["x".into()]), None);
+        assert_eq!(names(&restored), ["a"]);
+        // 展開後是空的
+        let mut one = Playlist::from_files(vec!["http://h/list.m3u".into()]);
+        one.select_index(0);
+        assert_eq!(one.replace_current(Vec::new()), Some(0));
+        assert!(one.is_empty() && one.current().is_none());
     }
 
     #[test]
