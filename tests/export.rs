@@ -749,8 +749,11 @@ fn main_player_with(opts: Options, src: &str) -> (Player, EngineCaps) {
     p.open(src).unwrap();
     p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
         .unwrap_or_else(|e| panic!("打不開 {src}：{e}"));
-    p.wait_state(TIMEOUT, |s| s.duration.is_some() && !s.tracks.is_empty())
-        .unwrap_or_else(|e| panic!("{src}：{e}"));
+    // 等 mpv 選好軌道（慢的機器上軌道清單比選好的軌道早到）：預設的片段軌道是主播放器選的
+    p.wait_state(TIMEOUT, |s| {
+        s.duration.is_some() && (s.selected(TrackKind::Video).is_some() || s.selected(TrackKind::Audio).is_some())
+    })
+    .unwrap_or_else(|e| panic!("{src}：{e}"));
     (p, caps)
 }
 
@@ -769,8 +772,11 @@ fn main_player_net(s: &NetSettings, src: &str) -> (Player, EngineCaps) {
     p.open(src).unwrap();
     p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
         .unwrap_or_else(|e| panic!("打不開 {src}：{e}"));
-    p.wait_state(TIMEOUT, |s| s.duration.is_some() && !s.tracks.is_empty())
-        .unwrap_or_else(|e| panic!("{src}：{e}"));
+    // 等 mpv 選好軌道（慢的機器上軌道清單比選好的軌道早到）：預設的片段軌道是主播放器選的
+    p.wait_state(TIMEOUT, |s| {
+        s.duration.is_some() && (s.selected(TrackKind::Video).is_some() || s.selected(TrackKind::Audio).is_some())
+    })
+    .unwrap_or_else(|e| panic!("{src}：{e}"));
     (p, caps)
 }
 
