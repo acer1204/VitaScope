@@ -163,6 +163,11 @@ fn main() -> eframe::Result {
     let net_resolver: Option<Arc<dyn vitascope::ytdl::Resolve>> = if launch.autoshot.is_none() {
         let locator = vitascope::ytdl::Locator::new(launch.tools_dir.clone());
         launch.ytdl = Some(locator.clone());
+        // 使用者按下「下載」「更新」時才從官方的 GitHub 下載到工具資料夾（不在背景自動連網）
+        launch.installer = launch
+            .tools_dir
+            .clone()
+            .map(|dir| Arc::new(vitascope::ytdl::install::Installer::github(dir)));
         Some(Arc::new(vitascope::ytdl::ProcessResolver::new(locator)))
     } else {
         None

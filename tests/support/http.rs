@@ -11,10 +11,12 @@
 //!   從那之後開始的請求也一樣；從檔案後半開始的請求（MP4 放在最後的 moov）照常送。播放到那裡就會「緩衝中」
 //! - `/norange/<路徑>`：跟 `/f/` 一樣的檔案，但不支援 `Range`（不管有沒有都送整個檔案、沒有 `Accept-Ranges`），
 //!   像很多小型伺服器、NAS。播放器只能從頭讀（不能跳轉），但總長度照樣知道：不是直播
+//! - 測試指定的固定回應（`put`）：假的 GitHub 發佈（轉址、檢查碼、要下載的檔案），可以送到一半就停住
 //!
 //! 每個請求的方法、路徑、標頭都記下來（`requests()`），測試用來確認播放器送了什麼。
 //! 一個連線一個執行緒；每個回應之後關閉連線（`Connection: close`）。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -42,10 +44,71 @@ impl Request {
     }
 }
 
+/// 測試指定的固定回應
+#[derive(Debug, Clone)]
+pub struct Canned {
+    pub status: u16,
+    /// 另外的標頭（`Content-Length`、`Connection` 由伺服器加）
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    /// 送了這麼多位元組之後就不再送（連線開著，直到伺服器關掉）：下載的進度、取消、沒有進度的測試用
+    pub stall_after: Option<usize>,
+    /// 不送 `Content-Length`（內容到連線關閉為止）：下載的那一邊事先不知道大小
+    pub no_length: bool,
+}
+
+impl Canned {
+    /// 200 與內容
+    pub fn ok(body: impl Into<Vec<u8>>) -> Canned {
+        Canned {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into(),
+            stall_after: None,
+            no_length: false,
+        }
+    }
+
+    /// 302 轉到 `location`
+    pub fn redirect(location: &str) -> Canned {
+        Canned {
+            status: 302,
+            headers: vec![("Location".into(), location.into())],
+            body: Vec::new(),
+            stall_after: None,
+            no_length: false,
+        }
+    }
+
+    /// 只有狀態碼
+    pub fn status(code: u16) -> Canned {
+        Canned {
+            status: code,
+            headers: Vec::new(),
+            body: format!("status {code}\n").into_bytes(),
+            stall_after: None,
+            no_length: false,
+        }
+    }
+
+    /// 送了 `n` 個位元組就停住
+    pub fn stall_after(mut self, n: usize) -> Canned {
+        self.stall_after = Some(n);
+        self
+    }
+
+    /// 不說大小（沒有 `Content-Length`，送完就關閉連線）
+    pub fn without_length(mut self) -> Canned {
+        self.no_length = true;
+        self
+    }
+}
+
 struct Shared {
     root: PathBuf,
     log: Mutex<Vec<Request>>,
     stop: AtomicBool,
+    canned: Mutex<HashMap<String, Canned>>,
 }
 
 pub struct Server {
@@ -66,6 +129,7 @@ impl Server {
             root,
             log: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            canned: Mutex::new(HashMap::new()),
         });
         let s = shared.clone();
         std::thread::spawn(move || {
@@ -97,6 +161,16 @@ impl Server {
             path.display()
         );
         self.url(&format!("/f/{rel}"))
+    }
+
+    /// 路徑 `path`（不含查詢字串）固定回應 `c`（取代同一個路徑之前指定的）
+    pub fn put(&self, path: &str, c: Canned) {
+        self.shared.canned.lock().unwrap().insert(path.to_owned(), c);
+    }
+
+    /// 拿掉 `put` 指定的回應（之後回應 404）
+    pub fn remove(&self, path: &str) {
+        self.shared.canned.lock().unwrap().remove(path);
     }
 
     /// 到目前為止收到的請求
@@ -165,6 +239,10 @@ fn serve(conn: TcpStream, s: &Shared) -> std::io::Result<()> {
     let head = req.method == "HEAD";
     // 查詢字串、網頁裡的位置（`#…`，播放器不一定會拿掉）不算路徑
     let route = req.path.split(['?', '#']).next().unwrap_or("");
+    let canned = s.canned.lock().unwrap().get(route).cloned();
+    if let Some(c) = canned {
+        return send_canned(&mut out, &c, head, s);
+    }
     if let Some(rel) = route.strip_prefix("/f/") {
         return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
     }
@@ -231,6 +309,8 @@ fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
         206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
@@ -275,6 +355,32 @@ fn send(out: &mut TcpStream, code: u16, ctype: &str, body: &[u8], head: bool) ->
         out.write_all(body)?;
     }
     out.flush()
+}
+
+/// 測試指定的固定回應；`stall_after` 的位置之後不再送，連線開著到伺服器關掉
+fn send_canned(out: &mut TcpStream, c: &Canned, head: bool, s: &Shared) -> std::io::Result<()> {
+    let mut text = format!("HTTP/1.1 {} {}\r\nConnection: close\r\n", c.status, reason(c.status));
+    if !c.no_length {
+        text += &format!("Content-Length: {}\r\n", c.body.len());
+    }
+    for (n, v) in &c.headers {
+        text += &format!("{n}: {v}\r\n");
+    }
+    text += "\r\n";
+    out.write_all(text.as_bytes())?;
+    if head {
+        return out.flush();
+    }
+    let n = c.stall_after.unwrap_or(c.body.len()).min(c.body.len());
+    out.write_all(&c.body[..n])?;
+    out.flush()?;
+    if c.stall_after.is_some() {
+        let begin = Instant::now();
+        while !s.stop.load(Ordering::SeqCst) && begin.elapsed() < SLOW_LIMIT {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    Ok(())
 }
 
 /// `Range: bytes=a-b`、`bytes=a-`、`bytes=-n` → (起點, 終點（含）)；看不懂時 None（整個檔案）

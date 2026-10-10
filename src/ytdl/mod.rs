@@ -6,11 +6,13 @@
 //! - [`json`]：yt-dlp 的 JSON；[`plan`]：JSON → mpv 要開的網址與選項（純邏輯）。
 //! - [`errors`]：yt-dlp 的錯誤與警告 → 原因（介面執行緒再轉成文字）。
 //! - [`hook`]：接上播放器的部分（哪些網址要問 yt-dlp、背景解析、結果的快取）。
+//! - [`install`]：使用者按下時才從官方的 GitHub 發佈下載 yt-dlp、deno（核對 SHA-256）、更新、移除。
 //!
 //! `Player` 在 mpv 開網址之前（`on_load` hook）呼叫 [`Resolve`]，把 [`plan::Plan`] 交給 mpv。
 
 pub mod errors;
 pub mod hook;
+pub mod install;
 pub mod json;
 pub mod locate;
 pub mod plan;

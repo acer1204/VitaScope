@@ -38,6 +38,9 @@ serde_json = "1"
 ureq = "3"
 # 網址的解析（主機名稱、帳號密碼、查詢參數）；本來就在相依樹裡（webbrowser 用的）
 url = "2.5.8"
+# 按需求下載的 yt-dlp、deno：核對 SHA-256（ring，rustls 本來就用它）、解開 deno 的 zip（flate2，ureq 本來就用它）
+ring = "0.17.14"
+flate2 = "1.1.10"
 
 # Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
 [target.'cfg(windows)'.dependencies]

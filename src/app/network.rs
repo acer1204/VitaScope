@@ -16,12 +16,14 @@
 //!   載入整個播放清單、複製網址、在瀏覽器開啟。
 
 use super::control_panel::adjust_locked_hover;
+use super::install::ToolAction;
 use super::{VitascopeApp, is_fullscreen, recent_label};
 use crate::history::History;
 use crate::net::{self, HlsBitrate, NetSettings};
 use crate::player::TrackKind;
 use crate::playlist::Playlist;
 use crate::theme::{self, Palette};
+use crate::ytdl::install::Tool;
 use crate::ytdl::plan::{Choice, NetInfo, QualityChoice};
 use crate::ytdl::{Browser, CodecPref, ListMode, SiteQuality};
 use crate::{tf, tr};
@@ -561,13 +563,16 @@ impl VitascopeApp {
         }
     }
 
-    /// 起始畫面上網站影片播不了的說明：原因（現在的語言）、警告裡看得出的提醒、建議怎麼做
-    pub(super) fn site_failure_lines(&self) -> Option<(String, Vec<&'static str>)> {
+    /// 起始畫面上網站影片播不了的說明：原因（現在的語言）、警告裡看得出的提醒、建議怎麼做。
+    /// 建議能直接按按鈕做的（下載 yt-dlp、deno，更新影戲下載的 yt-dlp）不寫那段文字，按鈕在 `placeholder_tools`；
+    /// 影戲下載的 yt-dlp 很久沒更新時多一句提醒
+    pub(super) fn site_failure_lines(&self) -> Option<(String, Vec<String>)> {
         let f = self.player.state.net_failure.as_ref()?;
-        let mut notes: Vec<&'static str> = f.hints.iter().map(|h| h.message()).collect();
-        if let Some(r) = f.remedy() {
-            notes.push(r.advice());
+        let mut notes: Vec<String> = f.hints.iter().map(|h| h.message().to_owned()).collect();
+        if let Some(r) = f.remedy().filter(|r| !self.remedy_has_button(*r)) {
+            notes.push(r.advice().to_owned());
         }
+        notes.extend(self.stale_note(f));
         notes.dedup();
         Some((f.error.message(), notes))
     }
@@ -1028,9 +1033,12 @@ impl VitascopeApp {
             );
         }
         ui.weak(tr!(
-            "Proxy 空白時用系統的 http_proxy 環境變數；Windows、macOS 系統設定裡的 proxy，播放引擎不會用。",
+            "Proxy 空白時用系統的 http_proxy 環境變數；Windows、macOS 系統設定裡的 proxy，播放引擎不會用。\
+             在影戲裡下載、更新 yt-dlp 與 deno 不用這一欄，只看 HTTPS_PROXY、HTTP_PROXY 環境變數。",
             "With no proxy, the http_proxy environment variable is used; \
-             the playback engine doesn't use the proxy set in Windows or macOS settings."
+             the playback engine doesn't use the proxy set in Windows or macOS settings. \
+             Downloading and updating yt-dlp and deno in VitaScope doesn't use this field, only the \
+             HTTPS_PROXY and HTTP_PROXY environment variables."
         ));
         if commit {
             self.commit_net_draft();
@@ -1091,6 +1099,8 @@ pub(super) enum SiteOp {
     WholePlaylist,
     CopyUrl,
     OpenInBrowser,
+    /// 更新影戲下載的 yt-dlp
+    UpdateYtdl,
 }
 
 /// 自己安裝的 yt-dlp 多久沒更新就提醒（天）。影戲下載的照 `locate::STALE_DAYS`（之後可以在影戲裡更新）
@@ -1106,6 +1116,7 @@ impl VitascopeApp {
             .filter(|n| st.loaded && st.path.as_deref() == Some(n.page_url.as_str()))?;
         let default = self.settings.net.quality;
         let list_mode = self.settings.net.list_mode;
+        let (can_update, busy) = (self.can_update_ytdl(), self.install_busy());
         let mut op = None;
         ui.menu_button(tr!("網站影片", "Website video"), |ui| {
             let videos: Vec<&QualityChoice> = info
@@ -1183,6 +1194,20 @@ impl VitascopeApp {
             if ui.button(tr!("在瀏覽器開啟", "Open in browser")).clicked() {
                 op = Some(SiteOp::OpenInBrowser);
             }
+            // 只有影戲下載的那一份能在這裡更新（自己安裝的用安裝它的方式更新）
+            if can_update {
+                ui.separator();
+                if ui
+                    .add_enabled(!busy, egui::Button::new(tr!("更新 yt-dlp", "Update yt-dlp")))
+                    .on_hover_text(tr!(
+                        "從 GitHub 檢查有沒有新版，有的話下載（只在按下時連網）",
+                        "Check GitHub for a newer version and download it (only connects when you press this)"
+                    ))
+                    .clicked()
+                {
+                    op = Some(SiteOp::UpdateYtdl);
+                }
+            }
         });
         op
     }
@@ -1245,6 +1270,7 @@ impl VitascopeApp {
                 ctx.copy_text(info.page_url.clone());
                 self.osd(tr!("已複製網址", "URL copied"));
             }
+            SiteOp::UpdateYtdl => self.update_ytdl(false),
             SiteOp::OpenInBrowser => {
                 // 網頁的網址一定是 http / https（yt-dlp 只解析這兩種）
                 if crate::ytdl::site_url(&info.page_url).is_some() {
@@ -1417,9 +1443,14 @@ impl VitascopeApp {
             ui.label(tr!("yt-dlp：搜尋中…", "yt-dlp: searching…"));
             // 找完時尋找的執行緒會叫醒介面；這裡只是保險
             ui.ctx().request_repaint_after(Duration::from_millis(250));
-        } else if let Some(t) = &tools {
-            self.ytdl_status(ui, t, problem);
         }
+        let mut action = None;
+        if !searching && let Some(t) = &tools {
+            action = self.ytdl_status(ui, t, problem);
+        }
+        // 正在下載、更新、移除：進度與取消；上一次失敗的原因
+        let cancel = self.install_progress(ui);
+        self.install_failure(ui, problem);
         let (mut choose, mut clear, mut again) = (false, false, false);
         ui.horizontal(|ui| {
             choose = ui
@@ -1555,12 +1586,30 @@ impl VitascopeApp {
             self.ytdl.refresh();
             self.ytdl.get();
         }
+        if let Some(a) = action {
+            self.tool_action(a, false);
+        }
+        if cancel {
+            self.cancel_install();
+        }
     }
 
-    /// 找到的 yt-dlp、deno（`t` = 背景尋找的結果）
-    fn ytdl_status(&self, ui: &mut egui::Ui, t: &crate::ytdl::Tools, problem: Color32) {
+    /// 找到的 yt-dlp、deno（`t` = 背景尋找的結果）。影戲能下載時：沒有的「下載…」，影戲下載的「立即更新」「移除…」；
+    /// 回傳按了哪一個
+    fn ytdl_status(&self, ui: &mut egui::Ui, t: &crate::ytdl::Tools, problem: Color32) -> Option<ToolAction> {
         use crate::ytdl::{Remedy, Source};
         let wanted = self.settings.net.ytdl_path.is_some();
+        let busy = self.install_busy();
+        let mut action = None;
+        let mut button = |ui: &mut egui::Ui, text: String, hover: String, a: ToolAction| {
+            if ui
+                .add_enabled(!busy, egui::Button::new(text))
+                .on_hover_text(hover)
+                .clicked()
+            {
+                action = Some(a);
+            }
+        };
         match &t.ytdl {
             Some(y) => {
                 let from = match y.source {
@@ -1602,8 +1651,21 @@ impl VitascopeApp {
                 if let Some(v) = t.ytdl_version {
                     let now = std::time::SystemTime::now();
                     let days = v.age_days(now);
-                    if y.managed() && v.is_stale(now) {
-                        ui.weak(Remedy::UpdateYtdl.advice());
+                    // 影戲下載的：版本舊、而且這段時間也沒檢查過更新才提醒（剛下載的最新版不提醒）
+                    let managed_stale = y
+                        .managed()
+                        .then(|| crate::ytdl::locate::managed_stale_days(v, self.ytdl.managed_modified(), now))
+                        .flatten();
+                    if let Some(days) = managed_stale {
+                        if self.can_install(Tool::Ytdl) {
+                            ui.weak(tf!(
+                                "影戲下載的 yt-dlp 已經 {days} 天沒更新，網站改版後可能播不了；可以按「立即更新」",
+                                "The yt-dlp VitaScope downloaded hasn't been updated for {days} days and may not \
+                                 work after site changes; use \"Update now\""
+                            ));
+                        } else {
+                            ui.weak(Remedy::UpdateYtdl.advice());
+                        }
                     } else if !y.managed() && days > USER_STALE_DAYS {
                         ui.weak(tf!(
                             "這個 yt-dlp 已經 {days} 天沒更新，網站改版後可能播不了；請用安裝它的方式更新",
@@ -1611,6 +1673,27 @@ impl VitascopeApp {
                              update it the way you installed it"
                         ));
                     }
+                }
+                // 影戲下載的：在這裡更新（已經是最新版就不下載）、移除
+                if y.managed() && self.can_install(Tool::Ytdl) {
+                    ui.horizontal(|ui| {
+                        button(
+                            ui,
+                            tr!("立即更新", "Update now").to_owned(),
+                            tr!(
+                                "從 GitHub 檢查有沒有新版，有的話下載（只在按下時連網）",
+                                "Check GitHub for a newer version and download it (only connects when you press this)"
+                            )
+                            .to_owned(),
+                            ToolAction::UpdateYtdl,
+                        );
+                        button(
+                            ui,
+                            tr!("移除…", "Remove…").to_owned(),
+                            tr!("刪除影戲下載的 yt-dlp", "Delete the yt-dlp VitaScope downloaded").to_owned(),
+                            ToolAction::Remove(Tool::Ytdl),
+                        );
+                    });
                 }
             }
             None => {
@@ -1623,9 +1706,38 @@ impl VitascopeApp {
                     tr!("找不到 yt-dlp", "yt-dlp not found")
                 };
                 ui.colored_label(problem, line);
+                if self.can_install(Tool::Ytdl) {
+                    let (mb, _) = Tool::Ytdl.sizes_mb(crate::paths::Os::current());
+                    button(
+                        ui,
+                        tf!("下載 yt-dlp（約 {mb} MB）…", "Download yt-dlp (about {mb} MB)…"),
+                        tr!(
+                            "從 yt-dlp 的官方 GitHub 下載（會先問過）",
+                            "Download from yt-dlp's official GitHub (asks first)"
+                        )
+                        .to_owned(),
+                        ToolAction::Download(Tool::Ytdl),
+                    );
+                    ui.weak(tr!("也可以自己安裝：", "Or install it yourself:"));
+                }
                 ui.weak(Remedy::GetYtdl.advice());
             }
         }
+        let can_deno = self.can_install(Tool::Deno);
+        let deno_button = |button: &mut dyn FnMut(&mut egui::Ui, String, String, ToolAction), ui: &mut egui::Ui| {
+            if can_deno {
+                let (mb, disk) = Tool::Deno.sizes_mb(crate::paths::Os::current());
+                button(
+                    ui,
+                    tf!("下載 deno（約 {mb} MB）…", "Download deno (about {mb} MB)…"),
+                    tf!(
+                        "從 deno 的官方 GitHub 下載，解開後約 {disk} MB（會先問過）",
+                        "Download from deno's official GitHub; about {disk} MB once unpacked (asks first)"
+                    ),
+                    ToolAction::Download(Tool::Deno),
+                );
+            }
+        };
         match (&t.deno, &t.deno_too_old) {
             (Some(d), _) => {
                 ui.label(tf!(
@@ -1634,6 +1746,14 @@ impl VitascopeApp {
                     d.version
                 ))
                 .on_hover_text(d.path.display().to_string());
+                if d.managed && can_deno {
+                    button(
+                        ui,
+                        tr!("移除 deno…", "Remove deno…").to_owned(),
+                        tr!("刪除影戲下載的 deno", "Delete the deno VitaScope downloaded").to_owned(),
+                        ToolAction::Remove(Tool::Deno),
+                    );
+                }
             }
             (None, Some((path, v))) => {
                 ui.colored_label(
@@ -1644,6 +1764,7 @@ impl VitascopeApp {
                     ),
                 )
                 .on_hover_text(path.display().to_string());
+                deno_button(&mut button, ui);
                 ui.weak(Remedy::GetDeno.advice());
             }
             (None, None) => {
@@ -1651,9 +1772,11 @@ impl VitascopeApp {
                     "沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質",
                     "No deno (JavaScript runtime): YouTube offers only some qualities"
                 ));
+                deno_button(&mut button, ui);
                 ui.weak(Remedy::GetDeno.advice());
             }
         }
+        action
     }
 }
 

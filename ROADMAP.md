@@ -482,7 +482,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   直播（沒有結尾標記的 HLS）、不支援 Range 的伺服器上的檔案不是直播、續播與書籤的代號（不記網址、有 token 的網址、不能跳轉的不續播）、網路上的清單、「設定 → 網路」、`VITASCOPE_MPV_OPTS` 停用、英文介面）
   - [ ] 手動確認：真的網路上的 HLS 直播、DASH、IPTV 的 m3u 網址（Windows、macOS、Linux AppImage 與 tar.gz 各一次）；
     Windows 上網路擋住憑證撤銷檢查時的說明與「檢查網站憑證」開關；HTTP proxy；從瀏覽器拖曳連結沒有反應、Ctrl（⌘）+ V 可以
-- [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
+- [x] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
   - 已完成：找 yt-dlp / deno、執行與取消（Windows Job Object、Unix 程序群組）、讀 JSON、錯誤與警告（C5）；
     接上播放器：`on_load` hook 在背景問 yt-dlp（影片網站先問，其他網頁 mpv 讀到內容卻認不出時才問；連線失敗不問），
     合成 EDL、這個檔案專用的標頭 / Cookie（`file-local-options`）、網站字幕（選到才下載）、章節（載入後設定）、
@@ -506,7 +506,27 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
     headless 另一個 mpv 照 `net_stream` 開得起來（伺服器收到網站的標頭與 Cookie）、選單選的畫質不再問 yt-dlp、關掉 yt-dlp 不問；
     kittest 換畫質保留狀態、預設畫質 / 只播聲音 / 複製 / 瀏覽器、載入整個播放清單、選單只在網站影片出現、「網路設定…」按鈕、
     設定頁的搜尋中、選擇檔案、指定的檔案不能用、很久沒更新、deno 太舊、偏好送到 yt-dlp、含 token 的書籤不存檔、英文介面）
-  - 還沒做：由影戲下載 yt-dlp 與 deno、更新 yt-dlp（C8）
+  - 取得 yt-dlp 與 deno（主人的決定 Q2 (a)）：只在使用者按下時才連網、不在背景自動更新。起始畫面（網站影片播不了時）有
+    「下載 yt-dlp…」「下載 deno…」「更新 yt-dlp 再試一次」，「設定 → 網路」有下載、「立即更新」、「移除…」，播放中「網站影片 ▸ 更新 yt-dlp」
+    （只有影戲下載的那一份；自己安裝的照它的方式更新）。下載前先問（來源、大小，deno 寫下載約 40 MB、解開後約 100 MB，放在哪裡）；
+    從官方的 GitHub 發佈下載：`releases/latest` 轉去的標籤（不用 API），檢查碼與檔案都從同一個標籤取，核對 SHA-256（ring；
+    yt-dlp 的 `SHA2-256SUMS`、deno 的 `.sha256sum`，Windows 版是 PowerShell 的格式）；deno 的 zip 自己讀（flate2、CRC、
+    有不安全檔名的整個拒絕、解開後最多 300 MB），Unix 設成 0755。下載用自己的 ureq 設定（`web.rs`：連線 10 秒、等回應的標頭 20 秒、
+    沒有整體的時間限制，60 秒沒有資料才放棄，隨時可以取消；proxy 只看環境變數，設定頁的 Proxy 欄有說明）；先寫暫存檔，核對後才換上，
+    換檔案、移除時等正在用它的 yt-dlp（包括取消後還在跑的）結束，deno 也等會用到它的 yt-dlp，等的時候也能取消。「更新」先看最新的標籤，已經是最新版就不下載（不用 `yt-dlp -U`）；影戲下載的版本超過 30 天、
+    而且這段時間沒檢查過更新時，網站影片播不了時與設定頁提醒（不自動連網）。做完了提示結果，從起始畫面按的再開一次那個網址。
+    `THIRD-PARTY-NOTICES.md` 說明這兩個按需求下載、不隨影戲散布的程式（C8）
+    （自動：web / install 單元測試（檢查碼的兩種格式、標籤、zip 的不壓縮與 deflate、CRC 錯、截斷、不安全的檔名、大小上限、暫存檔清理、
+    多久沒更新的提醒、壓縮檔說的大小比實際小、yt-dlp 執行中也能更新檔案時間）；headless 從本機測試伺服器上的假 GitHub 發佈下載 yt-dlp 與 deno、
+    檢查碼不符時原本的檔案不動、沒有檢查碼不下載、找不到發佈與 HTTP 錯誤、已經是最新版不下載、進度與取消、沒有進度時放棄、
+    等正在解析的 yt-dlp（換 deno 時也等，等的時候取消）、執行 yt-dlp 時拿著它會用的 deno 的鎖、這個系統沒有版本時不連網、
+    大小上限（伺服器說的大小與沒說大小時）；kittest 沒有 yt-dlp 時先問再下載、Esc 不下載也不連網、下載後再開一次就播、
+    起始畫面的進度、取消與失敗原因（開了別的網址就不寫）、等的時候開了別的檔案就不搶、太舊時（包括只有警告說太舊）更新再試一次、選單的更新、
+    自己安裝的 yt-dlp 不更新也不移除、缺 deno 時起始畫面的「下載 deno…」（設定頁在下載時照舊寫說明）、
+    很久沒更新的提醒（有、沒有下載的方法）與「立即更新」之後不再提醒、設定頁下載 deno 的進度、取消、檢查碼不符、移除、英文介面）
+  - [ ] 手動確認：YouTube 1080p / 4K（有、沒有 deno 各一次；AV1 在 RTX 3090 上用 nvdec）、Bilibili、直播
+  - [ ] 手動確認：在影戲裡下載 yt-dlp 與 deno（Windows、macOS、Linux 各一次），Windows Defender 會不會擋下、執行時不閃黑色視窗（yt-dlp 與 deno）
+  - [ ] 手動確認：「更新 yt-dlp 再試一次」「立即更新」「移除…」在真的 GitHub 上；`VITASCOPE_ONLINE_TESTS=1 cargo test --test install -- --ignored`
 - [ ] 線上搜尋字幕（OpenSubtitles API）
 - [ ] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF
 - [ ] 縮圖總覽圖匯出（thumbnail sheet）

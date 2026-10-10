@@ -4812,6 +4812,660 @@ fn network_page_ytdl_section() {
     site_page_never_fetched(&server);
 }
 
+// ───────────── 影戲下載 yt-dlp、deno（本機的測試伺服器當成 GitHub；不連到真的 GitHub、不執行任何程式） ─────────────
+
+/// 只看工具資料夾的尋找：影戲下載的 yt-dlp 的第一行當成版本（`release::fake_ytdl`），有 deno 就當成 2.9.7。
+/// 不執行任何程式、不找使用者電腦上的
+fn tools_locator(tools: PathBuf) -> vitascope::ytdl::Locator {
+    use vitascope::ytdl::locate::{Deno, DenoVersion};
+    use vitascope::ytdl::{Located, SearchEnv, Source, Tools, Version};
+    vitascope::ytdl::Locator::with_finder(
+        Some(tools),
+        Arc::new(|env: &SearchEnv| {
+            let mut t = Tools::none(env);
+            if let Some(p) = env.managed_ytdl().filter(|p| p.is_file()) {
+                t.ytdl_version = std::fs::read(&p)
+                    .ok()
+                    .and_then(|b| Version::parse(&String::from_utf8_lossy(&b[..b.len().min(64)])));
+                t.ytdl = Some(Located::new(p, Source::Managed));
+            }
+            if let Some(p) = env.managed_deno().filter(|p| p.is_file()) {
+                t.deno = Some(Deno {
+                    path: p,
+                    version: DenoVersion::parse("deno 2.9.7").unwrap(),
+                    managed: true,
+                });
+            }
+            t
+        }),
+    )
+}
+
+/// 網站影片 + 能下載 yt-dlp、deno：測試伺服器同時是影片網站與假的 GitHub，工具資料夾是暫存的
+fn tools_harness(
+    fake: &Arc<FakeResolver>,
+    server: &Server,
+    tools: &std::path::Path,
+    installer: bool,
+    settings: Settings,
+) -> Harness<'static, VitascopeApp> {
+    use vitascope::ytdl::install::Installer;
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch {
+            ytdl: Some(tools_locator(tools.to_path_buf())),
+            installer: installer.then(|| Arc::new(Installer::with_base(tools.to_path_buf(), &server.url("")))),
+            ..Default::default()
+        },
+        settings,
+    )
+}
+
+/// 工具資料夾裡下載到一半的暫存檔
+fn partial_downloads(tools: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(tools)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".vitascope-download"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 往 GitHub（測試伺服器上的假發佈）的請求
+fn release_requests(server: &Server) -> Vec<String> {
+    server
+        .requests()
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| p.contains("/releases/"))
+        .collect()
+}
+
+/// 沒有 yt-dlp：起始畫面有「下載 yt-dlp…」，先問過（來源、大小、放在哪裡；Esc 不下載、也不連網），
+/// 同意後下載、核對，做完再開一次那個網址就播
+#[test]
+fn missing_ytdl_is_downloaded_on_request_and_the_video_plays() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("get-ytdl");
+    let tools = dir.0.join("tools");
+    let content = support::release::fake_ytdl("2026.10.01", 300_000);
+    support::release::publish_ytdl(&server, "2026.10.01", &content, None);
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    let json = long_site_json(&server.url(""));
+    let have = ytdl.clone();
+    let fake = FakeResolver::new(move |_, _| {
+        if have.is_file() {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Missing.into())
+        }
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    // 能下載：按鈕取代「請安裝…」的說明；「網路設定…」還在
+    assert!(h.query_by_label_contains("請安裝 yt-dlp").is_none());
+    h.get_by_label("網路設定…");
+    h.get_by_label("下載 yt-dlp…").click();
+    h.run_steps(2);
+    h.get_by_label("下載 yt-dlp？");
+    let (mb, _) = Tool::Ytdl.sizes_mb(Os::current());
+    h.get_by_label_contains(&format!("github.com/yt-dlp/yt-dlp）下載最新版的 yt-dlp，約 {mb} MB"));
+    h.get_by_label(tools.display().to_string().as_str());
+    // 對話框開著：按鍵不會傳到播放器；Esc 只關對話框、不下載
+    assert!(release_requests(&server).is_empty(), "問之前不連網");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("下載 yt-dlp？").is_none());
+    h.run_steps(5);
+    assert!(release_requests(&server).is_empty(), "取消了：不連網");
+    assert!(!h.state().install_running());
+    // 同意：下載、做完再開一次
+    h.get_by_label("下載 yt-dlp…").click();
+    h.run_steps(2);
+    h.get_by_label("下載").click();
+    h.run_steps(2);
+    step_until_net(&mut h, "下載好、再開一次網址就播", |app| {
+        playing_url(&app.player().state, &page)
+    });
+    assert_eq!(std::fs::read(&ytdl).unwrap(), content);
+    assert!(partial_downloads(&tools).is_empty());
+    assert_eq!(fake.calls(), 2, "下載前一次、下載後再開一次");
+    // 設定頁：找到影戲下載的那一份，可以更新、移除
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp 2026.10.01（影戲下載的）");
+    h.get_by_label("立即更新");
+    h.get_by_label("移除…");
+    assert!(h.query_by_label_contains("下載 yt-dlp（約").is_none());
+}
+
+/// 網站影片因為 yt-dlp 太舊播不了：影戲下載的那一份直接「更新 yt-dlp 再試一次」（不另外問，也不寫 `yt-dlp -U` 的說明），
+/// 更新後再開一次就播。播放中「網站影片 ▸ 更新 yt-dlp」：已經是最新版就不下載
+#[test]
+fn outdated_managed_ytdl_updates_and_tries_again() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("update-ytdl");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    std::fs::write(&ytdl, support::release::fake_ytdl("2026.01.01", 1000)).unwrap();
+    let newer = support::release::fake_ytdl("2026.10.01", 200_000);
+    support::release::publish_ytdl(&server, "2026.10.01", &newer, None);
+    let json = long_site_json(&server.url(""));
+    let file = ytdl.clone();
+    let fake = FakeResolver::new(move |_, _| {
+        let now = std::fs::read(&file).unwrap_or_default();
+        if now.starts_with(b"2026.10.01") {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Outdated.into())
+        }
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "無法播放網站影片：無法取得影片（yt-dlp 可能需要更新）");
+    step_until_label(&mut h, "更新 yt-dlp 再試一次");
+    assert!(
+        h.query_by_label_contains("yt-dlp -U").is_none(),
+        "影戲下載的：按鈕取代說明"
+    );
+    // 剛下載（檔案時間是現在）：版本雖然舊，不提醒「很久沒更新」
+    assert!(h.query_by_label_contains("天沒更新").is_none());
+    h.get_by_label("更新 yt-dlp 再試一次").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("下載 yt-dlp？").is_none(), "更新不另外問");
+    step_until_net(&mut h, "更新後再開一次就播", |app| {
+        playing_url(&app.player().state, &page)
+    });
+    assert_eq!(std::fs::read(&ytdl).unwrap(), newer);
+    assert_eq!(fake.calls(), 2);
+
+    // 播放中：網站影片 ▸ 更新 yt-dlp（影戲下載的才有）；已經是最新版：不下載
+    let asset = support::release::download_path(Tool::Ytdl, "2026.10.01", support::release::asset(Tool::Ytdl));
+    let downloads = |s: &Server| s.requests().iter().filter(|r| r.path == asset).count();
+    assert_eq!(downloads(&server), 1);
+    open_site_menu(&mut h);
+    hover_menu_item(&mut h, "更新 yt-dlp");
+    h.get_by_label("更新 yt-dlp").click();
+    h.step();
+    step_until_app(&mut h, "檢查完", |app| {
+        app.osd_text() == Some("yt-dlp 已經是最新版（2026.10.01）")
+    });
+    assert_eq!(downloads(&server), 1, "已經是最新版：不下載");
+    assert!(playing_url(&h.state().player().state, &page), "不影響播放");
+}
+
+/// 影戲下載的 yt-dlp 超過 30 天沒更新（版本舊、檔案的時間也舊）：網站影片播不了時、設定頁都提醒，
+/// 「立即更新」查過已經是最新版之後就不再提醒（檔案的時間更新）。沒有下載的方法時照舊寫怎麼更新
+#[test]
+fn stale_managed_ytdl_is_reminded() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("stale-ytdl");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    std::fs::write(&ytdl, support::release::fake_ytdl("2020.01.01", 1000)).unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(90 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&ytdl)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    // 網站最新的就是這一版（yt-dlp 偶爾很久才發佈一次）
+    support::release::publish_ytdl(
+        &server,
+        "2020.01.01",
+        &support::release::fake_ytdl("2020.01.01", 1000),
+        None,
+    );
+    let fake = FakeResolver::fail(YtdlError::NotABot.into()).arc();
+
+    // 沒有下載的方法：說明怎麼更新（Remedy::UpdateYtdl），沒有按鈕
+    let mut h = tools_harness(&fake, &server, &tools, false, no_auto_next());
+    h.step();
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp 2020.01.01（影戲下載的）");
+    h.get_by_label_contains("請更新 yt-dlp（yt-dlp -U");
+    assert!(h.query_by_label("立即更新").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "無法播放網站影片：網站要求確認不是機器人");
+    step_until_label(&mut h, "影戲下載的 yt-dlp 已經");
+    assert!(h.query_by_label("更新 yt-dlp 再試一次").is_none());
+    drop(h);
+
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "無法播放網站影片：網站要求確認不是機器人");
+    // 原因的建議（Cookie）照舊，多一句很久沒更新、可以更新再試一次
+    step_until_label(&mut h, "天沒更新，網站改版後可能播不了");
+    h.get_by_label_contains("在「設定 → 網路」選擇從瀏覽器讀 Cookie");
+    h.get_by_label("更新 yt-dlp 再試一次");
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    step_until_label(&mut h, "yt-dlp 2020.01.01（影戲下載的）");
+    h.get_by_label_contains("可以按「立即更新」");
+    assert!(release_requests(&server).is_empty(), "提醒不連網");
+    click_in_view(&mut h, "立即更新");
+    step_until_app(&mut h, "檢查完", |app| {
+        app.osd_text() == Some("yt-dlp 已經是最新版（2020.01.01）")
+    });
+    // 檢查過了：不再提醒
+    let start = Instant::now();
+    while h.query_by_label_contains("可以按「立即更新」").is_some() {
+        assert!(start.elapsed() < NET_TIMEOUT, "還在提醒");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let touched = std::fs::metadata(&ytdl).unwrap().modified().unwrap();
+    assert!(touched > long_ago + Duration::from_secs(86_400));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("天沒更新").is_none());
+    assert!(h.query_by_label("更新 yt-dlp 再試一次").is_none());
+}
+
+/// 「設定 → 網路」：沒有 deno 時「下載 deno（約 N MB）…」，先問過（寫解開後的大小）；下載中有進度、可以取消
+/// （不留下暫存檔）；失敗時寫原因；下載好之後可以移除（先確認）
+#[test]
+fn network_page_downloads_cancels_and_removes_deno() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("get-deno");
+    let tools = dir.0.join("tools");
+    // 壓縮不了的 2 MB：zip 也是 2.0 MB，送到 1 MB 停住，進度的數字是確定的
+    let exe = incompressible(2 << 20);
+    let zip = support::release::deno_zip(&exe);
+    assert_eq!(format!("{:.1}", zip.len() as f64 / 1048576.0), "2.0");
+    support::release::publish_deno(&server, "v2.9.7", &zip);
+    let zip_path = support::release::download_path(Tool::Deno, "v2.9.7", support::release::asset(Tool::Deno));
+    // 送到一半就停住
+    server.put(&zip_path, support::http::Canned::ok(zip.clone()).stall_after(1 << 20));
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質");
+    let (mb, disk) = Tool::Deno.sizes_mb(Os::current());
+    let button = format!("下載 deno（約 {mb} MB）…");
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載 deno？");
+    h.get_by_label_contains(&format!("解開後約 {disk} MB"));
+    h.get_by_label("下載").click();
+    h.run_steps(2);
+    // 收到一半：已收到、總共（zip 的大小）
+    step_until_label(&mut h, "下載 deno：1.0 / 2.0 MB");
+    assert!(h.state().install_running());
+    assert!(
+        h.query_by_label(&button)
+            .is_none_or(|b| b.accesskit_node().is_disabled()),
+        "下載中不能再按"
+    );
+    // 進度在設定頁的捲動區裡：先捲到看得見（字型不同時版面高度不同）
+    click_in_view(&mut h, "取消下載");
+    step_until_net(&mut h, "取消了", |app| !app.install_running());
+    assert_eq!(h.state().osd_text(), Some("已取消下載"));
+    let deno = tools.join(Tool::Deno.file_name(Os::current()));
+    assert!(!deno.exists());
+    assert!(partial_downloads(&tools).is_empty(), "{:?}", partial_downloads(&tools));
+
+    // 被改過的檔案（檢查碼不符）：寫出原因，不留下檔案
+    server.put(
+        &zip_path,
+        support::http::Canned::ok(support::release::deno_zip(b"tampered")),
+    );
+    // 做完會重新找 yt-dlp、deno：找完（按鈕回來）才按
+    step_until_label(&mut h, &button);
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載").click();
+    step_until_label(&mut h, "無法下載 deno：下載的檔案檢查失敗（雜湊不符），已刪除");
+    assert!(!deno.exists());
+
+    // 正常的：下載、解開，找到影戲下載的 deno；可以移除
+    server.put(&zip_path, support::http::Canned::ok(zip.clone()));
+    // 做完會重新找 yt-dlp、deno：找完（按鈕回來）才按
+    step_until_label(&mut h, &button);
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載").click();
+    step_until_label(&mut h, "JavaScript 執行環境（YouTube 需要）：deno 2.9.7");
+    assert!(
+        h.query_by_label_contains("無法下載 deno").is_none(),
+        "成功之後不再寫上次的失敗"
+    );
+    assert_eq!(std::fs::read(&deno).unwrap(), exe);
+    assert_eq!(h.state().osd_text(), Some("已下載 deno 2.9.7"));
+    click_in_view(&mut h, "移除 deno…");
+    h.get_by_label("移除影戲下載的 deno？");
+    h.get_by_label("移除").click();
+    step_until_label(&mut h, "沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質");
+    assert!(!deno.exists());
+    assert_eq!(h.state().osd_text(), Some("已移除影戲下載的 deno"));
+}
+
+/// 英文介面：起始畫面的按鈕、同意下載的對話框
+#[test]
+fn download_dialog_in_english() {
+    let server = Server::start();
+    let dir = TempDir::new("get-en");
+    let tools = dir.0.join("tools");
+    let fake = FakeResolver::missing().arc();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = tools_harness(&fake, &server, &tools, true, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "Website videos need yt-dlp");
+    h.get_by_label("Download yt-dlp…").click();
+    h.run_steps(2);
+    h.get_by_label("Download yt-dlp?");
+    h.get_by_label_contains("Downloads the latest yt-dlp from GitHub (github.com/yt-dlp/yt-dlp)");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Download yt-dlp?").is_none());
+    assert!(release_requests(&server).is_empty());
+}
+
+/// 壓縮不了的內容（下載的進度跟 zip 的大小一樣）
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// 起始畫面按的下載：進度與「取消下載」畫在起始畫面（只有一份）；檢查碼不符時在起始畫面寫原因，
+/// 開了別的網址就不再寫。等的時候使用者開了別的檔案在播：做完不搶（不再開一次播不了的網址）
+#[test]
+fn start_screen_download_progress_cancel_and_failure() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("start-get-ytdl");
+    let tools = dir.0.join("tools");
+    // 2 MB：送到 1 MB 停住，進度的數字是確定的
+    let content = support::release::fake_ytdl("2026.10.01", 2 << 20);
+    support::release::publish_ytdl(&server, "2026.10.01", &content, None);
+    let asset = support::release::download_path(Tool::Ytdl, "2026.10.01", support::release::asset(Tool::Ytdl));
+    server.put(&asset, support::http::Canned::ok(content.clone()).stall_after(1 << 20));
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    let json = long_site_json(&server.url(""));
+    let have = ytdl.clone();
+    let fake = FakeResolver::new(move |_, _| {
+        if have.is_file() {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Missing.into())
+        }
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=a");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    let download = |h: &mut Harness<'_, VitascopeApp>| {
+        h.get_by_label("下載 yt-dlp…").click();
+        h.run_steps(2);
+        h.get_by_label("下載").click();
+        h.run_steps(2);
+    };
+    download(&mut h);
+    // 進度在起始畫面，只有一份（設定頁沒開）；下載的按鈕換成進度
+    step_until_label(&mut h, "下載 yt-dlp：1.0 / 2.0 MB");
+    h.get_by_label("下載 yt-dlp：1.0 / 2.0 MB");
+    assert!(h.query_by_label("下載 yt-dlp…").is_none());
+    h.get_by_label("取消下載").click();
+    h.run_steps(2);
+    step_until_net(&mut h, "取消了", |app| !app.install_running());
+    assert_eq!(h.state().osd_text(), Some("已取消下載"));
+    assert!(!ytdl.exists());
+    assert!(partial_downloads(&tools).is_empty(), "{:?}", partial_downloads(&tools));
+    assert!(h.query_by_label_contains("無法下載").is_none(), "取消不算失敗");
+    h.get_by_label("下載 yt-dlp…");
+
+    // 被改過的檔案：起始畫面寫原因，可以再試
+    server.put(
+        &asset,
+        support::http::Canned::ok(support::release::fake_ytdl("2026.10.01", 5000)),
+    );
+    download(&mut h);
+    let failed = "無法下載 yt-dlp：下載的檔案檢查失敗（雜湊不符），已刪除";
+    step_until_label(&mut h, failed);
+    h.get_by_label(failed);
+    h.get_by_label("下載 yt-dlp…");
+    assert_eq!(fake.calls(), 1, "失敗了：不再開一次");
+    // 開了別的網址：上一次下載的失敗跟它無關，不再寫
+    let other = server.url("/watch?v=b");
+    h.event(egui::Event::Paste(other.clone()));
+    step_until_net(&mut h, "另一個網址也需要 yt-dlp", |app| {
+        app.player().opening() == Some(other.as_str()) && app.player().state.net_need_ytdl
+    });
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    h.run_steps(3);
+    assert!(h.query_by_label(failed).is_none(), "別的網址不寫上一次的失敗");
+
+    // 等正在用 yt-dlp 的程序時，使用者開了本機的檔案在播：做完不搶（不再開一次網址）
+    server.put(&asset, support::http::Canned::ok(content.clone()));
+    let lock = vitascope::ytdl::run::tool_lock(&ytdl);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let held = lock
+        .shared_until(&never, Instant::now() + Duration::from_secs(120))
+        .unwrap();
+    download(&mut h);
+    step_until_label(&mut h, "yt-dlp：等待 yt-dlp 結束…");
+    let calls = fake.calls();
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until(&mut h, "本機的檔案在播", |s| playing(s, "audio_flac.flac"));
+    drop(held);
+    step_until_net(&mut h, "下載好了", |app| !app.install_running());
+    assert_eq!(h.state().osd_text(), Some("已下載 yt-dlp 2026.10.01"));
+    assert_eq!(std::fs::read(&ytdl).unwrap(), content);
+    h.run_steps(10);
+    assert!(
+        playing(&h.state().player().state, "audio_flac.flac"),
+        "還在播本機的檔案"
+    );
+    assert_eq!(fake.calls(), calls, "沒有再開一次網址");
+}
+
+/// 網站影片缺 deno：起始畫面「下載 deno…」取代「請安裝 deno」的說明。從設定頁開始下載時，起始畫面不畫按鈕與進度，
+/// 照舊寫說明；取消後按鈕回來
+#[test]
+fn start_screen_offers_deno_and_keeps_the_advice_while_settings_download() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("start-get-deno");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    // 影戲下載的 yt-dlp（剛下載的），沒有 deno
+    std::fs::write(
+        tools.join(Tool::Ytdl.file_name(Os::current())),
+        support::release::fake_ytdl("2026.10.01", 1000),
+    )
+    .unwrap();
+    let zip = support::release::deno_zip(&incompressible(1 << 20));
+    support::release::publish_deno(&server, "v2.9.7", &zip);
+    let zip_path = support::release::download_path(Tool::Deno, "v2.9.7", support::release::asset(Tool::Deno));
+    server.put(
+        &zip_path,
+        support::http::Canned::ok(zip.clone()).stall_after(zip.len() / 2),
+    );
+    let fake = FakeResolver::fail(YtdlError::NeedsJsRuntime.into()).arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=yt")));
+    step_until_label(&mut h, "無法播放網站影片：YouTube 需要 JavaScript 執行環境（deno）");
+    step_until_label(&mut h, "下載 deno…");
+    let advice = "請安裝 deno 2.3 以上";
+    assert!(h.query_by_label_contains(advice).is_none(), "按鈕取代說明");
+    assert!(
+        h.query_by_label("更新 yt-dlp 再試一次").is_none(),
+        "缺 deno：更新 yt-dlp 沒有用"
+    );
+
+    // 從設定頁下載：起始畫面不畫按鈕、不畫進度，說明回來
+    open_settings_page(&mut h, "網路");
+    let (mb, _) = Tool::Deno.sizes_mb(Os::current());
+    // 設定頁的 yt-dlp、deno 在找完之後才畫（找的時候是「搜尋中…」）
+    let button = format!("下載 deno（約 {mb} MB）…");
+    step_until_label(&mut h, &button);
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載").click();
+    h.run_steps(2);
+    step_until_label(&mut h, "下載 deno：");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().install_running());
+    assert!(h.query_by_label_contains("下載 deno：").is_none(), "進度在設定頁");
+    assert!(h.query_by_label("下載 deno…").is_none());
+    h.get_by_label_contains(advice);
+
+    // 取消後：按鈕回來，說明不寫
+    open_settings_page(&mut h, "網路");
+    click_in_view(&mut h, "取消下載");
+    step_until_net(&mut h, "取消了", |app| !app.install_running());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    h.get_by_label("下載 deno…");
+    assert!(h.query_by_label_contains(advice).is_none());
+    assert!(!tools.join(Tool::Deno.file_name(Os::current())).exists());
+}
+
+/// 錯誤本身看不出原因、但 yt-dlp 的警告說它可能太舊（解不開網站的驗證）：影戲下載的那一份也有「更新 yt-dlp 再試一次」
+#[test]
+fn outdated_warnings_offer_the_update_too() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("hint-update");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(
+        tools.join(Tool::Ytdl.file_name(Os::current())),
+        support::release::fake_ytdl("2026.10.01", 1000),
+    )
+    .unwrap();
+    let fake = FakeResolver::fail(Failure {
+        error: YtdlError::Other("Unable to extract video data".into()),
+        hints: vec![Hint::Outdated],
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=sig")));
+    step_until_label(&mut h, "無法播放網站影片：yt-dlp：Unable to extract video data");
+    h.get_by_label("yt-dlp 可能需要更新");
+    step_until_label(&mut h, "更新 yt-dlp 再試一次");
+    assert!(
+        h.query_by_label_contains("天沒更新").is_none(),
+        "剛下載的：不是因為很久沒更新"
+    );
+    assert!(release_requests(&server).is_empty(), "只在按下時連網");
+}
+
+/// 自己安裝的 yt-dlp：影戲不更新、不移除（太舊時照舊寫 `yt-dlp -U` 的說明，沒有「更新 yt-dlp 再試一次」；
+/// 設定頁沒有「立即更新」「移除…」；「網站影片 ▸」沒有「更新 yt-dlp」），也不會下載一份蓋過它
+#[test]
+fn user_installed_ytdl_is_never_updated_or_removed() {
+    use vitascope::ytdl::{Located, SearchEnv, Source, Tools, Version};
+    let server = Server::start();
+    let dir = TempDir::new("user-ytdl");
+    let tools = dir.0.join("tools");
+    let locator = vitascope::ytdl::Locator::with_finder(
+        Some(tools.clone()),
+        Arc::new(|env: &SearchEnv| {
+            let mut t = Tools::none(env);
+            t.ytdl = Some(Located::new("/usr/bin/yt-dlp", Source::System));
+            t.ytdl_version = Version::parse("2020.01.01");
+            t
+        }),
+    );
+    let json = long_site_json(&server.url(""));
+    let fake = FakeResolver::new(move |req, _| {
+        if req.url.contains("v=long") {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Outdated.into())
+        }
+    })
+    .arc();
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch {
+            ytdl: Some(locator),
+            installer: Some(Arc::new(vitascope::ytdl::install::Installer::with_base(
+                tools.clone(),
+                &server.url(""),
+            ))),
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=old")));
+    step_until_label(&mut h, "無法播放網站影片：無法取得影片（yt-dlp 可能需要更新）");
+    h.get_by_label_contains("請更新 yt-dlp（yt-dlp -U");
+    h.run_steps(5);
+    assert!(h.query_by_label("更新 yt-dlp 再試一次").is_none());
+    assert!(h.query_by_label("下載 yt-dlp…").is_none());
+
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp 2020.01.01（另外安裝的）");
+    h.get_by_label_contains("這個 yt-dlp 已經");
+    assert!(h.query_by_label("立即更新").is_none());
+    assert!(h.query_by_label("移除…").is_none());
+    assert!(h.query_by_label_contains("下載 yt-dlp（約").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播放中", |app| playing_url(&app.player().state, &page));
+    open_site_menu(&mut h);
+    h.get_by_label("在瀏覽器開啟");
+    assert!(h.query_by_label("更新 yt-dlp").is_none(), "自己安裝的不在這裡更新");
+    assert!(release_requests(&server).is_empty(), "從來沒連到 GitHub");
+    assert!(!tools.exists(), "沒有下載任何東西");
+}
+
 /// 網址含登入資訊（token）時的書籤：只放在記憶體、不寫進 bookmarks.json（跟最近開啟、續播一樣），
 /// 第一個書籤提示一次；一般的網址照常存檔
 #[test]

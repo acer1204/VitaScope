@@ -11,8 +11,10 @@
 //!     關閉 Job 的 handle 時（正常結束後、影戲結束時）裡面剩下的程序也會被結束。
 //! - Unix：子程序自己一個 process group；取消、逾時先送 SIGTERM 給整個群組（PyInstaller 的外層會轉給裡面的程式、
 //!   清掉暫存資料夾），[`Limits::term_grace`] 後再送 SIGKILL。
-//! - 同一個 yt-dlp 的使用規則（[`ToolLock`]）：解析可以同時好幾個；更新（`-U`，之後的「立即更新」）要獨占，
+//! - 同一個 yt-dlp 的使用規則（[`ToolLock`]）：解析可以同時好幾個；換檔案（影戲的下載、更新、移除）要獨占，
 //!   而且要等放手的程序真的結束（不然換掉執行檔時它還在用）。新的解析不等放手的程序。
+//!   yt-dlp 在 YouTube 會開 deno：執行時也拿著子程序 PATH 裡第一個 deno 的共用鎖（[`deno_on_path`]，yt-dlp 自己也是
+//!   這樣找），換掉、移除 deno 時一樣等它結束。
 
 use super::Located;
 use std::collections::HashMap;
@@ -112,10 +114,17 @@ pub fn run(
     cancel: &AtomicBool,
 ) -> Result<Finished, RunError> {
     let started = Instant::now();
-    let tool = tool_lock(&program.program);
+    // 這個程式，以及它可能開的 deno（同一個檔案只拿一次）
+    let mut locks = vec![tool_lock(&program.program)];
+    if let Some(deno) = deno_on_path(env).filter(|d| *d != program.program) {
+        locks.push(tool_lock(&deno));
+    }
     let guard = match lock {
-        Lock::Shared => Some(tool.shared_until(cancel, started + limits.deadline)?),
-        Lock::Held => None,
+        Lock::Shared => locks
+            .iter()
+            .map(|l| l.shared_until(cancel, started + limits.deadline))
+            .collect::<Result<Vec<_>, _>>()?,
+        Lock::Held => Vec::new(),
     };
 
     let mut cmd = crate::syscmd::command(&program.program);
@@ -187,6 +196,16 @@ pub fn run(
     }
 }
 
+/// 子程序會用的 deno：它的 PATH（[`ChildEnv::path`]）裡第一個 `deno`（Windows `deno.exe`）。
+/// 沒有指定 PATH（繼承影戲的）時 None：那裡不會有影戲下載的 deno
+pub fn deno_on_path(env: &ChildEnv) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "deno.exe" } else { "deno" };
+    std::env::split_paths(env.path.as_ref()?)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
 /// 啟動。Linux 的「Text file busy」：別的執行緒剛好在 fork 時，剛寫好的執行檔（下載、更新後）還被那個子程序開著，
 /// 等一下就好，重試幾次
 fn spawn(cmd: &mut std::process::Command) -> Result<Child, RunError> {
@@ -232,8 +251,8 @@ fn spawn_reader<R: Read + Send + 'static>(pipe: Option<R>, cap: usize, tx: mpsc:
 }
 
 /// 不等了：程序交給背景執行緒結束。共用鎖換成「放手的程序」，更新要等它真的結束
-fn abandon(child: Child, group: Group, guard: Option<SharedGuard>, limits: &Limits, started: Instant) {
-    let abandoned = guard.map(SharedGuard::abandon);
+fn abandon(child: Child, group: Group, guard: Vec<SharedGuard>, limits: &Limits, started: Instant) {
+    let abandoned: Vec<AbandonedGuard> = guard.into_iter().map(SharedGuard::abandon).collect();
     group.terminate_softly();
     let limits = limits.clone();
     let spawned = std::thread::Builder::new()
@@ -245,7 +264,7 @@ fn abandon(child: Child, group: Group, guard: Option<SharedGuard>, limits: &Limi
 }
 
 /// 背景：等放手的程序結束，超過寬限時間就強制結束
-fn reap(mut child: Child, group: Group, abandoned: Option<AbandonedGuard>, limits: &Limits, started: Instant) {
+fn reap(mut child: Child, group: Group, abandoned: Vec<AbandonedGuard>, limits: &Limits, started: Instant) {
     let grace = if cfg!(windows) {
         limits
             .abandon_grace

@@ -39,4 +39,5 @@ pub mod theme;
 pub mod thumbs;
 pub mod update;
 pub mod video;
+pub mod web;
 pub mod ytdl;

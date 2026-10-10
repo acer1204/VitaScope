@@ -45,11 +45,13 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
 程式另外會建立這些資料。設定與播放紀錄在移除程式時保留，不需要可以自己刪；
 暫存資料夾在 Windows 安裝版解除安裝時會一併刪除，其他情況也可以自己刪：
 
-| 平台 | 設定、播放紀錄、播放清單 | 暫存（字幕轉碼、翻轉用的著色器等） |
-|---|---|---|
-| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`bookmarks.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\` |
-| macOS | `~/Library/Application Support/Vitascope/` | `~/Library/Caches/VitaScope/` |
-| Linux | `~/.config/vitascope/` | `~/.cache/vitascope/` |
+| 平台 | 設定、播放紀錄、播放清單 | 暫存（字幕轉碼、翻轉用的著色器等） | 影戲下載的 yt-dlp、deno |
+|---|---|---|---|
+| Windows | `%APPDATA%\Vitascope\`（`settings.json`、`history.json`、`bookmarks.json`、`playlist.m3u8`） | `%LOCALAPPDATA%\VitaScope\` | `%LOCALAPPDATA%\VitaScope\tools\` |
+| macOS | `~/Library/Application Support/Vitascope/` | `~/Library/Caches/VitaScope/` | `~/Library/Application Support/Vitascope/tools/` |
+| Linux | `~/.config/vitascope/` | `~/.cache/vitascope/` | `${XDG_DATA_HOME:-~/.local/share}/vitascope/tools/` |
+
+yt-dlp、deno 只在你按「下載」時才下載（見下面的「網站影片」）；不要的話在「設定 → 網路」按「移除…」，或直接刪掉 `tools` 資料夾。
 
 截圖預設存在系統「圖片」資料夾裡的 `VitaScope`，不會隨程式刪除。
 
@@ -165,7 +167,14 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   直播顯示「直播」、結束時提示；網址記進最近開啟（顯示標題），能跳轉、一分鐘以上的影片從上次的位置繼續（書籤也是）。
   「設定 → 網路」可以改 HLS / DASH 的起始畫質、重新連線、快取、逾時、憑證檢查、記不記網址，以及 User-Agent、Referer、標頭、proxy。
   從瀏覽器拖曳連結進來沒有作用（系統只把檔案交給程式），請複製網址後按 Ctrl（⌘）+ V
-- [ ] 網站影片（yt-dlp）
+- [x] 網站影片（yt-dlp）、可選畫質：YouTube、Bilibili、Vimeo、Twitch 之類的網址直接開（開啟網址、貼上、命令列），
+  影像、聲音分開的影片合成一部播，標題、章節、網站的字幕（繁中優先）、網站的播放清單都有；播放中右鍵選單「網站影片 ▸」
+  選擇畫質（接著現在的位置播，暫停、字幕、A-B 重播都保留）、預設畫質、只播聲音、載入整個播放清單。
+  沒有 yt-dlp 時起始畫面有「下載 yt-dlp…」：**按下並同意後**才從 yt-dlp 官方的 GitHub 下載（Windows 約 18 MB，核對發佈的檢查碼），
+  YouTube 要的 deno 也一樣（「設定 → 網路」，約 40 MB、解開後約 100 MB）；自己安裝的 yt-dlp、deno 也找得到。
+  影戲不會在背景自動更新：網站改版播不了時按「更新 yt-dlp 再試一次」，影戲下載的版本超過 30 天沒更新時會提醒
+  （「設定 → 網路」的「立即更新」、右鍵選單「網站影片 ▸ 更新 yt-dlp」）。Cookie（要登入、年齡限制的影片，建議 Firefox）、
+  編碼、字幕也在「設定 → 網路」
 - [ ] 線上搜尋字幕
 - [ ] 片段輸出、轉成 GIF、縮圖總覽圖
 - [ ] 播放清單：隨機、重複、播完後動作
@@ -253,7 +262,8 @@ Shift + , / Shift + .（< / >）字幕提早 / 延後、/ 字幕延遲歸零；H
 右鍵選單的「畫面」有畫面比例、裁切、縮放、移動、旋轉、翻轉與重設；「畫質」有影像調整（控制面板）、去交錯、去色帶、銳化、
 縮放演算法、像素著色器、HDR 色調映射與流暢播放；「音效」有等化器、音量平衡、轉成立體聲、音量上限、輸出裝置（含獨佔模式）與音訊直通；「擷取畫面」可以另存新檔、選擇含不含字幕、開啟或變更截圖資料夾。
 播網站影片（yt-dlp）時多一個「網站影片」：選擇畫質（只換這部影片，接著現在的位置播，暫停、字幕、A-B 重播都保留）、
-預設畫質、只播聲音、載入整個播放清單、複製網址、在瀏覽器開啟；yt-dlp 的位置、預設畫質、編碼、字幕、瀏覽器的 Cookie 在「設定 → 網路」。
+預設畫質、只播聲音、載入整個播放清單、複製網址、在瀏覽器開啟，影戲下載的 yt-dlp 還有「更新 yt-dlp」；
+yt-dlp 的位置、下載、更新、移除、預設畫質、編碼、字幕、瀏覽器的 Cookie 在「設定 → 網路」。
 播放清單開著時，拖放進來的檔案會加到清單最後；清單上可以按右鍵複製路徑。
 
 ## 支援格式
@@ -322,6 +332,8 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/async_opts.rs` | 非同步設定 mpv 選項（回覆依種類分派、先後順序、失敗時的處理）、偵測播放引擎的功能、L3 加的播放狀態 |
 | `tests/engine_build.rs` | 播放引擎的建置內容：用到的解碼器、分離器、協定、濾鏡都在，L3 元件（DASH、片段輸出、轉 GIF、音訊濾鏡）實際可用 |
 | `tests/net.rs` | 網路功能：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單）；用本機的測試伺服器（`tests/support/http.rs`，只聽 127.0.0.1）播 HTTP 的檔案、HLS、DASH（多畫質一開始選哪個），User-Agent、Referer、自訂標頭真的送到伺服器，網路設定 mpv 讀回來是設定的值；網路上的播放清單展開時拿掉本機檔案的項目、取消連線 |
+| `tests/ytdl.rs` | 網站影片：執行 yt-dlp（用假的 yt-dlp：Unix 的 sh、Windows 的 Python 腳本）的參數一字不差、取消與逾時連子程序一起結束、輸出上限、找 yt-dlp / deno 的順序 |
+| `tests/install.rs` | 影戲下載 yt-dlp、deno：從本機測試伺服器上的假 GitHub 發佈下載（不連到真的 GitHub）、核對 SHA-256、解開 deno 的 zip、進度與取消、沒有進度時放棄、已經是最新版不下載、換檔案時等正在用它的 yt-dlp、失敗時不留下半個檔案 |
 | `tests/net_errors.rs` | 開網址失敗的說明：HTTP 404 / 403 / 500、網頁不是影片、連線逾時（不重試）、找不到伺服器，起始畫面寫出原因。要看 FFmpeg 的記錄（只送到第一個建立的 mpv），所以自己一個測試程式、一次只有一個播放器 |
 | `tests/pacing.rs` | 流暢播放在播放引擎這一層的行為（`vo-null-fps` 當假的螢幕更新率） |
 | `tests/pacing_window.rs` | 流暢播放與畫面輸出節奏的實機量測（會開全螢幕視窗，預設不跑；見下方） |
@@ -405,6 +417,9 @@ src/
 ├─ video.rs      mpv render API → OpenGL FBO → egui 畫面
 ├─ player.rs     播放器核心：mpv 屬性與事件 → Rust 狀態（介面和測試共用）
 ├─ net.rs        網路：開啟網址的設定 → mpv 選項、哪些網址能開（依來源）、顯示名稱、能不能記進播放紀錄、連線失敗的說明
+├─ ytdl/         網站影片：找 yt-dlp / deno、執行與取消、JSON → mpv 要開的網址、錯誤與提醒、接上播放器的 hook、
+│                下載 / 更新 / 移除影戲管理的 yt-dlp 與 deno（install.rs）
+├─ web.rs        下載檔案（使用者按下時才連網）：連線與等回應的逾時、沒有進度時放棄、取消、大小上限
 ├─ mpv/          libmpv 的安全包裝（client API、render API：OpenGL 與軟體繪圖）
 ├─ geometry.rs   畫面調整：長寬比、裁切、縮放、旋轉、翻轉
 ├─ picture.rs    畫質：影像調整、去交錯、去色帶、銳化、縮放演算法、HDR 色調映射 → mpv 選項；picture/shader.rs 像素著色器組合

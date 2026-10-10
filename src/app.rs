@@ -5,6 +5,7 @@ mod capture;
 mod control_panel;
 mod dialogs;
 mod info_panel;
+mod install;
 mod network;
 mod pacing;
 mod playlist_panel;
@@ -214,6 +215,10 @@ enum PlaceholderOp {
     OpenRecent(String),
     /// 網站影片播不了時的「網路設定…」
     NetworkSettings,
+    /// 網站影片播不了時的「下載 yt-dlp…」「下載 deno…」「更新 yt-dlp 再試一次」（做完再開一次）
+    Tool(install::ToolAction),
+    /// 取消正在進行的下載
+    CancelInstall,
 }
 
 /// Esc 會關掉的視窗，依這個順序一次關一個（之後的批次把自己的視窗加進來：匯出、線上搜尋字幕…）
@@ -318,6 +323,8 @@ pub struct VitascopeApp {
     reload_keep: Option<network::ReloadKeep>,
     /// 「設定 → 網路」選 yt-dlp 檔案的結果（選的檔案不能用時說明原因）
     ytdl_path_problem: Option<crate::ytdl::locate::PathProblem>,
+    /// 下載 yt-dlp、deno（使用者按下時才連網）：下載、更新、移除的狀態
+    install: install::InstallUi,
     /// 已經提示過「書籤只保留到關閉影戲」的檔案（書籤的代號）
     private_marks_told: std::collections::HashSet<String>,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
@@ -579,6 +586,9 @@ pub struct Launch {
     /// 找 yt-dlp、deno 的狀態：跟播放器解析網站影片用的是同一個（main.rs 建立）；
     /// None = 不找（自動測試、`--shot`：不執行使用者電腦上的 yt-dlp）
     pub ytdl: Option<crate::ytdl::Locator>,
+    /// 下載 yt-dlp、deno 的方法（main.rs：從 GitHub 下載到 `tools_dir`）；
+    /// None = 不能下載（自動測試、`--shot`：不顯示下載、更新、移除的按鈕，絕不連網）
+    pub installer: Option<Arc<crate::ytdl::install::Installer>>,
 }
 
 impl VitascopeApp {
@@ -736,6 +746,7 @@ impl VitascopeApp {
             net_draft: None,
             reload_keep: None,
             ytdl_path_problem: None,
+            install: install::InstallUi::new(launch.installer),
             private_marks_told: Default::default(),
             was_eof: false,
             wheel: 0.0,
@@ -3218,6 +3229,8 @@ impl VitascopeApp {
             match op {
                 PlaceholderOp::OpenRecent(path) => self.open_recent(&path),
                 PlaceholderOp::NetworkSettings => self.show_network_settings(),
+                PlaceholderOp::Tool(a) => self.tool_action(a, true),
+                PlaceholderOp::CancelInstall => self.cancel_install(),
             }
         }
         // 網路串流：連線中（可以取消）、緩衝中
@@ -3659,9 +3672,14 @@ impl VitascopeApp {
         }
         for note in site.iter().flat_map(|(_, notes)| notes) {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(*note).size(13.0).color(Color32::from_gray(170)));
+            ui.label(
+                egui::RichText::new(note.as_str())
+                    .size(13.0)
+                    .color(Color32::from_gray(170)),
+            );
         }
-        let mut chosen = None;
+        // 下載 yt-dlp、deno，更新 yt-dlp 再試一次（或是正在下載的進度）
+        let mut chosen = self.placeholder_tools(&mut ui);
         // 沒有 yt-dlp、關掉了、Cookie 的問題：直接打開「設定 → 網路」
         if self.site_failure_wants_settings() {
             ui.add_space(8.0);
@@ -4371,6 +4389,8 @@ impl eframe::App for VitascopeApp {
         self.poll_folder_add();
         self.poll_dialog();
         self.poll_instance(ctx);
+        // 下載、更新 yt-dlp、deno 做完了沒（結果提示、重新找、再開一次播不了的網址）
+        self.install_tick(ctx);
         // macOS：已經開著時從 Finder 開的檔案
         #[cfg(target_os = "macos")]
         {
@@ -4503,6 +4523,8 @@ impl eframe::App for VitascopeApp {
         self.subtitle_style_window(&ctx);
         self.settings_window(&ctx);
         self.control_panel(&ctx);
+        // 同意下載、確認移除：在設定視窗之後畫（從設定頁按的，對話框要蓋在設定視窗上面）
+        self.install_modals(&ctx);
         self.typing_last_frame = ctx.text_edit_focused();
     }
 
@@ -4522,6 +4544,8 @@ impl eframe::App for VitascopeApp {
         self.remember_position();
         self.save_settings();
         self.persist_playlist();
+        // 下載到一半：停掉（暫存檔由背景執行緒刪掉；來不及的話下次下載時清掉）
+        self.cancel_install();
         // 剛加的書籤還在背景存檔：等它寫完（最多兩秒），結束程式時背景執行緒會直接被停掉
         if !self.bookmarks.flush(Duration::from_secs(2)) {
             eprintln!("[vitascope] 書籤還沒存完就結束了");

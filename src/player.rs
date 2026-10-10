@@ -2110,6 +2110,11 @@ impl Player {
         self.open_with_mode(&url, mode)
     }
 
+    /// 最近一次要開的（`open` 給的路徑或網址；開不了時也留著）：網站影片播不了、下載或更新 yt-dlp 之後「再試一次」用
+    pub fn opening(&self) -> Option<&str> {
+        self.opening.as_deref()
+    }
+
     /// 換畫質重開目前的網站影片要用的（網頁的網址, 要求）：從現在的位置接著播。不是網站影片時 None。
     /// 介面自己開（`open_with_mode`），換檔時的設定（播放清單的位置、要保留的暫停、字幕…）才照它的規則做
     pub fn reload_mode(&self, choice: Choice) -> Option<(String, Mode)> {

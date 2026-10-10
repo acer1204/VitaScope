@@ -552,6 +552,63 @@ fn runs_hold_the_tool_lock_and_abandoned_ones_keep_updates_waiting() {
     assert_eq!(lock.state(), run::LockState::default());
 }
 
+/// yt-dlp 在 YouTube 會開 deno：執行時也拿著子程序 PATH 裡第一個 deno 的共用鎖（影戲換掉、移除 deno 時等它結束，
+/// 包括取消後還在跑的）。PATH 後面的 deno 不用（yt-dlp 不會用到）
+#[test]
+fn runs_hold_the_lock_of_the_deno_they_may_start() {
+    let Some(fake) = Fake::new("deno-lock") else { return };
+    let name = if cfg!(windows) { "deno.exe" } else { "deno" };
+    let dirs: Vec<PathBuf> = ["no-deno", "deno-dir", "later"]
+        .iter()
+        .map(|d| fake.dir.join(d))
+        .collect();
+    for d in &dirs {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(dirs[1].join(name), b"deno").unwrap();
+    std::fs::write(dirs[2].join(name), b"deno").unwrap();
+    // 假 yt-dlp 還要用系統的程式（sleep 之類）：原本的 PATH 放在後面
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(dirs.iter().cloned().chain(std::env::split_paths(&inherited))).unwrap();
+    let env = ChildEnv {
+        path: Some(path),
+        cwd: None,
+    };
+    let deno = dirs[1].join(name);
+    assert_eq!(run::deno_on_path(&env), Some(deno.clone()));
+    assert_eq!(
+        run::deno_on_path(&ChildEnv::default()),
+        None,
+        "繼承的 PATH 裡不會有影戲下載的 deno"
+    );
+    let lock = run::tool_lock(&deno);
+    let later = run::tool_lock(&dirs[2].join(name));
+    let lim = Limits {
+        abandon_grace: Duration::from_secs(1),
+        term_grace: Duration::from_secs(1),
+        ..limits()
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (located, c, e) = (fake.located("hang"), cancel.clone(), env.clone());
+    let worker = std::thread::spawn(move || run::run(&located, &[], &e, &lim, Lock::Shared, &c));
+    fake.wait_heartbeat();
+    assert_eq!(lock.state().active, 1, "執行中拿著 deno 的共用鎖");
+    assert!(
+        lock.exclusive(Duration::from_millis(100)).is_none(),
+        "執行中不能換 deno"
+    );
+    assert_eq!(later.state(), run::LockState::default(), "PATH 後面的 deno 不鎖");
+    cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(worker.join().unwrap(), Err(RunError::Cancelled)));
+    assert_eq!(lock.state().active, 0);
+    // 放手的程序結束後就能換
+    fake.assert_tree_ends(Duration::from_secs(20));
+    let swap = lock.exclusive(Duration::from_secs(20));
+    assert!(swap.is_some(), "程序結束後可以換 deno：{:?}", lock.state());
+    drop(swap);
+    assert_eq!(lock.state(), run::LockState::default());
+}
+
 #[test]
 fn version_probe_runs_once_per_file() {
     let Some(fake) = Fake::new("version") else { return };

@@ -4,3 +4,4 @@
 
 pub mod fake_ytdl;
 pub mod http;
+pub mod release;

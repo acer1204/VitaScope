@@ -124,6 +124,19 @@ impl Version {
     }
 }
 
+/// 影戲下載的 yt-dlp 該提醒更新了嗎：版本超過 [`STALE_DAYS`] 天，**而且**這段時間也沒有檢查過更新
+/// （`modified` = 檔案的修改時間：下載、更新、「已經是最新版」都會更新它）。yt-dlp 偶爾一個多月才發佈一次，
+/// 剛下載的最新版不該馬上提醒。回傳多久沒更新（天）；不用提醒時 None
+pub fn managed_stale_days(version: Version, modified: Option<SystemTime>, now: SystemTime) -> Option<i64> {
+    let version_days = version.age_days(now);
+    // 檔案時間在未來（時鐘調過）：當成剛檢查過
+    let checked_days = modified.map_or(version_days, |m| {
+        now.duration_since(m).map_or(0, |d| (d.as_secs() / 86_400) as i64)
+    });
+    let days = version_days.min(checked_days);
+    (days > STALE_DAYS).then_some(days)
+}
+
 impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:04}.{:02}.{:02}", self.year, self.month, self.day)?;
@@ -618,6 +631,8 @@ struct LocState {
     done: Option<(u64, Arc<Tools>)>,
     /// `done` 是什麼時候找完的
     found_at: Option<std::time::Instant>,
+    /// `done` 找到的影戲下載的 yt-dlp 的修改時間（下載、檢查更新的時間；提醒更新用）
+    managed_modified: Option<SystemTime>,
 }
 
 impl Locator {
@@ -693,6 +708,12 @@ impl Locator {
         self.lock().running
     }
 
+    /// 找到的影戲下載的 yt-dlp 的修改時間（最近一次下載、檢查更新的時間；[`managed_stale_days`] 用）。
+    /// 在背景尋找時讀的，介面執行緒不碰檔案
+    pub fn managed_modified(&self) -> Option<SystemTime> {
+        self.lock().managed_modified
+    }
+
     /// 目前的結果找完多久了（還沒找完、要重新找時 None）
     pub fn age(&self) -> Option<Duration> {
         let s = self.lock();
@@ -751,8 +772,15 @@ impl Locator {
             };
             let env = SearchEnv::current(user_path, self.shared.tools_dir.clone());
             let tools = Arc::new((self.shared.finder)(&env));
+            let modified = tools
+                .ytdl
+                .as_ref()
+                .filter(|l| l.managed())
+                .and_then(|l| std::fs::metadata(&l.program).ok())
+                .and_then(|m| m.modified().ok());
             let mut s = self.lock();
             s.done = Some((generation, tools));
+            s.managed_modified = modified;
             s.found_at = Some(std::time::Instant::now());
             if s.generation == generation {
                 s.running = false;
@@ -806,6 +834,24 @@ mod tests {
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(days_from_civil(2000, 3, 1), 11_017);
         assert_eq!(days_from_civil(2026, 10, 10), 20_736);
+    }
+
+    #[test]
+    fn managed_copies_are_stale_only_when_not_checked_for_a_month() {
+        let v = Version::parse("2026.08.19").unwrap();
+        let day = |n: i64| SystemTime::UNIX_EPOCH + Duration::from_secs((v.days() + n) as u64 * 86_400 + 3600);
+        // 不知道什麼時候下載的：只看版本
+        assert_eq!(managed_stale_days(v, None, day(30)), None);
+        assert_eq!(managed_stale_days(v, None, day(45)), Some(45));
+        // 版本舊，但 40 天後才下載（當時的最新版）：從下載的時間算
+        assert_eq!(managed_stale_days(v, Some(day(40)), day(45)), None);
+        assert_eq!(managed_stale_days(v, Some(day(40)), day(71)), Some(31));
+        // 檢查過更新（已經是最新版）也一樣
+        assert_eq!(managed_stale_days(v, Some(day(100)), day(110)), None);
+        // 版本比檢查的時間新（不可能，但不要算錯）：取比較短的
+        assert_eq!(managed_stale_days(v, Some(day(-100)), day(20)), None);
+        // 檔案時間在未來（時鐘調過）：當成剛檢查過
+        assert_eq!(managed_stale_days(v, Some(day(200)), day(50)), None);
     }
 
     #[test]
