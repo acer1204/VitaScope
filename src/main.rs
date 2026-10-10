@@ -89,6 +89,8 @@ fn parse_args() -> (Launch, bool) {
         launch.bookmarks = vitascope::bookmarks::Bookmarks::load();
         // 影戲下載的 yt-dlp、deno 放的地方（自動截圖不找）
         launch.tools_dir = vitascope::paths::tools_dir();
+        // 匯出的磁碟快取；啟動時清掉上次留下的暫存檔（自動截圖不清）
+        launch.cache_root = Some(vitascope::paths::cache_root());
         launch.persist_playlist = true;
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
         if launch.files.is_empty()

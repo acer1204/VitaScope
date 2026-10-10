@@ -451,6 +451,19 @@ pub struct EngineCaps {
     /// 見 `video::GlInfo::compute_peak`）。看的是介面的 GL context，不是引擎：`probe_caps` 一律 false，
     /// 介面建立時依 GL context 設定（介面測試沒有 GL context，也是 false）
     pub compute_peak: bool,
+    /// 匯出片段（不重新編碼）：`dump-cache` 指令（command-list）
+    pub dump_cache: bool,
+    /// 匯出片段時把起點、終點對齊關鍵影格：`ab-loop-align-cache` 指令（command-list）
+    pub align_cache: bool,
+    /// 轉成 GIF：有 gif 編碼器（encoder-list）
+    pub gif: bool,
+    /// 轉成 GIF、縮圖總覽圖的 HDR 轉一般畫面：zscale 與 tonemap 濾鏡
+    pub zscale: bool,
+    pub tonemap: bool,
+    /// GIF 自己轉正（旋轉要在色盤之前做）：transpose 濾鏡
+    pub transpose: bool,
+    /// GIF 的色盤：palettegen 濾鏡（paletteuse 不能單獨偵測，有 palettegen 的 FFmpeg 都有）
+    pub palettegen: bool,
 }
 
 /// mpv 的版本（`mpv-version`：「mpv 0.37.0」「mpv v0.41.0-1102-g6c092d978」）→（主版本, 次版本）；看不懂時 None
@@ -1366,6 +1379,8 @@ impl Player {
         for name in AfCaps::NAMES {
             af.set(name, self.probe_af(name));
         }
+        let commands = self.list_field("command-list", "name");
+        let encoders = self.list_field("encoder-list", "driver");
         EngineCaps {
             af,
             deint_auto: self.probe_deint_auto(),
@@ -1377,27 +1392,59 @@ impl Player {
             macos: cfg!(target_os = "macos"),
             spdif_live: spdif_live(&self.mpv.get_string("mpv-version").unwrap_or_default()),
             compute_peak: false,
+            dump_cache: commands.iter().any(|c| c == "dump-cache"),
+            align_cache: commands.iter().any(|c| c == "ab-loop-align-cache"),
+            gif: encoders.iter().any(|e| e == "gif"),
+            zscale: self.probe_vf("zscale"),
+            tonemap: self.probe_vf("tonemap"),
+            transpose: self.probe_vf("transpose"),
+            palettegen: self.probe_vf("palettegen"),
         }
+    }
+
+    /// 清單屬性（`command-list`、`encoder-list`…）裡每一項的某個欄位；讀不到時是空的
+    fn list_field(&self, property: &str, field: &str) -> Vec<String> {
+        self.mpv
+            .get_string(property)
+            .ok()
+            .and_then(|j| serde_json::from_str::<Vec<serde_json::Value>>(&j).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| item[field].as_str().map(str::to_owned))
+            .collect()
     }
 
     /// 這個引擎有沒有這個 FFmpeg 音訊濾鏡。mpv 加進 af 時就會檢查濾鏡名稱（不用開檔）；
     /// 要用「@標籤:名稱」的寫法，「lavfi=[名稱]」要到建立濾鏡圖時才檢查。偵測完 af 恢復原狀
     pub fn probe_af(&mut self, name: &str) -> bool {
-        // 播放中加濾鏡會重建整條音訊濾鏡鏈（聲音會斷一下）
-        debug_assert!(!self.state.loaded && !self.state.loading, "probe_af 只能在開檔之前用");
-        let before = self.mpv.get_string("af").unwrap_or_default();
+        self.probe_filter("af", name)
+    }
+
+    /// 同 `probe_af`，影像濾鏡（vf）。匯出用（GIF、縮圖總覽圖在另外的 mpv 裡用這些濾鏡），主播放器只是拿來問
+    pub fn probe_vf(&mut self, name: &str) -> bool {
+        self.probe_filter("vf", name)
+    }
+
+    /// `chain` 是 "af" 或 "vf"
+    fn probe_filter(&mut self, chain: &str, name: &str) -> bool {
+        // 播放中加濾鏡會重建整條濾鏡鏈（聲音會斷一下、畫面會重新設定）
+        debug_assert!(
+            !self.state.loaded && !self.state.loading,
+            "probe_{chain} 只能在開檔之前用"
+        );
+        let before = self.mpv.get_string(chain).unwrap_or_default();
         let ok = self
             .mpv
-            .command(&["af", "add", &format!("{PROBE_LABEL}:{name}")])
+            .command(&[chain, "add", &format!("{PROBE_LABEL}:{name}")])
             .is_ok();
-        let _ = self.mpv.command(&["af", "remove", PROBE_LABEL]);
-        if self.mpv.get_string("af").unwrap_or_default() != before {
-            let _ = self.mpv.set_property("af", before.as_str());
+        let _ = self.mpv.command(&[chain, "remove", PROBE_LABEL]);
+        if self.mpv.get_string(chain).unwrap_or_default() != before {
+            let _ = self.mpv.set_property(chain, before.as_str());
         }
         if !ok {
             // 失敗時 mpv 記一筆「Option af-add: 'xxx' isn't supported.」
-            // （0.37 是「Option af-add: xxx doesn't exist.」）
-            self.probe_noise.push([name.to_owned(), "af-add".to_owned()]);
+            // （0.37 是「Option af-add: xxx doesn't exist.」；vf 是 vf-add）
+            self.probe_noise.push([name.to_owned(), format!("{chain}-add")]);
         }
         ok
     }
@@ -1643,6 +1690,17 @@ impl Player {
     /// 用數字讀（字串只到小數 6 位）；沒設時 mpv 給的是 "no"，讀不成數字就是 None
     pub fn ab_loop_points(&self) -> [Option<f64>; 2] {
         ["ab-loop-a", "ab-loop-b"].map(|name| self.mpv.get_property::<f64>(name).ok())
+    }
+
+    /// 分離器的起始時間（`demuxer-start-time`，秒；沒有檔案、讀不到時 0）。
+    /// mpv 的播放時間（time-pos、A-B 重播點）是「影片的時間戳 − 這個值」；匯出另外開的 mpv 可能用不同的分離器，
+    /// 起始時間不一定一樣，換算時兩邊都要看
+    pub fn demuxer_start_time(&self) -> f64 {
+        self.mpv
+            .get_property::<f64>("demuxer-start-time")
+            .ok()
+            .filter(|t| t.is_finite())
+            .unwrap_or(0.0)
     }
 
     /// 取消 A-B 重播（mpv 換檔時會沿用，所以開新檔時要清掉）

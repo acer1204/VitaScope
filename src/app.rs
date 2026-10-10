@@ -327,6 +327,10 @@ pub struct VitascopeApp {
     ytdl_path_problem: Option<crate::ytdl::locate::PathProblem>,
     /// 下載 yt-dlp、deno（使用者按下時才連網）：下載、更新、移除的狀態
     install: install::InstallUi,
+    /// 快取的根資料夾（匯出的磁碟快取、清掉上次留下的暫存檔）；None = 不用（自動測試、`--shot`）
+    cache_root: Option<PathBuf>,
+    /// 啟動時在背景清掉上次匯出留下的暫存檔（資料夾可能在網路磁碟上，不在介面執行緒做）
+    leftover_sweep: Option<std::thread::JoinHandle<usize>>,
     /// 已經提示過「書籤只保留到關閉影戲」的檔案（書籤的代號）
     private_marks_told: std::collections::HashSet<String>,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
@@ -591,6 +595,9 @@ pub struct Launch {
     /// 下載 yt-dlp、deno 的方法（main.rs：從 GitHub 下載到 `tools_dir`）；
     /// None = 不能下載（自動測試、`--shot`：不顯示下載、更新、移除的按鈕，絕不連網）
     pub installer: Option<Arc<crate::ytdl::install::Installer>>,
+    /// 快取的根資料夾（匯出的磁碟快取；啟動時清掉 `<快取>/export` 與匯出資料夾裡上次留下的暫存檔）。
+    /// 預設 None（自動測試、`--shot`：不清、不碰使用者的資料夾），播放器用 `paths::cache_root()`
+    pub cache_root: Option<PathBuf>,
 }
 
 impl VitascopeApp {
@@ -707,6 +714,14 @@ impl VitascopeApp {
         ytdl.set_user_path(settings.net.ytdl_path.clone());
         let ctx = cc.egui_ctx.clone();
         ytdl.set_wake(Arc::new(move || ctx.request_repaint()));
+        // 當掉、被強制結束時留下的匯出暫存檔：只刪影戲自己的、一小時以上沒動過的
+        let leftover_sweep = launch.cache_root.clone().map(|root| {
+            let folders = [
+                settings.export.clip_folder(),
+                settings.export.image_folder(settings.screenshot_dir.as_deref()),
+            ];
+            std::thread::spawn(move || crate::export::sweep_leftovers(&root, &folders))
+        });
         let mut app = Self {
             player,
             video,
@@ -750,6 +765,8 @@ impl VitascopeApp {
             reload_keep: None,
             ytdl_path_problem: None,
             install: install::InstallUi::new(launch.installer),
+            leftover_sweep,
+            cache_root: launch.cache_root,
             private_marks_told: Default::default(),
             was_eof: false,
             wheel: 0.0,
@@ -897,6 +914,19 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn player_mut(&mut self) -> &mut Player {
         &mut self.player
+    }
+
+    /// 匯出用的快取資料夾（`<快取>/export`）；沒有快取資料夾（自動測試、`--shot`）時 None
+    pub fn export_cache_dir(&self) -> Option<PathBuf> {
+        self.cache_root.as_deref().map(crate::export::cache_dir)
+    }
+
+    /// 測試用：啟動時清暫存檔的背景工作做完了（沒有要清的也算做完）
+    #[doc(hidden)]
+    pub fn leftover_sweep_finished(&self) -> bool {
+        self.leftover_sweep
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
     }
 
     /// 找 yt-dlp、deno 的狀態（之後的網站影片、網路設定頁用；介面測試用來確認沒有碰使用者的工具）

@@ -334,6 +334,7 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 | `tests/net.rs` | 網路功能：mpv 的 hook（開檔前停住等影戲處理、一定放行）、叫醒等待事件的執行緒、用 node 設定屬性（字串清單的項目裡有逗號、章節清單）；用本機的測試伺服器（`tests/support/http.rs`，只聽 127.0.0.1）播 HTTP 的檔案、HLS、DASH（多畫質一開始選哪個），User-Agent、Referer、自訂標頭真的送到伺服器，網路設定 mpv 讀回來是設定的值；網路上的播放清單展開時拿掉本機檔案的項目、取消連線 |
 | `tests/ytdl.rs` | 網站影片：執行 yt-dlp（用假的 yt-dlp：Unix 的 sh、Windows 的 Python 腳本）的參數一字不差、取消與逾時連子程序一起結束、輸出上限、找 yt-dlp / deno 的順序 |
 | `tests/install.rs` | 影戲下載 yt-dlp、deno：從本機測試伺服器上的假 GitHub 發佈下載（不連到真的 GitHub）、核對 SHA-256、解開 deno 的 zip、進度與取消、沒有進度時放棄、已經是最新版不下載、換檔案時等正在用它的 yt-dlp、失敗時不留下半個檔案 |
+| `tests/export.rs` | 匯出的基礎：背景工作取消或被丟掉時不留下暫存檔、兩個工作存同一個名稱不會互相蓋掉、啟動時只清掉影戲自己留下的舊暫存檔、寫好的檔案重新打開檢查（長度、軌道，不會把旁邊的外掛字幕算進去）、mpv 的記錄對應到原因 |
 | `tests/net_errors.rs` | 開網址失敗的說明：HTTP 404 / 403 / 500、網頁不是影片、連線逾時（不重試）、找不到伺服器，起始畫面寫出原因。要看 FFmpeg 的記錄（只送到第一個建立的 mpv），所以自己一個測試程式、一次只有一個播放器 |
 | `tests/pacing.rs` | 流暢播放在播放引擎這一層的行為（`vo-null-fps` 當假的螢幕更新率） |
 | `tests/pacing_window.rs` | 流暢播放與畫面輸出節奏的實機量測（會開全螢幕視窗，預設不跑；見下方） |

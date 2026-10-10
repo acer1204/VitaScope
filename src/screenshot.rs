@@ -8,26 +8,59 @@ use std::path::{Path, PathBuf};
 
 /// 預設的截圖資料夾：系統的「圖片」資料夾裡的 VitaScope
 pub fn default_dir() -> PathBuf {
-    pictures_dir()
+    known_dir(KnownDir::Pictures)
         .or_else(|| home().map(|h| h.join("Pictures")))
         .unwrap_or_else(std::env::temp_dir)
         .join("VitaScope")
 }
 
-fn home() -> Option<PathBuf> {
+/// 系統的使用者資料夾
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownDir {
+    /// 「圖片」（截圖、GIF、縮圖總覽圖）
+    Pictures,
+    /// 「影片」（匯出的片段；macOS 是「影片」= ~/Movies）
+    Videos,
+}
+
+impl KnownDir {
+    /// 問不到系統時用的家目錄底下的名稱
+    pub fn fallback_name(self) -> &'static str {
+        match self {
+            KnownDir::Pictures => "Pictures",
+            KnownDir::Videos if cfg!(target_os = "macos") => "Movies",
+            KnownDir::Videos => "Videos",
+        }
+    }
+
+    /// XDG 使用者資料夾設定（`user-dirs.dirs`）裡的名稱
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    fn xdg_key(self) -> &'static str {
+        match self {
+            KnownDir::Pictures => "XDG_PICTURES_DIR",
+            KnownDir::Videos => "XDG_VIDEOS_DIR",
+        }
+    }
+}
+
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
 
-/// Windows：已知資料夾 API（「圖片」可能被 OneDrive 或使用者搬到別的地方）
+/// Windows：已知資料夾 API（「圖片」「影片」可能被 OneDrive 或使用者搬到別的地方）
 #[cfg(windows)]
-fn pictures_dir() -> Option<PathBuf> {
+pub fn known_dir(which: KnownDir) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath};
+    let id = match which {
+        KnownDir::Pictures => &FOLDERID_Pictures,
+        KnownDir::Videos => &FOLDERID_Videos,
+    };
     let mut raw: *mut u16 = std::ptr::null_mut();
     // SAFETY: 成功時 raw 是系統配置、以 0 結尾的字串，用完要 CoTaskMemFree（失敗時也要）
     unsafe {
-        let hr = SHGetKnownFolderPath(&FOLDERID_Pictures, 0, std::ptr::null_mut(), &mut raw);
+        let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
         let path = (hr >= 0 && !raw.is_null()).then(|| {
             let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
             PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len)))
@@ -37,28 +70,29 @@ fn pictures_dir() -> Option<PathBuf> {
     }
 }
 
-/// Linux：XDG 的使用者資料夾設定（中文系統常是「~/圖片」）
+/// Linux：XDG 的使用者資料夾設定（中文系統常是「~/圖片」「~/影片」）
 #[cfg(all(unix, not(target_os = "macos")))]
-fn pictures_dir() -> Option<PathBuf> {
+pub fn known_dir(which: KnownDir) -> Option<PathBuf> {
     let home = home()?;
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
     let text = std::fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
-    parse_xdg_pictures(&text, &home)
+    parse_xdg_dir(&text, which.xdg_key(), &home)
 }
 
+/// macOS：家目錄底下固定的「圖片」「影片」（Movies）
 #[cfg(target_os = "macos")]
-fn pictures_dir() -> Option<PathBuf> {
-    home().map(|h| h.join("Pictures"))
+pub fn known_dir(which: KnownDir) -> Option<PathBuf> {
+    home().map(|h| h.join(which.fallback_name()))
 }
 
-/// `XDG_PICTURES_DIR="$HOME/圖片"` → `/home/me/圖片`
+/// `XDG_PICTURES_DIR="$HOME/圖片"` → `/home/me/圖片`（`key` 是要找的名稱）
 #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
-fn parse_xdg_pictures(text: &str, home: &Path) -> Option<PathBuf> {
+fn parse_xdg_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
     let value = text
         .lines()
-        .find_map(|l| l.trim().strip_prefix("XDG_PICTURES_DIR="))?
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))?
         .trim()
         .trim_matches('"');
     let path = match value.strip_prefix("$HOME") {
@@ -67,6 +101,11 @@ fn parse_xdg_pictures(text: &str, home: &Path) -> Option<PathBuf> {
     };
     // 設成家目錄本身 = 沒有設定
     (path.has_root() && path != home).then_some(path)
+}
+
+#[cfg(test)]
+fn parse_xdg_pictures(text: &str, home: &Path) -> Option<PathBuf> {
+    parse_xdg_dir(text, "XDG_PICTURES_DIR", home)
 }
 
 /// 檔名不能用的字元換成「_」（各系統都一樣處理，存到網路磁碟、隨身碟也不會出問題）
@@ -109,6 +148,14 @@ pub fn sanitize_stem(s: &str) -> String {
 /// 截圖檔名：「影片名稱 01.23.45.678.png」。網路串流知道標題（`title`：m3u 的 `#EXTINF`、影片本身的標題）時用標題，
 /// 不然用網址的最後一段；本機檔案一律用檔名
 pub fn file_name(source: &str, title: Option<&str>, time: f64) -> String {
+    let ms = (time.max(0.0) * 1000.0).round() as u64;
+    let (h, m, s, ms) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
+    format!("{} {h:02}.{m:02}.{s:02}.{ms:03}.png", source_stem(source, title))
+}
+
+/// 存檔用的名稱（不含副檔名，已經換掉不能用的字元）：網路串流有標題時用標題，不然用網址的最後一段；
+/// 本機檔案一律用檔名。截圖、匯出共用
+pub fn source_stem(source: &str, title: Option<&str>) -> String {
     let title = title.map(str::trim).filter(|t| !t.is_empty());
     let stem = if let Some(t) = title.filter(|_| crate::net::is_network(source)) {
         t.to_owned()
@@ -123,9 +170,7 @@ pub fn file_name(source: &str, title: Option<&str>, time: f64) -> String {
             .file_stem()
             .map_or_else(|| "VitaScope".to_owned(), |s| s.to_string_lossy().into_owned())
     };
-    let ms = (time.max(0.0) * 1000.0).round() as u64;
-    let (h, m, s, ms) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
-    format!("{} {h:02}.{m:02}.{s:02}.{ms:03}.png", sanitize_stem(&stem))
+    sanitize_stem(&stem)
 }
 
 /// 不覆蓋已有的檔案：「名稱 (2).png」「名稱 (3).png」…
@@ -472,5 +517,49 @@ mod tests {
             parse_xdg_pictures("XDG_PICTURES_DIR=\"/data/pics\"\n", home),
             Some(PathBuf::from("/data/pics"))
         );
+    }
+
+    #[test]
+    fn xdg_videos_dir() {
+        let home = Path::new("/home/me");
+        let text = "XDG_PICTURES_DIR=\"$HOME/圖片\"\nXDG_VIDEOS_DIR=\"$HOME/影片\"\n";
+        assert_eq!(
+            parse_xdg_dir(text, KnownDir::Videos.xdg_key(), home),
+            Some(PathBuf::from("/home/me/影片"))
+        );
+        assert_eq!(
+            parse_xdg_dir(text, KnownDir::Pictures.xdg_key(), home),
+            Some(PathBuf::from("/home/me/圖片")),
+            "同一個檔案裡各找各的"
+        );
+        // 沒有這一行、設成家目錄本身：沒有設定（退回家目錄底下的 Videos）
+        assert_eq!(
+            parse_xdg_dir("XDG_PICTURES_DIR=\"$HOME/圖片\"\n", "XDG_VIDEOS_DIR", home),
+            None
+        );
+        assert_eq!(
+            parse_xdg_dir("XDG_VIDEOS_DIR=\"$HOME\"\n", "XDG_VIDEOS_DIR", home),
+            None
+        );
+        // 名稱是另一個名稱的開頭時不能認錯（XDG_VIDEOS_DIR_OLD 不是 XDG_VIDEOS_DIR）
+        assert_eq!(
+            parse_xdg_dir("XDG_VIDEOS_DIR_OLD=\"/old\"\n", "XDG_VIDEOS_DIR", home),
+            None
+        );
+        assert_eq!(
+            KnownDir::Videos.fallback_name(),
+            if cfg!(target_os = "macos") { "Movies" } else { "Videos" }
+        );
+    }
+
+    #[test]
+    fn source_stems() {
+        assert_eq!(source_stem("C:/影片/第1集.mkv", None), "第1集");
+        assert_eq!(
+            source_stem("https://x.com/live/stream.m3u8", Some("新聞台: 直播")),
+            "新聞台_ 直播"
+        );
+        assert_eq!(source_stem("https://x.com/v/", None), "v");
+        assert_eq!(source_stem("", None), "VitaScope");
     }
 }

@@ -165,11 +165,19 @@ fn probe_caps_on_vendored_engine() {
     // 偵測完 af、deinterlace 都恢復原狀
     assert_eq!(p.get_string("af").unwrap(), "");
     assert_eq!(p.get_string("deinterlace").unwrap(), "no");
+    assert_eq!(p.get_string("vf").unwrap(), "", "偵測完 vf 也恢復原狀");
     assert!(!caps.dumb, "headless 沒有開軟體繪圖的簡化流程");
+    // 匯出片段要的指令：系統的 libmpv 0.37 也有
+    assert!(caps.dump_cache && caps.align_cache, "{caps:?}");
     assert_eq!(caps.macos, cfg!(target_os = "macos"));
     if l3_engine() {
         assert!(caps.af.all(), "含 L3 元件的引擎六個音訊濾鏡都要有：{:?}", caps.af);
         assert!(caps.deint_auto, "含 L3 元件的引擎有 deinterlace=auto");
+        assert!(caps.gif, "含 L3 元件的引擎有 gif 編碼器");
+        assert!(
+            caps.zscale && caps.tonemap && caps.transpose && caps.palettegen,
+            "含 L3 元件的引擎有 GIF、縮圖總覽圖要的濾鏡：{caps:?}"
+        );
     } else {
         eprintln!("不是含 L3 元件的播放引擎：只確認偵測不會出錯");
     }
@@ -184,14 +192,41 @@ fn probe_caps_on_vendored_engine() {
     // 偵測失敗的記錄（mpv 記成錯誤）不能變成開檔失敗時給使用者看的原因
     assert!(!p.probe_af("vitascope_no_such_filter"));
     assert_eq!(p.get_string("af").unwrap(), "", "偵測失敗也不能在 af 留下東西");
+    assert!(!p.probe_vf("vitascope_no_such_vf"));
+    assert_eq!(p.get_string("vf").unwrap(), "", "偵測失敗也不能在 vf 留下東西");
     let _ = p.wait_state(Duration::from_millis(500), |_| false);
     assert!(
         !p.recent_errors()
             .iter()
-            .any(|e| e.contains("vitascope_no_such_filter") || e.contains("deinterlace")),
+            .any(|e| e.contains("vitascope_no_such") || e.contains("deinterlace")),
         "偵測的記錄跑進 recent_errors：{:?}",
         p.recent_errors()
     );
+}
+
+#[test]
+fn probe_keeps_the_users_own_vf() {
+    // 使用者用 VITASCOPE_MPV_OPTS 加的影像濾鏡：偵測完照舊
+    let user_vf = "@mine:hflip";
+    let mut p = player_with(&[("vf", user_vf)]);
+    let before = p.get_string("vf").unwrap();
+    assert!(before.contains("@mine"), "{before}");
+    p.probe_caps();
+    assert_eq!(p.get_string("vf").unwrap(), before);
+}
+
+#[test]
+fn demuxer_start_time_is_read_from_mpv() {
+    let mut p = player_with(&[]);
+    assert_eq!(p.demuxer_start_time(), 0.0, "沒有檔案時是 0");
+    // MPEG-TS 的時間戳不是從 0 開始（ffmpeg 寫的約 1.4 秒）；MP4 從 0 開始
+    p.open(&sample("general/ts_h264_aac.ts")).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    let ts = p.demuxer_start_time();
+    assert!(ts > 0.5, "TS 的起始時間 {ts}");
+    p.open(&sample("common/mp4_h264_aac.mp4")).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert!(p.demuxer_start_time().abs() < 0.1, "{}", p.demuxer_start_time());
 }
 
 #[test]

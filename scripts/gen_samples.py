@@ -262,6 +262,9 @@ def samples() -> list[Sample]:
         S("mov_h264_alac", "general", "mov", X264, ["-c:a", "alac", "-ac", "2"], "h264", "alac"),
         S("mkv_h264_pcm", "general", "mkv", X264, PCM, "h264", "pcm_s16le"),
         S("mkv_h264_mp2", "general", "mkv", X264, ["-c:a", "mp2", "-ac", "2"], "h264", "mp2"),
+        # 每 2 秒剛好一個關鍵影格（不因為畫面變化多插）：片段匯出（不重新編碼）的關鍵影格對齊測試用
+        S("mkv_h264_gop2", "general", "mkv", X264 + ["-g", "48", "-keyint_min", "48", "-sc_threshold", "0"], AAC,
+          "h264", "aac", dur=12, note="12 秒、每 2 秒一個關鍵影格（片段匯出）"),
         # Matroska 裡的 WebVTT，mpv 回報的編碼名稱是 webvtt-webm
         S("mkv_h264_aac_webvtt", "general", "mkv", X264, AAC, "h264", "aac", sub_embed="webvtt", subs=["webvtt-webm"]),
         S("extsub_vtt", "general", "mp4", X264, AAC, "h264", "aac", sub_ext="vtt", subs=["webvtt"]),

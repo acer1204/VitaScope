@@ -14662,3 +14662,88 @@ fn unseekable_source_in_the_bookmarks_tab() {
         assert!(h.get_by_label(add).accesskit_node().is_disabled());
     }
 }
+
+// ───────────── 匯出：啟動時清掉上次留下的暫存檔 ─────────────
+
+#[test]
+fn startup_sweeps_old_partial_export_files() {
+    let tmp = TempDir::new("export-sweep");
+    let cache = tmp.0.join("cache");
+    let export_cache = cache.join("export");
+    let clips = tmp.0.join("clips");
+    let images = tmp.0.join("images");
+    for d in [&export_cache, &clips, &images] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    let make = |p: &std::path::Path, aged: bool| {
+        std::fs::write(p, b"x").unwrap();
+        if aged {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+    };
+    // 當掉、被強制結束時留下的（一小時以上沒動過）：刪掉
+    let gone = [
+        export_cache.join("a.4242-1.vitascope-part.mkv"),
+        export_cache.join("mpv-cache-AbC123.dat"),
+        clips.join("b.4242-2.vitascope-part.mp4"),
+        images.join("c.4242-3.vitascope-part.gif"),
+    ];
+    // 還在寫的（別的影戲正在匯出）、使用者自己的檔案：留著
+    let kept = [
+        (clips.join("d.4242-4.vitascope-part.mkv"), false),
+        (clips.join("舊的影片.mkv"), true),
+        (images.join("舊的截圖.png"), true),
+    ];
+    for p in &gone {
+        make(p, true);
+    }
+    for (p, aged) in &kept {
+        make(p, *aged);
+    }
+    let mut settings = Settings::default();
+    settings.export.clip_dir = Some(clips.clone());
+    settings.export.image_dir = Some(images.clone());
+    let launch = Launch {
+        cache_root: Some(cache.clone()),
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    assert_eq!(h.state().export_cache_dir(), Some(export_cache.clone()));
+    // 在背景清（資料夾可能在網路磁碟上）：等它做完
+    step_until_app(&mut h, "清完上次留下的暫存檔", |app| {
+        app.leftover_sweep_finished()
+    });
+    for p in &gone {
+        assert!(!p.exists(), "{} 要刪掉", p.display());
+    }
+    for (p, _) in &kept {
+        assert!(p.exists(), "{} 不能刪", p.display());
+    }
+}
+
+#[test]
+fn tests_and_shots_without_a_cache_folder_sweep_nothing() {
+    // 自動測試、--shot 沒有快取資料夾：不清任何東西（不碰使用者的「影片」「圖片」資料夾）
+    let tmp = TempDir::new("export-nosweep");
+    let old = tmp.0.join("a.4242-1.vitascope-part.mkv");
+    std::fs::write(&old, b"x").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 3600))
+        .unwrap();
+    let mut settings = Settings::default();
+    settings.export.clip_dir = Some(tmp.0.clone());
+    let mut h = harness_with(None, settings);
+    h.run_steps(2);
+    assert_eq!(h.state().export_cache_dir(), None);
+    assert!(h.state().leftover_sweep_finished(), "沒有開始清");
+    assert!(old.exists());
+}

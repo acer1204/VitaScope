@@ -6,6 +6,7 @@
 //! 視窗位置大小也自己存，不用 eframe 的機制：eframe 會連「全螢幕」一起記住，
 //! 下次啟動直接全螢幕，跟一般播放器的習慣不同。
 
+pub use crate::export::ExportSettings;
 pub use crate::keymap::KeySettings;
 pub use crate::net::NetSettings;
 pub use crate::pacing::SmoothMode;
@@ -63,6 +64,8 @@ pub struct Settings {
     pub keys: KeySettings,
     /// 網路：開啟網址（HLS / DASH 畫質、重新連線、快取、逾時、憑證、標頭、proxy…）
     pub net: NetSettings,
+    /// 匯出（片段、GIF、縮圖總覽圖）：存放的資料夾、片段的格式、上次的選擇
+    pub export: ExportSettings,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -195,6 +198,7 @@ impl Default for Settings {
             theme: ThemeChoice::default(),
             keys: KeySettings::default(),
             net: NetSettings::default(),
+            export: ExportSettings::default(),
             path: None,
             baseline: None,
         }
@@ -368,6 +372,7 @@ impl Settings {
         self.volume = self.volume.clamp(0.0, f64::from(a.volume_max));
         self.keys = self.keys.sanitized();
         self.net = self.net.sanitized();
+        self.export = self.export.sanitized();
         self
     }
 
@@ -712,6 +717,19 @@ mod tests {
         assert!(s.net.tls_verify, "預設檢查網站憑證");
         assert!(s.net.remember_urls, "預設記住開啟過的網址");
         assert_eq!((s.net.cache_mb, s.net.timeout_secs), (150, 30));
+        assert_eq!(s.export, ExportSettings::default());
+        assert_eq!(s.export.clip_dir, None, "片段預設放「影片」資料夾裡的 VitaScope");
+        assert_eq!(s.export.image_dir, None, "GIF、縮圖總覽圖預設跟截圖放一起");
+        assert_eq!(s.export.clip.format, crate::export::ClipFormat::Auto);
+        assert_eq!((s.export.gif.long_side, s.export.gif.fps), (480, 15));
+        assert!(s.export.gif.subtitles);
+        let sheet = s.export.sheet;
+        assert_eq!(
+            (sheet.columns, sheet.rows, sheet.width, sheet.jpeg_quality),
+            (4, 5, 1920, 90)
+        );
+        assert!(sheet.timestamps && sheet.header);
+        assert_eq!(sheet.format, crate::export::ImageFormat::Jpeg);
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -728,6 +746,9 @@ mod tests {
         assert!(s.video.keep_adjust && s.video.tone.compute_peak);
         assert_eq!(s.net.timeout_secs, 10);
         assert!(s.net.tls_verify && s.net.reconnect && s.net.cache_mb == 150);
+        let s: Settings = serde_json::from_str(r#"{"export":{"gif":{"fps":20}}}"#).unwrap();
+        assert_eq!((s.export.gif.fps, s.export.gif.long_side), (20, 480));
+        assert!(s.export.gif.subtitles && s.export.sheet.header);
     }
 
     #[test]
@@ -765,6 +786,7 @@ mod tests {
         assert_eq!(s.keys.mouse, crate::keymap::MouseSettings::default(), "升級後滑鼠不變");
         assert_eq!(s.side_tab, SideTab::Playlist, "升級後側邊面板還是播放清單");
         assert_eq!(s.net, NetSettings::default(), "升級後網路設定是預設值（檢查憑證）");
+        assert_eq!(s.export, ExportSettings::default(), "升級後匯出是預設值");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -883,6 +905,53 @@ mod tests {
         assert!(!back.net.tls_verify, "A 關掉的憑證檢查不能被 B 蓋回去");
         assert_eq!(back.net.proxy, "http://127.0.0.1:3128");
         assert_eq!(back.net.hls_bitrate, HlsBitrate::Min);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_settings_load_leniently_sanitize_and_merge() {
+        use crate::export::{ClipFormat, ImageFormat};
+        // 一項讀不懂（新版的格式）：只有那一項用預設值，同一組的其他項目、其他設定照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "export": {"clip": {"format": "avi"}, "gif": {"fps": 20, "long_side": "big"},
+                "sheet": {"format": "webp", "rows": 8}}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert_eq!(s.export.clip.format, ClipFormat::Auto);
+        assert_eq!((s.export.gif.fps, s.export.gif.long_side), (20, 480));
+        assert_eq!((s.export.sheet.format, s.export.sheet.rows), (ImageFormat::Jpeg, 8));
+        // 讀檔時整理：對齊選項、拉回範圍、相對路徑當成沒設定
+        let dir = temp_dir("export");
+        let path = dir.join("settings.json");
+        let clips = dir.join("clips");
+        std::fs::write(
+            &path,
+            serde_json::json!({"export": {
+                "clip_dir": clips, "image_dir": "relative",
+                "gif": {"long_side": 700, "fps": 12},
+                "sheet": {"columns": 50, "rows": 0, "width": 4000, "jpeg_quality": 101}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mut a = Settings::load_from(path.clone());
+        assert_eq!(a.export.clip_dir.as_deref(), Some(clips.as_path()));
+        assert_eq!(a.export.image_dir, None);
+        assert_eq!((a.export.gif.long_side, a.export.gif.fps), (640, 10));
+        let sh = a.export.sheet;
+        assert_eq!((sh.columns, sh.rows, sh.width, sh.jpeg_quality), (10, 1, 3840, 100));
+        // 兩個視窗各改了匯出的不同項目：兩個都留下
+        let mut b = Settings::load_from(path.clone());
+        a.export.clip.format = ClipFormat::Mp4;
+        a.save().unwrap();
+        b.export.gif.fps = 25;
+        b.export.image_dir = Some(dir.join("gifs"));
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.export.clip.format, ClipFormat::Mp4, "A 改的格式不能被 B 蓋回去");
+        assert_eq!(back.export.gif.fps, 25);
+        assert_eq!(back.export.image_dir, Some(dir.join("gifs")));
+        assert_eq!(back.export.clip_dir.as_deref(), Some(clips.as_path()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
