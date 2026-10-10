@@ -56,7 +56,7 @@ fn var(os: Os, env: &dyn Fn(&str) -> Option<OsString>, key: &str) -> Option<Path
 }
 
 /// `p` 在 `os` 上是不是完整路徑：Windows `C:\…`、`C:/…`、`\\server\…`；其他系統 `/…`
-fn absolute(os: Os, p: &str) -> bool {
+pub(crate) fn absolute(os: Os, p: &str) -> bool {
     match os {
         Os::Windows => {
             let b = p.as_bytes();

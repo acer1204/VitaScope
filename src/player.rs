@@ -248,6 +248,8 @@ pub struct State {
     pub net_busy: Option<hook::NetBusy>,
     /// 影片網站的網址，但沒有 yt-dlp（起始畫面說明怎麼取得）
     pub net_need_ytdl: bool,
+    /// 其他網頁（不是已知的影片網站）打不開、又沒有 yt-dlp：說明裡提一句要 yt-dlp，起始畫面也放「網路設定…」
+    pub net_page_needs_ytdl: bool,
     /// 網站影片播不了的原因（跟 `last_error` 同時設定）：介面每次畫的時候才轉成文字（目前的語言），旁邊列出提醒與建議
     pub net_failure: Option<Failure>,
     /// yt-dlp 成功了、但警告裡看得出的提醒（沒有 deno 時 YouTube 只有部分畫質之類）
@@ -702,7 +704,32 @@ struct SiteFile {
     missing: bool,
     /// 載入後要設定的章節
     chapters: Vec<ChapterMark>,
+    /// 網站影片：mpv 實際開的（解析出來的網址或 EDL）與連線用的 file-local 選項（`net_stream`）
+    stream: Option<(String, Vec<(String, Node)>)>,
 }
+
+/// 另一個 mpv（匯出片段、GIF）開同一個網路串流要的東西（`Player::net_stream`）
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetStream {
+    /// 使用者開的網址（網站影片是網頁）
+    pub page_url: String,
+    /// 要開的：網站影片是 yt-dlp 解析出來的網址或 `edl://`，其他網路串流是網址本身
+    pub open: String,
+    /// 開之前要設定的連線選項（照順序設定；後面的同名選項蓋過前面的）：「設定 → 網路」的設定
+    /// （User-Agent、proxy、逾時、憑證、標頭、重新連線），網站影片再加上網站要的標頭、User-Agent、Cookie
+    pub options: Vec<(String, Node)>,
+    /// yt-dlp 解析出來的網站影片
+    pub site: bool,
+}
+
+/// 網站影片的 file-local 選項裡，跟連線有關、另一個 mpv 開同一個串流也要的
+const STREAM_ACCESS: [&str; 5] = [
+    "user-agent",
+    "http-header-fields",
+    "cookies",
+    "cookies-file",
+    "stream-lavf-o",
+];
 
 /// 一條載入過的外掛字幕
 #[derive(Debug, Clone)]
@@ -2077,16 +2104,90 @@ impl Player {
     /// 用別的畫質重開目前的網站影片，從現在的位置接著播（20 分鐘內解析過，不用再執行 yt-dlp）。
     /// 不是網站影片時不做任何事
     pub fn reload_net(&mut self, choice: Choice) -> mpv::Result<()> {
-        let Some(url) = self.state.net.as_ref().map(|n| n.page_url.clone()) else {
+        let Some((url, mode)) = self.reload_mode(choice) else {
             return Ok(());
         };
+        self.open_with_mode(&url, mode)
+    }
+
+    /// 換畫質重開目前的網站影片要用的（網頁的網址, 要求）：從現在的位置接著播。不是網站影片時 None。
+    /// 介面自己開（`open_with_mode`），換檔時的設定（播放清單的位置、要保留的暫停、字幕…）才照它的規則做
+    pub fn reload_mode(&self, choice: Choice) -> Option<(String, Mode)> {
+        let url = self.state.net.as_ref().map(|n| n.page_url.clone())?;
         let at = self.position_now();
         let mode = Mode {
             choice,
-            yes_playlist: false,
             start_at: (at > 0.0).then_some(at),
+            this_video: true,
+            ..Default::default()
         };
-        self.open_with_mode(&url, mode)
+        Some((url, mode))
+    }
+
+    /// 另一個 mpv（匯出片段、GIF）開目前的網路串流要的東西：要開的網址（網站影片是解析出來的網址或 EDL）
+    /// 與連線的選項（`NetStream::options`）。沒有在播網路串流時 None
+    pub fn net_stream(&self) -> Option<NetStream> {
+        let st = &self.state;
+        let path = st.path.as_deref().filter(|p| st.loaded && net::is_network(p))?;
+        let wanted = self
+            .site
+            .wanted
+            .clone()
+            .unwrap_or_else(|| net::mpv_options(&self.site.net, &self.net_defaults()));
+        let mut options: Vec<(String, Node)> = Vec::new();
+        // 使用者用 VITASCOPE_MPV_OPTS 指定的：影戲沒有送，讀 mpv 現在的值
+        let scalar = |name: &str, value: &str| {
+            if self.user_overrides.contains(name) {
+                self.mpv.get_string(name).ok()
+            } else {
+                Some(value.to_owned())
+            }
+        };
+        for (name, value) in &wanted.scalars {
+            // 快取大小、HLS 的起始畫質是這個播放器自己的，不是連線的方式
+            if matches!(*name, "demuxer-max-bytes" | "demuxer-max-back-bytes" | "hls-bitrate") {
+                continue;
+            }
+            if let Some(v) = scalar(name, value) {
+                options.push(((*name).to_owned(), Node::Str(v)));
+            }
+        }
+        let headers = if self.user_overrides.contains(net::HEADERS) {
+            self.mpv.get_string_list(net::HEADERS).unwrap_or_default()
+        } else {
+            wanted.headers.clone()
+        };
+        options.push((net::HEADERS.to_owned(), Node::strings(headers)));
+        if let Some(lavf) = scalar(net::LAVF, &wanted.lavf) {
+            let map = lavf
+                .split(',')
+                .filter_map(|kv| kv.split_once('='))
+                .filter(|(k, _)| !k.is_empty())
+                .map(|(k, v)| (k.to_owned(), Node::Str(v.to_owned())))
+                .collect();
+            options.push((net::LAVF.to_owned(), Node::Map(map)));
+        }
+        let site = st
+            .net
+            .as_ref()
+            .filter(|n| n.page_url == path && self.site.file.url == path)
+            .and(self.site.file.stream.as_ref());
+        let open = match site {
+            Some((open, access)) => {
+                for (name, value) in access {
+                    options.retain(|(n, _)| n != name);
+                    options.push((name.clone(), value.clone()));
+                }
+                open.clone()
+            }
+            None => path.to_owned(),
+        };
+        Some(NetStream {
+            page_url: path.to_owned(),
+            open,
+            options,
+            site: site.is_some(),
+        })
     }
 
     /// 正在背景等 yt-dlp（自動測試用）
@@ -2138,7 +2239,11 @@ impl Player {
         let url = self.mpv.get_string("path").unwrap_or_default();
         // 只對這次有效的要求（換畫質之類）：只給那個網址用一次
         let mode = self.site.mode.take().filter(|(u, _)| *u == url).map(|(_, m)| m);
-        let route = hook::route(&url, mode.is_some(), &self.site.extra_sites);
+        let mut route = hook::route(&url, mode.is_some(), &self.site.extra_sites);
+        // 關掉了「用 yt-dlp 播放網站影片」：其他網頁照一般的網址開（開不起來也不問）；影片網站說明要打開
+        if !self.site.net.ytdl && route == Route::Fallback {
+            route = Route::Native;
+        }
         self.site.file = SiteFile {
             url,
             route: Some(route),
@@ -2177,6 +2282,9 @@ impl Player {
 
     /// 問 yt-dlp：有快取的結果就直接用，不然在背景解析（hook 等到做完）
     fn site_start(&mut self, id: u64, after_failure: bool) -> Option<PlayerEvent> {
+        if !self.site.net.ytdl {
+            return self.site_failed(id, after_failure, YtdlError::Disabled.into());
+        }
         let Some(resolver) = self.site.resolver.clone().filter(|r| r.available()) else {
             return self.site_failed(id, after_failure, YtdlError::Missing.into());
         };
@@ -2184,13 +2292,22 @@ impl Player {
         let mut prefs = self.site.prefs.clone();
         if self.site.file.mode.yes_playlist {
             prefs.list_mode = ytdl::ListMode::Playlist;
+        } else if self.site.file.mode.this_video {
+            // 換畫質：重開的是正在播的這部（播放清單的設定之後改成整個清單也一樣）
+            prefs.list_mode = ytdl::ListMode::Video;
         }
         let Some(request) = Request::new(&url, &self.site.net, &prefs) else {
             self.continue_hook(id, hook_name(after_failure));
             return None;
         };
         self.site.file.tried = true;
-        if let Some(hit) = self.site.cache.get(&request) {
+        // 選單選的畫質、只播聲音：只用之前的格式清單，畫質、編碼的偏好改了也不用再問 yt-dlp
+        let hit = if self.site.file.mode.choice == Choice::Default {
+            self.site.cache.get(&request)
+        } else {
+            self.site.cache.get_any_format(&request)
+        };
+        if let Some(hit) = hit {
             return self.site_apply(id, after_failure, &hit);
         }
         let playlist = request.playlist;
@@ -2282,6 +2399,13 @@ impl Player {
             }
         }
         self.site.file.chapters = m.chapters;
+        let access = m
+            .options
+            .iter()
+            .filter(|(name, _)| STREAM_ACCESS.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        self.site.file.stream = Some((m.open.clone(), access));
         self.state.net = Some(Arc::new(m.info));
         self.state.net_hints = hints.to_vec();
         Ok(())
@@ -2295,7 +2419,10 @@ impl Player {
             // 開不起來之後才問、yt-dlp 也不認得：不是網站影片，照 mpv 原本的說明（是網頁、不是影片檔）
             YtdlError::Unsupported if after_failure => {}
             // 其他網頁、沒有 yt-dlp（可能找完才知道）：照 mpv 原本的說明，另外提一句要 yt-dlp
-            YtdlError::Missing if after_failure => self.site.file.missing = true,
+            YtdlError::Missing if after_failure => {
+                self.site.file.missing = true;
+                self.state.net_page_needs_ytdl = true;
+            }
             _ => {
                 // 影片網站、沒有 yt-dlp：起始畫面說明怎麼取得
                 if failure.error == YtdlError::Missing {
@@ -2501,6 +2628,7 @@ impl Player {
                 // 網站影片的資料、原因是每個檔案各自的（on_load 時才設定）
                 self.state.net = None;
                 self.state.net_need_ytdl = false;
+                self.state.net_page_needs_ytdl = false;
                 self.state.net_failure = None;
                 self.state.net_hints.clear();
                 self.site.file = SiteFile::default();

@@ -10,7 +10,7 @@
 //! 參考 mpv 的 `player/lua/ytdl_hook.lua`（我們的播放引擎沒有 Lua，系統的 libmpv 也關掉了它的 ytdl）。
 
 use super::json::{Format, Fragment, Info};
-use super::{CodecPref, SitePrefs, YtdlError};
+use super::{CodecPref, SitePrefs, SiteQuality, YtdlError};
 use crate::mpv::Node;
 use crate::net::{self, NetDefaults, NetSettings, Origin};
 
@@ -81,6 +81,10 @@ pub struct Mode {
     pub yes_playlist: bool,
     /// 從這裡開始（秒；換畫質時接著播）
     pub start_at: Option<f64>,
+    /// 重開正在播的這部影片（換畫質）：只要這部，不管「設定 → 網路」的播放清單選項
+    pub this_video: bool,
+    /// `choice` 是「自動」照預設畫質從格式清單挑的：選單上還是「自動」，再改預設畫質也跟著換
+    pub follows_default: bool,
 }
 
 /// mpv 要開什麼
@@ -152,6 +156,11 @@ pub struct NetInfo {
     pub list_in_url: bool,
     /// 從這裡開始播（秒；換畫質時接著播的位置，或網址指定的開始時間）：有的話不再從上次的位置續播
     pub start_at: Option<f64>,
+    /// 這次開檔要的格式（選單上「自動」= `Choice::Default`，包括照預設畫質從格式清單挑的
+    /// `Mode::follows_default`）
+    pub choice: Choice,
+    /// 只播聲音（沒有影像軌，或關掉了影像）
+    pub audio_only: bool,
 }
 
 impl NetInfo {
@@ -559,6 +568,12 @@ fn media(info: &Info, page_url: &str, mode: &Mode, cfg: &PlanConfig) -> Result<P
         choices: choices(info, cfg.codec),
         list_in_url,
         start_at: start,
+        choice: if mode.follows_default {
+            Choice::Default
+        } else {
+            mode.choice.clone()
+        },
+        audio_only,
     };
     Ok(Plan::Media(Box::new(MediaPlan {
         open,
@@ -909,6 +924,32 @@ pub fn choices(info: &Info, codec: CodecPref) -> Vec<QualityChoice> {
         out.push(QualityChoice::AudioOnly { audio: a });
     }
     out
+}
+
+/// 「預設畫質」換成 `quality` 時，目前這部影片要播哪一個（不用再問 yt-dlp：從之前的選單挑）：
+/// 不超過上限的最高的一項；全部都超過時最低的一項；只播聲音是聲音那一項。沒有能挑的時 None
+pub fn choice_for(choices: &[QualityChoice], quality: SiteQuality) -> Option<Choice> {
+    if quality == SiteQuality::AudioOnly {
+        return choices
+            .iter()
+            .find(|c| matches!(c, QualityChoice::AudioOnly { .. }))
+            .map(QualityChoice::choice);
+    }
+    let videos: Vec<&QualityChoice> = choices
+        .iter()
+        .filter(|c| matches!(c, QualityChoice::Video { .. }))
+        .collect();
+    let height = |c: &QualityChoice| match c {
+        QualityChoice::Video { height, .. } => *height,
+        QualityChoice::AudioOnly { .. } => 0,
+    };
+    let max = quality.max_height().unwrap_or(u32::MAX);
+    // 選單由高到低：第一個不超過上限的就是最高的
+    videos
+        .iter()
+        .find(|c| height(c) <= max)
+        .or(videos.last())
+        .map(|c| c.choice())
 }
 
 /// f64 的排序（位元率；不會是 NaN，json 已經濾掉了）
@@ -1297,6 +1338,58 @@ mod tests {
         // DASH 的分段裡有不安全的網址
         let bad = DASH.replacen("https://cdn2.test/abs/seg-2.m4s", "file:///etc/passwd", 1);
         assert_eq!(p(&bad), Err(YtdlError::NoPlayable));
+    }
+
+    #[test]
+    fn default_quality_picks_from_the_menu_and_the_plan_remembers_the_choice() {
+        let i = info(YOUTUBE);
+        let menu = choices(&i, CodecPref::Auto);
+        let fmt = |v: &str, a: Option<&str>| {
+            Some(Choice::Format {
+                video: v.into(),
+                audio: a.map(str::to_owned),
+            })
+        };
+        // 不超過上限的最高的一項（60 fps 的排在同樣高度的前面）
+        assert_eq!(choice_for(&menu, SiteQuality::Best), fmt("303", Some("251")));
+        assert_eq!(choice_for(&menu, SiteQuality::P2160), fmt("303", Some("251")));
+        assert_eq!(choice_for(&menu, SiteQuality::P720), fmt("136", Some("251")));
+        // 480p 沒有：下一個比較低的（影音合在一起的 360p，不用另外配聲音）
+        assert_eq!(choice_for(&menu, SiteQuality::P480), fmt("18", None));
+        assert_eq!(choice_for(&menu, SiteQuality::AudioOnly), Some(Choice::AudioOnly));
+        // 全部都超過上限：最低的一項
+        let tall: Vec<QualityChoice> = menu
+            .iter()
+            .filter(|c| matches!(c, QualityChoice::Video { height, .. } if *height >= 720))
+            .cloned()
+            .collect();
+        assert_eq!(choice_for(&tall, SiteQuality::P360), fmt("136", Some("251")));
+        assert_eq!(choice_for(&tall, SiteQuality::AudioOnly), None);
+        assert_eq!(choice_for(&[], SiteQuality::Best), None);
+        // 計畫記下這次要的格式、是不是只播聲音（選單打勾用）
+        let m = media_plan(YOUTUBE, &Mode::default(), &PlanConfig::default());
+        assert_eq!((m.info.choice.clone(), m.info.audio_only), (Choice::Default, false));
+        let mode = Mode {
+            choice: fmt("136", Some("251")).unwrap(),
+            ..Default::default()
+        };
+        let m = media_plan(YOUTUBE, &mode, &PlanConfig::default());
+        assert_eq!(m.info.choice, mode.choice);
+        assert!(!m.info.audio_only);
+        // 「自動」照預設畫質挑的格式：播那個格式，選單上還是「自動」
+        let auto = Mode {
+            follows_default: true,
+            ..mode.clone()
+        };
+        let m = media_plan(YOUTUBE, &auto, &PlanConfig::default());
+        assert!(m.open.contains("itag=136") && m.open.contains("itag=251"));
+        assert_eq!(m.info.choice, Choice::Default);
+        let audio = Mode {
+            choice: Choice::AudioOnly,
+            ..Default::default()
+        };
+        let m = media_plan(YOUTUBE, &audio, &PlanConfig::default());
+        assert_eq!((m.info.choice.clone(), m.info.audio_only), (Choice::AudioOnly, true));
     }
 
     #[test]

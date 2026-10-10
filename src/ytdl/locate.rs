@@ -369,6 +369,46 @@ fn runnable(p: &Path) -> bool {
     true
 }
 
+/// 使用者選的 yt-dlp 為什麼不能用（只看路徑本身）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathProblem {
+    /// 不是完整路徑（相對路徑會跟著目前資料夾變）
+    NotAbsolute,
+    /// Windows 上不是 .exe：.bat、.cmd、.ps1、.vbs、.js 之類的指令檔要經過 cmd、PowerShell、Windows Script Host 才能執行，
+    /// 命令列的引號規則不同，網址裡的字元可能被當成指令
+    NotExe,
+}
+
+impl PathProblem {
+    pub fn message(self) -> &'static str {
+        match self {
+            PathProblem::NotAbsolute => crate::tr!("要選完整的路徑", "Choose a full path"),
+            PathProblem::NotExe => crate::tr!(
+                "請選 yt-dlp 的執行檔（.exe），不能用指令檔",
+                "Choose the yt-dlp program (.exe), not a script"
+            ),
+        }
+    }
+}
+
+/// 使用者選的 yt-dlp 能不能用：只看路徑（不碰檔案，介面執行緒可以用；檔案在不在、能不能執行由背景的尋找確認）
+pub fn check_user_path(path: &Path, os: Os) -> Result<(), PathProblem> {
+    let text = path.to_string_lossy();
+    if !crate::paths::absolute(os, &text) {
+        return Err(PathProblem::NotAbsolute);
+    }
+    if os == Os::Windows {
+        let name = text.rsplit(['\\', '/']).next().unwrap_or_default();
+        let exe = name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && ext.eq_ignore_ascii_case("exe"));
+        if !exe {
+            return Err(PathProblem::NotExe);
+        }
+    }
+    Ok(())
+}
+
 /// 找 yt-dlp（只看檔案，不執行）
 pub fn locate_ytdl(env: &SearchEnv) -> Option<Located> {
     if let Some(p) = env.user_path.as_ref().filter(|p| p.is_absolute() && runnable(p)) {
@@ -454,7 +494,20 @@ pub type Probe = dyn Fn(&Located, &ChildEnv) -> Result<String, YtdlError> + Send
 /// 找 yt-dlp、deno，並查版本（會執行程式：只在背景執行緒呼叫）
 pub fn find_tools(env: &SearchEnv, probe: &Probe) -> Tools {
     let mut tools = Tools::none(env);
-    tools.ytdl = locate_ytdl(env);
+    // 設定裡指定的 yt-dlp 只看路徑就不能用的（Windows 的指令檔之類：設定檔可能是手動改的、別的視窗存的）：
+    // 不執行它，照常找（設定頁說明指定的檔案不能用）。跟「選擇檔案…」用同一個規則
+    let usable = |p: &PathBuf| check_user_path(p, env.os()).is_ok();
+    let checked;
+    let ytdl_env = if env.user_path.as_ref().is_none_or(usable) {
+        env
+    } else {
+        checked = SearchEnv {
+            user_path: None,
+            ..env.clone()
+        };
+        &checked
+    };
+    tools.ytdl = locate_ytdl(ytdl_env);
     for cand in deno_candidates(env, tools.ytdl.as_ref().map(|l| l.program.as_path())) {
         if !runnable(&cand) {
             continue;
@@ -828,6 +881,46 @@ mod tests {
     }
 
     #[test]
+    fn chosen_ytdl_paths_are_checked_by_name_only() {
+        // Windows：只能是 .exe（指令檔要經過 cmd、PowerShell 之類，引號規則不同）
+        assert_eq!(check_user_path(Path::new(r"C:\Tools\yt-dlp.exe"), Os::Windows), Ok(()));
+        assert_eq!(check_user_path(Path::new(r"D:\x\YT-DLP.EXE"), Os::Windows), Ok(()));
+        assert_eq!(
+            check_user_path(Path::new(r"\\nas\tools\yt-dlp.exe"), Os::Windows),
+            Ok(())
+        );
+        for bad in [
+            r"C:\Tools\yt-dlp.bat",
+            r"C:\Tools\yt-dlp.cmd",
+            r"C:\Tools\yt-dlp.ps1",
+            r"C:\Tools\yt-dlp.vbs",
+            r"C:\Tools\yt-dlp.js",
+            r"C:\Tools\yt-dlp",
+            r"C:\Tools\.exe",
+            r"C:\Tools.exe\yt-dlp",
+        ] {
+            assert_eq!(
+                check_user_path(Path::new(bad), Os::Windows),
+                Err(PathProblem::NotExe),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            check_user_path(Path::new(r"tools\yt-dlp.exe"), Os::Windows),
+            Err(PathProblem::NotAbsolute)
+        );
+        // macOS、Linux：沒有副檔名也可以（能不能執行由背景的尋找確認）
+        for os in [Os::Macos, Os::Linux] {
+            assert_eq!(check_user_path(Path::new("/opt/homebrew/bin/yt-dlp"), os), Ok(()));
+            assert_eq!(check_user_path(Path::new("/home/me/yt-dlp_linux"), os), Ok(()));
+            assert_eq!(
+                check_user_path(Path::new("bin/yt-dlp"), os),
+                Err(PathProblem::NotAbsolute)
+            );
+        }
+    }
+
+    #[test]
     fn discovery_order() {
         let d = Dirs::new("order");
         let env = env_in(&d, &["p1", "p2"]);
@@ -861,6 +954,42 @@ mod tests {
         // 沒有工具資料夾（自動測試）：不找影戲下載的
         let no_tools = SearchEnv { tools_dir: None, ..env };
         assert_eq!(locate_ytdl(&no_tools).unwrap().program, app);
+    }
+
+    #[test]
+    fn chosen_paths_that_fail_the_name_check_are_never_run() {
+        let d = Dirs::new("chosen-check");
+        let env = env_in(&d, &["p1"]);
+        let found = d.file("p1", &exe("yt-dlp"));
+        let probe = |_: &Located, _: &ChildEnv| -> Result<String, YtdlError> {
+            Ok("2026.08.19
+"
+            .into())
+        };
+        // 能用的：用指定的那一個
+        let mine = d.file("mine", &exe("my-yt-dlp"));
+        let with = |p: &Path| SearchEnv {
+            user_path: Some(p.to_path_buf()),
+            ..env.clone()
+        };
+        let t = find_tools(&with(&mine), &probe);
+        assert_eq!(t.ytdl, Some(Located::new(&mine, Source::UserPath)));
+        // Windows 的指令檔（設定檔裡手動改的）：存在也不執行，照常找
+        let script = d.file("mine", "yt-dlp.cmd");
+        let windows = SearchEnv {
+            os: Some(Os::Windows),
+            ..with(&script)
+        };
+        let t = find_tools(&windows, &probe);
+        assert_ne!(
+            t.ytdl.as_ref().map(|l| l.source),
+            Some(Source::UserPath),
+            "{:?}",
+            t.ytdl
+        );
+        if cfg!(windows) {
+            assert_eq!(t.ytdl, Some(Located::new(&found, Source::System)));
+        }
     }
 
     #[test]

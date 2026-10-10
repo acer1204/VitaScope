@@ -1442,3 +1442,198 @@ fn duplicated_hooks_after_an_old_style_removal_are_handled_once() {
     assert_eq!(q.state.tracks_of(TrackKind::Sub).count(), 1, "{:#?}", q.state.tracks);
     assert_eq!(q.mpv().hooks_pending(), 0);
 }
+
+/// 匯出（另一個 mpv）要開同一個網路串流：`net_stream` 給解析出來的網址（EDL）與連線的選項。
+/// 照它設定另一個 mpv、開起來：伺服器收到網站要的 User-Agent、Referer、Cookie，加上全域的標頭
+#[test]
+fn net_stream_opens_the_same_stream_in_another_mpv() {
+    if !net_sample("net_stream_opens_the_same_stream_in_another_mpv", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "vid1")).arc();
+    let s = NetSettings {
+        headers: vec!["X-Global: 1".into()],
+        ..NetSettings::default()
+    };
+    let mut p = site_player(&fake, true, &s, &[("pause", "yes")]);
+    assert_eq!(p.net_stream(), None, "沒有在播");
+    loaded(&mut p, &page);
+    let stream = p.net_stream().expect("網站影片");
+    assert!(stream.site);
+    assert_eq!(stream.page_url, page);
+    assert!(stream.open.starts_with("edl://"), "{}", stream.open);
+    let option = |name: &str| {
+        stream
+            .options
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    // 同名的只有一個（網站的蓋過全域的），快取大小之類不是連線的方式、不給
+    assert_eq!(option("user-agent"), [Node::Str(SITE_UA.into())]);
+    assert_eq!(option("http-header-fields").len(), 1);
+    assert_eq!(option("tls-verify"), [Node::Str("yes".into())]);
+    assert!(option("demuxer-max-bytes").is_empty() && option("hls-bitrate").is_empty());
+    let before = server.requests_to("/f/net/video_only.mp4").len();
+
+    // 另一個 mpv：照給的選項設定，開解析出來的網址
+    let other = raw_mpv();
+    for (name, value) in &stream.options {
+        other
+            .set_node(name, value)
+            .unwrap_or_else(|e| panic!("無法設定 {name}：{e}"));
+    }
+    other.set_property("pause", "yes").unwrap();
+    other.command(&["loadfile", &stream.open]).unwrap();
+    wait_event(&other, "另一個 mpv 開好", |e| matches!(e, Event::FileLoaded));
+    let reqs = server.requests_to("/f/net/video_only.mp4");
+    assert!(reqs.len() > before, "另一個 mpv 沒有讀影片");
+    for r in &reqs[before..] {
+        assert_eq!(r.header("User-Agent"), Some(SITE_UA), "{r:#?}");
+        assert_eq!(r.header("Referer"), Some(SITE_REFERER), "{r:#?}");
+        assert_eq!(r.header("X-Global"), Some("1"), "全域的標頭也要送：{r:#?}");
+        assert!(
+            r.header("Cookie").is_some_and(|c| c.contains(SITE_COOKIE)),
+            "沒有送網站的 Cookie：{r:#?}"
+        );
+    }
+    drop(other);
+
+    // 一般的網址：開的就是網址本身，用全域的設定
+    let file = server.file_url("common/mp4_h264_aac.mp4");
+    loaded(&mut p, &file);
+    let plain = p.net_stream().expect("網路串流");
+    assert!(!plain.site);
+    assert_eq!(plain.open, file);
+    let engine_ua = p.net_defaults().user_agent;
+    assert!(plain.options.contains(&("user-agent".into(), Node::Str(engine_ua))));
+    assert!(
+        plain
+            .options
+            .contains(&("http-header-fields".into(), Node::strings(["X-Global: 1"])))
+    );
+    assert!(!plain.options.iter().any(|(n, _)| n == "cookies-file"));
+    // 本機檔案：沒有
+    loaded(&mut p, &sample("common/mp4_h264_aac.mp4"));
+    assert_eq!(p.net_stream(), None);
+    page_never_fetched(&server);
+}
+
+/// `net_stream`：使用者自己指定的選項（VITASCOPE_MPV_OPTS，測試用 `Options.extra`）影戲沒有送，給的是 mpv 現在的值
+#[test]
+fn net_stream_keeps_options_the_user_forced() {
+    let server = Server::start();
+    let fake = FakeResolver::missing().arc();
+    let s = NetSettings {
+        headers: vec!["X-Global: 1".into()],
+        ..NetSettings::default()
+    };
+    let mut p = site_player(
+        &fake,
+        false,
+        &s,
+        &[
+            ("pause", "yes"),
+            ("user-agent", "Forced/1"),
+            ("http-header-fields", "X-Forced: 2"),
+        ],
+    );
+    let file = server.file_url("common/mp4_h264_aac.mp4");
+    loaded(&mut p, &file);
+    let stream = p.net_stream().expect("網路串流");
+    assert_eq!(stream.open, file);
+    let option = |name: &str| {
+        stream
+            .options
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(option("user-agent"), [Node::Str("Forced/1".into())]);
+    assert_eq!(option("http-header-fields"), [Node::strings(["X-Forced: 2"])]);
+    // 沒有指定的照設定
+    assert_eq!(option("tls-verify"), [Node::Str("yes".into())]);
+    let reqs = server.requests_to("/f/common/mp4_h264_aac.mp4");
+    assert!(
+        reqs.iter().all(|r| r.header("User-Agent") == Some("Forced/1")),
+        "{reqs:#?}"
+    );
+}
+
+/// 選單選的畫質用之前的格式清單：「預設畫質」、編碼改了也不再問 yt-dlp；「自動」照新的預設畫質重新問
+#[test]
+fn menu_choices_reuse_the_formats_after_settings_change() {
+    if !net_sample(
+        "menu_choices_reuse_the_formats_after_settings_change",
+        "net/video_only.mp4",
+    ) {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    loaded(&mut p, &page);
+    let s = NetSettings {
+        quality: vitascope::ytdl::SiteQuality::P720,
+        codec: vitascope::ytdl::CodecPref::H264,
+        ..NetSettings::default()
+    };
+    p.set_net_config(&s, &s.site_prefs());
+    for choice in [
+        Choice::AudioOnly,
+        Choice::Format {
+            video: "v1".into(),
+            audio: Some("a1".into()),
+        },
+    ] {
+        p.reload_net(choice.clone()).unwrap();
+        p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+        let info = p.state.net.clone().unwrap();
+        assert_eq!(info.choice, choice);
+        assert_eq!(info.audio_only, choice == Choice::AudioOnly);
+        assert_eq!(fake.calls(), 1, "選單選的畫質不再問 yt-dlp：{choice:?}");
+    }
+    // 「自動」：yt-dlp 照新的預設畫質、編碼挑，要重新問
+    p.reload_net(Choice::Default).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert_eq!(fake.calls(), 2, "「自動」照新的預設畫質重新問");
+    let req = fake.requests().pop().unwrap();
+    assert_eq!(req.quality, vitascope::ytdl::SiteQuality::P720);
+    assert_eq!(req.codec, vitascope::ytdl::CodecPref::H264);
+    page_never_fetched(&server);
+}
+
+/// 「用 yt-dlp 播放網站影片」關掉：影片網站的網址說明要打開（不問 yt-dlp、不讀網頁）；其他網頁照一般的網址開，
+/// 認不出內容也不問 yt-dlp
+#[test]
+fn ytdl_turned_off_never_asks() {
+    let server = Server::start();
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &server.url("/html"), "h1")).arc();
+    let off = NetSettings {
+        ytdl: false,
+        ..NetSettings::default()
+    };
+    let mut p = site_player(&fake, true, &off, &[]);
+    p.set_net_config(&off, &off.site_prefs());
+    let err = failure_text(&mut p, &server.url("/watch?v=x"), "yt-dlp");
+    assert_eq!(err, "網站影片需要 yt-dlp（已在「設定 → 網路」關閉）");
+    assert_eq!(
+        p.state.net_failure.as_ref().and_then(|f| f.remedy()),
+        Some(vitascope::ytdl::Remedy::EnableYtdl)
+    );
+    assert!(!p.state.net_need_ytdl, "有 yt-dlp，只是關掉了");
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    page_never_fetched(&server);
+    // 其他網頁：mpv 自己開，認不出內容就說明是網頁
+    let mut q = site_player(&fake, false, &off, &[]);
+    q.set_net_config(&off, &off.site_prefs());
+    let err = failure_text(&mut q, &server.url("/html"), "網頁");
+    assert_eq!(err, "無法開啟網址：這個網址是網頁，不是影片檔");
+    assert_eq!(fake.calls(), 0);
+    assert_eq!(q.mpv().hooks_pending(), 0);
+}

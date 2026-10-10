@@ -208,6 +208,14 @@ enum Action {
     BookmarkRemove,
 }
 
+/// 起始畫面上按的
+enum PlaceholderOp {
+    /// 「最近開啟」裡的檔案
+    OpenRecent(String),
+    /// 網站影片播不了時的「網路設定…」
+    NetworkSettings,
+}
+
 /// Esc 會關掉的視窗，依這個順序一次關一個（之後的批次把自己的視窗加進來：匯出、線上搜尋字幕…）
 #[derive(Debug, Clone, Copy)]
 enum EscWindow {
@@ -265,6 +273,8 @@ pub struct VitascopeApp {
     start_fullscreen: bool,
     /// 以全螢幕啟動時，第一個檔案不調整視窗大小
     skip_next_fit: bool,
+    /// 換畫質重開時還原了長寬比、裁切、旋轉（`restore_reload`）：畫面設定好時套用，視窗不跟著調整
+    shape_restored: bool,
     /// 目前設定給 mpv 的字幕底部邊距（sub-margin-y）
     sub_margin: i64,
     /// 目前的檔案已經收到影像設定事件（影片尺寸是新的）
@@ -304,6 +314,12 @@ pub struct VitascopeApp {
     live_end_shown: bool,
     /// 「設定 → 網路 → 進階」正在編輯的文字（離開欄位才寫回設定）
     net_draft: Option<network::NetDraft>,
+    /// 網站影片換畫質：重開前記下的狀態（暫停、字幕、A-B…），載入完成時還原
+    reload_keep: Option<network::ReloadKeep>,
+    /// 「設定 → 網路」選 yt-dlp 檔案的結果（選的檔案不能用時說明原因）
+    ytdl_path_problem: Option<crate::ytdl::locate::PathProblem>,
+    /// 已經提示過「書籤只保留到關閉影戲」的檔案（書籤的代號）
+    private_marks_told: std::collections::HashSet<String>,
     /// 上一幀是否已經播到結尾（偵測「剛播完」，自動接下一個）
     was_eof: bool,
     /// 滑鼠滾輪還沒湊滿一格的量（觸控板的捲動是連續的）
@@ -560,7 +576,8 @@ pub struct Launch {
     /// 外部工具的資料夾（影戲下載的 yt-dlp、deno）；預設 None（自動測試不找、不碰使用者的工具），
     /// 播放器用 `paths::tools_dir()`
     pub tools_dir: Option<PathBuf>,
-    /// 找 yt-dlp、deno 的狀態：跟播放器解析網站影片用的是同一個（main.rs 建立）；None = 用 `tools_dir` 自己建立一個
+    /// 找 yt-dlp、deno 的狀態：跟播放器解析網站影片用的是同一個（main.rs 建立）；
+    /// None = 不找（自動測試、`--shot`：不執行使用者電腦上的 yt-dlp）
     pub ytdl: Option<crate::ytdl::Locator>,
 }
 
@@ -667,10 +684,15 @@ impl VitascopeApp {
         // 存檔失敗的回覆要叫醒介面（顯示提示）
         let ctx = cc.egui_ctx.clone();
         bookmarks.set_wake(Arc::new(move || ctx.request_repaint()));
-        // yt-dlp、deno：第一次需要時才在背景找（網站影片、網路設定），找完叫醒介面
-        let ytdl = launch
-            .ytdl
-            .unwrap_or_else(|| crate::ytdl::Locator::new(launch.tools_dir));
+        // yt-dlp、deno：第一次需要時才在背景找（網站影片、網路設定），找完叫醒介面。
+        // 沒有給（自動測試、`--shot`）：不找（不執行使用者電腦上的 yt-dlp，設定頁的狀態固定是「找不到」）
+        let ytdl = launch.ytdl.unwrap_or_else(|| {
+            crate::ytdl::Locator::with_finder(
+                launch.tools_dir,
+                Arc::new(|env: &crate::ytdl::SearchEnv| crate::ytdl::Tools::none(env)),
+            )
+        });
+        ytdl.set_user_path(settings.net.ytdl_path.clone());
         let ctx = cc.egui_ctx.clone();
         ytdl.set_wake(Arc::new(move || ctx.request_repaint()));
         let mut app = Self {
@@ -692,6 +714,7 @@ impl VitascopeApp {
             frames: 0,
             start_fullscreen: launch.fullscreen,
             skip_next_fit: launch.fullscreen,
+            shape_restored: false,
             sub_margin: 22,
             video_reconfigured: false,
             about_open: false,
@@ -711,6 +734,9 @@ impl VitascopeApp {
             net_live: false,
             live_end_shown: false,
             net_draft: None,
+            reload_keep: None,
+            ytdl_path_problem: None,
+            private_marks_told: Default::default(),
             was_eof: false,
             wheel: 0.0,
             right_controls_width: 0.0,
@@ -1029,6 +1055,18 @@ impl VitascopeApp {
     /// 開檔。`list_index`：從播放清單上開的（上一個 / 下一個、雙擊）是第幾項，
     /// 同一個檔案在清單上出現兩次時才不會跳回第一個
     fn open_at(&mut self, path: &Path, list_index: Option<usize>) {
+        self.open_at_mode(path, list_index, None);
+    }
+
+    /// 開檔，這次有只對這次有效的要求（網站影片換畫質、載入整個播放清單；見 `Player::open_with_mode`）
+    pub(super) fn open_at_mode(
+        &mut self,
+        path: &Path,
+        list_index: Option<usize>,
+        mode: Option<crate::ytdl::plan::Mode>,
+    ) {
+        // 換畫質時要保留的狀態只給那一次（`reload_site` 開完才設定）
+        self.reload_keep = None;
         // 播放清單檔：換成檔案裡的清單（只讀一次；HLS 串流的 .m3u8 交給 mpv）
         if formats::is_playlist(path) && !is_url(&path.to_string_lossy()) {
             match crate::m3u::read_text(path) {
@@ -1093,7 +1131,11 @@ impl VitascopeApp {
         let _ = self.player.set_sub_delay(0.0);
         // 開了音訊直通：新檔案可能會直通，濾鏡鏈先清空（同步，排在開檔之前）
         self.sound_before_open();
-        if let Err(e) = self.player.open(&path.to_string_lossy()) {
+        let opened = match mode {
+            Some(mode) => self.player.open_with_mode(&path.to_string_lossy(), mode),
+            None => self.player.open(&path.to_string_lossy()),
+        };
+        if let Err(e) = opened {
             self.player.state.last_error = Some(crate::tf!("無法開啟：{e}", "Cannot open: {e}"));
             // 不會有 StartFile 了：舊檔案照樣在播，畫面調整要繼續同步；濾鏡鏈照舊檔案的音軌
             self.switching_file = false;
@@ -2020,6 +2062,7 @@ impl VitascopeApp {
                 // 畫面調整是每個檔案各自的（mpv 那邊由 reset-on-next-file 還原）
                 self.geometry = Geometry::default();
                 self.natural = None;
+                self.shape_restored = false;
                 self.refit_until = None;
                 self.refit_now = false;
                 self.switching_file = false;
@@ -2079,8 +2122,10 @@ impl VitascopeApp {
                 {
                     self.natural = Some(natural);
                     // 畫面設定好之前就按了長寬比、裁切、旋轉：現在才真的套用，視窗也要跟著調
+                    //（換畫質還原的不算：視窗不動）
                     let g = &self.geometry;
-                    early_shape = g.aspect.is_some() || g.crop.is_some() || g.rotate != 0;
+                    early_shape = !std::mem::take(&mut self.shape_restored)
+                        && (g.aspect.is_some() || g.crop.is_some() || g.rotate != 0);
                     // 用濾鏡翻轉時要看檔案本身的旋轉，之前翻的要重新套一次
                     if self.flip_with_filter() {
                         for (horizontal, on) in [(true, self.geometry.hflip), (false, self.geometry.vflip)] {
@@ -2144,12 +2189,19 @@ impl VitascopeApp {
         // 選上的音軌會不會直通（開了直通時，開檔前先清空了濾鏡鏈）
         self.sound_file_loaded();
         self.preview_file_loaded();
+        // 網站影片換畫質重開的：只給這一次載入
+        let keep = self.reload_keep.take();
         let Ok(path) = self.player.get_string("path") else {
             return;
         };
-        // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到（網路串流用續播的代號，跟 `media_key` 一樣）
-        let key = network::history_key(&path, self.player.state.net.as_deref());
-        self.bookmarks.refresh(&key.unwrap_or_else(|| path.clone()));
+        // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到（網路串流用續播的代號，跟 `media_key` 一樣）。
+        // 網址含登入資訊、token 的：書籤只放在記憶體（不讀也不寫 bookmarks.json）
+        let key = network::history_key(&path, self.player.state.net.as_deref()).unwrap_or_else(|| path.clone());
+        if bookmarks_panel::marks_in_memory_only(&path, &key) {
+            self.bookmarks.keep_in_memory(&key);
+        } else {
+            self.bookmarks.refresh(&key);
+        }
         // 書籤分頁上選取的是上一個檔案的書籤
         self.bookmark_selected = None;
         if let Some((video, subs)) = self.pending_subs.take()
@@ -2164,10 +2216,14 @@ impl VitascopeApp {
         }
         if is_url(&path) {
             if crate::net::is_network(&path) {
+                let keep = keep.filter(|k| k.is_for(&path));
                 self.site_file_loaded(&path);
                 self.remember_url(&path);
-                self.net_file_loaded(&path);
+                self.net_file_loaded(&path, keep.is_some());
                 self.site_hint_osd();
+                if let Some(keep) = keep {
+                    self.restore_reload(keep);
+                }
             }
             self.adjust_reminder();
             return;
@@ -3157,9 +3213,12 @@ impl VitascopeApp {
         }
         if !st.loaded
             && !self.player.loading_now()
-            && let Some(path) = self.placeholder(ui, rect)
+            && let Some(op) = self.placeholder(ui, rect)
         {
-            self.open_recent(&path);
+            match op {
+                PlaceholderOp::OpenRecent(path) => self.open_recent(&path),
+                PlaceholderOp::NetworkSettings => self.show_network_settings(),
+            }
         }
         // 網路串流：連線中（可以取消）、緩衝中
         if self.loading_overlay(ui, rect) {
@@ -3484,6 +3543,8 @@ impl VitascopeApp {
         if let Some(a) = self.sound_menu(ui) {
             action = Some(a);
         }
+        // 網站影片 ▸（只在播 yt-dlp 解析出來的網站影片時出現）
+        let site_op = self.site_menu(ui);
         let has_video = self.player.state.loaded && self.player.state.has_video();
         if let Some(a) = self.screenshot_menu(ui, has_video) {
             action = Some(a);
@@ -3539,14 +3600,17 @@ impl VitascopeApp {
             );
             self.osd(msg);
         }
+        if let Some(op) = site_op {
+            self.site_menu_op(&ctx, op);
+        }
         if let Some(a) = action {
             self.run(&ctx, a);
         }
     }
 
     /// 沒有開檔時的畫面。用一般的 label（不是直接畫字），螢幕閱讀器和介面測試才讀得到。
-    /// 回傳使用者在「最近開啟」裡點選的檔案
-    fn placeholder(&self, ui: &mut egui::Ui, rect: Rect) -> Option<String> {
+    /// 回傳使用者按了什麼：「最近開啟」裡的檔案、網站影片播不了時的「網路設定…」
+    fn placeholder(&self, ui: &mut egui::Ui, rect: Rect) -> Option<PlaceholderOp> {
         let mut ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(rect.shrink(40.0))
@@ -3597,8 +3661,15 @@ impl VitascopeApp {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(*note).size(13.0).color(Color32::from_gray(170)));
         }
-        // 最近開啟的檔案，點一下就開
         let mut chosen = None;
+        // 沒有 yt-dlp、關掉了、Cookie 的問題：直接打開「設定 → 網路」
+        if self.site_failure_wants_settings() {
+            ui.add_space(8.0);
+            if ui.button(crate::tr!("網路設定…", "Network settings…")).clicked() {
+                chosen = Some(PlaceholderOp::NetworkSettings);
+            }
+        }
+        // 最近開啟的檔案，點一下就開
         if !recent.is_empty() {
             ui.add_space(28.0);
             ui.label(
@@ -3616,7 +3687,7 @@ impl VitascopeApp {
                     .on_hover_text(path)
                     .clicked()
                 {
-                    chosen = Some(path.clone());
+                    chosen = Some(PlaceholderOp::OpenRecent(path.clone()));
                 }
             }
         }

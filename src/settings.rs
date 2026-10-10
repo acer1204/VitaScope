@@ -769,6 +769,81 @@ mod tests {
     }
 
     #[test]
+    fn site_video_settings_defaults_lenient_load_and_merge() {
+        use crate::ytdl::{Browser, CodecPref, ListMode, SitePrefs, SiteQuality};
+        // 沒寫的（舊版、C6 以前的設定檔）：用 yt-dlp、最高畫質、自動編碼、網站字幕、不用 Cookie、只播這部影片
+        let s: Settings = serde_json::from_str(r#"{"net":{"timeout_secs":10}}"#).unwrap();
+        assert!(s.net.ytdl, "預設用 yt-dlp 播放網站影片");
+        assert_eq!(s.net.ytdl_path, None);
+        assert_eq!(s.net.quality, SiteQuality::Best);
+        assert_eq!(s.net.codec, CodecPref::Auto);
+        assert!(s.net.site_subs && !s.net.auto_subs);
+        assert_eq!(s.net.cookies_from, None);
+        assert_eq!(s.net.list_mode, ListMode::Video);
+        assert_eq!(s.net.site_prefs(), SitePrefs::default(), "預設的偏好跟之前寫死的一樣");
+        // 一項讀不懂（新版的畫質）：只有那一項用預設值，同一組的逾時照樣讀進來
+        let s = lenient(
+            r#"{"net": {"quality": "8k", "timeout_secs": 10, "codec": "av1", "cookies_from": "netscape",
+                "list_mode": "playlist", "ytdl": false, "ytdl_path": "/opt/yt-dlp"}}"#,
+        );
+        assert_eq!(s.net.quality, SiteQuality::Best);
+        assert_eq!(s.net.timeout_secs, 10);
+        assert_eq!(s.net.codec, CodecPref::Av1);
+        assert_eq!(s.net.cookies_from, None);
+        assert_eq!(s.net.list_mode, ListMode::Playlist);
+        assert!(!s.net.ytdl);
+        assert_eq!(s.net.ytdl_path.as_deref(), Some(std::path::Path::new("/opt/yt-dlp")));
+        // 偏好整組交給 yt-dlp
+        let mut n = NetSettings {
+            quality: SiteQuality::P720,
+            codec: CodecPref::H264,
+            site_subs: false,
+            auto_subs: true,
+            cookies_from: Some(Browser::Firefox),
+            list_mode: ListMode::Playlist,
+            ..Default::default()
+        };
+        assert_eq!(
+            n.site_prefs(),
+            SitePrefs {
+                quality: SiteQuality::P720,
+                codec: CodecPref::H264,
+                site_subs: false,
+                auto_subs: true,
+                cookies_from: Some(Browser::Firefox),
+                list_mode: ListMode::Playlist,
+            }
+        );
+        // 空白的路徑 = 自動尋找
+        n.ytdl_path = Some(std::path::PathBuf::new());
+        assert_eq!(n.sanitized().ytdl_path, None);
+        // 存檔、讀回來；兩個視窗各改了不同的項目：兩個都留下（kebab-case 的寫法）
+        let dir = temp_dir("site");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.net.quality = SiteQuality::P1080;
+        a.net.cookies_from = Some(Browser::Edge);
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""quality": "p1080""#), "{text}");
+        assert!(text.contains(r#""cookies_from": "edge""#), "{text}");
+        b.net.codec = CodecPref::Vp9;
+        b.net.ytdl_path = Some("/usr/local/bin/yt-dlp".into());
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.net.quality, SiteQuality::P1080, "A 改的畫質不能被 B 蓋回去");
+        assert_eq!(back.net.cookies_from, Some(Browser::Edge));
+        assert_eq!(back.net.codec, CodecPref::Vp9);
+        assert_eq!(
+            back.net.ytdl_path.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin/yt-dlp"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn net_settings_load_leniently_sanitize_and_merge() {
         use crate::net::HlsBitrate;
         // 一項讀不懂（新版的畫質、型別不對）：只有那一項用預設值，同一組的其他項目、其他設定照樣讀進來

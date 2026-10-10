@@ -4148,6 +4148,813 @@ fn site_playlist_at_the_limit_says_only_the_first_were_loaded() {
     site_page_never_fetched(&server);
 }
 
+// ───────────── 網站影片 ▸ 選單、換畫質、「設定 → 網路」的 yt-dlp ─────────────
+
+/// 有網路測試的樣本（`python scripts/gen_samples.py` 的 net 這一組）；沒有就印出原因、回傳 false
+fn has_net_samples(test: &str) -> bool {
+    let ok = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/sub.vtt")
+        .exists();
+    if !ok {
+        eprintln!("略過 {test}：沒有網路測試的樣本（python scripts/gen_samples.py）");
+    }
+    ok
+}
+
+/// 兩種畫質的網站影片（都是影音合在一起的 90 秒 `common/mp4_long.mp4`，網址不同：`?q=hi` 720p、`?q=lo` 360p），
+/// 一個只有聲音的格式（`net/audio_only.m4a`），三個網站字幕（en、ja、zh-TW：開檔時照一般的規則會選繁中）。
+/// yt-dlp 自己挑的是 720p
+fn two_quality_json(base: &str) -> String {
+    let muxed = |id: &str, file: &str, height: u32, tbr: u32| {
+        format!(
+            r#"{{"format_id": "{id}", "url": "{base}/f/common/{file}?q={id}", "protocol": "http",
+                "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "height": {height}, "fps": 24, "tbr": {tbr}}}"#
+        )
+    };
+    format!(
+        r#"{{"id": "two", "title": "兩種畫質", "extractor_key": "FakeSite", "duration": 90,
+            "format_id": "hi", "url": "{base}/f/common/mp4_long.mp4?q=hi", "protocol": "http",
+            "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "height": 720, "fps": 24, "tbr": 2000,
+            "formats": [{}, {},
+              {{"format_id": "a", "url": "{base}/f/net/audio_only.m4a", "protocol": "http", "vcodec": "none",
+                "acodec": "mp4a.40.2", "abr": 128}}],
+            "requested_subtitles": {{
+              "en": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?en", "name": "English"}},
+              "ja": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?ja", "name": "Japanese"}},
+              "zh-TW": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?zh", "name": "中文（台灣）"}}}}}}"#,
+        muxed("hi", "mp4_long.mp4", 720, 2000),
+        muxed("lo", "mp4_long.mp4", 360, 500)
+    )
+}
+
+/// 開兩種畫質的網站影片，等到能跳轉
+fn playing_two_qualities(
+    server: &Server,
+    settings: Settings,
+) -> (Harness<'static, VitascopeApp>, Arc<FakeResolver>, String) {
+    let json = two_quality_json(&server.url(""));
+    let fake = FakeResolver::json(json).arc();
+    let mut h = site_harness(&fake, settings);
+    h.step();
+    let page = server.url("/watch?v=two");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播網站影片", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.is_some() && s.seekable && s.video_size.is_some()
+    });
+    (h, fake, page)
+}
+
+/// 等到子選單打開、裡面有這一項（CI 比較慢：滑鼠移過去之後子選單不一定下一幀就打開）
+fn wait_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    let start = Instant::now();
+    while h.query_all_by_label(label).next().is_none() {
+        assert!(start.elapsed() < NET_TIMEOUT, "等不到選單裡的「{label}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 在影片上按右鍵、打開「網站影片 ▸」，等它的子選單出來
+fn open_site_menu(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "網站影片");
+    wait_menu_item(h, "選擇畫質 ⏵");
+}
+
+/// 網站影片 ▸ 選擇畫質 ▸ 某一項
+fn pick_site_quality(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    open_site_menu(h);
+    hover_menu_item(h, "選擇畫質");
+    wait_menu_item(h, label);
+    h.get_by_label(label).click();
+    h.step();
+}
+
+/// 網站影片 ▸ 預設畫質 ▸ 某一項（「只播聲音」在「網站影片 ▸」裡也有一個勾選框：點預設畫質的那個圓鈕）
+fn pick_default_quality(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    open_site_menu(h);
+    hover_menu_item(h, "預設畫質");
+    let start = Instant::now();
+    loop {
+        let radio = h
+            .query_all_by_label(label)
+            .find(|n| n.accesskit_node().role() == egui::accesskit::Role::RadioButton);
+        if let Some(radio) = radio {
+            radio.click();
+            break;
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "等不到預設畫質的「{label}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.step();
+}
+
+/// 等待時每一幀看到的 OSD、送出的視窗大小（OSD 1.5 秒就消失：CI 比較慢時等完再看可能已經不見了）
+#[derive(Default)]
+struct Seen {
+    osd: Vec<String>,
+    sizes: Vec<egui::Vec2>,
+}
+
+impl Seen {
+    fn record(&mut self, h: &Harness<'_, VitascopeApp>) {
+        if let Some(t) = h.state().osd_text()
+            && self.osd.last().map(String::as_str) != Some(t)
+        {
+            self.osd.push(t.to_owned());
+        }
+        self.sizes
+            .extend(viewport_commands(h).into_iter().filter_map(|c| match c {
+                egui::ViewportCommand::InnerSize(s) => Some(s),
+                _ => None,
+            }));
+    }
+}
+
+/// 同 `step_until_net`，每一幀記下 OSD、視窗大小
+fn step_until_seen(
+    h: &mut Harness<'_, VitascopeApp>,
+    seen: &mut Seen,
+    what: &str,
+    cond: impl Fn(&VitascopeApp) -> bool,
+) {
+    let start = Instant::now();
+    seen.record(h);
+    while !cond(h.state()) {
+        assert!(
+            start.elapsed() < NET_TIMEOUT,
+            "等待逾時：{what}
+目前狀態：{:#?}",
+            h.state().player().state
+        );
+        h.step();
+        seen.record(h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 正在播的網站影片用的格式是這個
+fn playing_format(app: &VitascopeApp, page: &str, id: &str) -> bool {
+    let s = &app.player().state;
+    playing_url(s, page)
+        && s.net
+            .as_ref()
+            .is_some_and(|n| !n.audio_only && n.chosen.iter().any(|f| f.format_id.as_deref() == Some(id)))
+}
+
+/// 讀過這個網址（伺服器收到過；查詢字串也比對）
+fn fetched(server: &Server, path: &str) -> bool {
+    !server.requests_to(path).is_empty()
+}
+
+/// 網站影片 ▸ 選擇畫質：列出網站的畫質，選了就從現在的位置接著播（不再問 yt-dlp、不續播、沒有「下一個」的提示），
+/// 暫停、字幕延遲、A-B 重播、選的字幕、畫面的調整（長寬比、翻轉）都保留，跟 PotPlayer 一樣
+#[test]
+fn site_quality_switch_keeps_pause_delay_ab_subtitle_and_view() {
+    if !has_net_samples("site_quality_switch_keeps_pause_delay_ab_subtitle_and_view") {
+        return;
+    }
+    let server = Server::start();
+    let (mut h, fake, page) = playing_two_qualities(&server, no_auto_next());
+    assert!(fetched(&server, "/f/common/mp4_long.mp4?q=hi"), "yt-dlp 挑的是 720p");
+    // 換畫質之前：選日文字幕（開檔時照規則選的是繁中）、第二字幕英文、字幕延遲、A-B、長寬比 16:9、左右翻轉，停在 10 秒
+    let sub_id = |h: &Harness<'_, VitascopeApp>, lang: &str| {
+        h.state()
+            .player()
+            .state
+            .tracks_of(TrackKind::Sub)
+            .find(|t| t.lang.as_deref() == Some(lang))
+            .map(|t| t.id)
+            .unwrap_or_else(|| panic!("網站的字幕 {lang}"))
+    };
+    assert_eq!(
+        h.state()
+            .player()
+            .state
+            .selected(TrackKind::Sub)
+            .and_then(|t| t.lang.clone())
+            .as_deref(),
+        Some("zh-TW")
+    );
+    let (ja, en) = (sub_id(&h, "ja"), sub_id(&h, "en"));
+    h.state_mut()
+        .player_mut()
+        .select_track(TrackKind::Sub, Some(ja))
+        .unwrap();
+    h.state_mut().player_mut().set_secondary_sub(Some(en)).unwrap();
+    h.state_mut().player_mut().set_sub_delay(0.5).unwrap();
+    h.state_mut().player_mut().set_ab_loop(Some(5.0), Some(15.0)).unwrap();
+    h.key_press(egui::Key::A);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    h.key_press(egui::Key::Space);
+    step_until_net(&mut h, "暫停", |app| app.player().state.paused);
+    paused_at(&mut h, 10.0);
+    assert_eq!(h.state().geometry().aspect, Some(0));
+    assert!(h.state().geometry().hflip);
+
+    pick_site_quality(&mut h, "360p · AVC");
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "換成 360p", |app| playing_format(app, &page, "lo"));
+    assert!(fetched(&server, "/f/common/mp4_long.mp4?q=lo"));
+    // 載入完成後還原：選的字幕要等網站的字幕軌出現
+    step_until_seen(&mut h, &mut seen, "還原日文字幕", |app| {
+        app.player()
+            .state
+            .selected(TrackKind::Sub)
+            .and_then(|t| t.lang.as_deref())
+            == Some("ja")
+    });
+    h.run_steps(3);
+    seen.record(&h);
+    let p = h.state().player();
+    assert_eq!(p.get_string("pause").unwrap(), "yes", "暫停中換畫質：還是暫停");
+    let t = p.get_f64("time-pos").unwrap();
+    assert!((t - 10.0).abs() < 1.0, "接著 10 秒播：{t}");
+    assert_eq!(p.get_f64("sub-delay").unwrap(), 0.5);
+    assert_eq!(p.ab_loop_points(), [Some(5.0), Some(15.0)]);
+    let secondary: i64 = p.get_string("secondary-sid").unwrap().parse().expect("第二字幕保留");
+    assert_eq!(secondary, sub_id(&h, "en"));
+    assert_eq!(h.state().geometry().aspect, Some(0), "長寬比保留");
+    assert!(h.state().geometry().hflip, "翻轉保留");
+    step_until_seen(&mut h, &mut seen, "翻轉的著色器", |app| {
+        app.player()
+            .shader_list()
+            .unwrap()
+            .iter()
+            .any(|f| f.ends_with("hflip.glsl"))
+    });
+    // 長寬比套用完（mpv 換檔時還原了，要再設一次）、再多等一下：視窗不跟著調整
+    step_until_seen(&mut h, &mut seen, "長寬比 16:9", |app| {
+        app.player()
+            .get_f64("video-aspect-override")
+            .is_ok_and(|a| (a - 16.0 / 9.0).abs() < 0.01)
+    });
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(800) {
+        h.step();
+        seen.record(&h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(seen.sizes.is_empty(), "換畫質不調整視窗大小：{:?}", seen.sizes);
+    assert_eq!(fake.calls(), 1, "換畫質用之前的格式清單，不再問 yt-dlp");
+    assert_eq!(seen.osd, ["畫質：360p · AVC"], "不是續播、不是「下一個」");
+    assert_eq!(h.state().playlist().map(|l| l.len()), Some(1), "播放清單不變");
+    // 換回「自動」（yt-dlp 挑的）：一樣不再問
+    pick_site_quality(&mut h, "自動（最高）");
+    step_until_net(&mut h, "換回自動", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page)
+            && s.net
+                .as_ref()
+                .is_some_and(|n| n.choice == vitascope::ytdl::plan::Choice::Default)
+    });
+    assert_eq!(fake.calls(), 1);
+    // 載入中按了播放（重開時設好了暫停）：載入完成時不再暫停回去。
+    // 播放清單的設定改成整個清單之後換畫質：重開的還是這部影片（不問 yt-dlp 播放清單）
+    h.state_mut()
+        .change_net(|n| n.list_mode = vitascope::ytdl::ListMode::Playlist);
+    step_until_net(&mut h, "還是暫停", |app| app.player().state.paused);
+    pick_site_quality(&mut h, "360p · AVC");
+    h.state_mut().player_mut().set_pause(false).unwrap();
+    step_until_net(&mut h, "又換成 360p", |app| {
+        playing_format(app, &page, "lo") && app.player().state.loaded
+    });
+    // 載入完成時的還原做完（字幕還原成日文）之後
+    step_until_net(&mut h, "還原日文字幕", |app| {
+        app.player()
+            .state
+            .selected(TrackKind::Sub)
+            .and_then(|t| t.lang.as_deref())
+            == Some("ja")
+    });
+    h.run_steps(3);
+    assert_eq!(
+        h.state().player().get_string("pause").unwrap(),
+        "no",
+        "載入中按了播放：照使用者的"
+    );
+    assert_eq!(fake.calls(), 1, "換畫質不因為播放清單的設定再問 yt-dlp");
+    assert!(fake.requests().iter().all(|r| !r.playlist));
+    assert_eq!(h.state().playlist().map(|l| l.len()), Some(1));
+    site_page_never_fetched(&server);
+}
+
+/// 網站影片 ▸ 預設畫質（存檔；正在播「自動」時照新的預設換，不用再問 yt-dlp）、只播聲音、複製網址、在瀏覽器開啟
+#[test]
+fn site_menu_default_quality_audio_only_copy_and_browser() {
+    if !has_net_samples("site_menu_default_quality_audio_only_copy_and_browser") {
+        return;
+    }
+    let server = Server::start();
+    let dir = TempDir::new("site-menu");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let (mut h, fake, page) = playing_two_qualities(&server, settings);
+    // 字幕關掉：換畫質之後還是關著（不然開檔時會照一般的規則選一條）
+    h.state_mut().player_mut().select_track(TrackKind::Sub, None).unwrap();
+    step_until_app(&mut h, "關掉字幕", |app| {
+        app.player().get_string("sid").is_ok_and(|v| v == "no")
+    });
+    use vitascope::ytdl::{SiteQuality, plan::Choice};
+    let auto = |app: &VitascopeApp| {
+        app.player()
+            .state
+            .net
+            .as_ref()
+            .is_some_and(|n| n.choice == Choice::Default)
+    };
+    // 預設畫質 ▸ 最高 360p：存檔，正在播的「自動」換成 360p（從格式清單挑，不再問 yt-dlp）
+    pick_default_quality(&mut h, "最高 360p");
+    assert_eq!(h.state().settings().net.quality, SiteQuality::P360);
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["net"]["quality"], "p360");
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "照新的預設換成 360p", |app| {
+        playing_format(app, &page, "lo") && app.player().state.loaded
+    });
+    assert_eq!(seen.osd, ["預設畫質：最高 360p"]);
+    assert_eq!(h.state().player().get_string("sid").unwrap(), "no", "字幕還是關著");
+    assert_eq!(fake.calls(), 1);
+    // 還是「自動」：選單上勾「自動（最高 360p）」，再改預設畫質也跟著換
+    assert!(auto(h.state()), "照預設畫質挑的還是「自動」");
+    open_site_menu(&mut h);
+    hover_menu_item(&mut h, "選擇畫質");
+    wait_menu_item(&mut h, "自動（最高 360p）");
+    assert_eq!(
+        h.get_by_label("自動（最高 360p）").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    assert_eq!(
+        h.get_by_label("360p · AVC").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    pick_default_quality(&mut h, "最高 720p");
+    step_until_net(&mut h, "照新的預設換回 720p", |app| {
+        playing_format(app, &page, "hi") && app.player().state.loaded && auto(app)
+    });
+    assert_eq!(fake.calls(), 1);
+    // 自己選了畫質：改預設畫質只存檔，這部影片不換
+    pick_site_quality(&mut h, "360p · AVC");
+    step_until_net(&mut h, "選 360p", |app| {
+        playing_format(app, &page, "lo") && app.player().state.loaded
+    });
+    assert!(!auto(h.state()));
+    let hi_requests = server.requests_to("/f/common/mp4_long.mp4?q=hi").len();
+    pick_default_quality(&mut h, "最高 1080p");
+    assert_eq!(h.state().settings().net.quality, SiteQuality::P1080);
+    assert_eq!(h.state().osd_text(), Some("預設畫質：最高 1080p"));
+    wait_real(&mut h, 1.0);
+    assert!(playing_format(h.state(), &page, "lo"), "自己選的畫質不換");
+    assert!(h.state().player().state.loaded);
+    assert_eq!(
+        server.requests_to("/f/common/mp4_long.mp4?q=hi").len(),
+        hi_requests,
+        "沒有重開"
+    );
+    // 只播聲音：沒有影像，讀的是聲音的格式
+    open_site_menu(&mut h);
+    h.get_by_label("只播聲音").click();
+    h.step();
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "只播聲音", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.as_ref().is_some_and(|n| n.audio_only)
+    });
+    assert!(fetched(&server, "/f/net/audio_only.m4a"));
+    assert_eq!(seen.osd, ["只播聲音：開啟"]);
+    assert_eq!(fake.calls(), 1, "只播聲音也用之前的格式清單");
+    // 預設畫質是只播聲音時取消「只播聲音」：改播最高的畫質（「自動」也只有聲音）
+    pick_default_quality(&mut h, "只播聲音");
+    assert_eq!(h.state().settings().net.quality, SiteQuality::AudioOnly);
+    open_site_menu(&mut h);
+    h.get_by_label("只播聲音").click();
+    h.step();
+    step_until_net(&mut h, "取消只播聲音", |app| {
+        playing_format(app, &page, "hi") && app.player().state.loaded
+    });
+    assert!(!auto(h.state()));
+    assert_eq!(fake.calls(), 1);
+    // 複製網址、在瀏覽器開啟：網頁的網址
+    open_site_menu(&mut h);
+    h.get_by_label("複製網址").click();
+    h.step();
+    let copied = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == page));
+    assert!(copied, "{:?}", h.output().platform_output.commands);
+    assert_eq!(h.state().osd_text(), Some("已複製網址"));
+    open_site_menu(&mut h);
+    h.get_by_label("在瀏覽器開啟").click();
+    h.step();
+    let opened = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == page));
+    assert!(opened, "{:?}", h.output().platform_output.commands);
+    site_page_never_fetched(&server);
+}
+
+/// 「網站影片 ▸」只在播網站影片時出現；一般的網址、本機檔案沒有
+#[test]
+fn site_menu_only_for_site_videos() {
+    let server = Server::start();
+    let mut h = harness(None);
+    h.step();
+    let url = server.file_url("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &url) && s.video_size.is_some()
+    });
+    h.run_steps(5);
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("音效");
+    assert!(h.query_by_label_contains("網站影片").is_none());
+}
+
+/// 沒有 yt-dlp、關掉了 yt-dlp：起始畫面說明原因，「網路設定…」打開「設定 → 網路」（找不到 yt-dlp、怎麼安裝）；
+/// 在那裡打開「用 yt-dlp 播放網站影片」，再開一次就播
+#[test]
+fn site_video_problems_offer_the_network_settings() {
+    let server = Server::start();
+    let missing = FakeResolver::missing().arc();
+    let mut h = site_harness(&missing, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    h.get_by_label("網站影片（yt-dlp）");
+    // 自動測試不找使用者電腦上的 yt-dlp：找不到、說明怎麼安裝
+    step_until_label(&mut h, "找不到 yt-dlp");
+    assert_eq!(
+        h.query_all_by_label_contains("請安裝 yt-dlp").count(),
+        2,
+        "起始畫面、設定頁都說明怎麼安裝"
+    );
+    h.get_by_label_contains("請安裝 deno");
+    site_page_never_fetched(&server);
+
+    // 關掉了：說明在設定裡關掉了；打開之後再開一次就播
+    if !has_net_samples("site_video_problems_offer_the_network_settings") {
+        return;
+    }
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(support::fake_ytdl::site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut settings = no_auto_next();
+    settings.net.ytdl = false;
+    let mut h = site_harness(&fake, settings);
+    h.step();
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "網站影片需要 yt-dlp（已在「設定 → 網路」關閉）");
+    h.get_by_label_contains("打開「用 yt-dlp 播放網站影片」");
+    assert_eq!(fake.calls(), 0);
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    click_in_view(&mut h, "用 yt-dlp 播放網站影片");
+    assert!(h.state().settings().net.ytdl);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "打開之後就播", |app| {
+        playing_url(&app.player().state, &page)
+    });
+    assert_eq!(fake.calls(), 1);
+    site_page_never_fetched(&server);
+}
+
+/// 其他網頁（不是已知的影片網站）打不開、又沒有 yt-dlp：說明裡提一句要 yt-dlp，起始畫面也有「網路設定…」
+#[test]
+fn web_page_without_ytdl_offers_the_network_settings() {
+    let server = Server::start();
+    let missing = FakeResolver::missing().arc();
+    let resolver: Arc<dyn Resolve> = missing.clone();
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: Vec::new(),
+            ..Options::headless()
+        },
+        Launch::default(),
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(server.url("/html")));
+    step_until_label(&mut h, "（網站上的影片要用 yt-dlp 播放）");
+    assert!(!h.state().player().state.net_need_ytdl, "不是已知的影片網站");
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    h.get_by_label("網站影片（yt-dlp）");
+    step_until_label(&mut h, "找不到 yt-dlp");
+}
+
+/// 「設定 → 網路」的網站影片：找 yt-dlp 的時候顯示「搜尋中…」，找到後顯示版本與來源（沒有 deno 時說明）；
+/// 選擇檔案（Windows 只能選 .exe；只看路徑，在不在由背景確認）、改用自動找到的；預設畫質、編碼、Cookie、字幕、
+/// 播放清單的設定下一次解析就用
+#[test]
+fn network_page_ytdl_section() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use vitascope::ytdl::{Located, Locator, SearchEnv, Source, Tools, Version};
+    let gate = Arc::new(AtomicBool::new(false));
+    let open = gate.clone();
+    let locator = Locator::with_finder(
+        None,
+        Arc::new(move |env: &SearchEnv| {
+            let until = Instant::now() + Duration::from_secs(60);
+            while !open.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut t = Tools::none(env);
+            let chosen = env.user_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+            match chosen.as_deref() {
+                // 指定的檔案不見了，也沒有別的
+                Some(p) if p.contains("gone") => return t,
+                // 指定的檔案不能用：改用自動找到的（很舊的版本、太舊的 deno）
+                Some(p) if p.contains("broken") => {
+                    t.ytdl = Some(Located::new("/usr/bin/yt-dlp", Source::System));
+                    t.ytdl_version = Version::parse("2020.01.01");
+                    t.deno_too_old = Some((
+                        PathBuf::from("/usr/bin/deno"),
+                        vitascope::ytdl::locate::DenoVersion::parse("deno 2.1.0 (stable)").unwrap(),
+                    ));
+                    return t;
+                }
+                Some(p) => t.ytdl = Some(Located::new(p, Source::UserPath)),
+                None => t.ytdl = Some(Located::new("/usr/bin/yt-dlp", Source::System)),
+            }
+            t.ytdl_version = Version::parse("2026.08.19");
+            t
+        }),
+    );
+    let dir = TempDir::new("ytdl-section");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch {
+            ytdl: Some(locator.clone()),
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    assert!(!locator.started(), "打開設定頁之前不找");
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp：搜尋中…");
+    gate.store(true, Ordering::SeqCst);
+    step_until_label(&mut h, "yt-dlp 2026.08.19（另外安裝的）");
+    h.get_by_label("沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質");
+
+    // 選擇檔案：存進設定、重新找，用指定的那一個
+    let chosen = if cfg!(windows) {
+        PathBuf::from(r"C:\tools\yt-dlp.exe")
+    } else {
+        PathBuf::from("/opt/tools/yt-dlp")
+    };
+    let answer = chosen.clone();
+    let seen = record_dialogs(&mut h, move |_| Some(vec![answer.clone()]));
+    click_in_view(&mut h, "選擇檔案…");
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::YtdlPath, Pick::File)]);
+    assert_eq!(h.state().settings().net.ytdl_path.as_deref(), Some(chosen.as_path()));
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["net"]["ytdl_path"], chosen.to_string_lossy().as_ref());
+    step_until_label(&mut h, "yt-dlp 2026.08.19（指定的檔案）");
+    // 只看路徑就知道不能用的：不存、說明原因
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![PathBuf::from("bin/yt-dlp")]);
+    h.run_steps(2);
+    h.get_by_label("要選完整的路徑");
+    if cfg!(windows) {
+        h.state_mut()
+            .on_dialog_result(DialogKind::YtdlPath, vec![PathBuf::from(r"C:\tools\yt-dlp.cmd")]);
+        h.run_steps(2);
+        h.get_by_label("請選 yt-dlp 的執行檔（.exe），不能用指令檔");
+    }
+    assert_eq!(h.state().settings().net.ytdl_path.as_deref(), Some(chosen.as_path()));
+    // 指定的檔案不能用（背景確認的）：說明改用自動找到的；很久沒更新的 yt-dlp、太舊的 deno 也說明
+    let other = |name: &str| {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\tools\{name}\yt-dlp.exe"))
+        } else {
+            PathBuf::from(format!("/opt/{name}/yt-dlp"))
+        }
+    };
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![other("broken")]);
+    step_until_label(&mut h, "指定的檔案不存在或不能執行，改用自動找到的");
+    h.get_by_label("yt-dlp 2020.01.01（另外安裝的）");
+    h.get_by_label_contains("這個 yt-dlp 已經");
+    h.get_by_label("deno 2.1.0 太舊（要 2.3 以上），YouTube 只有部分畫質");
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![other("gone")]);
+    step_until_label(&mut h, "找不到 yt-dlp（指定的檔案不存在或不能執行）");
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![chosen.clone()]);
+    step_until_label(&mut h, "yt-dlp 2026.08.19（指定的檔案）");
+    assert!(h.query_by_label_contains("指定的檔案不存在").is_none());
+    click_in_view(&mut h, "改用自動找到的");
+    assert_eq!(h.state().settings().net.ytdl_path, None);
+    assert!(h.query_by_label("要選完整的路徑").is_none());
+    step_until_label(&mut h, "yt-dlp 2026.08.19（另外安裝的）");
+
+    // 網站影片的偏好
+    combo_in_view(&mut h, "預設畫質");
+    h.get_by_label("最高 720p").click();
+    h.run_steps(2);
+    combo_in_view(&mut h, "影像編碼");
+    h.get_by_label("H.264 優先（相容性最好）").click();
+    h.run_steps(2);
+    combo_in_view(&mut h, "瀏覽器的 Cookie");
+    h.get_by_label("Firefox").click();
+    h.run_steps(2);
+    click_in_view(&mut h, "也載入自動產生的字幕");
+    click_in_view(&mut h, "整個播放清單");
+    let net = h.state().settings().net.clone();
+    assert_eq!(net.quality, vitascope::ytdl::SiteQuality::P720);
+    assert_eq!(net.codec, vitascope::ytdl::CodecPref::H264);
+    assert_eq!(net.cookies_from, Some(vitascope::ytdl::Browser::Firefox));
+    assert!(net.auto_subs);
+    assert_eq!(net.list_mode, vitascope::ytdl::ListMode::Playlist);
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["net"]["cookies_from"], "firefox");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    let server = Server::start();
+    h.event(egui::Event::Paste(server.url("/watch?v=prefs")));
+    step_until_label(&mut h, "無法播放網站影片");
+    let req = fake.requests().pop().expect("問了 yt-dlp");
+    assert_eq!(req.quality, vitascope::ytdl::SiteQuality::P720);
+    assert_eq!(req.codec, vitascope::ytdl::CodecPref::H264);
+    assert_eq!(req.cookies_from, Some(vitascope::ytdl::Browser::Firefox));
+    assert!(req.subs && req.auto_subs && req.playlist);
+    site_page_never_fetched(&server);
+}
+
+/// 網址含登入資訊（token）時的書籤：只放在記憶體、不寫進 bookmarks.json（跟最近開啟、續播一樣），
+/// 第一個書籤提示一次；一般的網址照常存檔
+#[test]
+fn bookmarks_on_urls_with_sign_in_data_stay_in_memory() {
+    let server = Server::start();
+    let dir = TempDir::new("private-marks");
+    let store = dir.0.join("bookmarks.json");
+    let mut h = harness_launch(
+        Launch {
+            bookmarks: vitascope::bookmarks::Bookmarks::load_from(store.clone()),
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    let secret = format!("{}?token=abc123", server.file_url("common/mp4_long.mp4"));
+    h.event(egui::Event::Paste(secret.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &secret) && s.seekable && s.video_size.is_some()
+    });
+    h.key_press(egui::Key::Space);
+    step_until_net(&mut h, "暫停", |app| app.player().state.paused);
+    paused_at(&mut h, 10.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("這個網址含登入資訊，書籤只保留到關閉影戲"));
+    paused_at(&mut h, 20.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert!(
+        h.state().osd_text().is_some_and(|t| t.starts_with("新增書籤")),
+        "只提示一次：{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().bookmarks().marks(&secret).len(), 2);
+    // 一般的網址照常存
+    let plain = server.file_url("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(plain.clone()));
+    step_until_net(&mut h, "播一般的網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &plain) && s.seekable && s.video_size.is_some()
+    });
+    h.key_press(egui::Key::Space);
+    step_until_net(&mut h, "暫停", |app| app.player().state.paused);
+    paused_at(&mut h, 1.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert!(h.state().bookmarks().flush(TIMEOUT), "背景存檔");
+    let text = std::fs::read_to_string(&store).unwrap();
+    assert!(
+        !text.contains("token=abc123"),
+        "含 token 的網址寫進了 bookmarks.json：{text}"
+    );
+    assert!(text.contains("mp4_h264_aac.mp4"), "{text}");
+    // 回到含 token 的網址：這次執行期間書籤還在（開檔時不從磁碟讀回、蓋掉）
+    h.event(egui::Event::Paste(secret.clone()));
+    step_until_net(&mut h, "再播一次", |app| {
+        let s = &app.player().state;
+        playing_url(s, &secret) && s.seekable
+    });
+    h.run_steps(5);
+    assert!(h.state().bookmarks().flush(TIMEOUT));
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks().marks(&secret).len(), 2);
+}
+
+/// 網址同時是影片和播放清單（`&list=`）：先只播這部影片；網站影片 ▸ 載入整個播放清單：整個清單變成播放清單，
+/// 從這部影片開始
+#[test]
+fn site_menu_loads_the_whole_playlist() {
+    if !has_net_samples("site_menu_loads_the_whole_playlist") {
+        return;
+    }
+    let server = Server::start();
+    let base = server.url("");
+    let page = server.url("/watch?v=p2&list=PL1");
+    let p1 = server.url("/watch?v=p1");
+    let p2 = server.url("/watch?v=p2");
+    let list_json = site_playlist_json(&page, &[(p1.clone(), "p1"), (p2.clone(), "p2")]);
+    let fake = FakeResolver::new(move |req, _| {
+        let text = if req.playlist {
+            list_json.clone()
+        } else {
+            support::fake_ytdl::site_video_json(&base, &req.url, "p")
+        };
+        Ok(support::fake_ytdl::resolved(&text, Vec::new()))
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "只播這部影片", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.is_some() && s.video_size.is_some()
+    });
+    h.run_steps(5);
+    assert!(!fake.requests()[0].playlist);
+    open_site_menu(&mut h);
+    h.get_by_label("載入整個播放清單").click();
+    h.step();
+    step_until_net(&mut h, "整個清單", |app| playing_url(&app.player().state, &p2));
+    assert_eq!(playlist_items(h.state()), [p1.clone(), p2.clone()]);
+    assert_eq!(
+        h.state().playlist().and_then(|l| l.current_index()),
+        Some(1),
+        "從網址的 v= 開始"
+    );
+    assert!(fake.requests().iter().any(|r| r.url == page && r.playlist));
+    site_page_never_fetched(&server);
+}
+
+/// 英文介面：網站影片的選單、設定頁
+#[test]
+fn site_menu_and_ytdl_settings_in_english() {
+    if !has_net_samples("site_menu_and_ytdl_settings_in_english") {
+        return;
+    }
+    let server = Server::start();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let (mut h, _fake, _page) = playing_two_qualities(&server, settings);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Website video");
+    wait_menu_item(&mut h, "Default quality ⏵");
+    for label in ["Audio only", "Copy URL", "Open in browser"] {
+        h.get_by_label(label);
+    }
+    hover_menu_item(&mut h, "Choose quality");
+    wait_menu_item(&mut h, "Automatic (Best)");
+    h.get_by_label("360p · AVC");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_settings_page(&mut h, "Network");
+    h.get_by_label("Website videos (yt-dlp)");
+    h.get_by_label("Play website videos with yt-dlp");
+    step_until_label(&mut h, "yt-dlp not found");
+    for label in ["Default quality", "Video codec", "Browser cookies"] {
+        combo_box(&h, label);
+    }
+}
+
 // ───────────── 媒體資訊 ─────────────
 
 #[test]

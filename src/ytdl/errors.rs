@@ -13,6 +13,8 @@ const MAX_RAW_CHARS: usize = 200;
 pub enum YtdlError {
     /// 找不到 yt-dlp（沒有安裝、指定的檔案不見了）
     Missing,
+    /// 「設定 → 網路」關掉了「用 yt-dlp 播放網站影片」
+    Disabled,
     /// yt-dlp 不支援這個網站
     Unsupported,
     /// 影片已刪除或設為私人
@@ -74,10 +76,12 @@ pub enum Remedy {
     TryFirefox,
     /// 取得 yt-dlp
     GetYtdl,
+    /// 到「設定 → 網路」打開「用 yt-dlp 播放網站影片」
+    EnableYtdl,
 }
 
 impl Remedy {
-    /// 錯誤訊息下面的建議（文字；設定頁、下載的按鈕之後才有）
+    /// 錯誤訊息下面的建議（文字）。跟設定有關的建議，起始畫面另外放「網路設定…」按鈕（[`Self::in_settings`]）
     pub fn advice(self) -> &'static str {
         self.advice_on(crate::paths::Os::current())
     }
@@ -112,21 +116,34 @@ impl Remedy {
                 "Install deno 2.3 or newer (deno.com) so YouTube offers every quality"
             ),
             Remedy::UseCookies => tr!(
-                "需要登入的影片：可以在 yt-dlp 的設定檔加上 --cookies-from-browser firefox",
-                "For videos that need a login, add --cookies-from-browser firefox to yt-dlp's config file"
+                "需要登入的影片：在「設定 → 網路」選擇從瀏覽器讀 Cookie（建議 Firefox）",
+                "For videos that need a login, choose a browser to read cookies from in Settings → Network (Firefox recommended)"
             ),
             Remedy::TryFirefox => tr!(
-                "Chrome、Edge 開著時常常讀不到 Cookie，建議改用 Firefox 的 Cookie",
-                "Chrome and Edge cookies often can't be read while the browser is open; try Firefox's cookies"
+                "Chrome、Edge 開著時常常讀不到 Cookie，建議在「設定 → 網路」改用 Firefox 的 Cookie",
+                "Chrome and Edge cookies often can't be read while the browser is open; \
+                 try Firefox's cookies in Settings → Network"
+            ),
+            Remedy::EnableYtdl => tr!(
+                "要播放網站影片，請在「設定 → 網路」打開「用 yt-dlp 播放網站影片」",
+                "To play website videos, turn on \"Play website videos with yt-dlp\" in Settings → Network"
             ),
         }
+    }
+
+    /// 建議的處理方式在「設定 → 網路」（起始畫面放「網路設定…」按鈕）
+    pub fn in_settings(self) -> bool {
+        matches!(
+            self,
+            Remedy::GetYtdl | Remedy::UseCookies | Remedy::TryFirefox | Remedy::EnableYtdl
+        )
     }
 }
 
 impl YtdlError {
     /// 給使用者看的完整訊息（「無法播放網站影片：原因」）
     pub fn message(&self) -> String {
-        if *self == YtdlError::Missing {
+        if matches!(self, YtdlError::Missing | YtdlError::Disabled) {
             return self.reason();
         }
         let reason = self.reason();
@@ -138,6 +155,11 @@ impl YtdlError {
         use crate::{tf, tr};
         match self {
             YtdlError::Missing => tr!("網站影片需要 yt-dlp", "Website videos need yt-dlp").to_owned(),
+            YtdlError::Disabled => tr!(
+                "網站影片需要 yt-dlp（已在「設定 → 網路」關閉）",
+                "Website videos need yt-dlp (turned off in Settings → Network)"
+            )
+            .to_owned(),
             YtdlError::Unsupported => tr!("yt-dlp 不支援這個網站", "yt-dlp doesn't support this site").to_owned(),
             YtdlError::Unavailable => tr!(
                 "影片無法觀看（已刪除或設為私人）",
@@ -218,6 +240,7 @@ impl YtdlError {
     pub fn remedy(&self) -> Option<Remedy> {
         match self {
             YtdlError::Missing => Some(Remedy::GetYtdl),
+            YtdlError::Disabled => Some(Remedy::EnableYtdl),
             YtdlError::AgeRestricted | YtdlError::NotABot | YtdlError::MembersOnly => Some(Remedy::UseCookies),
             YtdlError::Forbidden | YtdlError::Outdated => Some(Remedy::UpdateYtdl),
             YtdlError::NeedsJsRuntime => Some(Remedy::GetDeno),
@@ -685,6 +708,32 @@ mod tests {
                     YtdlError::Blocked(code)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn settings_remedies_point_to_the_network_page() {
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        // 關掉了 yt-dlp：跟沒有 yt-dlp 一樣不加「無法播放網站影片：」，建議打開
+        assert_eq!(
+            YtdlError::Disabled.message(),
+            "網站影片需要 yt-dlp（已在「設定 → 網路」關閉）"
+        );
+        assert_eq!(YtdlError::Disabled.remedy(), Some(Remedy::EnableYtdl));
+        assert!(Remedy::EnableYtdl.advice().contains("設定 → 網路"));
+        // Cookie 的建議改成設定頁（不是 yt-dlp 的設定檔）
+        assert!(Remedy::UseCookies.advice().contains("設定 → 網路"));
+        assert!(!Remedy::UseCookies.advice().contains("--cookies-from-browser"));
+        for r in [
+            Remedy::GetYtdl,
+            Remedy::EnableYtdl,
+            Remedy::UseCookies,
+            Remedy::TryFirefox,
+        ] {
+            assert!(r.in_settings(), "{r:?}");
+        }
+        for r in [Remedy::UpdateYtdl, Remedy::GetDeno] {
+            assert!(!r.in_settings(), "{r:?}");
         }
     }
 

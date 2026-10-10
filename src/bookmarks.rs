@@ -11,7 +11,7 @@
 
 use crate::instance::Wake;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -444,6 +444,8 @@ pub struct Bookmarks {
     files: HashMap<String, FileMarks>,
     /// None = 只放在記憶體（自動測試、`--shot`）
     writer: Option<Writer>,
+    /// 只放在記憶體、不存檔的檔案（`norm` 過的代號）：網址含登入資訊、token 的（[`Self::keep_in_memory`]）
+    in_memory: HashSet<String>,
 }
 
 impl Bookmarks {
@@ -489,7 +491,11 @@ impl Bookmarks {
                 None
             }
         };
-        Self { files, writer }
+        Self {
+            files,
+            writer,
+            in_memory: HashSet::new(),
+        }
     }
 
     /// 寫入執行緒有回覆時叫醒介面（存檔失敗要提示）
@@ -499,6 +505,18 @@ impl Bookmarks {
         {
             *slot = Some(wake);
         }
+    }
+
+    /// 這個檔案的書籤只放在記憶體，不寫進 bookmarks.json（關閉影戲就沒有了）：網址含帳號密碼、token 之類的，
+    /// 跟最近開啟、續播一樣不記到磁碟。之後的新增、改名、刪除都不送去存檔，也不從磁碟讀回（讀回會蓋掉記憶體裡的）。
+    /// 第一次標記時回傳 true
+    pub fn keep_in_memory(&mut self, key: &str) -> bool {
+        self.in_memory.insert(norm(key))
+    }
+
+    /// 這個檔案的書籤只放在記憶體（[`Self::keep_in_memory`]）
+    pub fn is_in_memory(&self, key: &str) -> bool {
+        self.in_memory.contains(&norm(key))
     }
 
     /// 這個檔案的書籤（依時間排序）
@@ -596,6 +614,9 @@ impl Bookmarks {
 
     /// 背景讀回磁碟上這個檔案的書籤（開檔時：同時開著的別的視窗加的書籤也看得到），結果在 [`Self::poll`] 換上
     pub fn refresh(&mut self, key: &str) {
+        if self.is_in_memory(key) {
+            return;
+        }
         if let Some(w) = &mut self.writer {
             w.sent += 1;
             let _ = w.tx.send(Msg::Refresh(w.sent, key.to_owned()));
@@ -603,6 +624,9 @@ impl Bookmarks {
     }
 
     fn send(&mut self, change: Change) {
+        if self.is_in_memory(change.key()) {
+            return;
+        }
         if let Some(w) = &mut self.writer {
             w.sent += 1;
             let _ = w.tx.send(Msg::Change(w.sent, change));
@@ -621,6 +645,10 @@ impl Bookmarks {
             w.pending.extend(reply.synced);
             if reply.seq == w.sent {
                 for (key, f) in w.pending.drain() {
+                    // 只放在記憶體的：標記之前送出的讀回，不能蓋掉記憶體裡的書籤
+                    if self.in_memory.contains(&key) {
+                        continue;
+                    }
                     match f {
                         Some(f) => self.files.insert(key, f),
                         None => self.files.remove(&key),
@@ -884,6 +912,42 @@ mod tests {
         sync(&mut b);
         let disk = Bookmarks::load_from(path.clone());
         assert_eq!(disk.file_count(), 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn marks_kept_in_memory_are_never_written_or_replaced() {
+        // 網址含 token：書籤只放在記憶體（新增、改名、刪除都不送去存檔，讀回也不會蓋掉）
+        let path = temp_file("in-memory");
+        let secret = "https://iptv.example/live/user/pass/1.ts";
+        let mut b = Bookmarks::load_from(path.clone());
+        // 開檔時送出的讀回（標記之前）：回來的「磁碟上沒有」不能把記憶體裡的書籤拿掉
+        b.refresh(secret);
+        assert!(b.keep_in_memory(secret), "第一次標記");
+        assert!(!b.keep_in_memory(secret), "已經標記過");
+        assert!(b.is_in_memory(secret));
+        let m = b.add(secret, 12.0).unwrap();
+        assert!(b.rename(secret, m.id, "進球"));
+        b.add(secret, 30.0).unwrap();
+        // 一般的檔案照常存
+        b.add("movie.mkv", 5.0).unwrap();
+        assert!(sync(&mut b).is_empty());
+        assert_eq!(times(b.marks(secret)), [12.0, 30.0], "讀回之後還在記憶體裡");
+        assert_eq!(b.marks(secret)[0].name, "進球");
+        b.refresh(secret);
+        sync(&mut b);
+        assert_eq!(b.marks(secret).len(), 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("iptv.example"), "含 token 的網址寫進了檔案：{text}");
+        assert!(text.contains("movie.mkv"));
+        let again = Bookmarks::load_from(path.clone());
+        assert!(again.marks(secret).is_empty());
+        assert_eq!(again.marks("movie.mkv").len(), 1);
+        // 刪除也只在記憶體
+        assert!(b.remove(secret, m.id));
+        assert_eq!(b.clear(secret), 1);
+        sync(&mut b);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("iptv.example"));
         cleanup(&path);
     }
 

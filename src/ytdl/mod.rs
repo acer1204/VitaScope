@@ -184,7 +184,7 @@ pub enum ListMode {
     Playlist,
 }
 
-/// 網站影片的偏好（之後放進「設定 → 網路」；現在先用預設值）
+/// 網站影片的偏好（「設定 → 網路」的網站影片部分，`NetSettings::site_prefs`）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SitePrefs {
     pub quality: SiteQuality,

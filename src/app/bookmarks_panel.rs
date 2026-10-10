@@ -24,6 +24,12 @@ const MARKER_HEIGHT: f32 = 5.0;
 /// 書籤分頁每一列左邊留給「▶」（目前的位置）的寬度
 const ROW_GUTTER: f32 = 16.0;
 
+/// 這個檔案的書籤只放在記憶體、不存檔：開的是網址，而書籤的代號含帳號密碼、token 之類的（`net::storable`；
+/// 跟最近開啟、續播一樣不記到磁碟），關閉影戲就沒有了。網站影片的代號是 `ytdl://網站/影片代號`，網址裡的 token 不在代號裡：照常存檔
+pub(super) fn marks_in_memory_only(path: &str, key: &str) -> bool {
+    crate::net::is_network(path) && !crate::net::storable(key)
+}
+
 /// 書籤分頁上正在改名的書籤（Enter、點別的地方 = 改好；Esc = 不改）
 pub(super) struct RenameEdit {
     /// 哪個檔案的書籤（換了檔案就不改了）
@@ -94,7 +100,18 @@ impl VitascopeApp {
             return;
         }
         let t = self.player.position_now().max(0.0);
+        let path = self.player.state.path.clone().unwrap_or_default();
+        let private = marks_in_memory_only(&path, &key);
+        if private {
+            self.bookmarks.keep_in_memory(&key);
+        }
         let msg = match self.bookmarks.add(&key, t) {
+            // 第一次在這種網址上加書籤：說一次書籤不會留下來
+            Ok(_) if private && self.private_marks_told.insert(key.clone()) => crate::tr!(
+                "這個網址含登入資訊，書籤只保留到關閉影戲",
+                "This URL contains sign-in data; its bookmarks are kept until VitaScope closes"
+            )
+            .to_owned(),
             Ok(m) => crate::tf!("新增書籤 {}", "Bookmark added at {}", fmt_time(m.time)),
             Err(AddError::Duplicate(at)) => {
                 crate::tf!("{} 已經有書籤", "There's already a bookmark at {}", fmt_time(at))

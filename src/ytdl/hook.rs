@@ -244,6 +244,23 @@ impl Cache {
             .map(|(_, _, v)| v.clone())
     }
 
+    /// 選單選的格式（換畫質、只播聲音）：網址、播放清單、字幕、Cookie…一樣就好，畫質、編碼的偏好不用一樣
+    /// （那兩個只影響 yt-dlp 自己挑的格式，格式清單本身一樣）。有好幾個時用最新的
+    pub fn get_any_format(&mut self, req: &Request) -> Option<Arc<Resolved>> {
+        self.entries.retain(|(_, at, _)| at.elapsed() < CACHE_AGE);
+        let same = |r: &Request| {
+            let mut r = r.clone();
+            r.quality = req.quality;
+            r.codec = req.codec;
+            r == *req
+        };
+        self.entries
+            .iter()
+            .rev()
+            .find(|(r, _, _)| same(r))
+            .map(|(_, _, v)| v.clone())
+    }
+
     pub fn insert(&mut self, req: Request, resolved: Arc<Resolved>) {
         self.entries.retain(|(r, _, _)| *r != req);
         self.entries.push((req, Instant::now(), resolved));
@@ -359,6 +376,48 @@ mod tests {
         // 同一個要求再放一次：換成新的，不會變成兩個
         c.insert(req("https://h.test/v/9"), resolved());
         assert_eq!(c.len(), CACHE_SIZE);
+    }
+
+    #[test]
+    fn menu_choices_reuse_results_whatever_the_quality_setting() {
+        // 選單選的畫質只用格式清單：預設畫質、編碼改了也用之前的結果（不再執行 yt-dlp）
+        let mut c = Cache::default();
+        let old = req("https://h.test/v/1");
+        c.insert(old.clone(), resolved());
+        let mut changed = old.clone();
+        changed.quality = crate::ytdl::SiteQuality::P720;
+        changed.codec = crate::ytdl::CodecPref::H264;
+        assert!(c.get(&changed).is_none(), "yt-dlp 自己挑的格式跟著設定變：要重新問");
+        assert!(c.get_any_format(&changed).is_some());
+        // 其他不一樣（網址、播放清單、字幕、Cookie）就不算
+        for other in [
+            Request {
+                playlist: true,
+                ..changed.clone()
+            },
+            Request {
+                subs: false,
+                ..changed.clone()
+            },
+            Request {
+                cookies_from: Some(crate::ytdl::Browser::Firefox),
+                ..changed.clone()
+            },
+            req("https://h.test/v/2"),
+        ] {
+            assert!(c.get_any_format(&other).is_none(), "{other:?}");
+        }
+        // 好幾個都符合時用最新的
+        let newer = Arc::new(Resolved {
+            info: crate::ytdl::json::Info {
+                id: Some("newer".into()),
+                ..Default::default()
+            },
+            hints: Vec::new(),
+        });
+        c.insert(changed.clone(), newer);
+        let hit = c.get_any_format(&old).unwrap();
+        assert_eq!(hit.info.id.as_deref(), Some("newer"));
     }
 
     #[test]

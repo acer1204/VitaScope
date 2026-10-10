@@ -10,15 +10,20 @@
 //! - 網路上的播放清單（IPTV 的 .m3u 網址、yt-dlp 解析出來的網站播放清單）：展開成影戲的播放清單，項目照一般的開檔重新開。
 //! - 網站影片（yt-dlp，播放器的 `on_load` hook）：等 yt-dlp 時顯示「正在取得網站影片」，記下網站給的標題，
 //!   續播、書籤用同一部影片的代號；播不了時起始畫面寫出原因、提醒與建議（每次畫的時候才轉成文字，換語言也跟著換）。
-//! - 「設定 → 網路」頁：串流的設定（HLS / DASH 畫質、重新連線、快取、逾時、憑證、記住網址）與進階（標頭、proxy）。
+//! - 「設定 → 網路」頁：網站影片（yt-dlp：找到的版本、指定檔案、預設畫質、編碼、字幕、Cookie、播放清單）、
+//!   串流的設定（HLS / DASH 畫質、重新連線、快取、逾時、憑證、記住網址）與進階（標頭、proxy）。
+//! - 「網站影片 ▸」選單：換畫質（重開時保留暫停、字幕延遲、A-B、字幕、畫面的調整）、預設畫質、只播聲音、
+//!   載入整個播放清單、複製網址、在瀏覽器開啟。
 
 use super::control_panel::adjust_locked_hover;
 use super::{VitascopeApp, is_fullscreen, recent_label};
 use crate::history::History;
 use crate::net::{self, HlsBitrate, NetSettings};
+use crate::player::TrackKind;
 use crate::playlist::Playlist;
 use crate::theme::{self, Palette};
-use crate::ytdl::plan::NetInfo;
+use crate::ytdl::plan::{Choice, NetInfo, QualityChoice};
+use crate::ytdl::{Browser, CodecPref, ListMode, SiteQuality};
 use crate::{tf, tr};
 use eframe::egui::{self, Align, Color32, Frame, Id, Key, Layout, Rect, ViewportCommand};
 use std::path::{Path, PathBuf};
@@ -76,10 +81,12 @@ impl VitascopeApp {
         self.site_config();
     }
 
-    /// 網站影片（yt-dlp）用的網路設定（proxy、逾時、憑證…）：下一次解析就用
+    /// 網站影片（yt-dlp）用的設定（畫質、編碼、字幕、Cookie、播放清單，以及 proxy、逾時、憑證…）：下一次解析就用。
+    /// 指定的 yt-dlp 改了就重新找
     fn site_config(&mut self) {
-        self.player
-            .set_net_config(&self.settings.net, &crate::ytdl::SitePrefs::default());
+        let net = &self.settings.net;
+        self.player.set_net_config(net, &net.site_prefs());
+        self.ytdl.set_user_path(net.ytdl_path.clone());
     }
 
     /// 設定改了之後：非同步送出有變的選項（播放中改不會卡住介面；正在播的串流到下一次連線才用新的值），
@@ -489,7 +496,8 @@ impl VitascopeApp {
     // ───────────── 載入中、緩衝中、直播 ─────────────
 
     /// 網路串流載入完成：記下是不是直播（`net::is_live`），能跳轉的影片從上次的位置繼續
-    pub(super) fn net_file_loaded(&mut self, url: &str) {
+    /// `reloaded` = 網站影片換畫質重開的：接著原本的位置播，不續播
+    pub(super) fn net_file_loaded(&mut self, url: &str, reloaded: bool) {
         // 直接問 mpv（總長度、能不能跳轉的通知可能還沒到）
         let duration = self
             .player
@@ -509,7 +517,7 @@ impl VitascopeApp {
             return;
         }
         // 網站影片從指定的位置開始（換畫質時接著播、網址的 &t=90）：不跳到上次的位置
-        if site.as_ref().is_some_and(|s| s.start_at.is_some()) {
+        if reloaded || site.as_ref().is_some_and(|s| s.start_at.is_some()) {
             return;
         }
         let Some(key) = history_key(url, site.as_deref()) else {
@@ -765,7 +773,8 @@ impl VitascopeApp {
         });
     }
 
-    /// 「設定 → 網路」頁：串流（HLS / DASH 畫質、快取、逾時、重新連線、憑證、記住網址），進階（User-Agent、Referer、標頭、proxy）。
+    /// 「設定 → 網路」頁：串流（HLS / DASH 畫質、快取、逾時、重新連線、憑證、記住網址），
+    /// 進階（User-Agent、Referer、標頭、proxy），網站影片（yt-dlp）。
     /// 改了馬上套用、存檔（逾時拖曳時先套用，放開才存檔；文字離開欄位才套用）。VITASCOPE_MPV_OPTS 指定的選項停用
     pub(super) fn network_page(&mut self, ui: &mut egui::Ui) {
         let locked = |app: &Self, names: &[&str]| names.iter().any(|n| app.player.user_overrides().contains(*n));
@@ -903,6 +912,9 @@ impl VitascopeApp {
             .id_salt("settings_net_advanced")
             .default_open(false)
             .show(ui, |ui| self.network_advanced(ui));
+        ui.add_space(8.0);
+        ui.separator();
+        self.ytdl_section(ui);
     }
 
     /// 改網路設定：整理過再套用（只送有變的），`save` 時存檔
@@ -1023,5 +1035,634 @@ impl VitascopeApp {
         if commit {
             self.commit_net_draft();
         }
+    }
+}
+
+// ───────────── 網站影片：換畫質、「網站影片 ▸」選單、「設定 → 網路」的 yt-dlp ─────────────
+
+/// 一條字幕軌：語言、標題一樣就是同一條（重開之後軌道編號可能不一樣）
+#[derive(Debug, Clone, PartialEq)]
+struct TrackLabel {
+    lang: Option<String>,
+    title: Option<String>,
+}
+
+impl TrackLabel {
+    fn of(t: &crate::player::Track) -> Self {
+        Self {
+            lang: t.lang.clone(),
+            title: t.title.clone(),
+        }
+    }
+}
+
+/// 網站影片換畫質（用別的格式重開）時保留的狀態，跟 PotPlayer 一樣：暫停、字幕（主字幕、第二字幕）、畫面的調整。
+/// 暫停、字幕延遲、A-B 重播 mpv 換檔時本來就沿用，重開後馬上設回去（`reload_site`）；這裡的在載入完成時還原
+/// （`restore_reload`）。換畫質不從上次的位置續播（接著現在的位置播），也沒有「下一個」的提示
+pub(super) struct ReloadKeep {
+    /// 重開的網址（網頁）
+    url: String,
+    /// 字幕關著
+    sub_off: bool,
+    /// 選的主字幕、第二字幕（None = 沒有選，或認不出是哪一條：照一般的規則）
+    sub: Option<TrackLabel>,
+    secondary: Option<TrackLabel>,
+    geometry: crate::geometry::Geometry,
+    /// 載入完成時再提示一次（不被 yt-dlp 的提醒蓋掉）
+    osd: String,
+}
+
+impl ReloadKeep {
+    /// 重開的是這個網址
+    pub(super) fn is_for(&self, url: &str) -> bool {
+        self.url == url
+    }
+}
+
+/// 「網站影片 ▸」選單選的
+pub(super) enum SiteOp {
+    /// 這部影片換成這個畫質（只對這次有效）；選單上的文字
+    Reload(Choice, String),
+    /// 預設畫質（存檔）
+    DefaultQuality(SiteQuality),
+    /// 只播聲音：開 / 關
+    AudioOnly(bool),
+    /// 載入整個播放清單
+    WholePlaylist,
+    CopyUrl,
+    OpenInBrowser,
+}
+
+/// 自己安裝的 yt-dlp 多久沒更新就提醒（天）。影戲下載的照 `locate::STALE_DAYS`（之後可以在影戲裡更新）
+const USER_STALE_DAYS: i64 = 60;
+
+impl VitascopeApp {
+    /// 「網站影片 ▸」：只在播 yt-dlp 解析出來的網站影片時出現（放在「音效」後面）
+    pub(super) fn site_menu(&mut self, ui: &mut egui::Ui) -> Option<SiteOp> {
+        let st = &self.player.state;
+        let info = st
+            .net
+            .clone()
+            .filter(|n| st.loaded && st.path.as_deref() == Some(n.page_url.as_str()))?;
+        let default = self.settings.net.quality;
+        let list_mode = self.settings.net.list_mode;
+        let mut op = None;
+        ui.menu_button(tr!("網站影片", "Website video"), |ui| {
+            let videos: Vec<&QualityChoice> = info
+                .choices
+                .iter()
+                .filter(|c| matches!(c, QualityChoice::Video { .. }))
+                .collect();
+            ui.add_enabled_ui(!videos.is_empty(), |ui| {
+                ui.menu_button(tr!("選擇畫質", "Choose quality"), |ui| {
+                    let auto = tf!("自動（{}）", "Automatic ({})", default.label());
+                    let is_auto = info.choice == Choice::Default && !info.audio_only;
+                    if ui.radio(is_auto, auto.as_str()).clicked() && !is_auto {
+                        op = Some(SiteOp::Reload(Choice::Default, auto.clone()));
+                    }
+                    for c in &videos {
+                        let on = info.choice != Choice::Default && c.is_chosen(&info.chosen);
+                        let label = c.label();
+                        if ui.radio(on, label.as_str()).clicked() && !on {
+                            op = Some(SiteOp::Reload(c.choice(), label));
+                        }
+                    }
+                });
+            });
+            ui.menu_button(tr!("預設畫質", "Default quality"), |ui| {
+                for q in SiteQuality::ALL {
+                    if ui.radio(default == q, q.label()).clicked() && default != q {
+                        op = Some(SiteOp::DefaultQuality(q));
+                    }
+                }
+                ui.separator();
+                ui.weak(tr!(
+                    "之後開的網站影片都用這個畫質（正在播「自動」的這部也會換）",
+                    "Used for website videos you open from now on (and for this one while it plays Automatic)"
+                ));
+            });
+            let has_audio = info.audio_only
+                || info
+                    .choices
+                    .iter()
+                    .any(|c| matches!(c, QualityChoice::AudioOnly { .. }));
+            let mut audio = info.audio_only;
+            if ui
+                .add_enabled(
+                    has_audio,
+                    egui::Checkbox::new(&mut audio, tr!("只播聲音", "Audio only")),
+                )
+                .on_hover_text(tr!(
+                    "只讀聲音（省流量）；只對這部影片有效",
+                    "Fetch only the audio (uses less data); for this video only"
+                ))
+                .changed()
+            {
+                op = Some(SiteOp::AudioOnly(audio));
+            }
+            if info.list_in_url
+                && list_mode == ListMode::Video
+                && ui
+                    .button(tr!("載入整個播放清單", "Load the whole playlist"))
+                    .on_hover_text(tr!(
+                        "這個網址也是播放清單：把整個清單放進播放清單",
+                        "This URL is also a playlist: load all of it into the playlist"
+                    ))
+                    .clicked()
+            {
+                op = Some(SiteOp::WholePlaylist);
+            }
+            ui.separator();
+            if ui
+                .button(tr!("複製網址", "Copy URL"))
+                .on_hover_text(info.page_url.as_str())
+                .clicked()
+            {
+                op = Some(SiteOp::CopyUrl);
+            }
+            if ui.button(tr!("在瀏覽器開啟", "Open in browser")).clicked() {
+                op = Some(SiteOp::OpenInBrowser);
+            }
+        });
+        op
+    }
+
+    /// 做「網站影片 ▸」選單選的事
+    pub(super) fn site_menu_op(&mut self, ctx: &egui::Context, op: SiteOp) {
+        let Some(info) = self.player.state.net.clone() else {
+            return;
+        };
+        match op {
+            SiteOp::Reload(choice, label) => {
+                let osd = tf!("畫質：{label}", "Quality: {label}");
+                self.reload_site(choice, false, osd);
+            }
+            SiteOp::DefaultQuality(q) => {
+                self.change_net(|n| n.quality = q);
+                let osd = tf!("預設畫質：{}", "Default quality: {}", q.label());
+                // 正在播「自動」：照新的預設畫質換（從之前的格式清單挑，不用再問 yt-dlp）；
+                // 自己選了畫質的這部影片不動，之後開的影片才用
+                let target = (info.choice == Choice::Default)
+                    .then(|| crate::ytdl::plan::choice_for(&info.choices, q))
+                    .flatten();
+                let playing_it = |c: &Choice| match c {
+                    Choice::AudioOnly => info.audio_only,
+                    Choice::Format { video, .. } => {
+                        !info.audio_only && info.chosen.iter().any(|f| f.format_id.as_deref() == Some(video))
+                    }
+                    Choice::Default => true,
+                };
+                match target {
+                    Some(c) if !playing_it(&c) => self.reload_site(c, true, osd),
+                    _ => self.osd(osd),
+                }
+            }
+            SiteOp::AudioOnly(on) => {
+                let choice = if on {
+                    Choice::AudioOnly
+                } else if self.settings.net.quality == SiteQuality::AudioOnly {
+                    // 預設就是只播聲音：「自動」也只有聲音，改播最高的畫質
+                    crate::ytdl::plan::choice_for(&info.choices, SiteQuality::Best).unwrap_or_default()
+                } else {
+                    Choice::Default
+                };
+                let osd = if on {
+                    tr!("只播聲音：開啟", "Audio only: on")
+                } else {
+                    tr!("只播聲音：關閉", "Audio only: off")
+                };
+                self.reload_site(choice, false, osd.to_owned());
+            }
+            SiteOp::WholePlaylist => {
+                let mode = crate::ytdl::plan::Mode {
+                    yes_playlist: true,
+                    ..Default::default()
+                };
+                let index = self.playlist.as_ref().and_then(|l| l.current_index());
+                self.open_at_mode(Path::new(&info.page_url), index, Some(mode));
+            }
+            SiteOp::CopyUrl => {
+                ctx.copy_text(info.page_url.clone());
+                self.osd(tr!("已複製網址", "URL copied"));
+            }
+            SiteOp::OpenInBrowser => {
+                // 網頁的網址一定是 http / https（yt-dlp 只解析這兩種）
+                if crate::ytdl::site_url(&info.page_url).is_some() {
+                    ctx.open_url(egui::OpenUrl::new_tab(info.page_url.clone()));
+                }
+            }
+        }
+    }
+
+    /// 用別的格式重開目前的網站影片，接著現在的位置播（20 分鐘內解析過的格式清單直接用，不再執行 yt-dlp）。
+    /// 暫停、字幕延遲、A-B 重播、字幕、畫面的調整都保留；不續播、不調整視窗大小。
+    /// `follows_default`：「自動」照預設畫質挑的格式（選單上還是「自動」）
+    pub(super) fn reload_site(&mut self, choice: Choice, follows_default: bool, osd: String) {
+        let Some((url, mut mode)) = self.player.reload_mode(choice) else {
+            return;
+        };
+        mode.follows_default = follows_default;
+        // 直接問 mpv（介面記下的狀態可能還沒更新）
+        let p = &self.player;
+        let paused = p.get_string("pause").map_or(p.state.paused, |v| v == "yes");
+        let sub_delay = p.get_f64("sub-delay").unwrap_or(p.state.sub_delay);
+        let ab = p.ab_loop_points();
+        let track = |prop: &str| {
+            let id: i64 = p.get_string(prop).ok()?.parse().ok()?;
+            p.state
+                .tracks_of(TrackKind::Sub)
+                .find(|t| t.id == id)
+                .map(TrackLabel::of)
+        };
+        let keep = ReloadKeep {
+            url: url.clone(),
+            sub_off: p.get_string("sid").is_ok_and(|v| v == "no"),
+            sub: track("sid"),
+            secondary: track("secondary-sid"),
+            geometry: self.geometry.clone(),
+            osd: osd.clone(),
+        };
+        let index = self.playlist.as_ref().and_then(|l| l.current_index());
+        // 畫質不同、影片的形狀一樣：視窗大小不變
+        self.skip_next_fit = true;
+        self.open_at_mode(Path::new(&url), index, Some(mode));
+        if !self.switching_file {
+            // 沒有換檔（開不了）：下一個檔案照常調整視窗
+            self.skip_next_fit = false;
+            return;
+        }
+        // 這兩個 mpv 換檔時本來就沿用（`open_at` 為了新檔案清掉了）：馬上設回去
+        let _ = self.player.set_sub_delay(sub_delay);
+        let _ = self.player.set_ab_loop(ab[0], ab[1]);
+        // 新的檔案一開始就暫停（停在接著播的那一格）
+        if paused {
+            let _ = self.player.set_pause(true);
+        }
+        self.reload_keep = Some(keep);
+        self.osd(osd);
+    }
+
+    /// 換畫質重開的影片載入完成：還原字幕、畫面的調整。暫停在重開時就設好了（mpv 換檔時沿用）；
+    /// 這裡不再設一次：載入中使用者按了播放的話照使用者的
+    pub(super) fn restore_reload(&mut self, keep: ReloadKeep) {
+        let find = |label: &Option<TrackLabel>| {
+            let label = label.as_ref()?;
+            self.player
+                .state
+                .tracks_of(TrackKind::Sub)
+                .find(|t| TrackLabel::of(t) == *label)
+                .map(|t| t.id)
+        };
+        let (sub, secondary) = (find(&keep.sub), find(&keep.secondary));
+        // 字幕關著就關著；選的那一條還在就選它（不在了照一般的規則選）
+        if keep.sub_off {
+            let _ = self.switch_track(TrackKind::Sub, None);
+        } else if let Some(id) = sub {
+            let _ = self.switch_track(TrackKind::Sub, Some(id));
+        }
+        if let Some(id) = secondary.filter(|id| Some(*id) != sub) {
+            let _ = self.player.set_secondary_sub(Some(id));
+        }
+        // 畫面的調整：mpv 換檔時還原了（reset-on-next-file），照記下的再設一次。
+        // 長寬比、裁切、旋轉要知道影片原本的形狀：還不知道時等畫面設定好（VideoReconfig）才套用
+        let g = keep.geometry;
+        if !g.is_default() {
+            self.geometry = g;
+            // 不是使用者剛改的：畫面設定好時照樣套用，但視窗不跟著調整（換畫質不動視窗）
+            self.shape_restored = true;
+            let _ = self
+                .player
+                .mpv()
+                .set_property("panscan", if self.geometry.fill { 1.0 } else { 0.0 });
+            self.apply_zoom_and_pan();
+            for (horizontal, on) in [(true, self.geometry.hflip), (false, self.geometry.vflip)] {
+                if on {
+                    self.apply_flip(horizontal);
+                }
+            }
+            self.sync_shape(false);
+        }
+        self.osd(keep.osd);
+    }
+
+    // ───────────── 起始畫面 ─────────────
+
+    /// 起始畫面上網站影片播不了時，要不要放「網路設定…」按鈕
+    /// （沒有 yt-dlp（影片網站，或要 yt-dlp 才能播的其他網頁）、關掉了 yt-dlp、Cookie 的問題：都在「設定 → 網路」處理）
+    pub(super) fn site_failure_wants_settings(&self) -> bool {
+        let st = &self.player.state;
+        st.net_need_ytdl
+            || st.net_page_needs_ytdl
+            || st
+                .net_failure
+                .as_ref()
+                .and_then(|f| f.remedy())
+                .is_some_and(|r| r.in_settings())
+    }
+
+    /// 打開「設定 → 網路」
+    pub(super) fn show_network_settings(&mut self) {
+        self.settings_page = super::settings_window::Page::Network;
+        self.settings_open = true;
+    }
+
+    // ───────────── 設定 → 網路：網站影片（yt-dlp） ─────────────
+
+    /// 「選擇檔案…」選好的 yt-dlp：只看路徑（Windows 要 .exe；不碰檔案，網路磁碟不會卡住畫面），
+    /// 檔案在不在、能不能執行由背景的尋找確認，設定頁說明結果
+    pub(super) fn set_ytdl_path(&mut self, path: PathBuf) {
+        match crate::ytdl::locate::check_user_path(&path, crate::paths::Os::current()) {
+            Ok(()) => {
+                self.ytdl_path_problem = None;
+                self.change_net(|n| n.ytdl_path = Some(path));
+            }
+            Err(problem) => {
+                self.ytdl_path_problem = Some(problem);
+                self.osd(problem.message());
+            }
+        }
+    }
+
+    /// 「選擇檔案…」：選 yt-dlp 的執行檔
+    fn choose_ytdl_path(&mut self) {
+        let mut dialog = self.file_dialog().set_title(tr!("選擇 yt-dlp", "Choose yt-dlp"));
+        if cfg!(windows) {
+            dialog = dialog.add_filter("yt-dlp", &["exe"]);
+        }
+        if let Some(dir) = self.settings.net.ytdl_path.as_deref().and_then(Path::parent) {
+            dialog = dialog.set_directory(dir);
+        }
+        self.show_dialog(super::DialogKind::YtdlPath, super::Pick::File, dialog);
+    }
+
+    /// 「設定 → 網路」的網站影片（yt-dlp；在串流、進階的下面）：找到的 yt-dlp、deno，指定檔案，預設畫質、編碼、Cookie、字幕、播放清單。
+    /// 改了馬上套用（下一次解析就用）、存檔
+    pub(super) fn ytdl_section(&mut self, ui: &mut egui::Ui) {
+        let mut n = self.settings.net.clone();
+        let problem = Palette::of(ui.visuals()).problem;
+        ui.strong(tr!("網站影片（yt-dlp）", "Website videos (yt-dlp)"));
+        ui.checkbox(
+            &mut n.ytdl,
+            tr!("用 yt-dlp 播放網站影片", "Play website videos with yt-dlp"),
+        )
+        .on_hover_text(tr!(
+            "YouTube、Bilibili 之類的網址請 yt-dlp 找出影片的實際網址（只讀取影片的資料，不把影片存到電腦）",
+            "Ask yt-dlp for the video behind YouTube, Bilibili and similar pages \
+             (it only looks up the video; nothing is saved to your computer)"
+        ));
+        // 第一次打開這頁時才在背景找（不等）；重新找的時候顯示「搜尋中…」
+        let tools = self.ytdl.get();
+        let searching = self.ytdl.searching();
+        if searching {
+            ui.label(tr!("yt-dlp：搜尋中…", "yt-dlp: searching…"));
+            // 找完時尋找的執行緒會叫醒介面；這裡只是保險
+            ui.ctx().request_repaint_after(Duration::from_millis(250));
+        } else if let Some(t) = &tools {
+            self.ytdl_status(ui, t, problem);
+        }
+        let (mut choose, mut clear, mut again) = (false, false, false);
+        ui.horizontal(|ui| {
+            choose = ui
+                .button(tr!("選擇檔案…", "Choose file…"))
+                .on_hover_text(tr!(
+                    "使用指定的 yt-dlp（不用自動找到的）",
+                    "Use this yt-dlp instead of the one found automatically"
+                ))
+                .clicked();
+            if let Some(p) = &n.ytdl_path {
+                clear = ui
+                    .button(tr!("改用自動找到的", "Find automatically"))
+                    .on_hover_text(p.display().to_string())
+                    .clicked();
+            }
+            again = ui
+                .add_enabled(!searching, egui::Button::new(tr!("重新尋找", "Search again")))
+                .on_hover_text(tr!(
+                    "剛安裝或更新了 yt-dlp、deno 的時候",
+                    "After installing or updating yt-dlp or deno"
+                ))
+                .clicked();
+        });
+        if let Some(p) = self.ytdl_path_problem {
+            ui.colored_label(problem, p.message());
+        }
+        ui.add_space(4.0);
+        ui.add_enabled_ui(n.ytdl, |ui| {
+            egui::Grid::new("settings_net_ytdl")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    let name = ui.label(tr!("預設畫質", "Default quality"));
+                    egui::ComboBox::from_id_salt("settings_net_quality")
+                        .selected_text(n.quality.label())
+                        .show_ui(ui, |ui| {
+                            for q in SiteQuality::ALL {
+                                ui.selectable_value(&mut n.quality, q, q.label());
+                            }
+                        })
+                        .response
+                        .labelled_by(name.id)
+                        .on_hover_text(tr!(
+                            "網站影片一開始播的畫質（播放中可以在右鍵選單「網站影片」換）",
+                            "The quality website videos start with (change it while playing from the \
+                             \"Website video\" menu)"
+                        ));
+                    ui.end_row();
+
+                    let name = ui.label(tr!("影像編碼", "Video codec"));
+                    egui::ComboBox::from_id_salt("settings_net_codec")
+                        .selected_text(codec_label(n.codec))
+                        .show_ui(ui, |ui| {
+                            for c in CodecPref::ALL {
+                                ui.selectable_value(&mut n.codec, c, codec_label(c));
+                            }
+                        })
+                        .response
+                        .labelled_by(name.id)
+                        .on_hover_text(tr!(
+                            "同樣的畫質有好幾種編碼時優先用哪一種。舊電腦、顯示卡不能硬體解碼 AV1、VP9 時選 H.264\
+                             （YouTube 的 H.264 最高 1080p）",
+                            "Which codec to prefer when a quality comes in several. Choose H.264 on older computers \
+                             whose graphics can't decode AV1 or VP9 (YouTube offers H.264 up to 1080p)"
+                        ));
+                    ui.end_row();
+
+                    let name = ui.label(tr!("瀏覽器的 Cookie", "Browser cookies"));
+                    let none = tr!("不使用", "Don't use");
+                    egui::ComboBox::from_id_salt("settings_net_cookies")
+                        .selected_text(n.cookies_from.map_or(none, Browser::label))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut n.cookies_from, None, none);
+                            for b in Browser::ALL {
+                                // Safari 只有 macOS 有
+                                if b == Browser::Safari && !cfg!(target_os = "macos") {
+                                    continue;
+                                }
+                                ui.selectable_value(&mut n.cookies_from, Some(b), b.label());
+                            }
+                        })
+                        .response
+                        .labelled_by(name.id)
+                        .on_hover_text(tr!(
+                            "要登入才能看的影片、年齡限制、網站要求確認「不是機器人」時，讓 yt-dlp 讀這個瀏覽器登入的 Cookie。\
+                             Windows 上的 Chrome、Edge 開著時常常讀不到（瀏覽器加密），建議用 Firefox",
+                            "For videos that need a login, age-restricted videos, or when the site asks you to \
+                             confirm you're not a bot: yt-dlp reads this browser's cookies. Chrome and Edge on \
+                             Windows often can't be read while open (the browser encrypts them); Firefox is recommended"
+                        ));
+                    ui.end_row();
+                });
+            ui.add_space(4.0);
+            ui.checkbox(&mut n.site_subs, tr!("載入網站的字幕", "Load the site's subtitles"))
+                .on_hover_text(tr!(
+                    "中文、英文、日文的字幕，選到才下載",
+                    "Chinese, English and Japanese subtitles, downloaded only when selected"
+                ));
+            ui.add_enabled_ui(n.site_subs, |ui| {
+                ui.checkbox(
+                    &mut n.auto_subs,
+                    tr!("也載入自動產生的字幕", "Also load auto-generated subtitles"),
+                );
+            });
+            ui.label(tr!(
+                "網址同時是影片和播放清單時：",
+                "When a URL is both a video and a playlist:"
+            ));
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut n.list_mode,
+                    ListMode::Video,
+                    tr!("只播這部影片", "Play just the video"),
+                );
+                ui.radio_value(
+                    &mut n.list_mode,
+                    ListMode::Playlist,
+                    tr!("整個播放清單", "The whole playlist"),
+                );
+            });
+        });
+        if n != self.settings.net {
+            self.change_net_now(n, true);
+        }
+        if choose {
+            self.choose_ytdl_path();
+        }
+        if clear {
+            self.ytdl_path_problem = None;
+            self.change_net(|n| n.ytdl_path = None);
+        }
+        if again {
+            self.ytdl.refresh();
+            self.ytdl.get();
+        }
+    }
+
+    /// 找到的 yt-dlp、deno（`t` = 背景尋找的結果）
+    fn ytdl_status(&self, ui: &mut egui::Ui, t: &crate::ytdl::Tools, problem: Color32) {
+        use crate::ytdl::{Remedy, Source};
+        let wanted = self.settings.net.ytdl_path.is_some();
+        match &t.ytdl {
+            Some(y) => {
+                let from = match y.source {
+                    Source::UserPath => tr!("指定的檔案", "the file you chose"),
+                    Source::Managed => tr!("影戲下載的", "downloaded by VitaScope"),
+                    Source::NextToApp => tr!("影戲的資料夾裡的", "in VitaScope's folder"),
+                    Source::System => tr!("另外安裝的", "installed separately"),
+                };
+                let path = y.program.display().to_string();
+                match (&t.ytdl_version, &t.ytdl_error) {
+                    (Some(v), _) => {
+                        ui.label(tf!("yt-dlp {v}（{from}）", "yt-dlp {v} ({from})"))
+                            .on_hover_text(path);
+                    }
+                    (None, Some(e)) => {
+                        ui.colored_label(
+                            problem,
+                            tf!(
+                                "yt-dlp 無法執行：{}（{from}）",
+                                "yt-dlp can't run: {} ({from})",
+                                e.reason()
+                            ),
+                        )
+                        .on_hover_text(path);
+                    }
+                    (None, None) => {
+                        ui.label(tf!("yt-dlp（{from}）", "yt-dlp ({from})")).on_hover_text(path);
+                    }
+                }
+                if wanted && y.source != Source::UserPath {
+                    ui.colored_label(
+                        problem,
+                        tr!(
+                            "指定的檔案不存在或不能執行，改用自動找到的",
+                            "The file you chose is missing or can't run; using the one found automatically"
+                        ),
+                    );
+                }
+                if let Some(v) = t.ytdl_version {
+                    let now = std::time::SystemTime::now();
+                    let days = v.age_days(now);
+                    if y.managed() && v.is_stale(now) {
+                        ui.weak(Remedy::UpdateYtdl.advice());
+                    } else if !y.managed() && days > USER_STALE_DAYS {
+                        ui.weak(tf!(
+                            "這個 yt-dlp 已經 {days} 天沒更新，網站改版後可能播不了；請用安裝它的方式更新",
+                            "This yt-dlp is {days} days old and may stop working when sites change; \
+                             update it the way you installed it"
+                        ));
+                    }
+                }
+            }
+            None => {
+                let line = if wanted {
+                    tr!(
+                        "找不到 yt-dlp（指定的檔案不存在或不能執行）",
+                        "yt-dlp not found (the file you chose is missing or can't run)"
+                    )
+                } else {
+                    tr!("找不到 yt-dlp", "yt-dlp not found")
+                };
+                ui.colored_label(problem, line);
+                ui.weak(Remedy::GetYtdl.advice());
+            }
+        }
+        match (&t.deno, &t.deno_too_old) {
+            (Some(d), _) => {
+                ui.label(tf!(
+                    "JavaScript 執行環境（YouTube 需要）：deno {}",
+                    "JavaScript runtime (needed for YouTube): deno {}",
+                    d.version
+                ))
+                .on_hover_text(d.path.display().to_string());
+            }
+            (None, Some((path, v))) => {
+                ui.colored_label(
+                    problem,
+                    tf!(
+                        "deno {v} 太舊（要 2.3 以上），YouTube 只有部分畫質",
+                        "deno {v} is too old (2.3 or newer is needed); YouTube offers only some qualities"
+                    ),
+                )
+                .on_hover_text(path.display().to_string());
+                ui.weak(Remedy::GetDeno.advice());
+            }
+            (None, None) => {
+                ui.label(tr!(
+                    "沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質",
+                    "No deno (JavaScript runtime): YouTube offers only some qualities"
+                ));
+                ui.weak(Remedy::GetDeno.advice());
+            }
+        }
+    }
+}
+
+/// 影像編碼選項的文字（設定頁）
+fn codec_label(c: CodecPref) -> &'static str {
+    match c {
+        CodecPref::Auto => tr!("自動", "Automatic"),
+        CodecPref::H264 => tr!("H.264 優先（相容性最好）", "Prefer H.264 (most compatible)"),
+        CodecPref::Av1 => tr!("AV1 優先", "Prefer AV1"),
+        CodecPref::Vp9 => tr!("VP9 優先", "Prefer VP9"),
     }
 }

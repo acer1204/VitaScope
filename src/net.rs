@@ -7,17 +7,35 @@
 //! 從檔案（本機的 .m3u）、網路上的播放清單、網站影片的資料讀到的網址，只開網路串流，
 //! 不開 `edl://`、`av://` 這類能讀本機檔案或執行濾鏡的特殊網址（mpv 只依「誰開的」限制，我們自己開的它都接受）。
 
+use crate::ytdl::{Browser, CodecPref, ListMode, SitePrefs, SiteQuality};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// 網路快取的選項（MB）：demuxer-max-bytes；往回的快取（demuxer-max-back-bytes）是它的三分之一
 pub const CACHE_SIZES: [u32; 4] = [64, 150, 400, 1000];
 /// 連線逾時（秒）的範圍
 pub const TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 5..=120;
 
-/// 網路：開啟網址（串流的部分；網站影片 yt-dlp 的設定之後加在這裡）
+/// 網路：開啟網址（HTTP、HLS、DASH 的串流）與網站影片（yt-dlp）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NetSettings {
+    /// 用 yt-dlp 播放網站影片（關掉時影片網站的網址說明要打開，其他網頁照一般的網址開）
+    pub ytdl: bool,
+    /// 使用者指定的 yt-dlp；None = 自動尋找（影戲下載的 → 影戲旁邊 → PATH → 常見位置）
+    pub ytdl_path: Option<PathBuf>,
+    /// 網站影片的預設畫質
+    pub quality: SiteQuality,
+    /// 優先的影像編碼
+    pub codec: CodecPref,
+    /// 載入網站提供的字幕
+    pub site_subs: bool,
+    /// 也載入網站自動產生的字幕
+    pub auto_subs: bool,
+    /// 從哪個瀏覽器讀 Cookie（要登入才能看的影片）；None = 不使用
+    pub cookies_from: Option<Browser>,
+    /// 網址同時是影片和播放清單時播哪個
+    pub list_mode: ListMode,
     /// HLS / DASH 一開始選哪個畫質（mpv 的 hls-bitrate）
     pub hls_bitrate: HlsBitrate,
     /// 連線中斷時自動重新連線
@@ -43,6 +61,14 @@ pub struct NetSettings {
 impl Default for NetSettings {
     fn default() -> Self {
         Self {
+            ytdl: true,
+            ytdl_path: None,
+            quality: SiteQuality::Best,
+            codec: CodecPref::Auto,
+            site_subs: true,
+            auto_subs: false,
+            cookies_from: None,
+            list_mode: ListMode::Video,
             hls_bitrate: HlsBitrate::Max,
             reconnect: true,
             cache_mb: 150,
@@ -97,7 +123,23 @@ impl NetSettings {
             *text = clean_line(text).unwrap_or_default();
         }
         self.headers = self.headers.iter().filter_map(|h| clean_header(h)).collect();
+        // 空白的路徑 = 自動尋找
+        if self.ytdl_path.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+            self.ytdl_path = None;
+        }
         self
+    }
+
+    /// 網站影片的偏好（交給 yt-dlp 的部分）
+    pub fn site_prefs(&self) -> SitePrefs {
+        SitePrefs {
+            quality: self.quality,
+            codec: self.codec,
+            site_subs: self.site_subs,
+            auto_subs: self.auto_subs,
+            cookies_from: self.cookies_from,
+            list_mode: self.list_mode,
+        }
     }
 }
 

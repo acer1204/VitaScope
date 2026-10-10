@@ -1,4 +1,4 @@
-//! 檔案對話框（開檔、載入字幕／音軌、播放清單、截圖資料夾、像素著色器）。
+//! 檔案對話框（開檔、載入字幕／音軌、播放清單、截圖資料夾、像素著色器、yt-dlp 的執行檔）。
 //!
 //! 以前在介面的執行緒上直接開（同步），對話框開著時 eframe 整個停住：mpv 照樣播聲音，影像卻停在那裡。
 //! 現在 Windows、Linux 在背景執行緒開（擁有者照樣是主視窗：Windows 上主視窗按不到，跟以前一樣），
@@ -36,6 +36,8 @@ pub enum DialogKind {
     ShaderFiles(u32),
     /// 擷取畫面「另存新檔…」：只在介面的執行緒上開（開著時暫停，見 `capture.rs`）
     ScreenshotSaveAs,
+    /// 「設定 → 網路」選擇 yt-dlp 的執行檔
+    YtdlPath,
 }
 
 impl DialogKind {
@@ -201,6 +203,7 @@ impl VitascopeApp {
                 self.add_shader_files(preset, &paths);
             }
             DialogKind::ScreenshotSaveAs => self.save_screenshot_as(first),
+            DialogKind::YtdlPath => self.set_ytdl_path(first),
         }
     }
 
