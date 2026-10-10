@@ -563,6 +563,8 @@ struct LocState {
     running: bool,
     /// 找到的結果與當時的 `generation`
     done: Option<(u64, Arc<Tools>)>,
+    /// `done` 是什麼時候找完的
+    found_at: Option<std::time::Instant>,
 }
 
 impl Locator {
@@ -638,6 +640,13 @@ impl Locator {
         self.lock().running
     }
 
+    /// 目前的結果找完多久了（還沒找完、要重新找時 None）
+    pub fn age(&self) -> Option<Duration> {
+        let s = self.lock();
+        let current = s.done.as_ref().is_some_and(|(g, _)| *g == s.generation);
+        s.found_at.filter(|_| current).map(|t| t.elapsed())
+    }
+
     /// 等找完目前要的結果（背景執行緒用；介面執行緒不要用）：不回傳設定改之前的舊結果。超過 `timeout` 時 None
     pub fn wait(&self, timeout: Duration) -> Option<Arc<Tools>> {
         let until = std::time::Instant::now() + timeout;
@@ -691,6 +700,7 @@ impl Locator {
             let tools = Arc::new((self.shared.finder)(&env));
             let mut s = self.lock();
             s.done = Some((generation, tools));
+            s.found_at = Some(std::time::Instant::now());
             if s.generation == generation {
                 s.running = false;
                 drop(s);

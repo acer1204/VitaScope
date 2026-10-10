@@ -12,10 +12,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use support::fake_ytdl::{
+    FakeResolver, SITE_COOKIE, SITE_REFERER, SITE_TITLE_TEXT, SITE_UA, site_playlist_json, site_video_json,
+};
 use support::http::Server;
 use vitascope::mpv::{EndReason, Event, Mpv, Node};
 use vitascope::net::{self, HlsBitrate, NetSettings};
 use vitascope::player::{Options, Player, PlayerEvent, TrackKind};
+use vitascope::ytdl::plan::{Choice, Mode};
+use vitascope::ytdl::{Failure, Hint, Resolve, SitePrefs, YtdlError};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const LAVFI: &str = "av://lavfi:testsrc2=size=160x90:rate=10:duration=10";
@@ -769,4 +774,671 @@ fn cancel_loading_stops_cleanly() {
     assert!(p.net_loading().is_none());
     p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
     assert!(!p.loading_now());
+}
+
+// ───────────── 網站影片（假的 yt-dlp；不執行程式、不連網） ─────────────
+
+/// 有網路 hook、用假的 yt-dlp 的播放器（跟介面一樣）。`sites` = 本機的測試伺服器（127.0.0.1）當成影片網站（先問 yt-dlp）；
+/// 不當成的話是「其他網頁」：先照原樣開，認不出內容才問
+fn site_player(fake: &Arc<FakeResolver>, sites: bool, s: &NetSettings, extra: &[(&str, &str)]) -> Player {
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    let mut p = Player::new(Options {
+        net_hooks: true,
+        net_resolver: Some(resolver),
+        net_sites: if sites { vec!["127.0.0.1".into()] } else { Vec::new() },
+        extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        ..Options::headless()
+    })
+    .expect("建立 mpv 失敗");
+    let opts = net::mpv_options(s, &p.net_defaults());
+    for (name, _, r) in p.apply_net(&opts, true) {
+        r.unwrap_or_else(|e| panic!("無法設定 {name}：{e}"));
+    }
+    p.set_net_config(s, &SitePrefs::default());
+    p
+}
+
+/// 等到開檔失敗，回傳最後的說明（詳細原因的記錄可能比失敗晚到：等到說明裡有 `want`，等不到就回傳最後看到的）
+fn failure_text(p: &mut Player, url: &str, want: &str) -> String {
+    p.open(url).unwrap();
+    loop {
+        match p.wait(TIMEOUT) {
+            Some(PlayerEvent::EndFile { error: Some(_), .. }) => break,
+            Some(PlayerEvent::FileLoaded) => panic!("{url} 不該開得起來"),
+            Some(_) => {}
+            None => panic!("等不到 {url} 開檔失敗"),
+        }
+    }
+    let _ = p.wait_state(TIMEOUT, |s| s.last_error.as_deref().is_some_and(|e| e.contains(want)));
+    p.state.last_error.clone().unwrap_or_default()
+}
+
+/// 處理事件，直到開始等 yt-dlp
+fn until_resolving(p: &mut Player) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !p.site_resolving() {
+        assert!(Instant::now() < deadline, "沒有開始問 yt-dlp");
+        p.wait(Duration::from_millis(50));
+    }
+}
+
+/// 網頁本身（`/watch`、`/playlist`）一次都沒被讀：網站影片只讀 yt-dlp 給的網址
+fn page_never_fetched(server: &Server) {
+    let pages: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.starts_with("/watch") || r.path.starts_with("/playlist"))
+        .collect();
+    assert!(pages.is_empty(), "播放器自己去讀了網頁：{pages:#?}");
+}
+
+/// 網站影片：yt-dlp 給的影像、聲音合成一部（EDL），用網站要的 User-Agent、Referer、Cookie（memory:// 的 Cookie 檔）去讀；
+/// 標題、章節（載入後才設定）、網站的字幕（選到才下載）都有，mpv 的 path 還是網頁的網址
+#[test]
+fn fake_site_video_edl() {
+    if !net_sample("fake_site_video_edl", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    loaded(&mut p, &page);
+    assert_eq!(fake.calls(), 1);
+    assert_eq!(fake.requests()[0].url, page);
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    p.wait_state(TIMEOUT, |s| s.chapters.len() == 3).unwrap();
+    assert_eq!(p.state.path.as_deref(), Some(page.as_str()), "path 是網頁");
+    assert_eq!(p.get_string("media-title").unwrap(), SITE_TITLE_TEXT);
+    assert_eq!(p.state.tracks_of(TrackKind::Video).filter(|t| !t.albumart).count(), 1);
+    assert_eq!(p.state.tracks_of(TrackKind::Audio).count(), 1);
+    let subs: Vec<_> = p.state.tracks_of(TrackKind::Sub).collect();
+    assert_eq!(subs.len(), 1, "{:#?}", p.state.tracks);
+    assert_eq!(subs[0].lang.as_deref(), Some("en"));
+    assert_eq!(subs[0].title.as_deref(), Some("English (site)"));
+    // 沒有標題的章節：mpv 給空字串，選單上顯示「第 n 章」
+    let titles: Vec<&str> = p
+        .state
+        .chapters
+        .iter()
+        .map(|c| c.title.as_deref().unwrap_or_default())
+        .collect();
+    assert_eq!(titles, ["開頭", "中間", ""]);
+    let info = p.state.net.clone().expect("網站影片的資料");
+    assert_eq!(info.page_url, page);
+    assert_eq!(info.resume_key().as_deref(), Some("ytdl://fakesite/vid1"));
+    assert!(p.state.net_busy.is_none() && p.state.net_failure.is_none());
+    for rel in ["/f/net/video_only.mp4", "/f/net/audio_only.m4a"] {
+        let reqs = server.requests_to(rel);
+        assert!(!reqs.is_empty(), "沒有讀 {rel}");
+        for r in &reqs {
+            assert_eq!(r.header("User-Agent"), Some(SITE_UA), "{r:#?}");
+            assert_eq!(r.header("Referer"), Some(SITE_REFERER), "{r:#?}");
+            assert!(
+                r.header("Cookie").is_some_and(|c| c.contains(SITE_COOKIE)),
+                "沒有送網站的 Cookie：{r:#?}"
+            );
+        }
+    }
+    page_never_fetched(&server);
+}
+
+/// 網站影片的標頭、Cookie 只用在那個檔案：下一個網址照全域的設定（引擎預設的 User-Agent、沒有 Cookie、沒有 Referer）
+#[test]
+fn file_local_options_do_not_leak() {
+    if !net_sample("file_local_options_do_not_leak", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    loaded(&mut p, &page);
+    loaded(&mut p, &server.file_url("common/mp4_h264_aac.mp4"));
+    assert!(p.state.net.is_none(), "不是網站影片了");
+    let engine_ua = p.net_defaults().user_agent;
+    let reqs = server.requests_to("/f/common/mp4_h264_aac.mp4");
+    assert!(!reqs.is_empty());
+    for r in &reqs {
+        assert_eq!(r.header("User-Agent"), Some(engine_ua.as_str()), "{r:#?}");
+        assert_eq!(r.header("Cookie"), None, "{r:#?}");
+        assert_eq!(r.header("Referer"), None, "{r:#?}");
+    }
+    assert_eq!(p.get_string("user-agent").unwrap(), engine_ua);
+    assert!(p.mpv().get_string_list("http-header-fields").unwrap().is_empty());
+    assert_eq!(fake.calls(), 1, "媒體檔的網址不問 yt-dlp");
+}
+
+/// 網站影片播放中改了 User-Agent：網站影片用 file-local 蓋過了它，mpv 在檔案結束時會還原成改之前的值。
+/// 播放器要再送一次：下一個網址用新的 User-Agent
+#[test]
+fn ua_change_during_site_video_reaches_next_url() {
+    if !net_sample("ua_change_during_site_video_reaches_next_url", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    loaded(&mut p, &page);
+    let changed = NetSettings {
+        user_agent: "Changed/2".into(),
+        headers: vec!["X-After: 1".into()],
+        ..NetSettings::default()
+    };
+    apply_async(&mut p, &changed);
+    loaded(&mut p, &server.file_url("common/mp4_h264_aac.mp4"));
+    let reqs = server.requests_to("/f/common/mp4_h264_aac.mp4");
+    assert!(!reqs.is_empty());
+    for r in &reqs {
+        assert_eq!(r.header("User-Agent"), Some("Changed/2"), "{r:#?}");
+        assert_eq!(r.header("X-After"), Some("1"), "{r:#?}");
+        assert_eq!(r.header("Cookie"), None, "{r:#?}");
+    }
+    assert_eq!(p.get_string("user-agent").unwrap(), "Changed/2");
+    // 記下的值跟 mpv 一致：同樣的設定不再送
+    let opts = net::mpv_options(&changed, &p.net_defaults());
+    assert!(p.apply_net(&opts, false).is_empty(), "沒變的設定又送了一次");
+}
+
+/// 網址指定的開始時間（yt-dlp 的 start_time）；換畫質時從現在的位置接著播，20 分鐘內不再問 yt-dlp（用之前的結果）
+#[test]
+fn start_time_and_reload_keep_position() {
+    if !net_sample("start_time_and_reload_keep_position", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1&t=1");
+    let json = site_video_json(&server.url(""), &page, "vid1").replacen(
+        "\"duration\": 3,",
+        "\"duration\": 3, \"start_time\": 1.5,",
+        1,
+    );
+    let fake = FakeResolver::json(json).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    loaded(&mut p, &page);
+    p.wait_state(TIMEOUT, |s| (s.time_pos - 1.5).abs() < 0.25).unwrap();
+    assert_eq!(p.state.net.as_ref().and_then(|n| n.start_at), Some(1.5));
+    p.seek_to(0.5, true).unwrap();
+    p.wait_state(TIMEOUT, |s| (s.time_pos - 0.5).abs() < 0.1).unwrap();
+    p.reload_net(Choice::Format {
+        video: "v1".into(),
+        audio: Some("a1".into()),
+    })
+    .unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    p.wait_state(TIMEOUT, |s| (s.time_pos - 0.5).abs() < 0.25).unwrap();
+    assert_eq!(fake.calls(), 1, "換畫質用之前的結果，不再問 yt-dlp");
+    let info = p.state.net.clone().unwrap();
+    assert!(
+        info.start_at.is_some_and(|t| (t - 0.5).abs() < 0.1),
+        "{:?}",
+        info.start_at
+    );
+    let ids: Vec<_> = info.chosen.iter().filter_map(|f| f.format_id.as_deref()).collect();
+    assert_eq!(ids, ["v1", "a1"]);
+    page_never_fetched(&server);
+}
+
+/// 等 yt-dlp 的時候開了別的檔案：不等了，新的檔案馬上開；之後才到的結果不理（不會換回網站影片）
+#[test]
+fn cancel_by_opening_another_file() {
+    if !net_sample("cancel_by_opening_another_file", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=slow");
+    let late = site_video_json(&server.url(""), &page, "slow");
+    // 不理會取消，8 秒後照樣回傳結果
+    let fake = FakeResolver::block(Duration::from_secs(8), true, move || {
+        Ok(support::fake_ytdl::resolved(&late, Vec::new()))
+    })
+    .arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    p.open(&page).unwrap();
+    until_resolving(&mut p);
+    assert!(p.state.net_busy.as_ref().is_some_and(|b| b.url == page && !b.playlist));
+    let local = sample("common/mp4_h264_aac.mp4");
+    let start = Instant::now();
+    p.open(&local).unwrap();
+    assert!(!p.site_resolving() && p.state.net_busy.is_none());
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
+        .expect("等 yt-dlp 的時候開別的檔案，要馬上開");
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "新的檔案等了 yt-dlp：{:?}",
+        start.elapsed()
+    );
+    let is_local = |p: &Player| p.state.path.as_deref().map(std::path::Path::new) == Some(std::path::Path::new(&local));
+    assert!(is_local(&p), "{:?}", p.state.path);
+    // 等到假的 yt-dlp 真的回傳了（不理會取消的那一個），再處理一陣子事件：還是本機的檔案
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fake.running() > 0 {
+        assert!(Instant::now() < deadline, "假的 yt-dlp 沒有結束");
+        p.wait(Duration::from_millis(100));
+    }
+    p.wait(Duration::from_millis(500));
+    assert!(p.state.loaded);
+    assert!(is_local(&p), "{:?}", p.state.path);
+    assert!(p.state.net.is_none());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    page_never_fetched(&server);
+}
+
+/// 等 yt-dlp 的時候取消（Esc、取消、停止）：結束的原因是 stop、沒有錯誤；hook 放行了，背景的解析也收到取消
+#[test]
+fn cancel_loading_during_resolve() {
+    let server = Server::start();
+    let page = server.url("/watch?v=slow");
+    let fake = FakeResolver::block(Duration::from_secs(60), false, || Err(YtdlError::NoResponse.into())).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[]);
+    p.open(&page).unwrap();
+    until_resolving(&mut p);
+    let (loading, _) = p.net_loading().expect("連線中");
+    assert_eq!(loading, page);
+    p.cancel_loading().unwrap();
+    assert!(!p.loading_now() && p.state.net_busy.is_none());
+    match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
+        Ok(PlayerEvent::EndFile {
+            reason: EndReason::Stop,
+            error: None,
+        }) => {}
+        other => panic!("取消 = 停止、沒有錯誤：{other:?}"),
+    }
+    assert!(p.state.last_error.is_none() && p.state.net_failure.is_none());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    let deadline = Instant::now() + TIMEOUT;
+    while fake.cancelled() == 0 {
+        assert!(Instant::now() < deadline, "背景的解析沒有收到取消");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    page_never_fetched(&server);
+}
+
+/// 等 yt-dlp 的時候直接停止（不是 `cancel_loading`）、或還沒處理到 hook 就換了檔案：播放器發現那個檔案被拿掉了，
+/// 不等 yt-dlp、放行 hook（被換掉的那一個根本不問）
+#[test]
+fn stop_or_replace_before_the_hook_never_waits_for_ytdl() {
+    let server = Server::start();
+    let page = server.url("/watch?v=slow");
+    let fake = FakeResolver::block(Duration::from_secs(60), false, || Err(YtdlError::NoResponse.into())).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[]);
+    p.open(&page).unwrap();
+    until_resolving(&mut p);
+    p.stop().unwrap();
+    match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
+        Ok(PlayerEvent::EndFile {
+            reason: EndReason::Stop,
+            error: None,
+        }) => {}
+        other => panic!("停止、沒有錯誤：{other:?}"),
+    }
+    assert!(!p.site_resolving() && p.state.net_busy.is_none());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    assert_eq!(fake.calls(), 1);
+    // 開了網站影片、還沒處理事件（hook 還沒收到）就換成本機的檔案：網站影片根本不問 yt-dlp
+    p.open(&server.url("/watch?v=replaced")).unwrap();
+    let local = sample("common/mp4_h264_aac.mp4");
+    p.open(&local).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded)
+        .expect("換掉的網站影片不該讓新的檔案等 yt-dlp");
+    assert_eq!(fake.calls(), 1, "被換掉的網址不問 yt-dlp");
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    page_never_fetched(&server);
+}
+
+/// yt-dlp 的錯誤：說明用 yt-dlp 的原因（不是「無法載入檔案」），提醒與建議也留著；網址換成空的 memory://，
+/// mpv 不會再去讀網頁。沒有 yt-dlp、yt-dlp 一直不回應（看門狗）也說明原因
+#[test]
+fn resolver_timeout_and_failure_messages() {
+    let server = Server::start();
+    let fake = FakeResolver::new(|req, _| {
+        let v = req.url.rsplit('=').next().unwrap_or_default();
+        match v {
+            "unsupported" => Err(YtdlError::Unsupported.into()),
+            "bot" => Err(Failure {
+                error: YtdlError::NotABot,
+                hints: vec![Hint::NeedsJsRuntime],
+            }),
+            "drm" => Err(YtdlError::Drm.into()),
+            // 第一次用的時候才找完：沒有 yt-dlp
+            "gone" => Err(YtdlError::Missing.into()),
+            // 不理會取消、一直不回應
+            _ => {
+                std::thread::sleep(Duration::from_secs(30));
+                Err(YtdlError::NoResponse.into())
+            }
+        }
+    })
+    .with_watchdog(Duration::from_secs(1))
+    .arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[]);
+    for (v, want, hints) in [
+        ("unsupported", "無法播放網站影片：yt-dlp 不支援這個網站", vec![]),
+        (
+            "bot",
+            "無法播放網站影片：網站要求確認不是機器人",
+            vec![Hint::NeedsJsRuntime],
+        ),
+        ("drm", "無法播放網站影片：影片有 DRM 保護，無法播放", vec![]),
+    ] {
+        let err = failure_text(&mut p, &server.url(&format!("/watch?v={v}")), want);
+        assert_eq!(err, want, "記錄：{:#?}", p.recent_errors());
+        let f = p.state.net_failure.clone().expect("網站影片的原因");
+        assert_eq!(f.hints, hints);
+        assert!(!p.state.net_need_ytdl);
+        assert_eq!(p.mpv().hooks_pending(), 0);
+    }
+    assert_eq!(
+        p.state.net_failure.as_ref().and_then(|f| f.remedy()),
+        None,
+        "DRM 沒有建議"
+    );
+    // 解析的時候才知道沒有 yt-dlp（第一次用、還沒找完）：跟一開始就知道一樣，說明要 yt-dlp
+    let err = failure_text(&mut p, &server.url("/watch?v=gone"), "yt-dlp");
+    assert_eq!(err, "網站影片需要 yt-dlp");
+    assert!(p.state.net_need_ytdl);
+    // 看門狗（這裡 1 秒）：不再等，說明 yt-dlp 沒有回應
+    let start = Instant::now();
+    let err = failure_text(&mut p, &server.url("/watch?v=hang"), "沒有回應");
+    assert_eq!(err, "無法播放網站影片：yt-dlp 沒有回應");
+    assert!(start.elapsed() >= Duration::from_millis(900), "{:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_secs(20), "{:?}", start.elapsed());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    page_never_fetched(&server);
+
+    // 沒有 yt-dlp：影片網站的網址馬上說明要 yt-dlp（建議取得），不去讀網頁
+    let missing = FakeResolver::missing().arc();
+    let mut q = site_player(&missing, true, &NetSettings::default(), &[]);
+    let err = failure_text(&mut q, &server.url("/watch?v=x"), "yt-dlp");
+    assert_eq!(err, "網站影片需要 yt-dlp");
+    assert!(q.state.net_need_ytdl);
+    assert_eq!(
+        q.state.net_failure.as_ref().and_then(|f| f.remedy()),
+        Some(vitascope::ytdl::Remedy::GetYtdl)
+    );
+    assert_eq!(missing.calls(), 0);
+    page_never_fetched(&server);
+}
+
+/// 網站資料裡的網址是本機檔案、edl:// 之類（不能從網站開的）：不開，說明沒有可以播放的格式
+#[test]
+fn unsafe_urls_from_site_are_dropped() {
+    let server = Server::start();
+    let page = server.url("/watch?v=bad");
+    let fake = FakeResolver::json(
+        r#"{"title": "bad", "requested_formats": [
+             {"format_id": "v", "url": "file:///etc/passwd", "protocol": "https", "vcodec": "avc1", "acodec": "none"},
+             {"format_id": "a", "url": "edl://%3%abc", "protocol": "http", "vcodec": "none", "acodec": "mp4a"}]}"#,
+    )
+    .arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[]);
+    let err = failure_text(&mut p, &page, "格式");
+    assert_eq!(err, "無法播放網站影片：沒有可以播放的格式");
+    page_never_fetched(&server);
+}
+
+/// N-M4：mpv 不保證錯誤記錄比 on_load_fail 的 hook 事件先送到（平常是先到）。hook 先到、「Failed to open」後到時，
+/// 也要等記錄都收到了才決定：連不上的網頁不問 yt-dlp。用 `inject_event` 照這個順序送，不靠 mpv 剛好怎麼送
+#[test]
+fn on_load_fail_waits_for_a_log_that_arrives_after_it() {
+    let server = Server::start();
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut p = site_player(&fake, false, &NetSettings::default(), &[]);
+    // 其他網頁：放行 on_load（照原樣開），mpv 連到伺服器後一直等（`/slow` 不回應）
+    let slow = server.url("/slow");
+    p.open(&slow).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    while server.requests_to("/slow").is_empty() {
+        assert!(Instant::now() < deadline, "沒有連到伺服器");
+        let _ = p.wait(Duration::from_millis(20));
+    }
+    p.poll();
+    assert!(p.loading_now() && !p.site_resolving());
+    // hook 先到（序號是假的：放行時 mpv 說不是等待中的，沒關係），記錄後到，同一次 poll 處理
+    p.inject_event(Event::Hook {
+        name: "on_load_fail".into(),
+        id: u64::MAX,
+        userdata: 2,
+    });
+    p.inject_event(Event::Log {
+        prefix: "stream".into(),
+        level: "error".into(),
+        text: format!(
+            "Failed to open {slow}.
+"
+        ),
+    });
+    p.poll();
+    assert!(
+        !p.site_resolving(),
+        "hook 一到就決定了（還沒看到記錄）：連不上的網頁去問了 yt-dlp"
+    );
+    assert_eq!(fake.calls(), 0);
+    p.stop().unwrap();
+    p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. }))
+        .expect("停止");
+    let deadline = Instant::now() + TIMEOUT;
+    while p.mpv().hooks_pending() > 0 {
+        assert!(Instant::now() < deadline, "hook 沒有放行");
+        let _ = p.wait(Duration::from_millis(20));
+    }
+    assert_eq!(fake.calls(), 0);
+}
+
+/// 網站的播放清單：交給介面（NetPlaylist：照順序、標題），這個網址安靜地停下（stop、沒有錯誤）。
+/// 「載入整個播放清單」（只對這次有效的要求）從網址 v= 的那一部開始
+#[test]
+fn site_playlist_redirect_import() {
+    let server = Server::start();
+    let page = server.url("/playlist?list=PL1");
+    let items = vec![(server.url("/watch?v=p1"), "p1"), (server.url("/watch?v=p2"), "p2")];
+    let fake = FakeResolver::json(site_playlist_json(&page, &items)).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[]);
+    p.open(&page).unwrap();
+    let ev = p
+        .wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::NetPlaylist { .. }))
+        .unwrap();
+    let want: Vec<(String, Option<String>)> = vec![
+        (items[0].0.clone(), Some("第 1 部".into())),
+        (items[1].0.clone(), Some("第 2 部".into())),
+    ];
+    assert_eq!(
+        ev,
+        PlayerEvent::NetPlaylist {
+            source: page.clone(),
+            entries: want.clone(),
+            start: 0,
+            dropped: 0,
+            capped: false,
+        }
+    );
+    match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
+        Ok(PlayerEvent::EndFile {
+            reason: EndReason::Stop,
+            error: None,
+        }) => {}
+        other => panic!("播放清單的網址安靜地停下：{other:?}"),
+    }
+    assert!(p.state.last_error.is_none());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    assert!(!fake.requests()[0].playlist, "預設只播這部影片（--no-playlist）");
+    // 載入整個播放清單：從 v=p2 開始
+    let both = server.url("/watch?v=p2&list=PL1");
+    p.open_with_mode(
+        &both,
+        Mode {
+            yes_playlist: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ev = p
+        .wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::NetPlaylist { .. }))
+        .unwrap();
+    assert_eq!(
+        ev,
+        PlayerEvent::NetPlaylist {
+            source: both,
+            entries: want,
+            start: 1,
+            dropped: 0,
+            capped: false,
+        }
+    );
+    assert!(fake.requests()[1].playlist, "--yes-playlist");
+    page_never_fetched(&server);
+}
+
+/// 其他網頁：先照原樣開。mpv 認不出內容（是網頁）才問 yt-dlp，問得到就照樣播；連不上、HTTP 404 之類不問
+/// （說明照原本的原因，不多等 yt-dlp）。要不要問看錯誤記錄（記錄比 hook 晚到時的順序見
+/// `on_load_fail_waits_for_a_log_that_arrives_after_it`）
+#[test]
+fn fallback_only_for_unrecognized_content() {
+    if !net_sample("fallback_only_for_unrecognized_content", "net/video_only.mp4") {
+        return;
+    }
+    let server = Server::start();
+    let html = server.url("/html");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &html, "h1")).arc();
+    let mut p = site_player(&fake, false, &NetSettings::default(), &[("pause", "yes")]);
+    // 404：不問 yt-dlp（mpv 在 on_load_fail 之前記下「Failed to open」）
+    let not_found = server.url("/status/404");
+    p.open(&not_found).unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let mut ended = None;
+    while server.requests_to("/status/404").is_empty() && ended.is_none() {
+        assert!(Instant::now() < deadline, "沒有連到伺服器");
+        // 放行 on_load（處理事件；很快的機器上可能這時就已經失敗了）
+        ended = p
+            .wait(Duration::from_millis(5))
+            .filter(|e| matches!(e, PlayerEvent::EndFile { .. }));
+    }
+    if ended.is_none() {
+        ended = p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })).ok();
+    }
+    assert!(
+        matches!(ended, Some(PlayerEvent::EndFile { error: Some(_), .. })),
+        "404 應該開檔失敗：{ended:?}"
+    );
+    assert_eq!(fake.calls(), 0, "HTTP 404 不該問 yt-dlp");
+    assert!(p.state.net_failure.is_none());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    // 網頁：先自己讀（伺服器收到），認不出來才問 yt-dlp，照 yt-dlp 的結果播
+    loaded(&mut p, &html);
+    assert_eq!(fake.calls(), 1);
+    assert!(!server.requests_to("/html").is_empty(), "其他網頁先照原樣開");
+    assert_eq!(p.get_string("media-title").unwrap(), SITE_TITLE_TEXT);
+    assert!(p.state.net.is_some());
+    assert_eq!(p.mpv().hooks_pending(), 0);
+
+    // yt-dlp 也不認得這個網頁：照 mpv 原本的說明（是網頁，不是影片檔）
+    let unknown = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut q = site_player(&unknown, false, &NetSettings::default(), &[]);
+    let err = failure_text(&mut q, &html, "網頁");
+    assert_eq!(err, "無法開啟網址：這個網址是網頁，不是影片檔");
+    assert_eq!(unknown.calls(), 1);
+    // 沒有 yt-dlp：說明裡提一句
+    let missing = FakeResolver::missing().arc();
+    let mut r = site_player(&missing, false, &NetSettings::default(), &[]);
+    let err = failure_text(&mut r, &html, "yt-dlp");
+    assert_eq!(
+        err,
+        "無法開啟網址：這個網址是網頁，不是影片檔（網站上的影片要用 yt-dlp 播放）"
+    );
+    assert!(!r.state.net_need_ytdl, "不是已知的影片網站：不另外提示取得 yt-dlp");
+    assert_eq!(r.mpv().hooks_pending(), 0);
+}
+
+/// mpv 的事件佇列滿了、送不出 hook 時會把 hook 拿掉（「Removing hook」）：播放器重新註冊，之後的檔案照樣收得到
+#[test]
+fn removed_hook_is_registered_again() {
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut p = site_player(&fake, false, &NetSettings::default(), &[]);
+    let mpv = p.mpv().clone();
+    // 塞滿佇列（不讀事件）：每個非同步指令的回覆都先預留一個位置，塞到 mpv 說滿了為止
+    let mut sent = 0u64;
+    while sent < 5000 && mpv.command_async(sent + 1, &["ignore"]).is_ok() {
+        sent += 1;
+    }
+    assert!(sent < 5000, "佇列一直沒滿");
+    mpv.command(&["loadfile", LAVFI]).unwrap();
+    // 不讀事件，等檔案載入：佇列是滿的，mpv 送不出 on_load，把 hook 拿掉、照樣載入。
+    // （hook 送出去了的話，mpv 會停在 hook 等，永遠不會載入）
+    let deadline = Instant::now() + TIMEOUT;
+    while p.get_f64("duration").is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "佇列滿了，mpv 卻沒有拿掉 hook（塞了 {sent} 個指令）"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 讀事件（包括「Removing hook」的記錄）：重新註冊
+    while p.hooks_readded() == 0 {
+        assert!(Instant::now() < deadline, "mpv 拿掉了 hook，播放器沒有重新註冊");
+        p.poll();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 新版的 mpv 說是哪一個（只拿掉了 on_load）；0.37 沒說，兩個都重新註冊
+    assert!((1..=2).contains(&p.hooks_readded()), "{}", p.hooks_readded());
+    // 之後的檔案照樣收到 on_load
+    let before = p.hooks_continued();
+    p.open(LAVFI).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    assert!(
+        p.hooks_continued() > before,
+        "hook 被拿掉之後沒有重新註冊（之後的檔案收不到 on_load）"
+    );
+    assert_eq!(p.mpv().hooks_pending(), 0);
+}
+
+/// 舊的 libmpv（0.37）拿掉 hook 時的記錄沒寫是哪一個：兩個都重新註冊，沒被拿掉的那一個就有兩份。
+/// 同一個檔案收到兩次 on_load 只處理一次（字幕不會加兩次、不會問兩次 yt-dlp），兩次 on_load_fail 也照常放行
+#[test]
+fn duplicated_hooks_after_an_old_style_removal_are_handled_once() {
+    if !net_sample(
+        "duplicated_hooks_after_an_old_style_removal_are_handled_once",
+        "net/video_only.mp4",
+    ) {
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut p = site_player(&fake, true, &NetSettings::default(), &[("pause", "yes")]);
+    // 0.37 的寫法（沒有「main/on_load」）
+    p.inject_event(Event::Log {
+        prefix: "cplayer".into(),
+        level: "warn".into(),
+        text: "Sending hook command failed. Removing hook.\n".into(),
+    });
+    p.poll();
+    assert_eq!(p.hooks_readded(), 2, "看不出是哪一個：兩個都重新註冊");
+    let before = p.hooks_continued();
+    loaded(&mut p, &page);
+    assert_eq!(p.hooks_continued() - before, 2, "on_load 有兩份，兩個都放行");
+    assert_eq!(fake.calls(), 1, "只問一次 yt-dlp");
+    assert_eq!(
+        p.state.tracks_of(TrackKind::Sub).count(),
+        1,
+        "網站的字幕只加一次：{:#?}",
+        p.state.tracks
+    );
+    assert_eq!(p.mpv().hooks_pending(), 0);
+    // 其他網頁（不是影片網站）：認不出內容才問 yt-dlp。on_load_fail 也有兩份：第二份直接放行，只問一次
+    let html = server.url("/html");
+    let fallback = FakeResolver::json(site_video_json(&server.url(""), &html, "h1")).arc();
+    let mut q = site_player(&fallback, false, &NetSettings::default(), &[("pause", "yes")]);
+    q.inject_event(Event::Log {
+        prefix: "cplayer".into(),
+        level: "warn".into(),
+        text: "Sending hook command failed. Removing hook.
+"
+        .into(),
+    });
+    q.poll();
+    loaded(&mut q, &html);
+    assert_eq!(fallback.calls(), 1, "只問一次 yt-dlp");
+    assert_eq!(q.state.tracks_of(TrackKind::Sub).count(), 1, "{:#?}", q.state.tracks);
+    assert_eq!(q.mpv().hooks_pending(), 0);
 }

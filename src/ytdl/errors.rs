@@ -76,6 +76,53 @@ pub enum Remedy {
     GetYtdl,
 }
 
+impl Remedy {
+    /// 錯誤訊息下面的建議（文字；設定頁、下載的按鈕之後才有）
+    pub fn advice(self) -> &'static str {
+        self.advice_on(crate::paths::Os::current())
+    }
+
+    /// 在 `os` 上的建議（測試在任何系統上檢查每個系統的說法）。
+    /// 「放在影戲的資料夾」只有 Windows 說得通：macOS 的程式資料夾在 VitaScope.app 裡面（放進去會破壞簽章），
+    /// Linux 的 AppImage 執行時的資料夾是唯讀的暫時資料夾；這兩個系統說常用的安裝方式（找得到的位置見 `locate`）
+    pub fn advice_on(self, os: crate::paths::Os) -> &'static str {
+        use crate::paths::Os;
+        use crate::tr;
+        match self {
+            Remedy::GetYtdl => match os {
+                Os::Windows => tr!(
+                    "請安裝 yt-dlp（github.com/yt-dlp/yt-dlp，或 winget、scoop），或把 yt-dlp.exe 放在影戲的資料夾",
+                    "Install yt-dlp (github.com/yt-dlp/yt-dlp, or winget, scoop), or put yt-dlp.exe in VitaScope's folder"
+                ),
+                Os::Macos => tr!(
+                    "請安裝 yt-dlp（用 Homebrew：brew install yt-dlp，或 github.com/yt-dlp/yt-dlp）",
+                    "Install yt-dlp (with Homebrew: brew install yt-dlp, or github.com/yt-dlp/yt-dlp)"
+                ),
+                Os::Linux => tr!(
+                    "請安裝 yt-dlp（用套件管理員、pipx，或把 github.com/yt-dlp/yt-dlp 的 yt-dlp 放在 ~/.local/bin）",
+                    "Install yt-dlp (with your package manager or pipx, or put yt-dlp from github.com/yt-dlp/yt-dlp in ~/.local/bin)"
+                ),
+            },
+            Remedy::UpdateYtdl => tr!(
+                "請更新 yt-dlp（yt-dlp -U，或用安裝它的方式更新）後再試一次",
+                "Update yt-dlp (yt-dlp -U, or the way you installed it) and try again"
+            ),
+            Remedy::GetDeno => tr!(
+                "請安裝 deno 2.3 以上（deno.com），YouTube 才能取得全部畫質",
+                "Install deno 2.3 or newer (deno.com) so YouTube offers every quality"
+            ),
+            Remedy::UseCookies => tr!(
+                "需要登入的影片：可以在 yt-dlp 的設定檔加上 --cookies-from-browser firefox",
+                "For videos that need a login, add --cookies-from-browser firefox to yt-dlp's config file"
+            ),
+            Remedy::TryFirefox => tr!(
+                "Chrome、Edge 開著時常常讀不到 Cookie，建議改用 Firefox 的 Cookie",
+                "Chrome and Edge cookies often can't be read while the browser is open; try Firefox's cookies"
+            ),
+        }
+    }
+}
+
 impl YtdlError {
     /// 給使用者看的完整訊息（「無法播放網站影片：原因」）
     pub fn message(&self) -> String {
@@ -655,5 +702,21 @@ mod tests {
             "無法播放網站影片：yt-dlp 不支援這個網站"
         );
         assert_eq!(Hint::NeedsJsRuntime.message(), "YouTube 需要 deno 才能取得全部畫質");
+        assert!(Remedy::GetYtdl.advice().contains("安裝 yt-dlp"));
+        // 只有 Windows 說放在影戲的資料夾（macOS 在 .app 裡面、AppImage 是唯讀的）
+        use crate::paths::Os;
+        assert!(Remedy::GetYtdl.advice_on(Os::Windows).contains("放在影戲的資料夾"));
+        for os in [Os::Macos, Os::Linux] {
+            let a = Remedy::GetYtdl.advice_on(os);
+            assert!(a.starts_with("請安裝 yt-dlp") && !a.contains("影戲的資料夾"), "{a}");
+        }
+        assert!(Remedy::GetYtdl.advice_on(Os::Macos).contains("brew install yt-dlp"));
+        assert!(Remedy::GetYtdl.advice_on(Os::Linux).contains("~/.local/bin"));
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        for os in [Os::Windows, Os::Macos, Os::Linux] {
+            assert!(Remedy::GetYtdl.advice_on(os).starts_with("Install yt-dlp"));
+        }
+        assert!(Remedy::GetYtdl.advice().starts_with("Install yt-dlp"));
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
     }
 }

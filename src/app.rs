@@ -560,6 +560,8 @@ pub struct Launch {
     /// 外部工具的資料夾（影戲下載的 yt-dlp、deno）；預設 None（自動測試不找、不碰使用者的工具），
     /// 播放器用 `paths::tools_dir()`
     pub tools_dir: Option<PathBuf>,
+    /// 找 yt-dlp、deno 的狀態：跟播放器解析網站影片用的是同一個（main.rs 建立）；None = 用 `tools_dir` 自己建立一個
+    pub ytdl: Option<crate::ytdl::Locator>,
 }
 
 impl VitascopeApp {
@@ -666,7 +668,9 @@ impl VitascopeApp {
         let ctx = cc.egui_ctx.clone();
         bookmarks.set_wake(Arc::new(move || ctx.request_repaint()));
         // yt-dlp、deno：第一次需要時才在背景找（網站影片、網路設定），找完叫醒介面
-        let ytdl = crate::ytdl::Locator::new(launch.tools_dir);
+        let ytdl = launch
+            .ytdl
+            .unwrap_or_else(|| crate::ytdl::Locator::new(launch.tools_dir));
         let ctx = cc.egui_ctx.clone();
         ytdl.set_wake(Arc::new(move || ctx.request_repaint()));
         let mut app = Self {
@@ -1143,7 +1147,7 @@ impl VitascopeApp {
             return;
         };
         // 本機檔案用路徑，網路串流用續播的代號；mpv 自己的網址（av:// 之類）不記
-        let Some(key) = network::history_key(&path) else {
+        let Some(key) = network::history_key(&path, st.net.as_deref()) else {
             return;
         };
         // 網路串流：能跳轉的影片才記（直播、伺服器不支援 Range 的檔案不能跳轉）；不記網址、網址裡有密碼之類的不記
@@ -2034,6 +2038,24 @@ impl VitascopeApp {
                 }
             }
             PlayerEvent::FileLoaded => self.on_file_loaded(),
+            // 網站的播放清單（yt-dlp 解析出來的）：跟網路上的 .m3u 一樣展開成播放清單，照一般的開檔開要播的那一個
+            PlayerEvent::NetPlaylist {
+                source,
+                entries,
+                start,
+                dropped,
+                capped,
+            } => {
+                self.adopt_remote_playlist(
+                    crate::net::RemotePlaylist {
+                        source,
+                        entries,
+                        start,
+                        dropped,
+                    },
+                    capped,
+                );
+            }
             PlayerEvent::CommandReply { id, error } => match crate::player::async_key(id) {
                 Some(k) => self.on_async_reply(id, k, error),
                 // 截圖
@@ -2097,7 +2119,7 @@ impl VitascopeApp {
                     // 網路上的播放清單讀完了：展開成播放清單、照一般的開檔重新開
                     EndReason::Redirect => {
                         if let Some(list) = self.player.take_remote_playlist() {
-                            self.adopt_remote_playlist(list);
+                            self.adopt_remote_playlist(list, false);
                         }
                     }
                     EndReason::Eof => self.live_file_ended(),
@@ -2126,8 +2148,8 @@ impl VitascopeApp {
             return;
         };
         // 背景讀回磁碟上這個檔案的書籤：同時開著的別的視窗加的也看得到（網路串流用續播的代號，跟 `media_key` 一樣）
-        self.bookmarks
-            .refresh(&network::history_key(&path).unwrap_or_else(|| path.clone()));
+        let key = network::history_key(&path, self.player.state.net.as_deref());
+        self.bookmarks.refresh(&key.unwrap_or_else(|| path.clone()));
         // 書籤分頁上選取的是上一個檔案的書籤
         self.bookmark_selected = None;
         if let Some((video, subs)) = self.pending_subs.take()
@@ -2142,8 +2164,10 @@ impl VitascopeApp {
         }
         if is_url(&path) {
             if crate::net::is_network(&path) {
+                self.site_file_loaded(&path);
                 self.remember_url(&path);
                 self.net_file_loaded(&path);
+                self.site_hint_osd();
             }
             self.adjust_reminder();
             return;
@@ -3554,17 +3578,24 @@ impl VitascopeApp {
                 .size(14.0)
                 .color(Color32::from_gray(120)),
         );
-        // 兩種錯誤都要顯示：影片畫面初始化失敗時，開檔錯誤也不能被蓋掉
-        for msg in [self.fatal.as_deref(), self.player.state.last_error.as_deref()]
-            .into_iter()
-            .flatten()
-        {
+        // 兩種錯誤都要顯示：影片畫面初始化失敗時，開檔錯誤也不能被蓋掉。
+        // 網站影片播不了的原因每次畫的時候才轉成文字（換了介面語言也跟著換），下面列出提醒與建議
+        let site = self.site_failure_lines();
+        let open_error = match &site {
+            Some((msg, _)) => Some(msg.as_str()),
+            None => self.player.state.last_error.as_deref(),
+        };
+        for msg in [self.fatal.as_deref(), open_error].into_iter().flatten() {
             ui.add_space(16.0);
             ui.label(
                 egui::RichText::new(msg)
                     .size(15.0)
                     .color(Palette::of(ui.visuals()).problem),
             );
+        }
+        for note in site.iter().flat_map(|(_, notes)| notes) {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(*note).size(13.0).color(Color32::from_gray(170)));
         }
         // 最近開啟的檔案，點一下就開
         let mut chosen = None;

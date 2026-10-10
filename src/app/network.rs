@@ -7,7 +7,9 @@
 //! - 網路串流載入完成時記下標題、加進最近開啟；能跳轉、一分鐘以上的影片續播（依續播的代號，`net::resume_key`）。
 //! - 播放中：連線中（300 毫秒後才出現，本機檔案不會閃一下）、緩衝中的畫面，取消正在連線的網址
 //!   （Esc 只在一般視窗；全螢幕時 Esc 照樣是離開全螢幕）、直播的「直播」標示與結束的提示。
-//! - 網路上的播放清單（IPTV 的 .m3u 網址）：展開成影戲的播放清單，項目照一般的開檔重新開。
+//! - 網路上的播放清單（IPTV 的 .m3u 網址、yt-dlp 解析出來的網站播放清單）：展開成影戲的播放清單，項目照一般的開檔重新開。
+//! - 網站影片（yt-dlp，播放器的 `on_load` hook）：等 yt-dlp 時顯示「正在取得網站影片」，記下網站給的標題，
+//!   續播、書籤用同一部影片的代號；播不了時起始畫面寫出原因、提醒與建議（每次畫的時候才轉成文字，換語言也跟著換）。
 //! - 「設定 → 網路」頁：串流的設定（HLS / DASH 畫質、重新連線、快取、逾時、憑證、記住網址）與進階（標頭、proxy）。
 
 use super::control_panel::adjust_locked_hover;
@@ -16,6 +18,7 @@ use crate::history::History;
 use crate::net::{self, HlsBitrate, NetSettings};
 use crate::playlist::Playlist;
 use crate::theme::{self, Palette};
+use crate::ytdl::plan::NetInfo;
 use crate::{tf, tr};
 use eframe::egui::{self, Align, Color32, Frame, Id, Key, Layout, Rect, ViewportCommand};
 use std::path::{Path, PathBuf};
@@ -70,10 +73,19 @@ impl VitascopeApp {
                 eprintln!("[vitascope] 無法套用 {name}：{e}");
             }
         }
+        self.site_config();
     }
 
-    /// 設定改了之後：非同步送出有變的選項（播放中改不會卡住介面；正在播的串流到下一次連線才用新的值）
+    /// 網站影片（yt-dlp）用的網路設定（proxy、逾時、憑證…）：下一次解析就用
+    fn site_config(&mut self) {
+        self.player
+            .set_net_config(&self.settings.net, &crate::ytdl::SitePrefs::default());
+    }
+
+    /// 設定改了之後：非同步送出有變的選項（播放中改不會卡住介面；正在播的串流到下一次連線才用新的值），
+    /// 網站影片（yt-dlp 的逾時、憑證、proxy，網站影片的重新連線、標頭）也從下一次解析起用新的設定
     fn apply_net(&mut self) {
+        self.site_config();
         let opts = net::mpv_options(&self.settings.net, &self.net_defaults);
         for (name, key, result) in self.player.apply_net(&opts, false) {
             match result {
@@ -402,11 +414,15 @@ fn url_line(ui: &mut egui::Ui, text: &str) {
         .on_hover_text(text);
 }
 
-/// 播放紀錄（續播）、書籤用的代號：本機檔案是路徑本身，網路串流是 `net::resume_key`（去掉 `#` 之後的部分；
-/// 之後網站影片是 `ytdl://擷取器/代號`）。mpv 自己的網址（`av://` 之類）沒有代號：不續播
-pub(super) fn history_key(path: &str) -> Option<String> {
+/// 播放紀錄（續播）、書籤用的代號：本機檔案是路徑本身，網路串流是 `net::resume_key`（去掉 `#` 之後的部分）。
+/// 網站影片（`site` = yt-dlp 解析出來的資料，是這個網址的時候）是同一部影片的代號 `ytdl://擷取器/代號`：
+/// `youtu.be/x`、`watch?v=x&t=90` 是同一個。mpv 自己的網址（`av://` 之類）沒有代號：不續播
+pub(super) fn history_key(path: &str, site: Option<&NetInfo>) -> Option<String> {
     if !super::is_url(path) {
         return Some(path.to_owned());
+    }
+    if let Some(key) = site.filter(|s| s.page_url == path).and_then(NetInfo::resume_key) {
+        return Some(key);
     }
     net::resume_key(path, None)
 }
@@ -484,12 +500,21 @@ impl VitascopeApp {
         // 直播：沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類。直播的 HLS 也有「總長度」：FFmpeg 用開頭讀到的那一段估的
         // （不到一秒），mpv 之後跟著已經讀到的長度變長。伺服器不支援 Range 的一般檔案也不能跳轉，但不是直播（見 `net::is_live`）
         let format = self.player.get_string("file-format").ok();
-        self.net_live = net::is_live(url, duration, seekable, format.as_deref());
+        let site = self.player.state.net.clone().filter(|s| s.page_url == url);
+        // 網站影片：yt-dlp 說是直播就是（EDL 合成的影片看不出來）
+        self.net_live =
+            site.as_ref().is_some_and(|s| s.live) || net::is_live(url, duration, seekable, format.as_deref());
         // 不記網址時也不續播（續播的位置跟最近開啟一樣，是記下來的網址）；自動截圖要固定的畫面
         if !self.settings.resume || self.autoshot.is_some() || !self.settings.net.remember_urls || !net::storable(url) {
             return;
         }
-        let Some(key) = history_key(url) else { return };
+        // 網站影片從指定的位置開始（換畫質時接著播、網址的 &t=90）：不跳到上次的位置
+        if site.as_ref().is_some_and(|s| s.start_at.is_some()) {
+            return;
+        }
+        let Some(key) = history_key(url, site.as_deref()) else {
+            return;
+        };
         let Some(t) = self.history.resume_point(&key) else {
             return;
         };
@@ -505,6 +530,38 @@ impl VitascopeApp {
             // 同一個網址換成了較短的影片：位置已經不合理
             self.update_history(|h| h.forget(&key));
         }
+    }
+
+    /// 網站影片載入完成：網站給的標題（比之前記的、網址的最後一段準）記下來，最近開啟、播放清單都顯示它
+    pub(super) fn site_file_loaded(&mut self, url: &str) {
+        let Some(site) = self.player.state.net.clone().filter(|s| s.page_url == url) else {
+            return;
+        };
+        if let Some(t) = site.title.as_deref().and_then(|t| net::useful_title(url, t)) {
+            self.titles.insert(url.to_owned(), t);
+        }
+    }
+
+    /// 網站影片播得了、但 yt-dlp 警告裡看得出問題（沒有 deno 時 YouTube 只有部分畫質之類）：提示一次。
+    /// 已經有續播的提示時不蓋掉它
+    pub(super) fn site_hint_osd(&mut self) {
+        if self.resume_target.is_some() {
+            return;
+        }
+        if let Some(hint) = self.player.state.net_hints.first() {
+            self.osd(hint.message());
+        }
+    }
+
+    /// 起始畫面上網站影片播不了的說明：原因（現在的語言）、警告裡看得出的提醒、建議怎麼做
+    pub(super) fn site_failure_lines(&self) -> Option<(String, Vec<&'static str>)> {
+        let f = self.player.state.net_failure.as_ref()?;
+        let mut notes: Vec<&'static str> = f.hints.iter().map(|h| h.message()).collect();
+        if let Some(r) = f.remedy() {
+            notes.push(r.advice());
+        }
+        notes.dedup();
+        Some((f.error.message(), notes))
     }
 
     /// 正在播的是直播（網路串流，載入時沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類）：時間顯示「直播」，播完時提示
@@ -555,10 +612,20 @@ impl VitascopeApp {
             ui.ctx().request_repaint_after(Duration::from_millis(250));
             let host = net::host(url).unwrap_or_else(|| net::display_name(url, None));
             let secs = waited.as_secs();
-            let line = if secs >= 1 {
-                tf!("正在連線：{host}…（{secs} 秒）", "Connecting to {host}… ({secs} s)")
-            } else {
-                tf!("正在連線：{host}…", "Connecting to {host}…")
+            // 等 yt-dlp 解析網頁（第一次啟動 yt-dlp 要幾秒）；整個播放清單更久（最多兩分鐘）
+            let line = match st.net_busy.as_ref().map(|b| b.playlist) {
+                Some(true) if secs >= 1 => tf!(
+                    "正在讀取播放清單（yt-dlp）…（{secs} 秒）",
+                    "Reading the playlist (yt-dlp)… ({secs} s)"
+                ),
+                Some(true) => tr!("正在讀取播放清單（yt-dlp）…", "Reading the playlist (yt-dlp)…").to_owned(),
+                Some(false) if secs >= 1 => tf!(
+                    "正在取得網站影片（yt-dlp）…（{secs} 秒）",
+                    "Getting the website video (yt-dlp)… ({secs} s)"
+                ),
+                Some(false) => tr!("正在取得網站影片（yt-dlp）…", "Getting the website video (yt-dlp)…").to_owned(),
+                None if secs >= 1 => tf!("正在連線：{host}…（{secs} 秒）", "Connecting to {host}… ({secs} s)"),
+                None => tf!("正在連線：{host}…", "Connecting to {host}…"),
             };
             (line, true)
         } else if st.loaded && st.paused_for_cache {
@@ -607,7 +674,8 @@ impl VitascopeApp {
     /// 網路上的播放清單（IPTV 的 .m3u 網址）讀完了：展開成影戲的播放清單（清單本身在目前的播放清單上時，換成裡面的項目），
     /// 記下清單寫的標題，照一般的開檔重新開要播的那一個（換檔時的設定都照常做：取消暫停、A-B、字幕延遲、音訊直通的預測…）。
     /// 開檔用 `loadfile replace`，mpv 自己的播放清單又回到只有一個
-    pub(super) fn adopt_remote_playlist(&mut self, list: net::RemotePlaylist) {
+    /// `capped` = yt-dlp 解析出來的網站播放清單、只讀了前 200 個項目（清單可能更長）
+    pub(super) fn adopt_remote_playlist(&mut self, list: net::RemotePlaylist, capped: bool) {
         if self.settings.net.remember_urls && net::storable(&list.source) {
             let source = list.source.clone();
             self.update_history(|h| h.add_recent(&source));
@@ -648,6 +716,11 @@ impl VitascopeApp {
         let start = list.start.min(n - 1);
         self.open_at(&paths[start], Some(first + start));
         let mut msg = tf!("播放清單：{n} 個項目", "Playlist: {n} items");
+        // 網站的播放清單只讀前 200 個（頻道可能有上萬部影片）
+        if capped {
+            let max = crate::ytdl::PLAYLIST_MAX;
+            msg += &tf!("（只載入前 {max} 個）", " (only the first {max} were loaded)");
+        }
         if list.dropped > 0 {
             msg += &tf!(
                 "（略過 {} 個不能開的項目）",

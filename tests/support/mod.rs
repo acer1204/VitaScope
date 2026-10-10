@@ -2,4 +2,5 @@
 
 #![allow(dead_code)]
 
+pub mod fake_ytdl;
 pub mod http;

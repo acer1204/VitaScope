@@ -9,7 +9,9 @@ use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use support::fake_ytdl::{FakeResolver, site_playlist_json};
 use support::http::Server;
 use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
 use vitascope::keymap::Platform;
@@ -19,6 +21,7 @@ use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::{OnTop, Settings, SideTab};
 use vitascope::theme::ThemeChoice;
+use vitascope::ytdl::{Failure, Hint, Resolve, YtdlError};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -3785,6 +3788,364 @@ worse",
     );
     h.run_steps(2);
     h.get_by_label("Lines 1, 3 aren't \"Name: value\" and won't be sent");
+}
+
+// ───────────── 網站影片（假的 yt-dlp；不執行程式、不連網） ─────────────
+
+/// 播放器有網路 hook、用假的 yt-dlp（跟真正的播放器一樣）；本機的測試伺服器 127.0.0.1 當成影片網站
+fn site_harness(fake: &Arc<FakeResolver>, settings: Settings) -> Harness<'static, VitascopeApp> {
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch::default(),
+        settings,
+    )
+}
+
+/// 一部 90 秒的網站影片（影音合在一起的 `common/mp4_long.mp4`），代號 `long`：不同的網址解析出同一部影片
+fn long_site_json(base: &str) -> String {
+    format!(
+        r#"{{"id": "long", "title": "很長的網站影片", "extractor_key": "FakeSite", "duration": 90,
+            "url": "{base}/f/common/mp4_long.mp4", "protocol": "http", "vcodec": "avc1", "acodec": "mp4a",
+            "format_id": "18"}}"#
+    )
+}
+
+/// 網頁（`/watch`、`/playlist`）一次都沒被讀
+fn site_page_never_fetched(server: &Server) {
+    let pages: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.starts_with("/watch") || r.path.starts_with("/playlist"))
+        .collect();
+    assert!(pages.is_empty(), "播放器自己去讀了網頁：{pages:#?}");
+}
+
+/// 等 yt-dlp 的時候：影片上寫「正在取得網站影片（yt-dlp）…」（整個播放清單是「正在讀取播放清單」），
+/// Esc 取消（提示「已取消」、不是錯誤、回到起始畫面），背景的解析也收到取消
+#[test]
+fn site_video_connecting_text_and_escape_cancels() {
+    let server = Server::start();
+    let fake = FakeResolver::block(Duration::from_secs(60), false, || Err(YtdlError::NoResponse.into())).arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=slow")));
+    step_until_label(&mut h, "正在取得網站影片（yt-dlp）…");
+    assert!(h.query_by_label_contains("播放清單").is_none());
+    h.get_by_label("按 Esc 取消");
+    assert!(h.state().player().state.net_busy.is_some());
+    h.key_press(egui::Key::Escape);
+    step_until_net(&mut h, "取消", |app| !app.player().loading_now());
+    h.run_steps(3);
+    assert_eq!(h.state().osd_text(), Some("已取消"));
+    let st = &h.state().player().state;
+    assert!(
+        !st.loaded && st.last_error.is_none() && st.net_busy.is_none(),
+        "{st:#?}"
+    );
+    assert!(h.query_by_label_contains("正在取得網站影片").is_none());
+    h.get_by_label_contains("拖放到這裡");
+    let start = Instant::now();
+    while fake.cancelled() == 0 {
+        assert!(start.elapsed() < NET_TIMEOUT, "背景的解析沒有收到取消");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 載入整個播放清單（比較久）：寫的是讀取播放清單
+    let list = server.url("/watch?v=slow&list=PL1");
+    let mode = vitascope::ytdl::plan::Mode {
+        yes_playlist: true,
+        ..Default::default()
+    };
+    h.state_mut().player_mut().open_with_mode(&list, mode).unwrap();
+    step_until_label(&mut h, "正在讀取播放清單（yt-dlp）…");
+    assert!(h.query_by_label_contains("正在取得網站影片").is_none());
+    h.key_press(egui::Key::Escape);
+    step_until_net(&mut h, "取消播放清單", |app| !app.player().loading_now());
+    while fake.cancelled() < 2 {
+        assert!(start.elapsed() < NET_TIMEOUT * 2, "背景的解析沒有收到取消");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    site_page_never_fetched(&server);
+}
+
+/// 網站影片：標題是網站給的（最近開啟、清單上都用它）；續播、書籤用同一部影片的代號（`ytdl://網站/代號`），
+/// 同一部影片換個網址（分享連結之類）也從上次的位置繼續、看得到書籤（續播的提示不被 yt-dlp 的提醒蓋掉）。
+/// 網址指定了開始的位置（`&t=5`）時從那裡開始、不續播
+#[test]
+fn site_video_title_resume_and_bookmarks_follow_the_video_id() {
+    let server = Server::start();
+    let base = server.url("");
+    let fake = FakeResolver::new(move |req, _| {
+        let mut json = long_site_json(&base);
+        // yt-dlp 把網址的 &t=5 讀成 start_time
+        if req.url.contains("t=5") {
+            json = json.replacen(r#""duration": 90,"#, r#""duration": 90, "start_time": 5,"#, 1);
+        }
+        // 警告裡有提醒：續播的提示優先，不被它蓋掉
+        Ok(support::fake_ytdl::resolved(&json, vec![Hint::NeedsJsRuntime]))
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播網站影片", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.is_some() && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    assert_eq!(h.state().url_title(&page), Some("很長的網站影片"));
+    assert!(h.state().history().recent.contains(&page));
+    let key = "ytdl://fakesite/long";
+    h.state_mut().player_mut().seek_to(30.0, true).unwrap();
+    step_until_net(&mut h, "跳到 30 秒", |app| {
+        (app.player().state.time_pos - 30.0).abs() < 2.0
+    });
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks().marks(key).len(), 1, "書籤用影片的代號");
+    assert!(h.state().bookmarks().marks(&page).is_empty());
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    let at = h.state().history().resume_point(key).expect("依影片的代號記下位置");
+    assert!((at - 30.0).abs() < 3.0, "{at}");
+    assert_eq!(h.state().history().resume_point(&page), None);
+    // 同一部影片的另一個網址：從上次的位置繼續，書籤也看得到
+    let share = server.url("/watch?v=long&feature=share");
+    h.event(egui::Event::Paste(share.clone()));
+    step_until_net(&mut h, "從上次的位置繼續", |app| {
+        let s = &app.player().state;
+        playing_url(s, &share) && s.time_pos > at - 3.0
+    });
+    assert!(
+        h.state().osd_text().is_some_and(|t| t.starts_with("從 00:3")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().bookmarks().marks(key).len(), 1);
+    assert_eq!(fake.calls(), 2, "不同的網址各問一次");
+    // 網址指定了開始的位置：從 5 秒開始，不跳到上次的位置（30 秒）。等到真的在播（過了 5.5 秒），跳過去的話這時已經在 30 秒
+    let at_five = server.url("/watch?v=long&t=5");
+    h.event(egui::Event::Paste(at_five.clone()));
+    step_until_net(&mut h, "從 5 秒開始播", |app| {
+        let s = &app.player().state;
+        playing_url(s, &at_five) && s.loaded && s.net.is_some() && s.time_pos > 5.5
+    });
+    let t = h.state().player().state.time_pos;
+    assert!(t < 20.0, "跳到了上次的位置：{t}");
+    assert!(
+        h.state()
+            .player()
+            .state
+            .net
+            .as_ref()
+            .is_some_and(|n| n.start_at == Some(5.0))
+    );
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.starts_with("從 00:3")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    site_page_never_fetched(&server);
+}
+
+/// yt-dlp 成功了、但警告說沒有 deno（YouTube 只有部分畫質）：載入後提示一次（之後的提示不會又被它蓋掉）
+#[test]
+fn site_video_warnings_show_once() {
+    if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/video_only.mp4")
+        .exists()
+    {
+        eprintln!("略過 site_video_warnings_show_once：沒有網路測試的樣本（python scripts/gen_samples.py）");
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let json = support::fake_ytdl::site_video_json(&server.url(""), &page, "vid1");
+    let fake = FakeResolver::new(move |_, _| Ok(support::fake_ytdl::resolved(&json, vec![Hint::NeedsJsRuntime]))).arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播網站影片", |app| playing_url(&app.player().state, &page));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("YouTube 需要 deno 才能取得全部畫質"));
+    // 換成別的提示（音量）：提醒不再出現
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(2);
+    let volume = h.state().osd_text().map(str::to_owned);
+    assert!(volume.as_deref().is_some_and(|t| t.starts_with("音量")), "{volume:?}");
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(h.state().osd_text(), volume.as_deref(), "提醒又出現了");
+    }
+}
+
+/// 網站影片播不了：起始畫面寫 yt-dlp 說的原因、警告裡的提醒和建議。文字每次畫的時候才產生，換了介面語言也跟著換
+#[test]
+fn site_video_failure_shows_reason_hints_and_follows_the_language() {
+    let server = Server::start();
+    let fake = FakeResolver::fail(Failure {
+        error: YtdlError::Outdated,
+        hints: vec![Hint::NeedsJsRuntime],
+    })
+    .arc();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = site_harness(&fake, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=old")));
+    step_until_label(
+        &mut h,
+        "Can't play the website video: Couldn't get the video (yt-dlp may need an update)",
+    );
+    h.get_by_label("YouTube needs deno for all qualities");
+    // 真正的原因是缺 deno（警告），建議取得 deno、不是更新 yt-dlp
+    h.get_by_label("Install deno 2.3 or newer (deno.com) so YouTube offers every quality");
+    // 換成中文介面：同一個錯誤用中文顯示
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("English").click();
+    h.run_steps(2);
+    h.get_by_label("繁體中文").click();
+    h.run_steps(3);
+    h.get_by_label("無法播放網站影片：無法取得影片（yt-dlp 可能需要更新）");
+    h.get_by_label("YouTube 需要 deno 才能取得全部畫質");
+    assert!(h.query_by_label_contains("Can't play the website video").is_none());
+    site_page_never_fetched(&server);
+}
+
+/// 沒有 yt-dlp：影片網站的網址馬上說明要 yt-dlp、怎麼取得（不去讀網頁）
+#[test]
+fn site_video_without_ytdl_explains_how_to_get_it() {
+    let server = Server::start();
+    let fake = FakeResolver::missing().arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    h.get_by_label_contains("請安裝 yt-dlp");
+    assert!(h.state().player().state.net_need_ytdl);
+    assert_eq!(fake.calls(), 0);
+    site_page_never_fetched(&server);
+}
+
+/// 「設定 → 網路」頁改的設定（檢查網站憑證、逾時）下一次解析網站影片就用（yt-dlp 的 `--no-check-certificates`、
+/// `--socket-timeout`），不用重開影戲
+#[test]
+fn network_page_changes_reach_the_site_resolver() {
+    let server = Server::start();
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    open_settings_page(&mut h, "網路");
+    h.get_by_label("檢查網站憑證（建議）").click();
+    h.run_steps(2);
+    h.query_all_by_label("連線逾時")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+        .expect("逾時的數字欄")
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text("45".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    let net = h.state().settings().net.clone();
+    assert!(!net.tls_verify);
+    assert_eq!(net.timeout_secs, 45);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste(server.url("/watch?v=cfg")));
+    step_until_label(&mut h, "無法播放網站影片");
+    let req = fake.requests().pop().expect("問了 yt-dlp");
+    assert!(!req.tls_verify, "yt-dlp 還在檢查憑證（用的是啟動時的設定）");
+    assert_eq!(req.timeout_secs, 45);
+    site_page_never_fetched(&server);
+}
+
+/// 網站的播放清單：變成影戲的播放清單（照順序、清單寫的標題），開第一部；第一部載入後換成網站給的標題
+#[test]
+fn site_playlist_becomes_our_playlist() {
+    if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/video_only.mp4")
+        .exists()
+    {
+        eprintln!("略過 site_playlist_becomes_our_playlist：沒有網路測試的樣本（python scripts/gen_samples.py）");
+        return;
+    }
+    let server = Server::start();
+    let base = server.url("");
+    let list = server.url("/playlist?list=PL1");
+    let p1 = server.url("/watch?v=p1");
+    let p2 = server.url("/watch?v=p2");
+    let list_json = site_playlist_json(&list, &[(p1.clone(), "p1"), (p2.clone(), "p2")]);
+    let (b, l) = (base.clone(), list.clone());
+    let fake = FakeResolver::new(move |req, _| {
+        let text = if req.url == l {
+            list_json.clone()
+        } else {
+            support::fake_ytdl::site_video_json(&b, &req.url, "p")
+        };
+        Ok(support::fake_ytdl::resolved(&text, Vec::new()))
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(list.clone()));
+    step_until_net(&mut h, "開清單的第一部", |app| {
+        playing_url(&app.player().state, &p1)
+    });
+    assert_eq!(playlist_items(h.state()), [p1.clone(), p2.clone()]);
+    assert_eq!(h.state().playlist().and_then(|l| l.current_index()), Some(0));
+    assert_eq!(h.state().url_title(&p2), Some("第 2 部"));
+    assert_eq!(
+        h.state().url_title(&p1),
+        Some(support::fake_ytdl::SITE_TITLE_TEXT),
+        "載入後用網站給的標題"
+    );
+    assert!(h.state().player().state.last_error.is_none());
+    assert!(h.state().history().recent.contains(&list), "清單本身記進最近開啟");
+    site_page_never_fetched(&server);
+}
+
+/// 網站的播放清單到了 yt-dlp 的上限（`-I 1:200`）：提示只載入前 200 個（略過了不能開的、留下的不到 200 個也一樣），
+/// 也說略過了幾個
+#[test]
+fn site_playlist_at_the_limit_says_only_the_first_were_loaded() {
+    let server = Server::start();
+    let list = server.url("/playlist?list=BIG");
+    let max = vitascope::ytdl::PLAYLIST_MAX;
+    let mut items: Vec<(String, String)> = (0..max)
+        .map(|n| (server.url(&format!("/watch?v=b{n}")), format!("b{n}")))
+        .collect();
+    items[5].0 = "file:///etc/passwd".into();
+    let refs: Vec<(String, &str)> = items.iter().map(|(u, id)| (u.clone(), id.as_str())).collect();
+    let list_json = site_playlist_json(&list, &refs);
+    let l = list.clone();
+    let fake = FakeResolver::new(move |req, _| {
+        if req.url == l {
+            Ok(support::fake_ytdl::resolved(&list_json, Vec::new()))
+        } else {
+            Err(YtdlError::Unsupported.into())
+        }
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(list.clone()));
+    step_until_net(&mut h, "變成播放清單", |app| {
+        app.playlist().is_some_and(|_| playlist_items(app).len() == max - 1)
+    });
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播放清單：199 個項目（只載入前 200 個）（略過 1 個不能開的項目）")
+    );
+    site_page_never_fetched(&server);
 }
 
 // ───────────── 媒體資訊 ─────────────

@@ -5,10 +5,12 @@
 //! - [`run`]：執行外部程式（不經過 shell、Windows 不閃黑色視窗、取消與逾時時連子程序一起結束）。
 //! - [`json`]：yt-dlp 的 JSON；[`plan`]：JSON → mpv 要開的網址與選項（純邏輯）。
 //! - [`errors`]：yt-dlp 的錯誤與警告 → 原因（介面執行緒再轉成文字）。
+//! - [`hook`]：接上播放器的部分（哪些網址要問 yt-dlp、背景解析、結果的快取）。
 //!
-//! 這裡不碰 mpv：之後由 `Player` 的 `on_load` hook 呼叫 [`Resolve`]，把 [`plan::Plan`] 交給 mpv。
+//! `Player` 在 mpv 開網址之前（`on_load` hook）呼叫 [`Resolve`]，把 [`plan::Plan`] 交給 mpv。
 
 pub mod errors;
+pub mod hook;
 pub mod json;
 pub mod locate;
 pub mod plan;
@@ -235,6 +237,8 @@ pub const VIDEO_DEADLINE: Duration = Duration::from_secs(60);
 pub const PLAYLIST_DEADLINE: Duration = Duration::from_secs(120);
 /// 播放清單最多讀幾個項目（頻道可能有上萬部影片）
 pub const PLAYLIST_ITEMS: &str = "1:200";
+/// [`PLAYLIST_ITEMS`] 的上限：yt-dlp 給了這麼多個項目時，清單可能還有更多（被截掉了）
+pub const PLAYLIST_MAX: usize = 200;
 /// 交給 yt-dlp 的連線逾時上限（秒）
 const MAX_SOCKET_TIMEOUT: u32 = 30;
 /// 要的字幕語言（中、英、日；不要直播聊天室）
@@ -354,9 +358,19 @@ pub trait Resolve: Send + Sync {
     /// 在背景執行緒呼叫，會等很久（最多 [`Request::deadline`]，包括第一次找 yt-dlp 的時間）；
     /// `cancel` 變成 true 時盡快放棄（回傳 [`YtdlError::Cancelled`]）。失敗時也帶著警告裡的提醒（[`Failure`]）
     fn resolve(&self, req: &Request, cancel: &AtomicBool) -> Result<Resolved, Failure>;
-    /// 能不能用：找過了而且確定沒有 yt-dlp 時 false（還沒找完當成可以，真的沒有時 `resolve` 會回傳 [`YtdlError::Missing`]）
+    /// 能不能用：剛找過而且確定沒有 yt-dlp 時 false（還沒找完、要重新找時當成可以，真的沒有時 `resolve` 會回傳
+    /// [`YtdlError::Missing`]）
     fn available(&self) -> bool;
+    /// 播放器最多等多久就當成沒有回應、放行 hook（看門狗）：`resolve` 自己的時間限制再多 [`hook::WATCHDOG_GRACE`]。
+    /// `resolve` 沒有照時間結束時（卡住、不理會取消），載入也不會永遠停住
+    fn watchdog(&self, req: &Request) -> Duration {
+        req.deadline() + hook::WATCHDOG_GRACE
+    }
 }
+
+/// 上次沒找到 yt-dlp（或 deno）時，過了這麼久再開網站影片就重新找：使用者可能照起始畫面的說明裝好了，
+/// 不用重開影戲。連續開好幾個網址時不每次都找
+pub const RECHECK_MISSING: Duration = Duration::from_secs(5);
 
 /// 執行真的 yt-dlp（用 [`Locator`] 找到的那一個）
 pub struct ProcessResolver {
@@ -364,6 +378,8 @@ pub struct ProcessResolver {
     limits: run::Limits,
     /// 測試用：取代 [`Request::deadline`]
     deadline: Option<Duration>,
+    /// 沒找到的結果過了多久要重新找（[`RECHECK_MISSING`]）
+    recheck: Duration,
 }
 
 impl ProcessResolver {
@@ -372,7 +388,15 @@ impl ProcessResolver {
             locator,
             limits: run::Limits::default(),
             deadline: None,
+            recheck: RECHECK_MISSING,
         }
+    }
+
+    /// 測試用：沒找到的結果過了多久要重新找
+    #[doc(hidden)]
+    pub fn with_recheck(mut self, recheck: Duration) -> Self {
+        self.recheck = recheck;
+        self
     }
 
     /// 測試用：換掉時間限制（等待時間仍然是 [`Request::deadline`]，見 [`Self::with_deadline`]）
@@ -420,7 +444,25 @@ impl Resolve for ProcessResolver {
     }
 
     fn available(&self) -> bool {
-        self.locator.get().is_none_or(|t| t.ytdl.is_some())
+        // 還沒找完（第一次、正在重新找）：`resolve` 等找完的結果
+        let Some(tools) = self.locator.get() else {
+            return true;
+        };
+        if self.locator.searching() {
+            return true;
+        }
+        // 上次沒找到 yt-dlp 或 deno、而且找過一陣子了：重新找（只看檔案在不在，版本查過的檔案不再執行，很快）。
+        // 找完之前當成可以，`resolve` 等新的結果，還是沒有就回報缺 yt-dlp
+        let missing = tools.ytdl.is_none() || tools.deno.is_none();
+        if missing && self.locator.age().is_some_and(|a| a >= self.recheck) {
+            self.locator.refresh();
+            return true;
+        }
+        tools.ytdl.is_some()
+    }
+
+    fn watchdog(&self, req: &Request) -> Duration {
+        self.deadline.unwrap_or_else(|| req.deadline()) + hook::WATCHDOG_GRACE
     }
 }
 
@@ -479,6 +521,11 @@ mod tests {
             ("bv*+ba/b", Some("vcodec:vp9,res:360".into()))
         );
         assert_eq!(format_args(Q::AudioOnly, C::H264), ("ba/b", None));
+    }
+
+    #[test]
+    fn playlist_limit_matches_the_command_line() {
+        assert_eq!(PLAYLIST_ITEMS, format!("1:{PLAYLIST_MAX}"));
     }
 
     #[test]

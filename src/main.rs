@@ -158,6 +158,15 @@ fn main() -> eframe::Result {
             Err(e) => eprintln!("[vitascope] 不使用單一執行個體：{e}"),
         }
     }
+    // 網站影片：用 yt-dlp 解析（第一次需要時才在背景找 yt-dlp；自動截圖不用，網站的網址說明要 yt-dlp）。
+    // 播放器和介面（「設定 → 網路」的狀態）用同一個尋找的結果
+    let net_resolver: Option<Arc<dyn vitascope::ytdl::Resolve>> = if launch.autoshot.is_none() {
+        let locator = vitascope::ytdl::Locator::new(launch.tools_dir.clone());
+        launch.ytdl = Some(locator.clone());
+        Some(Arc::new(vitascope::ytdl::ProcessResolver::new(locator)))
+    } else {
+        None
+    };
     let wake = egui_ctx.clone();
     let pace = !launch.pacing.block;
     let player = match Player::new(Options {
@@ -173,6 +182,7 @@ fn main() -> eframe::Result {
             }
         })),
         hwdec: if settings.hwdec { "auto-safe" } else { "no" }.into(),
+        net_resolver,
         ..Options::default()
     }) {
         Ok(p) => p,

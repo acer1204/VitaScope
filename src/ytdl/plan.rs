@@ -30,6 +30,9 @@ pub struct PlanConfig {
     pub lavf: String,
     /// 畫質清單（選單）的編碼偏好
     pub codec: CodecPref,
+    /// 播放引擎讀得了 `memory://` 的 Cookie 檔（mpv 0.38 起）。舊的（Linux tar.gz 用的系統 libmpv 0.37）
+    /// 只讀本機檔案：改成 `Cookie:` 標頭（只放網域對得上影片主機的）
+    pub memory_cookies: bool,
 }
 
 impl PlanConfig {
@@ -42,6 +45,7 @@ impl PlanConfig {
             headers: o.headers,
             lavf: o.lavf,
             codec: prefs.codec,
+            memory_cookies: true,
         }
     }
 }
@@ -90,6 +94,10 @@ pub enum Plan {
     Playlist {
         entries: Vec<(String, Option<String>)>,
         start: usize,
+        /// yt-dlp 給的項目裡略過了幾個（不能開的、指回清單本身的）
+        dropped: usize,
+        /// yt-dlp 給的項目到了上限（[`super::PLAYLIST_MAX`]）：清單可能被截掉了
+        capped: bool,
     },
 }
 
@@ -142,6 +150,8 @@ pub struct NetInfo {
     pub choices: Vec<QualityChoice>,
     /// 網址裡有 `list=`（選單提供「載入整個播放清單」）
     pub list_in_url: bool,
+    /// 從這裡開始播（秒；換畫質時接著播的位置，或網址指定的開始時間）：有的話不再從上次的位置續播
+    pub start_at: Option<f64>,
 }
 
 impl NetInfo {
@@ -360,7 +370,14 @@ fn playlist(info: &Info, page_url: &str, mode: &Mode) -> Result<Plan, YtdlError>
     } else {
         0
     };
-    Ok(Plan::Playlist { entries, start })
+    // 截掉了沒有看 yt-dlp 給了幾個（略過的也算），不是留下幾個
+    let total = info.entries.len();
+    Ok(Plan::Playlist {
+        dropped: total - entries.len(),
+        capped: total >= super::PLAYLIST_MAX,
+        entries,
+        start,
+    })
 }
 
 /// 項目的網址：網頁的網址（指回清單本身的不算），不然是項目的 `url`；
@@ -448,10 +465,22 @@ fn media(info: &Info, page_url: &str, mode: &Mode, cfg: &PlanConfig) -> Result<P
     {
         opt("user-agent", Node::Str(ua.to_owned()));
     }
-    let site: Vec<(&str, &str)> = ["Referer", "Cookie", "X-Forwarded-For"]
+    let mut site: Vec<(&str, String)> = ["Referer", "Cookie", "X-Forwarded-For"]
         .into_iter()
-        .filter_map(|n| header(n).map(|v| (n, v)))
+        .filter_map(|n| header(n).map(|v| (n, v.to_owned())))
         .collect();
+    let cookies = first.cookies.as_deref().or(info.format.cookies.as_deref());
+    let hosts = first.url.as_deref().map(cookie_hosts).unwrap_or_default();
+    let cookie_file = cookies.and_then(|c| cookies_for_hosts(c, &hosts));
+    if !cfg.memory_cookies
+        && !site.iter().any(|(n, _)| *n == "Cookie")
+        && let Some(line) = cookie_file
+            .as_deref()
+            .zip(hosts.first())
+            .and_then(|(file, host)| cookie_header(file, host))
+    {
+        site.push(("Cookie", line));
+    }
     if !site.is_empty() {
         // 全域的標頭照樣送，網站給了同名的就用網站的
         let mut all: Vec<String> = cfg
@@ -466,9 +495,9 @@ fn media(info: &Info, page_url: &str, mode: &Mode, cfg: &PlanConfig) -> Result<P
         all.extend(site.iter().map(|(n, v)| format!("{n}: {v}")));
         opt("http-header-fields", Node::strings(all));
     }
-    let cookies = first.cookies.as_deref().or(info.format.cookies.as_deref());
-    let host = first.url.as_deref().and_then(net::host);
-    if let Some(data) = cookies.and_then(|c| netscape_cookies(c, host.as_deref())) {
+    if cfg.memory_cookies
+        && let Some(data) = cookie_file
+    {
         opt("cookies", Node::Flag(true));
         opt("cookies-file", Node::Str(format!("memory://{data}")));
     }
@@ -529,6 +558,7 @@ fn media(info: &Info, page_url: &str, mode: &Mode, cfg: &PlanConfig) -> Result<P
         chosen: streams.iter().map(|f| FormatSummary::of(f)).collect(),
         choices: choices(info, cfg.codec),
         list_in_url,
+        start_at: start,
     };
     Ok(Plan::Media(Box::new(MediaPlan {
         open,
@@ -634,6 +664,61 @@ fn dash_edl(f: &Format) -> Result<String, YtdlError> {
         parts.push(format!("{},length={d}", edl_escape(&join(fr)?)));
     }
     Ok(format!("edl://{};", parts.join(";")))
+}
+
+/// 沒寫網域的 Cookie 用的網域：影片網址的主機。網址寫了埠號時兩種都寫（`主機`、`主機:埠`）：
+/// FFmpeg 比對 Cookie 的網域時，新版（我們的引擎）拿的是含埠號的主機，系統的 FFmpeg 6.1 拿的是不含的
+/// （libavformat/http.c 的 `get_cookies` 比字尾）。各版本只對得上其中一個，不會送兩次
+fn cookie_hosts(url: &str) -> Vec<String> {
+    let Ok(u) = url::Url::parse(url) else {
+        return Vec::new();
+    };
+    let Some(host) = u.host_str().filter(|h| !h.is_empty()).map(str::to_ascii_lowercase) else {
+        return Vec::new();
+    };
+    match u.port() {
+        Some(port) => vec![host.clone(), format!("{host}:{port}")],
+        None => vec![host],
+    }
+}
+
+/// Netscape cookies.txt → `Cookie:` 標頭的值（`名稱=值; …`），只放網域是 `host`（或它的上層網域）的。
+/// 給讀不了 `memory://` Cookie 檔的舊引擎用：標頭會送到這個檔案的每一個網址，所以要先篩過網域
+fn cookie_header(netscape: &str, host: &str) -> Option<String> {
+    let host = host.to_ascii_lowercase();
+    let mut pairs: Vec<String> = Vec::new();
+    for line in netscape.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [domain, _, _, _, _, name, value] = cols.as_slice() else {
+            continue;
+        };
+        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        let ok = host == domain
+            || host
+                .strip_suffix(domain.as_str())
+                .is_some_and(|rest| rest.ends_with('.'));
+        let pair = format!("{name}={value}");
+        if ok && !pairs.contains(&pair) {
+            pairs.push(pair);
+        }
+    }
+    (!pairs.is_empty()).then(|| pairs.join("; "))
+}
+
+/// 每個主機各寫一份沒寫網域的 Cookie（有寫網域的只寫一次）
+fn cookies_for_hosts(line: &str, hosts: &[String]) -> Option<String> {
+    if hosts.is_empty() {
+        return netscape_cookies(line, None);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for h in hosts {
+        for l in netscape_cookies(line, Some(h)).unwrap_or_default().lines() {
+            if !out.iter().any(|o| o == l) {
+                out.push(l.to_owned());
+            }
+        }
+    }
+    (!out.is_empty()).then(|| out.iter().map(|l| format!("{l}\n")).collect())
 }
 
 /// yt-dlp 的 Cookie（一行：`名稱=值; Domain=…; Path=…; Secure; Expires=…; 下一個名稱=值; …`）→ Netscape cookies.txt。
@@ -929,6 +1014,24 @@ mod tests {
     }
 
     #[test]
+    fn old_engines_get_the_cookies_as_a_header() {
+        let cfg = PlanConfig {
+            memory_cookies: false,
+            ..Default::default()
+        };
+        let m = media_plan(YOUTUBE, &Mode::default(), &cfg);
+        assert!(option(&m, "cookies-file").is_none() && option(&m, "cookies").is_none());
+        // 影片在 rr1.googlevideo.com：.youtube.com 的 Cookie 不送，主機自己的（沒寫網域、路徑 /watch）照送
+        assert_eq!(
+            option(&m, "http-header-fields"),
+            Some(&Node::strings([
+                "Referer: https://www.youtube.com/",
+                "Cookie: PREF=f6=8"
+            ]))
+        );
+    }
+
+    #[test]
     fn user_settings_win_where_they_should() {
         let net = NetSettings {
             user_agent: "Mine/1.0".into(),
@@ -1072,6 +1175,7 @@ mod tests {
         assert!(m.open.contains("itag=248") && m.open.contains("itag=251"));
         // 換畫質時從原本的位置接著播（不用網址的開始時間）
         assert_eq!(option(&m, "start"), Some(&Node::Str("42.5".into())));
+        assert_eq!(m.info.start_at, Some(42.5), "有開始的位置：不再續播");
         // 不在清單上的格式
         let gone = Mode {
             choice: Choice::Format {
@@ -1130,6 +1234,7 @@ mod tests {
         assert_eq!(m.open, "https://live.test/master.m3u8");
         assert!(m.info.live);
         assert!(option(&m, "start").is_none());
+        assert_eq!(m.info.start_at, None);
     }
 
     #[test]
@@ -1198,10 +1303,16 @@ mod tests {
     fn playlists_become_our_own_entries() {
         let i = info(PLAYLIST);
         let page = "https://www.youtube.com/watch?v=bbbbbbbbbbb&list=PL1&index=2";
-        let Plan::Playlist { entries, start } = plan(&i, page, &Mode::default(), &PlanConfig::default()).unwrap()
+        let Plan::Playlist {
+            entries,
+            start,
+            dropped,
+            capped,
+        } = plan(&i, page, &Mode::default(), &PlanConfig::default()).unwrap()
         else {
             panic!("應該是播放清單");
         };
+        assert_eq!((dropped, capped), (2, false), "五個裡略過兩個；遠不到上限");
         assert_eq!(
             entries,
             vec![
@@ -1226,6 +1337,44 @@ mod tests {
             panic!()
         };
         assert_eq!(start, 1, "從網址 v= 的那一部開始");
+        // yt-dlp 給了上限那麼多個（-I 1:200）：清單可能被截掉了，就算略過了幾個、留下的不到上限也是
+        let many: Vec<String> = (0..crate::ytdl::PLAYLIST_MAX)
+            .map(|n| {
+                let url = if n == 7 {
+                    "file:///x".to_owned()
+                } else {
+                    format!("https://site.test/v/{n}")
+                };
+                format!(r#"{{"url": "{url}"}}"#)
+            })
+            .collect();
+        let many = info(&format!(r#"{{"_type": "playlist", "entries": [{}]}}"#, many.join(",")));
+        let Plan::Playlist {
+            entries,
+            dropped,
+            capped,
+            ..
+        } = plan(&many, "https://site.test/l", &Mode::default(), &PlanConfig::default()).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (entries.len(), dropped, capped),
+            (crate::ytdl::PLAYLIST_MAX - 1, 1, true)
+        );
+        let fewer = info(&format!(
+            r#"{{"_type": "playlist", "entries": [{}]}}"#,
+            (1..crate::ytdl::PLAYLIST_MAX)
+                .map(|n| format!(r#"{{"url": "https://site.test/v/{n}"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let Plan::Playlist { capped, .. } =
+            plan(&fewer, "https://site.test/l", &Mode::default(), &PlanConfig::default()).unwrap()
+        else {
+            panic!()
+        };
+        assert!(!capped, "比上限少一個：整個清單都讀到了");
         // 全部都不能開
         let empty = info(r#"{"_type": "playlist", "entries": [{"url": "file:///x"}, {"url": "rel"}]}"#);
         assert_eq!(
@@ -1266,6 +1415,25 @@ mod tests {
 
     #[test]
     fn netscape_cookie_text() {
+        // 沒寫網域：影片網址的主機（寫了埠號時連埠號一起，FFmpeg 比對時含埠號）
+        assert_eq!(cookie_hosts("https://CDN.test/v?x=1"), ["cdn.test"]);
+        assert_eq!(cookie_hosts("https://cdn.test:443/v"), ["cdn.test"]);
+        assert_eq!(cookie_hosts("http://127.0.0.1:8080/v"), ["127.0.0.1", "127.0.0.1:8080"]);
+        assert!(cookie_hosts("not a url").is_empty());
+        // 寫了埠號：沒寫網域的寫兩份（含不含埠號），有寫網域的只寫一次
+        assert_eq!(
+            cookies_for_hosts("a=1; b=2; Domain=.x.test", &cookie_hosts("http://h.test:81/v")),
+            Some("h.test\tFALSE\t/\tFALSE\t0\ta\t1\n.x.test\tTRUE\t/\tFALSE\t0\tb\t2\nh.test:81\tFALSE\t/\tFALSE\t0\ta\t1\n".into())
+        );
+        assert_eq!(cookies_for_hosts("a=1", &[]), None);
+        // 舊引擎的 Cookie 標頭：網域對得上主機（或上層網域）的才放，不重複
+        let file = cookies_for_hosts(
+            "a=1; b=2; Domain=.x.test; c=3; Domain=other.test",
+            &cookie_hosts("http://cdn.x.test:81/v"),
+        )
+        .unwrap();
+        assert_eq!(cookie_header(&file, "cdn.x.test").as_deref(), Some("a=1; b=2"));
+        assert_eq!(cookie_header(&file, "nothing.test"), None);
         assert_eq!(netscape_cookies("", Some("h")), None);
         // 沒有網域也沒有主機：略過
         assert_eq!(netscape_cookies("a=1", None), None);

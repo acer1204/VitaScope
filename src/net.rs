@@ -492,7 +492,7 @@ pub fn storable(url: &str) -> bool {
 }
 
 /// 續播、書籤用的代號（播放紀錄的鍵）：網路串流的網址去掉 `#` 之後的部分（只是網頁裡的位置，伺服器收不到）。
-/// `site` = 網站影片的（擷取器, 影片代號），之後 yt-dlp 解析出來時傳入：同一部影片的不同網址
+/// `site` = 網站影片的（擷取器, 影片代號），yt-dlp 解析出來時傳入（`NetInfo::resume_key`）：同一部影片的不同網址
 /// （`youtu.be/x`、`watch?v=x&t=90`）是同一個代號 `ytdl://擷取器/代號`。
 /// 不是網路串流（本機檔案、`av://` 之類）時 None：本機檔案用路徑本身，mpv 自己的網址不續播
 pub fn resume_key(url: &str, site: Option<(&str, &str)>) -> Option<String> {

@@ -52,11 +52,11 @@ enum MarkOp {
 
 impl VitascopeApp {
     /// 書籤用的檔案代號：本機檔案是完整路徑，網路串流是續播的代號（`network::history_key`：網址去掉 `#` 之後的部分，
-    /// 之後網站影片是同一部影片的代號），書籤跟續播用同一個；mpv 自己的網址（`av://` 之類）照開啟時的網址
+    /// 網站影片是同一部影片的代號），書籤跟續播用同一個；mpv 自己的網址（`av://` 之類）照開啟時的網址
     pub(super) fn media_key(&self) -> Option<String> {
         let st = &self.player.state;
         let path = st.path.clone().filter(|_| st.loaded)?;
-        Some(super::network::history_key(&path).unwrap_or(path))
+        Some(super::network::history_key(&path, st.net.as_deref()).unwrap_or(path))
     }
 
     /// 目前檔案的書籤（依時間排序）

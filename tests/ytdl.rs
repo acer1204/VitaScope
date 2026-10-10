@@ -624,6 +624,69 @@ fn process_resolver_uses_the_located_tools() {
     assert!(!resolver.available());
 }
 
+/// 沒找到 yt-dlp：剛找過時馬上說沒有（連續開好幾個網址不每次都找）；過了一陣子再開就重新找，
+/// 使用者照起始畫面的說明裝好之後不用重開影戲。找到 yt-dlp、沒有 deno 時也一樣（deno 裝好了也找得到）
+#[test]
+fn missing_tools_are_searched_again_later() {
+    let Some(fake) = Fake::new("install") else { return };
+    fake.write("stdout.txt", YOUTUBE_JSON);
+    let tools = Tools {
+        ytdl: Some(fake.located("out")),
+        ytdl_version: None,
+        ytdl_error: None,
+        deno: None,
+        deno_too_old: None,
+        env: ChildEnv {
+            path: None,
+            cwd: Some(fake.dir.clone()),
+        },
+    };
+    let installed = Arc::new(AtomicBool::new(false));
+    let searches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (i, n) = (installed.clone(), searches.clone());
+    let loc = Locator::with_finder(
+        None,
+        Arc::new(move |env: &SearchEnv| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if i.load(Ordering::SeqCst) {
+                tools.clone()
+            } else {
+                Tools::none(env)
+            }
+        }),
+    );
+    let never = AtomicBool::new(false);
+    let req = request("https://youtu.be/BaW_jenozKc");
+    // 剛找過、沒有：馬上說沒有，不再找
+    let recent = ProcessResolver::new(loc.clone()).with_recheck(Duration::from_secs(3600));
+    assert_eq!(
+        recent.resolve(&req, &never).map(|_| ()).map_err(|f| f.error),
+        Err(YtdlError::Missing)
+    );
+    assert!(!recent.available());
+    assert!(!recent.available());
+    assert_eq!(searches.load(Ordering::SeqCst), 1);
+    // 裝好了；過了一陣子（測試把間隔改成 0）再開：重新找，找到就播
+    installed.store(true, Ordering::SeqCst);
+    let later = ProcessResolver::new(loc.clone()).with_recheck(Duration::ZERO);
+    assert!(
+        later.available(),
+        "沒找到的結果過了一陣子：當成可以，解析時等重新找的結果"
+    );
+    let got = later.resolve(&req, &never).expect("裝好之後找得到 yt-dlp");
+    assert!(got.info.title.is_some());
+    assert_eq!(searches.load(Ordering::SeqCst), 2);
+    // 有 yt-dlp、沒有 deno：也會重新找
+    assert!(later.available());
+    later.resolve(&req, &never).unwrap();
+    assert_eq!(searches.load(Ordering::SeqCst), 3);
+    // 剛找過、有 yt-dlp：可以，不再找
+    assert!(recent.available());
+    assert!(loc.get().is_some_and(|t| t.ytdl.is_some()));
+    assert!(!loc.searching());
+    assert_eq!(searches.load(Ordering::SeqCst), 3);
+}
+
 #[test]
 fn the_tool_search_counts_against_the_deadline() {
     // 第一次播網站影片時要先找 yt-dlp：找的時間也算在等待時間裡（hook 的看門狗只多給 10 秒）

@@ -471,7 +471,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   （系統的 libmpv 也明確打開）、記住網址、User-Agent / Referer / 標頭（換行不能進標頭）/ proxy，在「設定 → 網路」改，
   `VITASCOPE_MPV_OPTS` 指定的停用。播放時：300 毫秒後才出現的「正在連線：主機…」（Esc 只在一般視窗取消，全螢幕時 Esc 照樣離開全螢幕；
   「取消」、停止也可以）、「緩衝中… N%」（`paused-for-cache`、`cache-buffering-state`），都畫成深色；直播（載入時沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類：
-  直播的 HLS 也有 FFmpeg 估的很短的總長度；伺服器不支援 Range 的一般檔案不能跳轉但不是直播）顯示「直播」、播完提示。續播與書籤用同一個代號（網址去掉 `#` 之後的部分；之後網站影片是
+  直播的 HLS 也有 FFmpeg 估的很短的總長度；伺服器不支援 Range 的一般檔案不能跳轉但不是直播）顯示「直播」、播完提示。續播與書籤用同一個代號（網址去掉 `#` 之後的部分；網站影片是
   `ytdl://擷取器/代號`），只記能跳轉、一分鐘以上、記得住的網址（含帳號密碼、token 的不記）。網路上的播放清單（IPTV 的 .m3u 網址）：
   mpv 結束這個網址（redirect）時讀出它展開的項目（清單的網址看 `playlist-path`），只留網路串流，換成影戲的播放清單、照一般的開檔重新開，
   mpv 自己的清單又只有一個。媒體資訊的「來源」（標題、網址、串流種類、預先讀了幾秒、下載速度、緩衝中），截圖檔名用標題。
@@ -483,6 +483,18 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：真的網路上的 HLS 直播、DASH、IPTV 的 m3u 網址（Windows、macOS、Linux AppImage 與 tar.gz 各一次）；
     Windows 上網路擋住憑證撤銷檢查時的說明與「檢查網站憑證」開關；HTTP proxy；從瀏覽器拖曳連結沒有反應、Ctrl（⌘）+ V 可以
 - [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
+  - 已完成：找 yt-dlp / deno、執行與取消（Windows Job Object、Unix 程序群組）、讀 JSON、錯誤與警告（C5）；
+    接上播放器：`on_load` hook 在背景問 yt-dlp（影片網站先問，其他網頁 mpv 讀到內容卻認不出時才問；連線失敗不問），
+    合成 EDL、這個檔案專用的標頭 / Cookie（`file-local-options`）、網站字幕（選到才下載）、章節（載入後設定）、
+    網站的播放清單交給影戲的播放清單、20 分鐘的結果快取、看門狗、換檔 / 取消時一定放行 hook、mpv 拿掉 hook 時重新註冊；
+    介面：「正在取得網站影片」／「正在讀取播放清單」、播不了時的原因與提醒（每次畫的時候才產生文字，換語言跟著換）、
+    續播與書籤用 `ytdl://擷取器/代號`；沒找到 yt-dlp / deno 時過一陣子再開就重新找（裝好不用重開）（C6）
+    （自動：hook 的路線、快取、看門狗、取消的單元測試；headless 用假的 yt-dlp 播本機伺服器上的影音合成、標頭與 Cookie 送到伺服器、
+    不會漏到下一個網址、播放中改 User-Agent 下一個網址照新的、開始時間與換畫質不再問、換檔 / 停止 / 取消不等、錯誤與看門狗、
+    不安全的網址、播放清單、只有認不出內容才問（錯誤記錄比 hook 晚到也一樣）、hook 被拿掉後重新註冊、裝好 yt-dlp 後重新找；
+    kittest 正在取得、Esc 取消、標題、續播與書籤的代號、網址指定的開始位置不續播、提醒只出現一次、原因與英文介面、沒有 yt-dlp、
+    播放清單與 200 個的上限、「設定 → 網路」改的設定下一次解析就用）
+  - 還沒做：「網站影片 ▸」選單（畫質、只播聲音、整個播放清單）、「設定 → 網路」的 yt-dlp 部分（C7）；由影戲下載 yt-dlp 與 deno（C8）
 - [ ] 線上搜尋字幕（OpenSubtitles API）
 - [ ] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF
 - [ ] 縮圖總覽圖匯出（thumbnail sheet）
@@ -775,6 +787,21 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   另外 HTTP 的錯誤碼（`HTTP error 404 Not Found`）是警告，不是錯誤：播放器要向 mpv 要警告等級的記錄才收得到。
   FFmpeg 7 以前（Ubuntu 24.04 系統的 libmpv 0.37 用的 FFmpeg 6.1）伺服器不回應、讀取逾時時什麼都不記錄，
   只有 mpv 的「Failed to open」：看不出原因、但花滿了 `network-timeout` 才失敗的，就當成逾時說明。
+- **mpv 開不起來時的錯誤記錄跟 `on_load_fail` hook 的先後**：連線失敗時「Failed to open <網址>」在 hook 之前就記了，
+  但記錄要等事件佇列空了才送：處理到 hook 事件時記錄可能還沒收到（實際上常常先到：還沒送出的屬性通知會讓 hook 晚一點送，
+  記錄趁機先到，但 API 沒有保證）。要看記錄決定的事，等 `wait_event(0)` 回傳沒有事件之後再決定。
+  另外「Failed to recognize file format」是檔案結束（`END_FILE`）之後才記的，「No video or audio streams」是載入成功之後，
+  兩個在 `on_load_fail` 的時候都還沒有：判斷「讀到了內容、只是認不出」只能反過來看有沒有連線失敗的記錄。
+- **FFmpeg 比對 Cookie 的網域時，新版用含埠號的主機、6.1 用不含的**（libavformat/http.c `get_cookies` 比字尾）：
+  網址寫了埠號時，我們的引擎（FFmpeg 9）要 Cookie 檔的網域寫 `主機:埠` 才送得出去，系統的 FFmpeg 6.1 要寫 `主機`。
+  網站影片沒寫網域的 Cookie 兩種都寫一份（各版本只對得上其中一個，不會送兩次）。
+  另外 mpv 0.37 的 Cookie 檔只讀本機檔案（0.38 起才讀得了 `memory://`）：系統的 libmpv 改用 `Cookie:` 標頭
+  （只放網域對得上影片主機的；標頭會送到這個檔案的每一個網址）。
+- **`file-local-options` 在檔案結束時還原成「設定之前」的值**（`END_FILE` 之前就還原了）：這段期間改的全域設定也會被蓋回去。
+  網站影片結束時，播放器把那段期間改過的網路設定再同步送一次。
+- **mpv 的事件佇列滿了（1000 個）時，送不出的 hook 會被拿掉**（警告「Failed sending hook command main/on_load. Removing hook.」；
+  0.37 是「Sending hook command failed. Removing hook.」，沒寫是哪一個）：之後的檔案都不會再停在 hook。
+  播放器看到這筆記錄就重新註冊（0.37 兩個都註冊，重複收到的 hook 認得出來）。
 - **Windows：觀察 `audio-device-list` 要讓程式一直有多執行緒 COM（MTA）**：mpv 在自己的執行緒初始化 MTA、關閉時拆掉，
   那是程式裡唯一的 MTA 時，系統的裝置通知還在用，關閉播放器時存取違規。啟動時先 `CoIncrementMTAUsage`，不再減回去。
 - **Linux 直接連結新版 libmpv 才有的函式，舊的 libmpv 在程式開始之前就被載入器擋掉**：Rust 預設 `-z now`（完整 RELRO），
