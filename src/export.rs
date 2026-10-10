@@ -77,6 +77,27 @@ pub enum ClipFormat {
     Ts,
 }
 
+impl ClipFormat {
+    pub const ALL: [ClipFormat; 5] = [
+        ClipFormat::Auto,
+        ClipFormat::Mkv,
+        ClipFormat::Mp4,
+        ClipFormat::Webm,
+        ClipFormat::Ts,
+    ];
+
+    /// 設定頁、匯出視窗上的名稱（格式名稱不翻譯）
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipFormat::Auto => crate::tr!("自動（照來源）", "Automatic (like the source)"),
+            ClipFormat::Mkv => "MKV",
+            ClipFormat::Mp4 => "MP4",
+            ClipFormat::Webm => "WebM",
+            ClipFormat::Ts => "TS",
+        }
+    }
+}
+
 /// 轉成 GIF 上次的選擇
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -517,10 +538,26 @@ impl Failure {
         }
     }
 
-    /// 提示文字：取消時「已取消匯出」，其他「無法匯出：原因」
+    /// 提示文字（一行）：取消時「已取消匯出」，其他「無法匯出：原因」。
+    /// 原因裡有路徑、系統或 mpv 的原文的，提示只說個大概（完整的在匯出視窗，[`details`](Self::details)）
     pub fn osd(&self) -> String {
+        use crate::{tf, tr};
+        let see = tr!("（詳情見匯出視窗）", " (see the Export window)");
+        let reason = match self {
+            Failure::Cancelled => return tr!("已取消匯出", "Export cancelled").into(),
+            Failure::NoPermission(Some(_)) => Failure::NoPermission(None).message(),
+            Failure::Unplayable(Some(_)) => Failure::Unplayable(None).message(),
+            Failure::Finish { .. } => format!("{}{see}", tr!("無法完成存檔", "Couldn't finish saving")),
+            Failure::Io(_) | Failure::Engine(_) => format!("{}{see}", tr!("發生錯誤", "An error occurred")),
+            other => other.message(),
+        };
+        tf!("無法匯出：{reason}", "Export failed: {reason}")
+    }
+
+    /// 匯出視窗裡的完整說明：「無法匯出：原因」（含路徑、原文）；取消時「已取消匯出」
+    pub fn details(&self) -> String {
         match self {
-            Failure::Cancelled => crate::tr!("已取消匯出", "Export cancelled").into(),
+            Failure::Cancelled => self.osd(),
             other => {
                 let reason = other.message();
                 crate::tf!("無法匯出：{reason}", "Export failed: {reason}")
@@ -1742,6 +1779,46 @@ mod tests {
             check_expect(Some(3.0), &[cover], &audio_only),
             Err(Failure::MissingTrack(TrackKind::Video))
         );
+    }
+
+    #[test]
+    fn failure_osd_is_one_short_line_without_paths_or_raw_text() {
+        // 提示只有一行（約 40 個字以內）；路徑、系統或 mpv 的原文只在匯出視窗裡（details）
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let temp = PathBuf::from(
+            r"C:\Users\someone\Videos\VitaScope\很長的影片名稱 00.12.03-00.12.45.12345-7.vitascope-part.mkv",
+        );
+        let raw = "The process cannot access the file because it is being used by another process. (os error 32)";
+        let cases = [
+            Failure::Finish {
+                error: raw.into(),
+                temp: temp.clone(),
+            },
+            Failure::NoPermission(Some(temp.clone())),
+            Failure::Unplayable(Some(raw.into())),
+            Failure::Io(raw.into()),
+            Failure::Engine(raw.into()),
+        ];
+        for f in &cases {
+            let osd = f.osd();
+            assert!(osd.starts_with("無法匯出："), "{osd}");
+            assert!(osd.chars().count() <= 40, "提示太長：{osd}");
+            assert!(!osd.contains("os error") && !osd.contains("VitaScope"), "{osd}");
+            // 視窗裡看得到完整的原因
+            let details = f.details();
+            assert!(details.starts_with("無法匯出："), "{details}");
+            assert!(
+                details.contains(raw) || details.contains(&temp.display().to_string()),
+                "{details}"
+            );
+        }
+        // 短的原因：提示與視窗一樣
+        assert_eq!(Failure::WriteFailed.osd(), Failure::WriteFailed.details());
+        assert_eq!(Failure::Cancelled.details(), "已取消匯出");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        let osd = cases[0].osd();
+        assert_eq!(osd, "Export failed: Couldn't finish saving (see the Export window)");
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
     }
 
     #[test]

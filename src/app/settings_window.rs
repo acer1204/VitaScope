@@ -28,6 +28,7 @@ pub(super) enum Page {
     Subtitles,
     /// 網路（開啟網址的串流設定；之後加網站影片 yt-dlp）
     Network,
+    /// 截圖與匯出（截圖資料夾；片段的資料夾、格式）
     Screenshot,
     System,
     Shortcuts,
@@ -54,7 +55,7 @@ impl Page {
             Page::Sound => tr!("音效", "Sound"),
             Page::Subtitles => tr!("字幕", "Subtitles"),
             Page::Network => tr!("網路", "Network"),
-            Page::Screenshot => tr!("截圖", "Screenshots"),
+            Page::Screenshot => tr!("截圖與匯出", "Screenshots and export"),
             Page::System => tr!("系統", "System"),
             Page::Shortcuts => tr!("快捷鍵", "Shortcuts"),
         }
@@ -843,6 +844,7 @@ impl VitascopeApp {
 
     fn screenshot_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) -> bool {
         let mut changed = false;
+        ui.strong(tr!("截圖", "Screenshots"));
         ui.label(tr!("截圖資料夾", "Screenshot folder"));
         ui.add(egui::Label::new(egui::RichText::new(self.screenshot_dir().display().to_string()).monospace()).wrap());
         ui.horizontal(|ui| {
@@ -874,6 +876,8 @@ impl VitascopeApp {
             "截圖是原始解析度的 PNG 檔。",
             "Screenshots are PNG files at the video's original resolution."
         ));
+        ui.add_space(12.0);
+        changed |= self.export_settings_section(ui, action);
         changed
     }
 }

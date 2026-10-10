@@ -392,14 +392,88 @@ pub fn temp_path(n: u64) -> PathBuf {
 /// 用系統的檔案管理員打開資料夾
 pub fn open_folder(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let program = if cfg!(windows) {
-        "explorer"
-    } else if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    crate::syscmd::command(program).arg(dir).spawn().map(|_| ())
+    open_with_system(dir)
+}
+
+/// 用系統預設的程式打開檔案（匯出完成時的「開啟檔案」）
+pub fn open_path(path: &Path) -> std::io::Result<()> {
+    open_with_system(path)
+}
+
+/// 在檔案管理員裡顯示這個檔案（「在資料夾中顯示」）：Windows、macOS 會選取它；
+/// Linux 打開所在的資料夾（選取要 D-Bus 的 FileManager1，之後再做）
+pub fn reveal(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        crate::syscmd::command(opener())
+            .raw_arg(reveal_arg(path))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::syscmd::command(opener()).arg("-R").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        open_folder(path.parent().unwrap_or(path))
+    }
+}
+
+/// 用系統的程式（Windows 的 explorer、macOS 的 open、Linux 的 xdg-open）打開檔案或資料夾。不經過 shell
+fn open_with_system(path: &Path) -> std::io::Result<()> {
+    let mut cmd = crate::syscmd::command(opener());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // explorer 自己解析命令列、把逗號當成參數的分隔：路徑一定要加引號。
+        // Rust 只在有空白時才加引號（「D:\Clips\a,b.mkv」會被拆開），所以自己加、原樣傳過去
+        cmd.raw_arg(quoted(path));
+    }
+    #[cfg(not(windows))]
+    cmd.arg(path);
+    cmd.spawn().map(|_| ())
+}
+
+/// 打開檔案、資料夾用的系統程式，用絕對路徑（不從 PATH 找，§1.10）。
+/// Linux 的 xdg-open 沒有固定的位置（各發行版、Flatpak 不一樣），只能從 PATH 找
+fn opener() -> PathBuf {
+    #[cfg(windows)]
+    {
+        windows_dir().join("explorer.exe")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/usr/bin/open")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("xdg-open")
+    }
+}
+
+/// Windows 資料夾（`%SystemRoot%`，沒有或不是絕對路徑時用 `%windir%`、再來是 C:\Windows）
+#[cfg(windows)]
+fn windows_dir() -> PathBuf {
+    ["SystemRoot", "windir"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+/// 加上引號的路徑（Windows 的檔名不能有 `"`，不用跳脫）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quoted(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
+/// explorer 的「選取這個檔案」參數：`/select,"C:\…\名稱.mkv"`
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reveal_arg(path: &Path) -> String {
+    format!("/select,{}", quoted(path))
 }
 
 #[cfg(test)]
@@ -561,5 +635,25 @@ mod tests {
         );
         assert_eq!(source_stem("https://x.com/v/", None), "v");
         assert_eq!(source_stem("", None), "VitaScope");
+    }
+
+    #[test]
+    fn reveal_selects_the_file_with_the_path_quoted() {
+        // 路徑有空白、逗號也不會被 explorer 拆開
+        assert_eq!(
+            reveal_arg(Path::new(r"C:\影片\a, b 00.00.01-00.00.02.mkv")),
+            r#"/select,"C:\影片\a, b 00.00.01-00.00.02.mkv""#
+        );
+        // 沒有空白、有逗號（使用者自己取的檔名）：「開啟檔案」一樣加引號
+        assert_eq!(quoted(Path::new(r"D:\Clips\a,b.mkv")), r#""D:\Clips\a,b.mkv""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_programs_use_absolute_paths() {
+        let explorer = opener();
+        assert!(explorer.is_absolute(), "{}", explorer.display());
+        assert!(explorer.ends_with("explorer.exe"), "{}", explorer.display());
+        assert!(explorer.exists(), "{}", explorer.display());
     }
 }

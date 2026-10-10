@@ -443,6 +443,8 @@ commands! {
     ScreenshotAs => "screenshot-as", Files, once, ("另存截圖…", "Save screenshot as…");
     LoadSubtitle => "load-subtitle", Files, once, ("載入字幕檔…", "Load subtitle file…");
     OpenUrl => "open-url", Files, once, ("開啟網址…", "Open URL…");
+    /// 匯出視窗的「片段」（預設沒有按鍵）
+    ExportClip => "export-clip", Files, once, ("儲存片段…", "Save clip…");
     BookmarkAdd => "bookmark-add", Bookmarks, once, ("新增書籤", "Add bookmark");
     BookmarkPrev => "bookmark-prev", Bookmarks, once, ("上一個書籤", "Previous bookmark");
     BookmarkNext => "bookmark-next", Bookmarks, once, ("下一個書籤", "Next bookmark");
@@ -1403,6 +1405,8 @@ mod tests {
         "bookmark-list",
         // C3
         "open-url",
+        // D3
+        "export-clip",
     ];
 
     #[test]
@@ -1533,6 +1537,7 @@ mod tests {
                 | C::ScreenshotAs
                 | C::LoadSubtitle
                 | C::OpenUrl
+                | C::ExportClip
                 | C::BookmarkAdd
                 | C::BookmarkPrev
                 | C::BookmarkNext

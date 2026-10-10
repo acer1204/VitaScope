@@ -592,12 +592,25 @@ pub struct ClipSpec {
     pub test: TestHooks,
 }
 
-/// 主播放器目前的檔案能不能存片段（不管範圍、格式）；不能時回傳原因（右鍵選單停用時的說明）。
-/// 有影像的檔案即使音軌的格式存不成檔案（藍光的 LPCM…）也能存：預設改用別的音軌，或只放影像（[`default_picks`]）
+/// 主播放器目前的檔案能不能存片段（不管範圍、格式、選了哪些軌道）；不能時回傳原因（右鍵選單停用時的說明）。
+/// 只要檔案裡有一條放得進片段的內嵌軌道就能存：主播放器關掉聲音（aid=no）時，匯出視窗照樣可以選音軌。
+/// 有影像的檔案即使音軌的格式存不成檔案（藍光的 LPCM…）也能存：改用別的音軌，或只放影像
 pub fn unavailable(player: &Player, caps: &EngineCaps) -> Option<Failure> {
     inspect(player, caps)
-        .and_then(|found| usable_picks(&player.state, default_picks(&player.state)).map(|_| found))
+        .and_then(|found| usable_picks(&player.state, any_picks(&player.state)).map(|_| found))
         .err()
+}
+
+/// 放得進片段的軌道（每一類的第一條，不管主播放器選了沒有）：判斷這個檔案能不能存片段用
+fn any_picks(state: &crate::player::State) -> Picks {
+    let pick = |kind: TrackKind| {
+        let track = state.tracks_of(kind).find(|t| clip_ready(t))?;
+        StreamPick::of(&state.tracks, track)
+    };
+    Picks {
+        video: pick(TrackKind::Video),
+        audio: pick(TrackKind::Audio),
+    }
 }
 
 /// 從主播放器看到的：要開什麼
@@ -1569,6 +1582,17 @@ mod tests {
         // 關掉聲音：不放聲音
         select(&mut state, TrackKind::Audio, 0);
         assert_eq!(default_picks(&state).audio, None);
+        // 只有聲音、主播放器又關掉了聲音：預設什麼都不放，但檔案照樣能存（匯出視窗裡可以選音軌）
+        let mut muted = state.clone();
+        muted.tracks.retain(|t| t.kind != TrackKind::Video);
+        assert!(usable_picks(&muted, default_picks(&muted)).is_err());
+        let any = any_picks(&muted);
+        assert_eq!(
+            any.audio.as_ref().map(|a| a.ordinal),
+            Some(2),
+            "跳過放不進的 LPCM：{any:?}"
+        );
+        assert!(usable_picks(&muted, any).is_ok());
         // 只有放不進的音軌：有影像時只放影像（選單照樣能用），沒有影像時說明音訊格式不能存
         state.tracks.retain(|t| t.kind != TrackKind::Audio || t.id == 1);
         select(&mut state, TrackKind::Audio, 1);
@@ -1577,6 +1601,7 @@ mod tests {
         assert!(usable_picks(&state, p).is_ok());
         state.tracks.retain(|t| t.kind != TrackKind::Video);
         assert_eq!(usable_picks(&state, default_picks(&state)), Err(Failure::AudioCodec));
+        assert_eq!(usable_picks(&state, any_picks(&state)), Err(Failure::AudioCodec));
         // 什麼都沒有
         let empty = crate::player::State::default();
         assert_eq!(usable_picks(&empty, default_picks(&empty)), Err(Failure::NoData));

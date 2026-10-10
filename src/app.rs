@@ -4,6 +4,7 @@ mod bookmarks_panel;
 mod capture;
 mod control_panel;
 mod dialogs;
+mod export_panel;
 mod info_panel;
 mod install;
 mod network;
@@ -207,6 +208,12 @@ enum Action {
     ToggleBookmarks,
     /// 刪掉書籤分頁上選取的書籤（Delete）
     BookmarkRemove,
+    /// 匯出視窗（右鍵選單「匯出 ▸」、快捷鍵），打開在指定的分頁
+    ShowExport(export_panel::ExportTab),
+    /// 開啟匯出的資料夾（系統的檔案管理員）
+    OpenExportDir(export_panel::ExportDir),
+    /// 變更匯出的資料夾（資料夾對話框）
+    ChooseExportDir(export_panel::ExportDir),
 }
 
 /// 起始畫面上按的
@@ -226,13 +233,15 @@ enum PlaceholderOp {
 enum EscWindow {
     SubtitleStyle,
     ControlPanel,
+    Export,
     Settings,
     MediaInfo,
 }
 
-const ESC_WINDOWS: [EscWindow; 4] = [
+const ESC_WINDOWS: [EscWindow; 5] = [
     EscWindow::SubtitleStyle,
     EscWindow::ControlPanel,
+    EscWindow::Export,
     EscWindow::Settings,
     EscWindow::MediaInfo,
 ];
@@ -441,6 +450,8 @@ pub struct VitascopeApp {
     settings_page: settings_window::Page,
     /// 擷取畫面
     capture: capture::Capture,
+    /// 匯出（片段）：視窗、正在做的工作、上一次的結果
+    export: export_panel::ExportUi,
     /// 進度條預覽縮圖（第一次停在進度條上才建立）
     thumbs: Option<crate::thumbs::Thumbnailer>,
     preview: preview::PreviewCache,
@@ -823,6 +834,7 @@ impl VitascopeApp {
             settings_open: false,
             settings_page: settings_window::Page::default(),
             capture: capture::Capture::default(),
+            export: export_panel::ExportUi::default(),
             thumbs: None,
             preview: preview::PreviewCache::default(),
             info_open: false,
@@ -1447,6 +1459,9 @@ impl VitascopeApp {
                 }
             }
             Action::ChooseScreenshotDir => self.choose_screenshot_dir(),
+            Action::ShowExport(tab) => self.show_export(tab),
+            Action::OpenExportDir(which) => self.open_export_dir(which),
+            Action::ChooseExportDir(which) => self.choose_export_dir(which),
             Action::Settings => self.settings_open = !self.settings_open,
             Action::ToggleSmooth => self.toggle_smooth(),
             Action::Adjust(kind, delta) => self.step_adjust(kind, delta),
@@ -2697,6 +2712,7 @@ impl VitascopeApp {
             Command::BookmarkPrev => Action::BookmarkStep(-1),
             Command::BookmarkNext => Action::BookmarkStep(1),
             Command::BookmarkList => Action::ToggleBookmarks,
+            Command::ExportClip => Action::ShowExport(export_panel::ExportTab::Clip),
         }
     }
 
@@ -2704,6 +2720,7 @@ impl VitascopeApp {
         match w {
             EscWindow::SubtitleStyle => self.sub_style_open,
             EscWindow::ControlPanel => self.panel_open,
+            EscWindow::Export => self.export.open,
             EscWindow::Settings => self.settings_open,
             EscWindow::MediaInfo => self.info_open,
         }
@@ -2716,6 +2733,7 @@ impl VitascopeApp {
                 self.save_settings();
             }
             EscWindow::ControlPanel => self.panel_open = false,
+            EscWindow::Export => self.export.open = false,
             EscWindow::Settings => self.settings_open = false,
             EscWindow::MediaInfo => self.info_open = false,
         }
@@ -3611,6 +3629,9 @@ impl VitascopeApp {
         if let Some(a) = self.screenshot_menu(ui, has_video) {
             action = Some(a);
         }
+        if let Some(a) = self.export_menu(ui) {
+            action = Some(a);
+        }
         ui.separator();
         if self.cmd_item(ui, true, crate::tr!("全螢幕", "Fullscreen"), Command::Fullscreen) {
             action = Some(Action::ToggleFullscreen);
@@ -4434,6 +4455,8 @@ impl eframe::App for VitascopeApp {
         self.poll_playlist_scan();
         self.poll_bookmarks();
         self.poll_screenshots(ctx);
+        // 匯出的進度、結果（換了檔案時，匯出視窗的軌道、檔名跟著新的檔案）
+        self.poll_export();
         self.poll_previews(ctx);
         self.poll_folder_add();
         self.poll_dialog();
@@ -4572,6 +4595,7 @@ impl eframe::App for VitascopeApp {
         self.subtitle_style_window(&ctx);
         self.settings_window(&ctx);
         self.control_panel(&ctx);
+        self.export_window(&ctx);
         // 同意下載、確認移除：在設定視窗之後畫（從設定頁按的，對話框要蓋在設定視窗上面）
         self.install_modals(&ctx);
         self.typing_last_frame = ctx.text_edit_focused();
@@ -4595,6 +4619,8 @@ impl eframe::App for VitascopeApp {
         self.persist_playlist();
         // 下載到一半：停掉（暫存檔由背景執行緒刪掉；來不及的話下次下載時清掉）
         self.cancel_install();
+        // 匯出到一半：取消、最多等一下、刪掉暫存檔（`Job` 被丟掉時做；寫檔中停不下來的，寫完由背景執行緒刪掉）
+        self.export.abandon();
         // 剛加的書籤還在背景存檔：等它寫完（最多兩秒），結束程式時背景執行緒會直接被停掉
         if !self.bookmarks.flush(Duration::from_secs(2)) {
             eprintln!("[vitascope] 書籤還沒存完就結束了");

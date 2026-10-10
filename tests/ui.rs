@@ -13085,8 +13085,8 @@ fn each_button_opens_its_file_dialog() {
         vec![path_str(&invert), path_str(&keep)]
     );
     assert!(!h.state().player().state.paused, "選完照樣在播");
-    // 設定 → 截圖 → 變更…
-    h.get_by_label("截圖").click();
+    // 設定 → 截圖與匯出 → 變更…（D3：「截圖」頁改名「截圖與匯出」）
+    h.get_by_label("截圖與匯出").click();
     h.run_steps(2);
     click_in_view(&mut h, "變更…");
     assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::ScreenshotDir, Pick::Folder)]);
@@ -14746,4 +14746,722 @@ fn tests_and_shots_without_a_cache_folder_sweep_nothing() {
     assert_eq!(h.state().export_cache_dir(), None);
     assert!(h.state().leftover_sweep_finished(), "沒有開始清");
     assert!(old.exists());
+}
+
+// ───────────── 匯出：視窗、右鍵選單「匯出 ▸」、「設定 → 截圖與匯出」 ─────────────
+
+/// 片段的工作最多等多久（CI 的機器很慢）
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 開 `file`、等它開始播；片段存到暫存資料夾的 clips，設定存在暫存資料夾的 settings.json。
+/// 回傳（暫存資料夾、片段資料夾、設定檔、介面）
+fn export_harness(name: &str, file: &str) -> (TempDir, PathBuf, PathBuf, Harness<'static, VitascopeApp>) {
+    export_harness_with(name, file, |_| {})
+}
+
+fn export_harness_with(
+    name: &str,
+    file: &str,
+    change: impl FnOnce(&mut Settings),
+) -> (TempDir, PathBuf, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let clips = dir.0.join("clips");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.export.clip_dir = Some(clips.clone());
+    change(&mut settings);
+    let mut h = harness_with(Some(sample(file)), settings);
+    let file_name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+    settle(&mut h, &file_name);
+    (dir, clips, path, h)
+}
+
+/// 右鍵選單「匯出 ▸ 儲存片段…」，等匯出視窗打開
+fn open_export_window(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "匯出");
+    wait_menu_item(h, "儲存片段…");
+    h.get_by_label("儲存片段…").click();
+    step_until_app(h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+}
+
+/// 匯出視窗的文字欄位（左邊的名稱是它的無障礙標籤）
+fn export_field<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::TextInput)
+        .unwrap_or_else(|| panic!("找不到欄位 {label}"))
+}
+
+/// 下拉選單現在選的（顯示的文字）
+fn combo_value(h: &Harness<'_, VitascopeApp>, label: &str) -> String {
+    combo_box(h, label).accesskit_node().value().unwrap_or_default()
+}
+
+/// 捲到看得到、把滑鼠移到上面，等滑鼠停留的說明出現（停用的按鈕的說明）
+fn hover_until_tooltip(h: &mut Harness<'_, VitascopeApp>, label: &str, tooltip: &str) {
+    h.get_by_label(label).scroll_to_me();
+    h.run_steps(15);
+    // 只移過去一次：一直送滑鼠移動，egui 會當成還在移動，不顯示說明
+    h.get_by_label(label).hover();
+    let start = Instant::now();
+    while h.query_by_label(tooltip).is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「{label}」上沒有出現說明「{tooltip}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 匯出視窗的文字欄位現在的內容
+fn field_value(h: &Harness<'_, VitascopeApp>, label: &str) -> String {
+    export_field(h, label).accesskit_node().value().unwrap_or_default()
+}
+
+/// 在匯出視窗的欄位裡打字（全選後取代）、按 Enter
+fn type_export_field(h: &mut Harness<'_, VitascopeApp>, label: &str, text: &str) {
+    export_field(h, label).scroll_to_me();
+    h.run_steps(15);
+    export_field(h, label).focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_steps(1);
+    h.event(egui::Event::Text(text.into()));
+    h.run_steps(1);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+}
+
+/// 等到 mpv 的 A-B 重播點是 `want`（直接問 mpv）
+fn wait_ab(h: &mut Harness<'_, VitascopeApp>, what: &str, want: [Option<f64>; 2]) {
+    step_until_app(h, what, |app| {
+        let got = app.player().ab_loop_points();
+        got.iter().zip(want).all(|(g, w)| match (g, w) {
+            (Some(g), Some(w)) => (g - w).abs() < 0.001,
+            (None, None) => true,
+            _ => false,
+        })
+    });
+}
+
+/// 暫停中跳到 `t` 秒（精確），等 mpv 停在那裡
+fn seek_exact(h: &mut Harness<'_, VitascopeApp>, t: f64) {
+    h.state().player().seek_to(t, true).unwrap();
+    step_until_app(h, "跳到指定的位置", |app| {
+        app.player().get_f64("time-pos").is_ok_and(|p| (p - t).abs() < 0.001)
+    });
+}
+
+/// 等到正在做的匯出結束（做完、失敗、取消）
+fn wait_export_done(h: &mut Harness<'_, VitascopeApp>) {
+    let start = Instant::now();
+    while h.state().export_busy() {
+        assert!(start.elapsed() < EXPORT_TIMEOUT, "等不到匯出結束");
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.run_steps(2);
+}
+
+/// 資料夾裡的檔名（沒有資料夾時是空的）
+fn dir_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// 背景工作在觀察點（`TestHooks`）停住，等測試放行：到了送出參數（暫存檔；沒有時是空的），
+/// 放行 = 丟掉 `release`（之後再到觀察點也不停）
+struct Gate {
+    reached: std::sync::mpsc::Receiver<PathBuf>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+type GateHook = Arc<dyn Fn(PathBuf) + Send + Sync>;
+
+fn gate() -> (Gate, GateHook) {
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let (reached_tx, release_rx) = (std::sync::Mutex::new(reached_tx), std::sync::Mutex::new(release_rx));
+    let hook: GateHook = Arc::new(move |p| {
+        let _ = reached_tx.lock().unwrap().send(p);
+        // 測試寫錯時不要永遠卡住
+        let _ = release_rx.lock().unwrap().recv_timeout(EXPORT_TIMEOUT);
+    });
+    (
+        Gate {
+            reached,
+            release: Some(release),
+        },
+        hook,
+    )
+}
+
+impl Gate {
+    /// 一直更新介面，直到背景工作停在觀察點
+    fn wait(&self, h: &mut Harness<'_, VitascopeApp>) -> PathBuf {
+        let start = Instant::now();
+        loop {
+            if let Ok(p) = self.reached.try_recv() {
+                h.run_steps(2);
+                return p;
+            }
+            assert!(start.elapsed() < EXPORT_TIMEOUT, "背景工作一直沒到觀察點");
+            h.step();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn release(&mut self) {
+        self.release = None;
+    }
+}
+
+#[test]
+fn export_menu_is_disabled_without_a_file_and_says_why_it_cannot_save() {
+    // 沒開檔：「匯出 ▸」整個停用（跟「擷取畫面」一樣）
+    let mut h = harness(None);
+    h.run_steps(2);
+    // 起始畫面中間是說明文字：在畫面的角落按右鍵
+    let corner = h.get_by_label("影片畫面").rect().min + egui::vec2(20.0, 20.0);
+    h.event(egui::Event::PointerMoved(corner));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: corner,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+    let (_, label, disabled) = MenuItem::contains("匯出").wait(&mut h);
+    assert!(disabled, "{label} 沒開檔時要停用");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 使用者開的 EDL（主播放器的時間對不到檔案）：選單看得到「儲存片段…」，但停用並說明原因
+    let tmp = TempDir::new("export-edl");
+    let src = sample("general/mkv_h264_gop2.mkv").to_string_lossy().into_owned();
+    let entry = format!("%{}%{src}", src.len());
+    let edl = tmp.0.join("list.edl");
+    std::fs::write(&edl, format!("# mpv EDL v0\n{entry},0,3\n{entry},6,3\n")).unwrap();
+    let mut h = harness(Some(edl));
+    settle(&mut h, "list.edl");
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "儲存片段…");
+    assert!(
+        h.get_by_label("儲存片段…").accesskit_node().is_disabled(),
+        "EDL 不能存片段"
+    );
+    hover_until_tooltip(
+        &mut h,
+        "儲存片段…",
+        "這個檔案用了章節連結（ordered chapters），不能匯出",
+    );
+    // 片段資料夾的項目照樣能用
+    assert!(!h.get_by_label("開啟片段資料夾").accesskit_node().is_disabled());
+}
+
+#[test]
+fn export_range_fields_are_the_ab_loop() {
+    let (_dir, _clips, _path, mut h) = export_harness("export-range", "common/mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    // 還沒設定範圍：開始停用，說明要先設定
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    assert_eq!(field_value(&h, "起點"), "");
+    // 按 L（視窗開著、沒在打字）：欄位顯示 A-B 重播的起點
+    h.key_press(egui::Key::L);
+    step_until_app(&mut h, "L 設定起點", |app| {
+        app.player().ab_loop_points()[0].is_some()
+    });
+    h.run_steps(2);
+    let a = h.state().player().ab_loop_points()[0].unwrap();
+    assert_eq!(field_value(&h, "起點"), vitascope::export::format_time(a));
+    // 打字改起點（分:秒、小數）
+    type_export_field(&mut h, "起點", "0:01.5");
+    wait_ab(&mut h, "起點改成 1.5 秒", [Some(1.5), None]);
+    // 終點比起點早：對調
+    type_export_field(&mut h, "終點", "0.5");
+    wait_ab(&mut h, "起點、終點對調", [Some(0.5), Some(1.5)]);
+    assert_eq!(field_value(&h, "起點"), "00:00:00.500");
+    assert_eq!(field_value(&h, "終點"), "00:00:01.500");
+    h.get_by_label_contains("長度 1.0 秒");
+    // 超過結尾：拉回影片的長度（不會變成「範圍外」的失敗）
+    type_export_field(&mut h, "終點", "99:00:00");
+    let duration = h.state().player().state.duration.unwrap();
+    wait_ab(&mut h, "終點拉回結尾", [Some(0.5), Some(duration)]);
+    // 看不懂的：說明，A-B 不變，欄位回到原本的時間
+    type_export_field(&mut h, "起點", "abc");
+    h.get_by_label_contains("看不懂的時間");
+    assert_eq!(h.state().player().ab_loop_points(), [Some(0.5), Some(duration)]);
+    assert_eq!(field_value(&h, "起點"), "00:00:00.500");
+    // 「目前位置」：停在確定的位置（不靠播了多久）再按。先按終點的：A-B 變了，剛才起點打錯的說明不再顯示
+    seek_exact(&mut h, 5.0);
+    h.query_all_by_label("目前位置").nth(1).unwrap().click();
+    wait_ab(&mut h, "終點換成目前位置", [Some(0.5), Some(5.0)]);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("看不懂的時間").is_none());
+    // 起點的「目前位置」（跟原本的 A 不一樣的位置）
+    seek_exact(&mut h, 3.0);
+    h.query_all_by_label("目前位置").next().unwrap().click();
+    wait_ab(&mut h, "起點換成目前位置", [Some(3.0), Some(5.0)]);
+    // 範圍設好了：可以開始
+    assert!(!h.get_by_label("開始匯出").accesskit_node().is_disabled());
+}
+
+#[test]
+fn export_clip_end_to_end() {
+    let (_dir, clips, _path, mut h) = export_harness("export-clip", "general/mkv_h264_gop2.mkv");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "3");
+    type_export_field(&mut h, "終點", "6.5");
+    wait_ab(&mut h, "範圍 3–6.5 秒", [Some(3.0), Some(6.5)]);
+    h.run_steps(2);
+    // 檔名照來源與範圍產生，格式照來源（MKV）；註明不含字幕
+    assert_eq!(field_value(&h, "檔名"), "mkv_h264_gop2 00.00.03-00.00.06");
+    h.get_by_label(".mkv");
+    h.get_by_label_contains("片段只包含影像與一條音軌，不含字幕");
+    let estimate = |h: &Harness<'_, VitascopeApp>| {
+        h.query_by_label_contains("預估大小")
+            .and_then(|n| n.accesskit_node().value())
+    };
+    let with_video = estimate(&h).expect("有影像時顯示預估大小");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    // 結果：提示（做完的那一幀設定的）、視窗裡的實際範圍（依關鍵影格：每 2 秒一個，從 2 秒開始）、開啟的按鈕
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：mkv_h264_gop2 00.00.03-00.00.06.mkv（"),
+        "{osd}"
+    );
+    let saved = clips.join("mkv_h264_gop2 00.00.03-00.00.06.mkv");
+    assert!(saved.exists(), "{:?}", dir_names(&clips));
+    h.get_by_label_contains("完成：mkv_h264_gop2 00.00.03-00.00.06.mkv");
+    h.get_by_label_contains("實際範圍：00:00:02.000");
+    h.get_by_label("不重新編碼：起點、終點對齊關鍵影格，片段可能比選的長幾秒");
+    h.get_by_label("開啟檔案");
+    h.get_by_label("在資料夾中顯示");
+    assert_eq!(dir_names(&clips), ["mkv_h264_gop2 00.00.03-00.00.06.mkv"]);
+
+    // 再存一次：只要聲音、自己取的檔名（不能用的字元換掉）→ 依音訊格式存成 .m4a
+    h.get_by_label_contains("影像（h264").click();
+    h.run_steps(2);
+    assert_eq!(combo_value(&h, "格式"), "自動（M4A）");
+    // 只有聲音：預估大小不是影片檔的比例（用音軌的位元率；不知道時不顯示）
+    let audio_only = estimate(&h);
+    assert_ne!(audio_only.as_deref(), Some(with_video.as_str()), "只有聲音的預估大小");
+    type_export_field(&mut h, "檔名", "我的:片段");
+    h.get_by_label(".m4a");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let audio = clips.join("我的_片段.m4a");
+    assert!(audio.exists(), "{:?}", dir_names(&clips));
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(osd.starts_with("已儲存片段：我的_片段.m4a"), "{osd}");
+    // 只有聲音：沒有關鍵影格的說明
+    assert!(
+        h.query_by_label_contains("不重新編碼：起點、終點對齊關鍵影格")
+            .is_none()
+    );
+    assert!(dir_names(&clips).iter().all(|n| !n.contains(".vitascope-part.")));
+}
+
+#[test]
+fn export_formats_that_cannot_hold_the_tracks_are_disabled() {
+    // 設定裡的格式放不下這個檔案（TS 放不下 VP9）：視窗改用自動，不是開始了才失敗
+    let (_dir, clips, path, mut h) = export_harness_with("export-format", "common/webm_vp9_opus.webm", |s| {
+        s.export.clip.format = vitascope::export::ClipFormat::Ts;
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    // 自動 = 照來源（WebM）
+    assert_eq!(combo_value(&h, "格式"), "自動（WebM）");
+    h.get_by_label(".webm");
+    // 開始匯出也用自動（不是設定裡放不下的 TS）
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：webm_vp9_opus 00.00.00-00.00.02.webm"),
+        "{osd}"
+    );
+    assert_eq!(dir_names(&clips), ["webm_vp9_opus 00.00.00-00.00.02.webm"]);
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    // 只有聲音：選 MKA 只用在這次，不改設定裡（有影像的片段用的）格式
+    h.get_by_label_contains("影像（vp9").click();
+    h.run_steps(2);
+    combo_in_view(&mut h, "格式");
+    h.get_by_label("MKA").click();
+    h.run_steps(3);
+    assert_eq!(combo_value(&h, "格式"), "MKA");
+    h.get_by_label(".mka");
+    assert_eq!(
+        h.state().settings().export.clip.format,
+        vitascope::export::ClipFormat::Ts,
+        "只有聲音時選的格式不存進設定"
+    );
+    h.get_by_label_contains("影像（vp9").click();
+    h.run_steps(2);
+    assert_eq!(combo_value(&h, "格式"), "自動（WebM）");
+    combo_in_view(&mut h, "格式");
+    assert!(h.get_by_label("TS").accesskit_node().is_disabled(), "TS 放不下 VP9");
+    hover_until_tooltip(&mut h, "TS", "TS 不能放 vp9，請改用 MKV");
+    // MKV 放得下：選了存進設定，視窗用它
+    h.get_by_label("MKV").click();
+    h.run_steps(3);
+    assert_eq!(
+        h.state().settings().export.clip.format,
+        vitascope::export::ClipFormat::Mkv
+    );
+    assert_eq!(saved(&path)["export"]["clip"]["format"], "mkv");
+    h.get_by_label(".mkv");
+    // 匯出用的就是選的 MKV
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：webm_vp9_opus 00.00.00-00.00.02.mkv"),
+        "{osd}"
+    );
+    assert!(
+        clips.join("webm_vp9_opus 00.00.00-00.00.02.mkv").exists(),
+        "{:?}",
+        dir_names(&clips)
+    );
+}
+
+#[test]
+fn export_settings_page_changes_the_clip_folder_and_format() {
+    let dir = TempDir::new("export-settings");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    let chosen = dir.0.join("我的片段");
+    let answer = chosen.clone();
+    let seen = record_dialogs(&mut h, move |kind| {
+        (kind == DialogKind::ExportClipDir).then(|| vec![answer.clone()])
+    });
+    // 「截圖」頁改名「截圖與匯出」
+    open_settings_page(&mut h, "截圖與匯出");
+    h.get_by_label("片段資料夾");
+    assert!(h.get_by_label("用預設的片段資料夾").accesskit_node().is_disabled());
+    click_in_view(&mut h, "變更片段資料夾…");
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::ExportClipDir, Pick::Folder)]);
+    assert_eq!(h.state().settings().export.clip_dir.as_deref(), Some(chosen.as_path()));
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    assert_eq!(saved(&path)["export"]["clip_dir"], chosen.to_string_lossy().as_ref());
+    h.get_by_label(chosen.to_string_lossy().as_ref());
+    // 還原預設
+    click_in_view(&mut h, "用預設的片段資料夾");
+    assert_eq!(h.state().settings().export.clip_dir, None);
+    assert_eq!(saved(&path)["export"]["clip_dir"], serde_json::Value::Null);
+    // 片段的格式
+    combo_in_view(&mut h, "片段的格式");
+    h.get_by_label("MP4").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().export.clip.format,
+        vitascope::export::ClipFormat::Mp4
+    );
+    assert_eq!(saved(&path)["export"]["clip"]["format"], "mp4");
+    // 截圖的部分照舊（按鈕的名稱沒有跟片段的混在一起）
+    h.get_by_label("變更…");
+    h.get_by_label("還原預設");
+}
+
+#[test]
+fn export_clip_command_and_escape() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("export-clip".into(), vec!["F9".into()]);
+    let mut h = harness_with(None, settings);
+    h.run_steps(2);
+    // 沒開檔：只提示
+    h.key_press(egui::Key::F9);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("先開啟影片才能匯出"));
+    assert!(!h.state().export_open());
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    // 選單上的按鍵從快捷鍵對照表來
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "儲存片段… F9");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F9);
+    step_until_app(&mut h, "F9 打開匯出視窗", |app| app.export_open());
+    // Esc 一次關一個：控制面板 → 匯出視窗 → 設定
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("一般");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("控制面板").is_none(), "先關控制面板");
+    assert!(h.state().export_open(), "匯出視窗還開著");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open(), "再按一次關匯出視窗");
+    assert!(h.query_by_label("一般").is_some(), "設定視窗還開著");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_none(), "最後關設定視窗");
+}
+
+#[test]
+fn export_cancel_and_one_export_at_a_time() {
+    let (_dir, clips, _path, mut h) = export_harness("export-cancel", "common/mp4_long.mp4");
+    let (mut gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        on_ready: Some(Arc::new(move |_: &vitascope::mpv::Mpv| hook(PathBuf::new()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "3");
+    wait_ab(&mut h, "範圍 1–3 秒", [Some(1.0), Some(3.0)]);
+    click_in_view(&mut h, "開始匯出");
+    // 匯出用的 mpv 開好、停在讀取之前
+    gate.wait(&mut h);
+    assert!(h.state().export_busy());
+    // 一次只做一個：開始停用並說明
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "正在匯出，請等這一個做完");
+    // 關掉視窗不會取消；再打開看得到進度
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open());
+    assert!(h.state().export_busy(), "關掉視窗不取消");
+    open_export_window(&mut h);
+    assert!(
+        !h.get_by_label("取消匯出").accesskit_node().is_disabled(),
+        "讀取中可以取消"
+    );
+    click_in_view(&mut h, "取消匯出");
+    gate.release();
+    wait_export_done(&mut h);
+    assert_eq!(h.state().osd_text(), Some("已取消匯出"));
+    h.get_by_label("已取消匯出");
+    assert!(dir_names(&clips).is_empty(), "取消後不留檔案：{:?}", dir_names(&clips));
+    // 做完之後可以再開始
+    assert!(!h.get_by_label("開始匯出").accesskit_node().is_disabled());
+}
+
+#[test]
+fn export_writing_cannot_be_cancelled() {
+    let (_dir, clips, _path, mut h) = export_harness("export-writing", "common/mp4_h264_aac.mp4");
+    let (mut gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        on_dump: Some(Arc::new(move || hook(PathBuf::new()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(&mut h, "開始匯出");
+    gate.wait(&mut h);
+    // 寫檔中（dump-cache 停不下來）：取消停用並說明
+    assert!(h.get_by_label("取消匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "取消匯出", "寫入中無法中斷");
+    // 關掉視窗不會取消：視窗關著做完，照樣存好、顯示提示（寫完之後如果被取消，結果會是「已取消匯出」）
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open());
+    assert!(h.state().export_busy(), "關掉視窗不取消");
+    gate.release();
+    wait_export_done(&mut h);
+    assert!(!h.state().export_open(), "做完時不會自己打開視窗");
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：mp4_h264_aac 00.00.00-00.00.02.mp4"),
+        "{osd}"
+    );
+    assert_eq!(dir_names(&clips), ["mp4_h264_aac 00.00.00-00.00.02.mp4"]);
+}
+
+#[test]
+fn export_works_when_the_player_has_turned_the_sound_off() {
+    // 只有聲音（加上專輯封面）的檔案、主播放器關掉了聲音（aid=no）：選單照樣能用，在視窗裡選了音軌就能開始
+    let (_dir, clips, _path, mut h) = export_harness("export-muted", "general/audio_mp3_cover.mp3");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.state().player().select_track(TrackKind::Audio, None).unwrap();
+    step_until(&mut h, "關掉聲音", |s| s.selected(TrackKind::Audio).is_none());
+    h.run_steps(2);
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "儲存片段…");
+    assert!(
+        !h.get_by_label("儲存片段…").accesskit_node().is_disabled(),
+        "檔案裡有放得進片段的音軌"
+    );
+    h.get_by_label("儲存片段…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    // 預設跟著主播放器（沒有聲音）：開始停用，說明要選軌道
+    assert_eq!(combo_value(&h, "聲音"), "不包含");
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "至少要包含影像或聲音");
+    // 選了音軌：可以開始
+    combo_in_view(&mut h, "聲音");
+    h.get_by_label_contains("#1").click();
+    h.run_steps(3);
+    assert!(combo_value(&h, "聲音").starts_with("#1"), "{}", combo_value(&h, "聲音"));
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：audio_mp3_cover 00.00.00-00.00.02."),
+        "{osd}"
+    );
+    assert_eq!(dir_names(&clips).len(), 1, "{:?}", dir_names(&clips));
+}
+
+#[test]
+fn export_tracks_follow_the_player_until_changed_and_reset_per_file() {
+    let (_dir, clips, _path, mut h) = export_harness("export-tracks", "common/mkv_multitrack.mkv");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let select_audio = |h: &mut Harness<'_, VitascopeApp>, id: i64| {
+        h.state().player().select_track(TrackKind::Audio, Some(id)).unwrap();
+        step_until(h, "換音軌", |s| {
+            s.selected(TrackKind::Audio).map(|t| t.id) == Some(id)
+        });
+        h.run_steps(2);
+    };
+    // 開視窗之前在「音軌」選單換了音軌：片段放正在聽的那一條
+    select_audio(&mut h, 2);
+    open_export_window(&mut h);
+    let audio = |h: &Harness<'_, VitascopeApp>| combo_value(h, "聲音");
+    assert!(audio(&h).starts_with("#2"), "{}", audio(&h));
+    // 視窗開著時換：沒在視窗裡選過就跟著換
+    select_audio(&mut h, 1);
+    assert!(audio(&h).starts_with("#1"), "{}", audio(&h));
+    // 自己選了「不包含」：之後主播放器換音軌也不變
+    combo_in_view(&mut h, "聲音");
+    h.get_by_label("不包含").click();
+    h.run_steps(3);
+    select_audio(&mut h, 2);
+    assert_eq!(audio(&h), "不包含");
+    // 只放影像（自己選的）：不說明「片段沒有聲音」
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "3");
+    wait_ab(&mut h, "範圍 1–3 秒", [Some(1.0), Some(3.0)]);
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：mkv_multitrack 00.00.01-00.00.03.mkv"),
+        "{osd}"
+    );
+    h.get_by_label_contains("完成：mkv_multitrack");
+    assert!(
+        h.query_by_label_contains("片段沒有聲音").is_none(),
+        "自己選了不包含聲音，不用說明"
+    );
+    assert_eq!(dir_names(&clips), ["mkv_multitrack 00.00.01-00.00.03.mkv"]);
+    // 自己取的檔名、選的軌道只用在這個檔案：換檔案後重新產生、回到預設
+    type_export_field(&mut h, "檔名", "自訂名稱");
+    assert_eq!(field_value(&h, "檔名"), "自訂名稱");
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.run_steps(3);
+    assert!(h.state().export_open(), "換檔案時視窗照樣開著");
+    assert!(audio(&h).starts_with("#1"), "{}", audio(&h));
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "1.5");
+    wait_ab(&mut h, "範圍 0.5–1.5 秒", [Some(0.5), Some(1.5)]);
+    h.run_steps(2);
+    assert_eq!(field_value(&h, "檔名"), "mp4_h264_aac 00.00.00-00.00.01");
+}
+
+#[test]
+fn exit_during_export_cleans_up() {
+    // 關閉影戲（介面測試：丟掉整個 App）時匯出做到一半：取消、刪掉暫存檔，也不會變成正式的檔案
+    let (_dir, clips, _path, mut h) = export_harness("export-exit", "common/mp4_h264_aac.mp4");
+    let (mut gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        after_dump: Some(Arc::new(move |temp: &std::path::Path| hook(temp.to_path_buf()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(&mut h, "開始匯出");
+    // 寫好了、還沒檢查、還沒換成正式的名稱：資料夾裡只有暫存檔
+    let temp = gate.wait(&mut h);
+    assert!(temp.exists(), "{}", temp.display());
+    assert!(vitascope::save::is_part(&temp.file_name().unwrap().to_string_lossy()));
+    assert_eq!(dir_names(&clips).len(), 1);
+    drop(h);
+    // 背景工作還停在觀察點也一樣：丟掉 App 時等一下就刪掉暫存檔
+    assert!(!temp.exists(), "關閉時沒有刪掉暫存檔：{:?}", dir_names(&clips));
+    gate.release();
+    // 放行之後背景工作發現檔案不見了、結束：不會留下任何檔案
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        assert!(dir_names(&clips).is_empty(), "{:?}", dir_names(&clips));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn export_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Save clip…");
+    h.get_by_label("Open the clips folder");
+    h.get_by_label("Save clip…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    assert_eq!(combo_value(&h, "Format"), "Automatic (MP4)");
+    for label in ["Range", "Tracks", "Start export", "Current position"] {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("找不到 {label}"));
+    }
+    h.get_by_label_contains("Clips contain the video and one audio track only");
+    export_field(&h, "Start");
+    export_field(&h, "File name");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Screenshots and export").click();
+    h.run_steps(2);
+    h.get_by_label("Change the clips folder…");
+    h.get_by_label("Clip format");
 }
