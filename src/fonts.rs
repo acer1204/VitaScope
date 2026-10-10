@@ -1,8 +1,9 @@
 //! 載入系統的中日韓字型。egui 內建字型沒有漢字，不載入的話中文檔名、選單都會變成方塊。
+//! 介面（[`install_cjk`]）與縮圖總覽圖的文字（`export::text`）用同一份字型（[`definitions`]）。
 
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// 常見的系統字型位置（依平台）
 fn candidates() -> &'static [&'static str] {
@@ -73,26 +74,49 @@ fn pick_font(list: &str) -> Option<&str> {
     PREFERRED.iter().find_map(|p| family(p)).or(fonts.first().copied())
 }
 
-pub fn install_cjk(ctx: &egui::Context) {
-    // fontconfig 只在固定路徑都找不到時才呼叫
-    let paths = candidates()
-        .iter()
-        .map(PathBuf::from)
-        .chain(std::iter::once_with(fontconfig_lookup).flatten());
-    for path in paths {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        let mut fonts = egui::FontDefinitions::default();
-        fonts
-            .font_data
-            .insert("cjk".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-        // 放在最後當備援：英數字仍用 egui 預設字型，缺字時才用 CJK 字型
+/// 找到的中日韓字型（第一次問時讀一次，之後共用：微軟正黑體約 20 MB，介面與縮圖總覽圖不要各讀一份）
+fn cjk_font() -> Option<&'static Arc<egui::FontData>> {
+    static FONT: OnceLock<Option<Arc<egui::FontData>>> = OnceLock::new();
+    FONT.get_or_init(|| {
+        // fontconfig 只在固定路徑都找不到時才呼叫
+        let paths = candidates()
+            .iter()
+            .map(PathBuf::from)
+            .chain(std::iter::once_with(fontconfig_lookup).flatten());
+        for path in paths {
+            if let Ok(bytes) = std::fs::read(&path) {
+                return Some(Arc::new(egui::FontData::from_owned(bytes)));
+            }
+        }
+        None
+    })
+    .as_ref()
+}
+
+/// 有沒有找到中日韓字型（沒有時縮圖總覽圖的標頭改用英文）
+pub fn has_cjk() -> bool {
+    cjk_font().is_some()
+}
+
+/// 介面用的字型：egui 內建的字型，加上找到的中日韓字型（放在最後當備援：英數字仍用 egui 預設字型，缺字時才用 CJK 字型）。
+/// 沒有中日韓字型時就是 egui 內建的
+pub fn definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Some(font) = cjk_font() {
+        fonts.font_data.insert("cjk".to_owned(), font.clone());
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             fonts.families.entry(family).or_default().push("cjk".to_owned());
         }
-        ctx.set_fonts(fonts);
-        return;
     }
-    eprintln!("[vitascope] 找不到中文字型，中文可能無法顯示（Linux 請安裝 Noto Sans CJK，例如 fonts-noto-cjk）");
+    fonts
+}
+
+pub fn install_cjk(ctx: &egui::Context) {
+    if has_cjk() {
+        ctx.set_fonts(definitions());
+    } else {
+        eprintln!("[vitascope] 找不到中文字型，中文可能無法顯示（Linux 請安裝 Noto Sans CJK，例如 fonts-noto-cjk）");
+    }
 }
 
 #[cfg(test)]

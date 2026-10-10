@@ -3,7 +3,8 @@
 
 use super::quality::{dumb_hover, follow_quality, scaler_choice};
 use super::sound::{auto_device_label, leveling_hover, volume_max_hover, volume_max_label};
-use super::{Action, VitascopeApp};
+use super::{Action, VitascopeApp, with_hint};
+use crate::keymap::Command;
 use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{
     ChromaScaler, Downscaler, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover, peak_label,
@@ -38,16 +39,16 @@ impl VitascopeApp {
         ui.menu_button(crate::tr!("畫質", "Video quality"), |ui| {
             let shown = self.panel_open && self.panel_tab == super::control_panel::PanelTab::Picture;
             let panel = egui::Button::selectable(shown, crate::tr!("影像調整…", "Image adjustments…"))
-                .shortcut_text(format!("{}+G", super::ALT_KEY));
+                .shortcut_text(self.keymap.hint(Command::ControlPanel));
             // 跟設定頁的按鈕一樣只負責打開畫質分頁（已經開著就換到畫質分頁；Alt+G 才是開關）
             if ui.add(panel).clicked() {
                 action = Some(Action::ShowAdjustments);
             }
-            if super::menu_item(
+            if self.cmd_item(
                 ui,
                 !self.adjust_is_neutral(),
                 crate::tr!("還原影像調整", "Reset image adjustments"),
-                "Q",
+                Command::AdjustReset,
             ) {
                 action = Some(Action::AdjustReset);
             }
@@ -63,10 +64,11 @@ impl VitascopeApp {
                 None => crate::tr!("流暢播放", "Smooth playback").to_owned(),
             };
             let locked = self.pacing_status().plan == Some(Plan::Untouched);
-            let r = ui
-                .add_enabled(!locked, egui::Checkbox::new(&mut on, label))
-                .on_hover_text(smooth_hover())
-                .on_disabled_hover_text(smooth_locked_hover());
+            let r = with_hint(ui, &self.keymap.hint(Command::ToggleSmooth), |ui| {
+                ui.add_enabled(!locked, egui::Checkbox::new(&mut on, label))
+                    .on_hover_text(smooth_hover())
+                    .on_disabled_hover_text(smooth_locked_hover())
+            });
             if r.changed() {
                 action = Some(Action::ToggleSmooth);
             }
@@ -231,12 +233,13 @@ impl VitascopeApp {
             }
             let eq_off = self.eq_disabled();
             let mut eq_on = a.eq.enabled;
-            let r = ui
-                .add_enabled(
+            let r = with_hint(ui, &self.keymap.hint(Command::ToggleEq), |ui| {
+                ui.add_enabled(
                     eq_off.is_none(),
                     egui::Checkbox::new(&mut eq_on, tr!("等化器", "Equalizer")),
                 )
-                .on_disabled_hover_text(eq_off.unwrap_or_default());
+                .on_disabled_hover_text(eq_off.unwrap_or_default())
+            });
             if r.changed() {
                 action = Some(Action::ToggleEq);
             }

@@ -142,10 +142,7 @@ pub fn flip_shader(horizontal: bool) -> &'static str {
 
 /// 翻轉著色器的檔案（放在快取資料夾，第一次用到時寫出來）
 pub fn flip_shader_path(horizontal: bool) -> std::io::Result<PathBuf> {
-    let dir = crate::subs::cache_dir()
-        .parent()
-        .map(|p| p.join("shaders"))
-        .unwrap_or_else(|| std::env::temp_dir().join("vitascope-shaders"));
+    let dir = crate::paths::cache_root().join("shaders");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(if horizontal { "hflip.glsl" } else { "vflip.glsl" });
     let content = flip_shader(horizontal);

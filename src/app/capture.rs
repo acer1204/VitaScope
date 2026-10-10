@@ -1,6 +1,7 @@
 //! 擷取畫面（Ctrl+E 存檔、Ctrl+C 複製到剪貼簿、右鍵選單「擷取畫面」）。截圖的處理見 `screenshot.rs`。
 
 use super::{Action, DialogKind, Pick, VitascopeApp, file_name, menu_item};
+use crate::keymap::Command;
 use crate::screenshot::{self, Done, Fixup, Target};
 use eframe::egui;
 use std::path::PathBuf;
@@ -98,7 +99,8 @@ impl VitascopeApp {
                             return;
                         }
                         let source = st.path.clone().unwrap_or_default();
-                        let name = screenshot::file_name(&source, st.time_pos);
+                        let name =
+                            screenshot::file_name(&source, self.titles.get(&source).map(String::as_str), st.time_pos);
                         // 還在寫的截圖還沒出現在資料夾裡：連按（例如暫停時）檔名也不能重複
                         let taken: Vec<PathBuf> = self
                             .capture
@@ -204,7 +206,8 @@ impl VitascopeApp {
         // 所以這個對話框照樣在介面的執行緒上開（開著時本來就暫停）
         let was_playing = self.pause_for_dialog();
         let time = self.player.get_f64("time-pos").unwrap_or(self.player.state.time_pos);
-        let name = screenshot::file_name(self.player.state.path.as_deref().unwrap_or_default(), time);
+        let source = self.player.state.path.clone().unwrap_or_default();
+        let name = screenshot::file_name(&source, self.titles.get(&source).map(String::as_str), time);
         let dialog = self
             .file_dialog()
             .set_title(crate::tr!("另存截圖", "Save screenshot as"))
@@ -247,18 +250,23 @@ impl VitascopeApp {
         let mut action = None;
         ui.add_enabled_ui(enabled, |ui| {
             ui.menu_button(crate::tr!("擷取畫面", "Screenshot"), |ui| {
-                if menu_item(
+                if self.cmd_item(
                     ui,
                     true,
                     crate::tr!("存到截圖資料夾", "Save to the screenshot folder"),
-                    SHOT_SHORTCUT,
+                    Command::Screenshot,
                 ) {
                     action = Some(Action::Screenshot);
                 }
-                if menu_item(ui, true, crate::tr!("另存新檔…", "Save as…"), "") {
+                if self.cmd_item(ui, true, crate::tr!("另存新檔…", "Save as…"), Command::ScreenshotAs) {
                     action = Some(Action::ScreenshotAs);
                 }
-                if menu_item(ui, true, crate::tr!("複製到剪貼簿", "Copy to clipboard"), COPY_SHORTCUT) {
+                if self.cmd_item(
+                    ui,
+                    true,
+                    crate::tr!("複製到剪貼簿", "Copy to clipboard"),
+                    Command::CopyFrame,
+                ) {
                     action = Some(Action::CopyFrame);
                 }
                 ui.separator();
@@ -289,10 +297,6 @@ impl VitascopeApp {
         action
     }
 }
-
-/// 截圖的快捷鍵說明
-pub(super) const SHOT_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+E" } else { "Ctrl+E" };
-pub(super) const COPY_SHORTCUT: &str = if cfg!(target_os = "macos") { "Cmd+C" } else { "Ctrl+C" };
 
 #[cfg(test)]
 mod tests {

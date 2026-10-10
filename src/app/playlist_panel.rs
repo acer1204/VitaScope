@@ -1,16 +1,21 @@
-//! 播放清單面板（F6，比照 PotPlayer）：目前的清單、雙擊播放、拖曳排序、Delete 移除，
+//! 側邊面板（比照 PotPlayer）：上面是兩個分頁「播放清單」（F6）、「書籤」（H，見 `bookmarks_panel.rs`）。
+//!
+//! 播放清單分頁：目前的清單、雙擊播放、拖曳排序、Delete 移除，
 //! 加入檔案 / 資料夾、依檔名排序、清空，開啟 / 儲存播放清單檔（.m3u8，見 `m3u.rs`）。
 //!
 //! 每一列是同一個能點也能拖的元件（`Ui::dnd_drag_source` 一按下就算開始拖，點擊會被吃掉）；
 //! 放下的位置看滑鼠在第幾列之間（列與列的空隙也算），拖到上下邊緣會自動捲動。
 
-use super::{ACCENT, DialogKind, Pick, VitascopeApp, file_name, icon_button};
+use super::{DialogKind, Pick, VitascopeApp, display_label, file_name, icon_button};
 use crate::formats;
+use crate::keymap::Command;
 use crate::m3u;
 use crate::playlist::Playlist;
+use crate::settings::SideTab;
+use crate::theme::Palette;
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, DragAndDrop, Layout, Rect, RichText, Sense, Stroke, TextWrapMode,
-    ViewportCommand, WidgetInfo, WidgetType, vec2,
+    self, Align, Align2, CursorIcon, DragAndDrop, Layout, Rect, RichText, Sense, Stroke, TextWrapMode, ViewportCommand,
+    WidgetInfo, WidgetType, vec2,
 };
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -24,9 +29,18 @@ const AUTOSCROLL_MARGIN: f32 = 24.0;
 #[derive(Clone, Copy)]
 struct DragRow(usize);
 
+/// 面板標題列上的操作（兩個分頁共用）
+#[derive(Clone, Copy)]
+pub(super) enum SideOp {
+    /// 換到另一個分頁
+    Switch(SideTab),
+    /// 關閉面板（×）
+    Close,
+}
+
 /// 面板上的操作（畫完再做，畫的時候還借著清單）
 enum ListOp {
-    Close,
+    Side(SideOp),
     Play(usize),
     Select(usize),
     Remove(usize),
@@ -41,9 +55,45 @@ enum ListOp {
 }
 
 impl VitascopeApp {
-    /// 打開 / 關閉播放清單。一般視窗（沒有最大化）時視窗跟著變寬 / 變窄，影片的大小不變；
+    /// 看得到播放清單（側邊面板開著、在播放清單分頁）
+    pub(super) fn playlist_shown(&self) -> bool {
+        self.settings.show_playlist && self.settings.side_tab == SideTab::Playlist
+    }
+
+    /// F6（播放清單）、H（書籤）：面板關著就打開到那一頁；開著但在另一頁就換過去（視窗大小不變）；
+    /// 已經在那一頁就關掉面板
+    pub(super) fn toggle_side(&mut self, ctx: &egui::Context, tab: SideTab) {
+        if self.settings.show_playlist && self.settings.side_tab != tab {
+            self.switch_side_tab(tab);
+        } else {
+            self.settings.side_tab = tab;
+            self.toggle_side_panel(ctx);
+        }
+    }
+
+    /// 換到另一個分頁（面板開著）
+    pub(super) fn switch_side_tab(&mut self, tab: SideTab) {
+        if self.settings.side_tab == tab {
+            return;
+        }
+        self.settings.side_tab = tab;
+        self.save_settings();
+        // 換回播放清單時捲到正在播的那一項
+        self.playlist_follow = None;
+        self.playlist_view = (0.0, 0.0);
+    }
+
+    /// 面板標題列的操作
+    pub(super) fn apply_side_op(&mut self, ctx: &egui::Context, op: SideOp) {
+        match op {
+            SideOp::Switch(tab) => self.switch_side_tab(tab),
+            SideOp::Close => self.toggle_side(ctx, self.settings.side_tab),
+        }
+    }
+
+    /// 打開 / 關閉側邊面板。一般視窗（沒有最大化）時視窗跟著變寬 / 變窄，影片的大小不變；
     /// 打開時沒有加寬（右邊放不下）的話，關掉時也不縮
-    pub(super) fn toggle_playlist(&mut self, ctx: &egui::Context) {
+    fn toggle_side_panel(&mut self, ctx: &egui::Context) {
         self.settings.show_playlist = !self.settings.show_playlist;
         self.save_settings();
         // 下次打開時捲到正在播的那一項
@@ -86,81 +136,133 @@ impl VitascopeApp {
         }
     }
 
-    /// 面板內容
+    /// 側邊面板：目前的分頁
+    pub(super) fn side_panel(&mut self, ui: &mut egui::Ui) {
+        match self.settings.side_tab {
+            SideTab::Playlist => self.playlist_panel(ui),
+            SideTab::Bookmarks => self.bookmarks_panel(ui),
+        }
+    }
+
+    /// 播放清單分頁的標題：「播放清單（1/3）」，正在播的不在清單裡時「播放清單（3）」
+    fn playlist_title(&self) -> String {
+        let count = self.playlist.as_ref().map_or(0, Playlist::len);
+        match self.playlist.as_ref().and_then(Playlist::current_index) {
+            Some(i) => crate::tf!("播放清單（{}/{count}）", "Playlist ({}/{count})", i + 1),
+            None => crate::tf!("播放清單（{count}）", "Playlist ({count})"),
+        }
+    }
+
+    /// 面板的標題列：兩個分頁（點了換過去）、×（關閉）、目前分頁的「…」選單（`menu` 畫那個按鈕）
+    pub(super) fn side_header(&self, ui: &mut egui::Ui, menu: impl FnOnce(&mut egui::Ui)) -> Option<SideOp> {
+        let tab = self.settings.side_tab;
+        let mut op = None;
+        ui.horizontal(|ui| {
+            let tabs = [
+                (
+                    SideTab::Playlist,
+                    self.playlist_title(),
+                    self.keymap
+                        .labeled(crate::tr!("播放清單", "Playlist"), Command::Playlist),
+                ),
+                (
+                    SideTab::Bookmarks,
+                    self.bookmarks_title(),
+                    self.keymap
+                        .labeled(crate::tr!("書籤清單", "Bookmark list"), Command::BookmarkList),
+                ),
+            ];
+            for (t, title, hover) in tabs {
+                let mut text = RichText::new(title);
+                if t == tab {
+                    text = text.strong();
+                }
+                if ui.selectable_label(t == tab, text).on_hover_text(hover).clicked() && t != tab {
+                    op = Some(SideOp::Switch(t));
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let cmd = match tab {
+                    SideTab::Playlist => Command::Playlist,
+                    SideTab::Bookmarks => Command::BookmarkList,
+                };
+                if ui
+                    .add(icon_button("×"))
+                    .on_hover_text(self.keymap.labeled(crate::tr!("關閉", "Close"), cmd))
+                    .clicked()
+                {
+                    op = Some(SideOp::Close);
+                }
+                menu(ui);
+            });
+        });
+        ui.separator();
+        op
+    }
+
+    /// 播放清單分頁
     pub(super) fn playlist_panel(&mut self, ui: &mut egui::Ui) {
         let mut op = None;
         let count = self.playlist.as_ref().map_or(0, Playlist::len);
         let current = self.playlist.as_ref().and_then(Playlist::current_index);
         let selected = self.playlist_selected.filter(|i| *i < count);
 
-        ui.horizontal(|ui| {
-            let title = match current {
-                Some(i) => crate::tf!("播放清單（{}/{count}）", "Playlist ({}/{count})", i + 1),
-                None => crate::tf!("播放清單（{count}）", "Playlist ({count})"),
-            };
-            ui.strong(title);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let side = self.side_header(ui, |ui| {
+            ui.menu_button("…", |ui| {
+                if ui.button(crate::tr!("加入檔案…", "Add files…")).clicked() {
+                    op = Some(ListOp::AddFiles);
+                }
+                if ui.button(crate::tr!("加入資料夾…", "Add folder…")).clicked() {
+                    op = Some(ListOp::AddFolder);
+                }
                 if ui
-                    .add(icon_button("×"))
-                    .on_hover_text(crate::tr!("關閉（F6）", "Close (F6)"))
+                    .add_enabled(count > 1, egui::Button::new(crate::tr!("依檔名排序", "Sort by name")))
                     .clicked()
                 {
-                    op = Some(ListOp::Close);
+                    op = Some(ListOp::Sort);
                 }
-                ui.menu_button("…", |ui| {
-                    if ui.button(crate::tr!("加入檔案…", "Add files…")).clicked() {
-                        op = Some(ListOp::AddFiles);
-                    }
-                    if ui.button(crate::tr!("加入資料夾…", "Add folder…")).clicked() {
-                        op = Some(ListOp::AddFolder);
-                    }
-                    if ui
-                        .add_enabled(count > 1, egui::Button::new(crate::tr!("依檔名排序", "Sort by name")))
-                        .clicked()
-                    {
-                        op = Some(ListOp::Sort);
-                    }
-                    if ui
-                        .add_enabled(
-                            selected.is_some(),
-                            egui::Button::new(crate::tr!("移除選取的項目", "Remove selected")).shortcut_text("Delete"),
-                        )
-                        .clicked()
-                        && let Some(i) = selected
-                    {
-                        op = Some(ListOp::Remove(i));
-                    }
-                    if ui
-                        .add_enabled(count > 0, egui::Button::new(crate::tr!("清空清單", "Clear")))
-                        .clicked()
-                    {
-                        op = Some(ListOp::Clear);
-                    }
-                    ui.separator();
-                    if ui
-                        .button(crate::tr!("開啟播放清單檔…", "Open playlist file…"))
-                        .clicked()
-                    {
-                        op = Some(ListOp::Open);
-                    }
-                    if ui
-                        .add_enabled(
-                            count > 0,
-                            egui::Button::new(crate::tr!("儲存播放清單檔…", "Save playlist file…")),
-                        )
-                        .clicked()
-                    {
-                        op = Some(ListOp::Save);
-                    }
-                })
-                .response
-                .on_hover_text(crate::tr!(
-                    "加入檔案、排序、存成播放清單檔",
-                    "Add files, sort, save as a playlist file"
-                ));
-            });
+                if ui
+                    .add_enabled(
+                        selected.is_some(),
+                        egui::Button::new(crate::tr!("移除選取的項目", "Remove selected")).shortcut_text("Delete"),
+                    )
+                    .clicked()
+                    && let Some(i) = selected
+                {
+                    op = Some(ListOp::Remove(i));
+                }
+                if ui
+                    .add_enabled(count > 0, egui::Button::new(crate::tr!("清空清單", "Clear")))
+                    .clicked()
+                {
+                    op = Some(ListOp::Clear);
+                }
+                ui.separator();
+                if ui
+                    .button(crate::tr!("開啟播放清單檔…", "Open playlist file…"))
+                    .clicked()
+                {
+                    op = Some(ListOp::Open);
+                }
+                if ui
+                    .add_enabled(
+                        count > 0,
+                        egui::Button::new(crate::tr!("儲存播放清單檔…", "Save playlist file…")),
+                    )
+                    .clicked()
+                {
+                    op = Some(ListOp::Save);
+                }
+            })
+            .response
+            .on_hover_text(crate::tr!(
+                "加入檔案、排序、存成播放清單檔",
+                "Add files, sort, save as a playlist file"
+            ));
         });
-        ui.separator();
+        if let Some(side) = side {
+            op = Some(ListOp::Side(side));
+        }
 
         let Some(list) = &self.playlist else {
             ui.weak(crate::tr!(
@@ -197,7 +299,8 @@ impl VitascopeApp {
             ui.spacing_mut().item_spacing.y = 0.0;
             for i in range {
                 let path = &list.items()[i];
-                let name = format!("{}. {}", i + 1, file_name(path));
+                // 網址顯示標題（m3u 的 #EXTINF、影片的標題），滑鼠停在上面看完整的網址
+                let name = format!("{}. {}", i + 1, display_label(&self.titles, path));
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click_and_drag());
                 // 無障礙資訊：螢幕閱讀器、介面測試找得到每一列
                 resp.widget_info(|| {
@@ -237,8 +340,11 @@ impl VitascopeApp {
             let content_top = out.inner_rect.top() - out.state.offset.y;
             let to = ((p.y - content_top) / row_h).round().clamp(0.0, count as f32) as usize;
             let y = content_top + to as f32 * row_h;
-            ui.painter_at(out.inner_rect.expand(1.0))
-                .hline(out.inner_rect.x_range(), y, Stroke::new(2.0, ACCENT));
+            ui.painter_at(out.inner_rect.expand(1.0)).hline(
+                out.inner_rect.x_range(),
+                y,
+                Stroke::new(2.0, Palette::of(ui.visuals()).accent),
+            );
             ctx.set_cursor_icon(CursorIcon::Grabbing);
             autoscroll(&ctx, &out, p);
             if ctx.input(|i| i.pointer.any_released()) && DragAndDrop::take_payload::<DragRow>(&ctx).is_some() {
@@ -253,7 +359,7 @@ impl VitascopeApp {
         // 開對話框的操作取消的話什麼都沒變；真的改了清單時它們自己會處理
         let edits = !matches!(
             op,
-            ListOp::Close
+            ListOp::Side(_)
                 | ListOp::Select(_)
                 | ListOp::Play(_)
                 | ListOp::Save
@@ -268,7 +374,7 @@ impl VitascopeApp {
             self.owns_session = true;
         }
         match op {
-            ListOp::Close => self.toggle_playlist(ctx),
+            ListOp::Side(side) => self.apply_side_op(ctx, side),
             ListOp::Select(i) => self.playlist_selected = Some(i),
             ListOp::Play(i) => {
                 self.playlist_selected = Some(i);
@@ -432,11 +538,20 @@ impl VitascopeApp {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let path = path.as_path();
         let base = path.parent().unwrap_or(Path::new(""));
-        let files: Vec<PathBuf> = m3u::parse(text, base)
+        let entries: Vec<m3u::Entry> = m3u::parse(text, base)
             .into_iter()
-            .map(|e| e.path)
-            .filter(|p| m3u::keep_entry(p))
+            .filter(|e| m3u::keep_entry(&e.path))
             .collect();
+        // 網址的 #EXTINF 標題（IPTV 的頻道名稱之類）：清單上顯示標題。本機檔案照樣顯示檔名
+        for e in &entries {
+            let url = e.path.to_string_lossy();
+            if m3u::is_url(&url)
+                && let Some(t) = e.title.as_deref().and_then(|t| crate::net::useful_title(&url, t))
+            {
+                self.titles.insert(url.into_owned(), t);
+            }
+        }
+        let files: Vec<PathBuf> = entries.into_iter().map(|e| e.path).collect();
         let Some(first) = files.first().cloned() else {
             self.osd(crate::tf!(
                 "播放清單是空的：{}",
@@ -477,7 +592,8 @@ impl VitascopeApp {
             .iter()
             .map(|p| m3u::Entry {
                 path: p.clone(),
-                title: None,
+                // 網址寫標題（本機檔案寫檔名）
+                title: self.titles.get(p.to_string_lossy().as_ref()).cloned(),
                 duration: None,
             })
             .collect();
@@ -507,15 +623,15 @@ impl VitascopeApp {
             Some(list) if list.is_manual() => (list.items(), list.resume_index()),
             _ => (&[], None),
         };
-        if let Err(e) = m3u::save_session(items, current) {
+        if let Err(e) = m3u::save_session(items, current, &self.titles) {
             eprintln!("[vitascope] 無法儲存播放清單：{e}");
         }
     }
 
-    /// 清單面板的底色（跟控制列一樣）
-    pub(super) fn playlist_frame() -> egui::Frame {
+    /// 清單面板的底色（跟著主題）
+    pub(super) fn playlist_frame(palette: &Palette) -> egui::Frame {
         egui::Frame::NONE
-            .fill(Color32::from_gray(28))
+            .fill(palette.side)
             .inner_margin(egui::Margin::symmetric(8, 6))
     }
 }
@@ -530,14 +646,15 @@ fn paint_row(ui: &egui::Ui, rect: Rect, resp: &egui::Response, name: &str, selec
             .rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
     }
     let gutter = 16.0;
-    let color = if current { ACCENT } else { visuals.text_color() };
+    let accent = Palette::of(visuals).accent;
+    let color = if current { accent } else { visuals.text_color() };
     if current {
         ui.painter().text(
             rect.left_center() + vec2(3.0, 0.0),
             Align2::LEFT_CENTER,
             "▶",
             egui::FontId::proportional(10.0),
-            ACCENT,
+            accent,
         );
     }
     let mut text = RichText::new(name).color(color);

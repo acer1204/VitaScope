@@ -98,6 +98,18 @@ pub struct MediaInfo {
     pub ao: Option<String>,
     /// 音訊裝置的名稱（`audio-device` 是 `auto` 或 `wasapi/{id}`，要查 `audio-device-list`）
     pub audio_device: Option<String>,
+    /// 網路串流：「來源」取代「檔案」那一段（標題、網址、串流的種類）；本機檔案是 None
+    pub source: Option<Source>,
+}
+
+/// 網路串流的來源
+#[derive(Debug, Clone, Default)]
+pub struct Source {
+    pub url: String,
+    /// 標題（m3u 的 `#EXTINF`、影片本身的標題）；不知道時顯示網址的最後一段
+    pub title: Option<String>,
+    /// 直播（載入時沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類；見 `net::is_live`）
+    pub live: bool,
 }
 
 /// 播放中一直在變的數字
@@ -122,6 +134,11 @@ pub struct LiveStats {
     /// 顯示時間跟預定的差太多的影格、晚了的影格
     pub mistimed_frame_count: Option<i64>,
     pub vo_delayed_frame_count: Option<i64>,
+    /// 網路串流：已經預先讀進快取的秒數（demuxer-cache-duration）、下載速度（cache-speed，位元組 / 秒）、
+    /// 快取不夠正在等（paused-for-cache）
+    pub cache_secs: Option<f64>,
+    pub cache_speed: Option<i64>,
+    pub buffering: bool,
 }
 
 fn lenient_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
@@ -136,7 +153,8 @@ fn json<T: serde::de::DeserializeOwned>(player: &Player, name: &str) -> Option<T
     serde_json::from_str(&player.get_string(name).ok()?).ok()
 }
 
-/// 讀檔案層級的資訊（約 0.3 毫秒；`audio_device` 第一次查裝置清單比較慢，另外快取）
+/// 讀檔案層級的資訊（約 0.3 毫秒；`audio_device` 第一次查裝置清單比較慢，另外快取）。
+/// 網路串流的來源（`source`）由介面另外填（標題在介面那邊，見 `app/info_panel.rs`）
 pub fn read(player: &Player, audio_device: Option<String>) -> MediaInfo {
     let st = &player.state;
     MediaInfo {
@@ -166,6 +184,7 @@ pub fn read(player: &Player, audio_device: Option<String>) -> MediaInfo {
         hwdec: st.hwdec.clone(),
         ao: player.get_string("current-ao").ok(),
         audio_device,
+        source: None,
     }
 }
 
@@ -205,6 +224,9 @@ pub fn read_live(player: &Player) -> LiveStats {
         video_speed_correction: float("video-speed-correction"),
         mistimed_frame_count: int("mistimed-frame-count"),
         vo_delayed_frame_count: int("vo-delayed-frame-count"),
+        cache_secs: float("demuxer-cache-duration"),
+        cache_speed: int("cache-speed"),
+        buffering: player.state.paused_for_cache,
     }
 }
 
@@ -397,6 +419,23 @@ pub fn container_name(format: &str) -> String {
     }
 }
 
+/// 網路串流的種類：HLS、DASH 串流，其他照容器（「HTTP · MP4 / MOV」）
+pub fn stream_kind(url: &str, format: Option<&str>) -> String {
+    let first = format.map(|f| f.split(',').next().unwrap_or(f));
+    match first {
+        Some("hls" | "applehttp") => crate::tr!("HLS 串流", "HLS stream").to_owned(),
+        Some("dash") => crate::tr!("DASH 串流", "DASH stream").to_owned(),
+        _ => {
+            let scheme = crate::net::scheme(url).unwrap_or_default().to_ascii_uppercase();
+            match format {
+                Some(f) if !scheme.is_empty() => format!("{scheme} · {}", container_name(f)),
+                Some(f) => container_name(f),
+                None => scheme,
+            }
+        }
+    }
+}
+
 /// 硬體解碼的說明
 pub fn hwdec_label(hwdec: Option<&str>) -> String {
     match hwdec {
@@ -453,7 +492,7 @@ fn codec_line(t: &TrackInfo) -> String {
     s
 }
 
-fn lang_label(lang: Option<&str>) -> Option<String> {
+pub(crate) fn lang_label(lang: Option<&str>) -> Option<String> {
     let lang = lang?;
     Some(
         match lang.to_ascii_lowercase().as_str() {
@@ -476,16 +515,27 @@ pub type Section = (&'static str, Vec<String>);
 pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
     let mut out = Vec::new();
 
-    // 檔案
+    // 檔案；網路串流是「來源」：標題、網址、串流的種類
     let mut file = vec![info.file_name.clone()];
     let mut facts = Vec::new();
-    if let Some(f) = &info.file_format {
+    if let Some(src) = &info.source {
+        file = vec![
+            crate::net::display_name(&src.url, src.title.as_deref()),
+            src.url.clone(),
+        ];
+        facts.push(stream_kind(&src.url, info.file_format.as_deref()));
+        if src.live {
+            facts.push(crate::tr!("直播", "Live").to_owned());
+        }
+    } else if let Some(f) = &info.file_format {
         facts.push(container_name(f));
     }
-    if let Some(size) = info.file_size.filter(|s| *s > 0) {
+    // 直播沒有大小、總長度（mpv 的數字只是目前讀到的那一段）
+    let is_live = info.source.as_ref().is_some_and(|s| s.live);
+    if let Some(size) = info.file_size.filter(|s| *s > 0 && !is_live) {
         facts.push(fmt_size(size));
     }
-    if let Some(d) = info.duration.filter(|d| *d > 0.0) {
+    if let Some(d) = info.duration.filter(|d| *d > 0.0 && !is_live) {
         facts.push(crate::app::fmt_time(d));
         if let Some(size) = info.file_size.filter(|s| *s > 0) {
             facts.push(crate::tf!(
@@ -501,7 +551,25 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
     if !facts.is_empty() {
         file.push(facts.join(" · "));
     }
-    out.push((crate::tr!("檔案", "File"), file));
+    if info.source.is_some() {
+        // 快取：已經預先讀了多少、下載速度、正在等
+        let mut cache = Vec::new();
+        if let Some(secs) = live.cache_secs.filter(|s| *s >= 0.0) {
+            cache.push(crate::tf!("已預先讀取 {:.0} 秒", "{:.0} s read ahead", secs));
+        }
+        if let Some(speed) = live.cache_speed.filter(|s| *s > 0) {
+            cache.push(crate::tf!("下載 {}/s", "Downloading {}/s", fmt_size(speed)));
+        }
+        if live.buffering {
+            cache.push(crate::tr!("緩衝中", "Buffering").to_owned());
+        }
+        if !cache.is_empty() {
+            file.push(cache.join(" · "));
+        }
+        out.push((crate::tr!("來源", "Source"), file));
+    } else {
+        out.push((crate::tr!("檔案", "File"), file));
+    }
 
     // 影像（專輯封面不算）
     if let Some(v) = info.video.as_ref().filter(|v| !v.albumart && !v.image) {
@@ -678,12 +746,12 @@ pub fn to_text(sections: &[Section]) -> String {
     s
 }
 
-fn fmt_fps(fps: f64) -> String {
+pub(crate) fn fmt_fps(fps: f64) -> String {
     let s = format!("{fps:.3}");
     s.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-fn fmt_khz(rate: i64) -> String {
+pub(crate) fn fmt_khz(rate: i64) -> String {
     let s = format!("{:.1}", rate as f64 / 1000.0);
     s.trim_end_matches(".0").to_owned()
 }
@@ -840,6 +908,61 @@ mod tests {
                 "Mistimed 0 · delayed 2".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn network_sources_show_the_source_and_the_cache() {
+        let info = MediaInfo {
+            file_name: "index.m3u8".into(),
+            file_format: Some("hls".into()),
+            file_size: Some(1_000),
+            duration: Some(3.0),
+            source: Some(Source {
+                url: "https://x.example/live/index.m3u8".into(),
+                title: Some("新聞台".into()),
+                live: true,
+            }),
+            ..Default::default()
+        };
+        let live = LiveStats {
+            cache_secs: Some(35.4),
+            cache_speed: Some(2_300_000),
+            buffering: true,
+            ..Default::default()
+        };
+        let s = sections(&info, &live);
+        assert_eq!(s[0].0, "來源");
+        assert_eq!(
+            s[0].1,
+            [
+                "新聞台",
+                "https://x.example/live/index.m3u8",
+                "HLS 串流 · 直播",
+                "已預先讀取 35 秒 · 下載 2.3 MB/s · 緩衝中",
+            ]
+        );
+        assert!(!to_text(&s).contains("檔案"), "網路串流沒有「檔案」");
+        // HTTP 的檔案：種類是協定 + 容器；有總長度、大小（不是直播）
+        let info = MediaInfo {
+            file_format: Some("mov,mp4,m4a,3gp,3g2,mj2".into()),
+            file_size: Some(1_000_000),
+            duration: Some(8.0),
+            source: Some(Source {
+                url: "http://127.0.0.1:8080/f/a%20b.mp4".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let s = sections(&info, &LiveStats::default());
+        assert_eq!(s[0].1[0], "a b.mp4", "沒有標題時用網址的最後一段");
+        assert!(
+            s[0].1[2].starts_with("HTTP · MP4 / MOV · 1.0 MB · 00:08"),
+            "{:?}",
+            s[0].1
+        );
+        assert_eq!(s[0].1.len(), 3, "沒有快取的數字就不列");
+        assert_eq!(stream_kind("https://h/a.mpd", Some("dash")), "DASH 串流");
+        assert_eq!(stream_kind("rtsp://h/a", None), "RTSP");
     }
 
     #[test]

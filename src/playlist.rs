@@ -218,6 +218,19 @@ impl Playlist {
         self.items.len() - before
     }
 
+    /// 目前那一項換成 `items`（網路上的播放清單展開成裡面的項目），回傳第一個換進來的在清單上的位置；
+    /// 沒有目前的項目時不動、回傳 None。換完之後目前的是第一個換進來的（之後由開檔選要播的那一個）
+    pub fn replace_current(&mut self, items: Vec<PathBuf>) -> Option<usize> {
+        let at = self.current_index()?;
+        self.manual = true;
+        self.items.splice(at..=at, items);
+        if self.items.is_empty() {
+            self.index = 0;
+            self.current_removed = true;
+        }
+        Some(at)
+    }
+
     /// 依檔名自然排序，目前的檔案維持是目前的
     pub fn sort(&mut self) {
         self.manual = true;
@@ -248,8 +261,12 @@ fn is_hidden(e: &std::fs::DirEntry) -> bool {
     false
 }
 
-/// 比對用的鍵：跟 `same_file` 一樣（Windows 不分大小寫），路徑分隔符號統一
+/// 比對用的鍵：跟 `same_file` 一樣（Windows 不分大小寫，網址一字不差），路徑分隔符號統一
 fn file_key(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if crate::m3u::is_url(&s) {
+        return s.into_owned();
+    }
     let joined = p
         .components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -275,7 +292,6 @@ pub fn media_in_dir(dir: &Path) -> Vec<PathBuf> {
     items
 }
 
-/// 是否為同一個檔案。Windows 的檔名不分大小寫（包括中文以外的各種字母）
 /// 完整路徑（網址不動）。命令列、其他程式送來的相對路徑要在一開始就轉換：
 /// 清單、播放紀錄、存起來的清單比對的都是完整路徑
 pub fn absolute(path: &Path) -> PathBuf {
@@ -286,7 +302,13 @@ pub fn absolute(path: &Path) -> PathBuf {
     }
 }
 
+/// 是否為同一個檔案。Windows 的檔名不分大小寫（包括中文以外的各種字母）。
+/// 網址一字不差才算（YouTube 的影片代號分大小寫；`Path` 的比較還會把 `a//b` 當成 `a/b`）
 pub fn same_file(a: &Path, b: &Path) -> bool {
+    let (sa, sb) = (a.to_string_lossy(), b.to_string_lossy());
+    if crate::m3u::is_url(&sa) || crate::m3u::is_url(&sb) {
+        return sa == sb;
+    }
     if cfg!(windows) {
         a == b || a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
     } else {
@@ -461,6 +483,27 @@ mod tests {
     }
 
     #[test]
+    fn remote_playlist_replaces_its_own_entry() {
+        // 本機的清單裡第 2 項是網路上的播放清單：展開成裡面的項目，前後不動
+        let mut list = Playlist::from_files(vec!["a".into(), "http://h/list.m3u".into(), "c".into()]);
+        assert!(list.select_index(1));
+        let at = list.replace_current(vec!["http://h/1.mp4".into(), "http://h/2.mp4".into()]);
+        assert_eq!(at, Some(1));
+        assert_eq!(names(&list), ["a", "http://h/1.mp4", "http://h/2.mp4", "c"]);
+        assert!(list.is_manual());
+        assert_eq!(list.current(), Some(Path::new("http://h/1.mp4")));
+        // 沒有目前的項目：不動
+        let mut restored = Playlist::restored(vec!["a".into()], Some(0));
+        assert_eq!(restored.replace_current(vec!["x".into()]), None);
+        assert_eq!(names(&restored), ["a"]);
+        // 展開後是空的
+        let mut one = Playlist::from_files(vec!["http://h/list.m3u".into()]);
+        one.select_index(0);
+        assert_eq!(one.replace_current(Vec::new()), Some(0));
+        assert!(one.is_empty() && one.current().is_none());
+    }
+
+    #[test]
     fn edits_make_a_list_manual_and_restored_lists_start_before_the_saved_item() {
         let mut list = Playlist::from_files(vec!["a".into(), "b".into()]);
         assert!(!list.is_manual());
@@ -532,6 +575,31 @@ mod tests {
         let start = std::time::Instant::now();
         list.extend(many);
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn urls_compare_exactly() {
+        let same = |a: &str, b: &str| same_file(Path::new(a), Path::new(b));
+        assert!(same("https://youtu.be/AbC", "https://youtu.be/AbC"));
+        // 影片代號分大小寫（Windows 也是）
+        assert!(!same("https://youtu.be/AbC", "https://youtu.be/abc"));
+        // Path 的比較會把這些當成一樣
+        assert!(!same("https://x.example/a//b", "https://x.example/a/b"));
+        assert!(!same("https://x.example/a/", "https://x.example/a"));
+        assert!(!same("https://x.example/a/b", r"https://x.example\a\b"));
+        // 本機路徑照舊
+        assert!(same("dir/a.mp4", "dir/a.mp4"));
+        assert_eq!(same("dir/A.mp4", "dir/a.mp4"), cfg!(windows));
+        // 清單去重複也一樣
+        let mut list = Playlist::from_files(vec!["https://youtu.be/AbC".into()]);
+        let added = list.extend([
+            "https://youtu.be/abc".into(),
+            "https://youtu.be/AbC".into(),
+            "https://x.example/a//b".into(),
+            "https://x.example/a/b".into(),
+        ]);
+        assert_eq!(added, 3);
+        assert!(list.contains(Path::new("https://youtu.be/abc")));
     }
 
     #[test]

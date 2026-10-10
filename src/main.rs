@@ -83,13 +83,30 @@ fn parse_args() -> (Launch, bool) {
     });
     // 流暢播放出問題時回到以前的做法：VITASCOPE_PACING=off（只在啟動時讀一次）
     launch.pacing = vitascope::pacing::Overrides::from_env();
-    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
+    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、書籤、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
     if launch.autoshot.is_none() {
         launch.history = History::load();
+        launch.bookmarks = vitascope::bookmarks::Bookmarks::load();
+        // 影戲下載的 yt-dlp、deno 放的地方（自動截圖不找）
+        launch.tools_dir = vitascope::paths::tools_dir();
+        // 匯出的磁碟快取；啟動時清掉上次留下的暫存檔（自動截圖不清）
+        launch.cache_root = Some(vitascope::paths::cache_root());
         launch.persist_playlist = true;
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
-        if launch.files.is_empty() {
-            launch.playlist = vitascope::m3u::load_session().map(|(items, current)| Playlist::restored(items, current));
+        if launch.files.is_empty()
+            && let Some((entries, current)) = vitascope::m3u::load_session_entries()
+        {
+            // 網址的標題（#EXTINF）：清單上照樣顯示標題，不是網址的最後一段
+            launch.titles = entries
+                .iter()
+                .filter_map(|e| {
+                    let url = e.path.to_string_lossy();
+                    let title = vitascope::net::useful_title(&url, e.title.as_deref()?)?;
+                    vitascope::m3u::is_url(&url).then(|| (url.into_owned(), title))
+                })
+                .collect();
+            let items = entries.into_iter().map(|e| e.path).collect();
+            launch.playlist = Some(Playlist::restored(items, current));
         }
     }
     (launch, new_window)
@@ -143,6 +160,20 @@ fn main() -> eframe::Result {
             Err(e) => eprintln!("[vitascope] 不使用單一執行個體：{e}"),
         }
     }
+    // 網站影片：用 yt-dlp 解析（第一次需要時才在背景找 yt-dlp；自動截圖不用，網站的網址說明要 yt-dlp）。
+    // 播放器和介面（「設定 → 網路」的狀態）用同一個尋找的結果
+    let net_resolver: Option<Arc<dyn vitascope::ytdl::Resolve>> = if launch.autoshot.is_none() {
+        let locator = vitascope::ytdl::Locator::new(launch.tools_dir.clone());
+        launch.ytdl = Some(locator.clone());
+        // 使用者按下「下載」「更新」時才從官方的 GitHub 下載到工具資料夾（不在背景自動連網）
+        launch.installer = launch
+            .tools_dir
+            .clone()
+            .map(|dir| Arc::new(vitascope::ytdl::install::Installer::github(dir)));
+        Some(Arc::new(vitascope::ytdl::ProcessResolver::new(locator)))
+    } else {
+        None
+    };
     let wake = egui_ctx.clone();
     let pace = !launch.pacing.block;
     let player = match Player::new(Options {
@@ -158,6 +189,7 @@ fn main() -> eframe::Result {
             }
         })),
         hwdec: if settings.hwdec { "auto-safe" } else { "no" }.into(),
+        net_resolver,
         ..Options::default()
     }) {
         Ok(p) => p,
@@ -192,7 +224,8 @@ fn main() -> eframe::Result {
             _ => viewport = viewport.with_position(g.pos),
         }
     }
-    if settings.always_on_top {
+    // 只有「永遠置頂」一開始就置頂；「播放時置頂」由 App 在開始播放時才設（App 記的初始層級也用 `at_launch`）
+    if settings.on_top.at_launch() {
         viewport = viewport.with_always_on_top();
     }
     let options = eframe::NativeOptions {

@@ -58,6 +58,23 @@ FFmpeg 不加 `--enable-gpl` / `--enable-version3` 建置，每個元件固定�
 Windows 的 `vitascope.exe` 以 MinGW-w64（GCC）編譯，靜態連結了 mingw-w64 的執行庫（授權條文在 `licenses/mingw-w64/`）
 與 GCC 的執行庫（GCC Runtime Library Exception，沒有另外的散布條件）。
 
+## 按需求下載的外部程式（不隨影戲散布）
+
+播放網站影片要用 yt-dlp，YouTube 另外要 deno。影戲的安裝包**不含**這兩個程式；使用者在影戲裡按下「下載 yt-dlp…」
+「下載 deno…」並同意後，影戲才從它們官方的 GitHub 發佈下載最新版，核對同一個發佈附的 SHA-256 檢查碼後放進工具資料夾。
+影戲不會在背景自動更新它們，只有按「立即更新」「更新 yt-dlp 再試一次」時才檢查新版。使用者自己安裝的 yt-dlp、deno 也找得到，影戲不會更動。
+
+| 程式 | 授權 | 來源 |
+|---|---|---|
+| yt-dlp（單一執行檔） | Unlicense；執行檔是 PyInstaller 打包的，內含 GPLv3+ 等授權的元件（見它的 `THIRD_PARTY_LICENSES.txt`） | https://github.com/yt-dlp/yt-dlp |
+| deno | MIT | https://github.com/denoland/deno |
+
+放在這裡（移除：在「設定 → 網路」按「移除…」，或直接刪掉這個資料夾）：
+
+- Windows：`%LOCALAPPDATA%\VitaScope\tools`（Windows 安裝版解除安裝時一併刪除）
+- macOS：`~/Library/Application Support/Vitascope/tools`
+- Linux：`${XDG_DATA_HOME:-~/.local/share}/vitascope/tools`
+
 ## Rust 套件與內建字型
 
 VitaScope 使用的 Rust 套件（含 egui 內建的 Ubuntu Font 與 Noto Emoji 字型）及其完整授權條文，

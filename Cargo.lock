@@ -1510,6 +1510,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3266,6 +3268,8 @@ dependencies = [
  "eframe",
  "egui_kittest",
  "encoding_rs",
+ "flate2",
+ "image",
  "libc",
  "libmpv2-sys",
  "objc2 0.6.5",
@@ -3274,9 +3278,11 @@ dependencies = [
  "png",
  "raw-window-handle",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "ureq",
+ "url",
  "windows-sys 0.61.2",
  "x11-dl",
 ]

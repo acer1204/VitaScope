@@ -6,9 +6,13 @@
 //! 視窗位置大小也自己存，不用 eframe 的機制：eframe 會連「全螢幕」一起記住，
 //! 下次啟動直接全螢幕，跟一般播放器的習慣不同。
 
+pub use crate::export::ExportSettings;
+pub use crate::keymap::KeySettings;
+pub use crate::net::NetSettings;
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
 pub use crate::sound::AudioSettings;
+pub use crate::theme::ThemeChoice;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -25,10 +29,13 @@ pub struct Settings {
     pub resume: bool,
     /// 字幕外觀
     pub subtitle: SubStyle,
-    /// 視窗置頂（蓋在其他視窗上面）
-    pub always_on_top: bool,
-    /// 顯示播放清單面板
+    /// 視窗置頂（蓋在其他視窗上面）：不置頂 / 永遠置頂 / 播放時置頂。
+    /// 以前是開關 `always_on_top`，讀檔時換成這個（見 `migrate`）
+    pub on_top: OnTop,
+    /// 顯示側邊面板（播放清單、書籤）
     pub show_playlist: bool,
+    /// 側邊面板目前的分頁（播放清單 / 書籤）；面板開不開還是看 `show_playlist`
+    pub side_tab: SideTab,
     /// 截圖資料夾；None = 「圖片」資料夾裡的 VitaScope
     pub screenshot_dir: Option<PathBuf>,
     /// 截圖包含字幕
@@ -51,6 +58,14 @@ pub struct Settings {
     pub audio: AudioSettings,
     /// 流暢播放（依螢幕更新率同步影像）
     pub smooth: SmoothMode,
+    /// 外觀：深色 / 淺色 / 跟隨系統
+    pub theme: ThemeChoice,
+    /// 快捷鍵（預設組、自己改過的）
+    pub keys: KeySettings,
+    /// 網路：開啟網址（HLS / DASH 畫質、重新連線、快取、逾時、憑證、標頭、proxy…）
+    pub net: NetSettings,
+    /// 匯出（片段、GIF、縮圖總覽圖）：存放的資料夾、片段的格式、上次的選擇
+    pub export: ExportSettings,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -166,8 +181,9 @@ impl Default for Settings {
             auto_next: true,
             resume: true,
             subtitle: SubStyle::default(),
-            always_on_top: false,
+            on_top: OnTop::Never,
             show_playlist: false,
+            side_tab: SideTab::Playlist,
             screenshot_dir: None,
             screenshot_subtitles: true,
             language: crate::i18n::Lang::default(),
@@ -179,8 +195,99 @@ impl Default for Settings {
             video: VideoSettings::default(),
             audio: AudioSettings::default(),
             smooth: SmoothMode::default(),
+            theme: ThemeChoice::default(),
+            keys: KeySettings::default(),
+            net: NetSettings::default(),
+            export: ExportSettings::default(),
             path: None,
             baseline: None,
+        }
+    }
+}
+
+/// 側邊面板的分頁
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SideTab {
+    /// 播放清單（F6）
+    #[default]
+    Playlist,
+    /// 目前檔案的書籤（H）
+    Bookmarks,
+}
+
+/// 視窗置頂模式（比照 PotPlayer 的三種）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnTop {
+    /// 不置頂
+    #[default]
+    Never,
+    /// 永遠置頂
+    Always,
+    /// 播放時置頂：暫停、停止、播完（停在最後一格）時回到一般視窗
+    WhilePlaying,
+}
+
+impl OnTop {
+    pub const ALL: [OnTop; 3] = [OnTop::Never, OnTop::Always, OnTop::WhilePlaying];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OnTop::Never => crate::tr!("不置頂", "Never"),
+            OnTop::Always => crate::tr!("永遠置頂", "Always"),
+            OnTop::WhilePlaying => crate::tr!("播放時置頂", "While playing"),
+        }
+    }
+
+    /// 快捷鍵依序切換：不置頂 → 永遠置頂 → 播放時置頂 → 不置頂
+    pub fn next(self) -> Self {
+        match self {
+            OnTop::Never => OnTop::Always,
+            OnTop::Always => OnTop::WhilePlaying,
+            OnTop::WhilePlaying => OnTop::Never,
+        }
+    }
+
+    /// 換成這個模式時的提示
+    pub fn osd(self) -> &'static str {
+        match self {
+            OnTop::Never => crate::tr!("視窗置頂：關閉", "Always on top: off"),
+            OnTop::Always => crate::tr!("視窗置頂：永遠", "Always on top: always"),
+            OnTop::WhilePlaying => crate::tr!("視窗置頂：播放時", "Always on top: while playing"),
+        }
+    }
+
+    /// 現在視窗要不要置頂；`playing` = 有檔案、正在播放（沒有暫停、沒有停在最後一格）
+    pub fn effective(self, playing: bool) -> bool {
+        match self {
+            OnTop::Never => false,
+            OnTop::Always => true,
+            OnTop::WhilePlaying => playing,
+        }
+    }
+
+    /// 視窗一開始要不要置頂（main.rs 建視窗、App 記下「已經送過的層級」都用這個，兩邊不會不一致）：
+    /// 只有永遠置頂；播放時置頂一開始還沒在播，是一般視窗
+    pub fn at_launch(self) -> bool {
+        self.effective(false)
+    }
+}
+
+/// 舊版的視窗置頂開關（v0.3.0 以前）：讀檔時換成 `on_top`，存檔時從檔案拿掉
+const OLD_ON_TOP: &str = "always_on_top";
+
+/// 讀檔前把舊的設定名稱換成新的。兩個都有時以新的為準
+///（新版存檔時會拿掉舊的；兩個都在代表是舊版後來寫的，舊版沒讀到 `on_top`，寫的是它自己的預設值）
+fn migrate(value: &mut serde_json::Value) {
+    let Some(fields) = value.as_object_mut() else { return };
+    if let Some(old) = fields.remove(OLD_ON_TOP)
+        && !fields.contains_key("on_top")
+        && let Some(on) = old.as_bool()
+    {
+        let mode = if on { OnTop::Always } else { OnTop::Never };
+        if let Ok(v) = serde_json::to_value(mode) {
+            fields.insert("on_top".into(), v);
         }
     }
 }
@@ -224,7 +331,8 @@ impl Settings {
 
     /// 讀不懂的設定（例如新版加的語言、手動改錯）只有那一項用預設值，其他設定照樣讀進來。
     /// 群組（字幕外觀、畫質、音效…）裡也是逐項：一項讀不懂，同一組的其他項目照樣讀進來
-    fn from_value_lenient(value: serde_json::Value) -> Self {
+    fn from_value_lenient(mut value: serde_json::Value) -> Self {
+        migrate(&mut value);
         if let Ok(s) = serde_json::from_value(value.clone()) {
             return s;
         }
@@ -262,6 +370,9 @@ impl Settings {
         }
         a.volume_max = crate::sound::snap_volume_max(a.volume_max);
         self.volume = self.volume.clamp(0.0, f64::from(a.volume_max));
+        self.keys = self.keys.sanitized();
+        self.net = self.net.sanitized();
+        self.export = self.export.sanitized();
         self
     }
 
@@ -279,10 +390,14 @@ impl Settings {
         let on_disk = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let merged = match (&self.baseline, on_disk) {
+        let mut merged = match (&self.baseline, on_disk) {
             (Some(base), Some(disk)) => merge(&current, base, disk, &mut Vec::new()),
             _ => current.clone(),
         };
+        // 舊的設定名稱不再寫（已經換成 `on_top`；其他不認得的設定照樣保留，可能是新版寫的）
+        if let Some(fields) = merged.as_object_mut() {
+            fields.remove(OLD_ON_TOP);
+        }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -348,6 +463,10 @@ fn slot<'a>(root: &'a mut serde_json::Value, path: &[String]) -> Option<&'a mut 
 const MERGE_BY_ID: &[&str] = &["video", "shaders", "presets"];
 /// 固定長度、逐格合併的陣列：等化器每一段的增益。兩個視窗各調了不同的段落，都留下
 const MERGE_BY_INDEX: &[&str] = &["audio", "eq", "gains"];
+/// 項目可以被刪掉的物件：自己改過的快捷鍵（「還原」就是拿掉那一項）。
+/// 一般的物件只合併現在有的項目，這個視窗刪掉的會從檔案裡回來；這裡跟上次讀檔、存檔時比，
+/// 這個視窗刪掉的也從檔案拿掉（跟 `merge_by_id` 的刪除一樣）。每一項（一個指令的按鍵）還是整個當成一個值
+const MERGE_DELETES: &[&str] = &["keys", "custom"];
 
 /// 三方合併：`now` 跟 `base` 不同的地方寫進 `disk`，其他的保留 `disk` 的。
 /// 物件（例如字幕外觀）逐項合併：兩個視窗各改了一項，兩項都留下。
@@ -373,6 +492,11 @@ fn merge(
                     _ => value.clone(),
                 };
                 disk.insert(key.clone(), merged);
+            }
+            if path.as_slice() == MERGE_DELETES {
+                for key in base.keys().filter(|k| !now.contains_key(*k)) {
+                    disk.remove(key);
+                }
             }
             Value::Object(disk)
         }
@@ -470,12 +594,12 @@ mod tests {
         let path = dir.join("settings.json");
         let mut s = Settings::load_from(path.clone());
         assert_eq!(s.volume, Settings::default().volume, "沒有檔案時用預設值");
-        s.always_on_top = true;
+        s.on_top = OnTop::Always;
         s.show_playlist = true;
         s.volume = 42.0;
         s.save().unwrap();
         let back = Settings::load_from(path.clone());
-        assert!(back.always_on_top && back.show_playlist);
+        assert!(back.on_top == OnTop::Always && back.show_playlist);
         assert_eq!(back.volume, 42.0);
         // 自動截圖用的設定：讀得到，但不寫回去
         let mut shot = back.detached();
@@ -574,6 +698,38 @@ mod tests {
         assert_eq!(s.video, VideoSettings::default());
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::Off, "流暢播放先預設關");
+        assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
+        assert_eq!(s.on_top, OnTop::Never, "預設不置頂");
+        assert_eq!(s.side_tab, SideTab::Playlist, "側邊面板預設是播放清單");
+        assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
+        assert!(s.keys.custom.is_empty());
+        assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
+        assert_eq!(s.keys.mouse.double_click, "fullscreen", "雙擊畫面預設全螢幕");
+        assert!(s.keys.mouse.middle.is_empty() && s.keys.mouse.back.is_empty() && s.keys.mouse.forward.is_empty());
+        assert_eq!(s.keys.mouse.wheel, crate::keymap::WheelMode::Volume, "滾輪預設調音量");
+        assert_eq!(s.net, NetSettings::default());
+        assert_eq!(
+            s.net.hls_bitrate,
+            crate::net::HlsBitrate::Max,
+            "HLS / DASH 預設最高畫質"
+        );
+        assert!(s.net.reconnect, "預設自動重新連線");
+        assert!(s.net.tls_verify, "預設檢查網站憑證");
+        assert!(s.net.remember_urls, "預設記住開啟過的網址");
+        assert_eq!((s.net.cache_mb, s.net.timeout_secs), (150, 30));
+        assert_eq!(s.export, ExportSettings::default());
+        assert_eq!(s.export.clip_dir, None, "片段預設放「影片」資料夾裡的 VitaScope");
+        assert_eq!(s.export.image_dir, None, "GIF、縮圖總覽圖預設跟截圖放一起");
+        assert_eq!(s.export.clip.format, crate::export::ClipFormat::Auto);
+        assert_eq!((s.export.gif.long_side, s.export.gif.fps), (480, 15));
+        assert!(s.export.gif.subtitles);
+        let sheet = s.export.sheet;
+        assert_eq!(
+            (sheet.columns, sheet.rows, sheet.width, sheet.jpeg_quality),
+            (4, 5, 1920, 90)
+        );
+        assert!(sheet.timestamps && sheet.header);
+        assert_eq!(sheet.format, crate::export::ImageFormat::Jpeg);
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -582,9 +738,17 @@ mod tests {
         assert!(s.audio.passthrough.ac3 && s.audio.passthrough.eac3 && s.audio.passthrough.dts);
         assert!(!s.audio.passthrough.enabled && !s.audio.passthrough.dts_hd && !s.audio.passthrough.truehd);
         // 一組只寫了一項：其他項目也是規格的預設值
-        let s: Settings = serde_json::from_str(r#"{"audio":{"downmix":true},"video":{"keep_adjust":true}}"#).unwrap();
+        let s: Settings = serde_json::from_str(
+            r#"{"audio":{"downmix":true},"video":{"keep_adjust":true},"net":{"timeout_secs":10}}"#,
+        )
+        .unwrap();
         assert!(s.audio.downmix && s.audio.normalize_downmix && s.audio.volume_max == 100);
         assert!(s.video.keep_adjust && s.video.tone.compute_peak);
+        assert_eq!(s.net.timeout_secs, 10);
+        assert!(s.net.tls_verify && s.net.reconnect && s.net.cache_mb == 150);
+        let s: Settings = serde_json::from_str(r#"{"export":{"gif":{"fps":20}}}"#).unwrap();
+        assert_eq!((s.export.gif.fps, s.export.gif.long_side), (20, 480));
+        assert!(s.export.gif.subtitles && s.export.sheet.header);
     }
 
     #[test]
@@ -607,7 +771,8 @@ mod tests {
         .unwrap();
         let s = Settings::load_from(path);
         assert_eq!(s.volume, 64.0);
-        assert!(s.muted && s.always_on_top && !s.auto_next && !s.hwdec && !s.single_instance);
+        assert!(s.muted && !s.auto_next && !s.hwdec && !s.single_instance);
+        assert_eq!(s.on_top, OnTop::Always, "舊的「視窗置頂」開著：永遠置頂");
         assert_eq!(s.subtitle.size, 50.0);
         assert!(s.subtitle.bold);
         assert_eq!(s.language, crate::i18n::Lang::En);
@@ -616,6 +781,456 @@ mod tests {
         assert_eq!(s.video, VideoSettings::default());
         assert_eq!(s.audio, AudioSettings::default());
         assert_eq!(s.smooth, SmoothMode::default());
+        assert_eq!(s.theme, ThemeChoice::Dark, "升級後外觀不變");
+        assert_eq!(s.keys, KeySettings::default(), "升級後快捷鍵不變");
+        assert_eq!(s.keys.mouse, crate::keymap::MouseSettings::default(), "升級後滑鼠不變");
+        assert_eq!(s.side_tab, SideTab::Playlist, "升級後側邊面板還是播放清單");
+        assert_eq!(s.net, NetSettings::default(), "升級後網路設定是預設值（檢查憑證）");
+        assert_eq!(s.export, ExportSettings::default(), "升級後匯出是預設值");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn site_video_settings_defaults_lenient_load_and_merge() {
+        use crate::ytdl::{Browser, CodecPref, ListMode, SitePrefs, SiteQuality};
+        // 沒寫的（舊版、C6 以前的設定檔）：用 yt-dlp、最高畫質、自動編碼、網站字幕、不用 Cookie、只播這部影片
+        let s: Settings = serde_json::from_str(r#"{"net":{"timeout_secs":10}}"#).unwrap();
+        assert!(s.net.ytdl, "預設用 yt-dlp 播放網站影片");
+        assert_eq!(s.net.ytdl_path, None);
+        assert_eq!(s.net.quality, SiteQuality::Best);
+        assert_eq!(s.net.codec, CodecPref::Auto);
+        assert!(s.net.site_subs && !s.net.auto_subs);
+        assert_eq!(s.net.cookies_from, None);
+        assert_eq!(s.net.list_mode, ListMode::Video);
+        assert_eq!(s.net.site_prefs(), SitePrefs::default(), "預設的偏好跟之前寫死的一樣");
+        // 一項讀不懂（新版的畫質）：只有那一項用預設值，同一組的逾時照樣讀進來
+        let s = lenient(
+            r#"{"net": {"quality": "8k", "timeout_secs": 10, "codec": "av1", "cookies_from": "netscape",
+                "list_mode": "playlist", "ytdl": false, "ytdl_path": "/opt/yt-dlp"}}"#,
+        );
+        assert_eq!(s.net.quality, SiteQuality::Best);
+        assert_eq!(s.net.timeout_secs, 10);
+        assert_eq!(s.net.codec, CodecPref::Av1);
+        assert_eq!(s.net.cookies_from, None);
+        assert_eq!(s.net.list_mode, ListMode::Playlist);
+        assert!(!s.net.ytdl);
+        assert_eq!(s.net.ytdl_path.as_deref(), Some(std::path::Path::new("/opt/yt-dlp")));
+        // 偏好整組交給 yt-dlp
+        let mut n = NetSettings {
+            quality: SiteQuality::P720,
+            codec: CodecPref::H264,
+            site_subs: false,
+            auto_subs: true,
+            cookies_from: Some(Browser::Firefox),
+            list_mode: ListMode::Playlist,
+            ..Default::default()
+        };
+        assert_eq!(
+            n.site_prefs(),
+            SitePrefs {
+                quality: SiteQuality::P720,
+                codec: CodecPref::H264,
+                site_subs: false,
+                auto_subs: true,
+                cookies_from: Some(Browser::Firefox),
+                list_mode: ListMode::Playlist,
+            }
+        );
+        // 空白的路徑 = 自動尋找
+        n.ytdl_path = Some(std::path::PathBuf::new());
+        assert_eq!(n.sanitized().ytdl_path, None);
+        // 存檔、讀回來；兩個視窗各改了不同的項目：兩個都留下（kebab-case 的寫法）
+        let dir = temp_dir("site");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.net.quality = SiteQuality::P1080;
+        a.net.cookies_from = Some(Browser::Edge);
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""quality": "p1080""#), "{text}");
+        assert!(text.contains(r#""cookies_from": "edge""#), "{text}");
+        b.net.codec = CodecPref::Vp9;
+        b.net.ytdl_path = Some("/usr/local/bin/yt-dlp".into());
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.net.quality, SiteQuality::P1080, "A 改的畫質不能被 B 蓋回去");
+        assert_eq!(back.net.cookies_from, Some(Browser::Edge));
+        assert_eq!(back.net.codec, CodecPref::Vp9);
+        assert_eq!(
+            back.net.ytdl_path.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin/yt-dlp"))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn net_settings_load_leniently_sanitize_and_merge() {
+        use crate::net::HlsBitrate;
+        // 一項讀不懂（新版的畫質、型別不對）：只有那一項用預設值，同一組的其他項目、其他設定照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "net": {"hls_bitrate": "8k", "timeout_secs": 10, "reconnect": "yes",
+                "user_agent": "UA/1", "headers": ["X-A: 1"]}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert_eq!(s.net.hls_bitrate, HlsBitrate::Max);
+        assert_eq!(s.net.timeout_secs, 10);
+        assert!(s.net.reconnect);
+        assert_eq!(s.net.user_agent, "UA/1");
+        assert_eq!(s.net.headers, ["X-A: 1"]);
+        // 讀檔時整理：快取對齊選項、逾時拉回範圍、有換行的標頭拿掉（不能多塞一個標頭）
+        let dir = temp_dir("net");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"net": {"cache_mb": 999, "timeout_secs": 0, "hls_bitrate": "min",
+                "headers": ["X-Ok: 1", "X-Bad: 1\r\nX-Evil: 2"], "referrer": "http://a/\nb"}}"#,
+        )
+        .unwrap();
+        let mut a = Settings::load_from(path.clone());
+        assert_eq!((a.net.cache_mb, a.net.timeout_secs), (1000, 5));
+        assert_eq!(a.net.hls_bitrate, HlsBitrate::Min);
+        assert_eq!(a.net.headers, ["X-Ok: 1"]);
+        assert_eq!(a.net.referrer, "");
+        // 存檔、讀回來；兩個視窗各改了網路設定的不同項目：兩個都留下
+        let mut b = Settings::load_from(path.clone());
+        a.net.tls_verify = false;
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""hls_bitrate": "min""#), "{text}");
+        b.net.proxy = "http://127.0.0.1:3128".into();
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert!(!back.net.tls_verify, "A 關掉的憑證檢查不能被 B 蓋回去");
+        assert_eq!(back.net.proxy, "http://127.0.0.1:3128");
+        assert_eq!(back.net.hls_bitrate, HlsBitrate::Min);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_settings_load_leniently_sanitize_and_merge() {
+        use crate::export::{ClipFormat, ImageFormat};
+        // 一項讀不懂（新版的格式）：只有那一項用預設值，同一組的其他項目、其他設定照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "export": {"clip": {"format": "avi"}, "gif": {"fps": 20, "long_side": "big"},
+                "sheet": {"format": "webp", "rows": 8}}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert_eq!(s.export.clip.format, ClipFormat::Auto);
+        assert_eq!((s.export.gif.fps, s.export.gif.long_side), (20, 480));
+        assert_eq!((s.export.sheet.format, s.export.sheet.rows), (ImageFormat::Jpeg, 8));
+        // 讀檔時整理：對齊選項、拉回範圍、相對路徑當成沒設定
+        let dir = temp_dir("export");
+        let path = dir.join("settings.json");
+        let clips = dir.join("clips");
+        std::fs::write(
+            &path,
+            serde_json::json!({"export": {
+                "clip_dir": clips, "image_dir": "relative",
+                "gif": {"long_side": 700, "fps": 12},
+                "sheet": {"columns": 50, "rows": 0, "width": 4000, "jpeg_quality": 101}
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let mut a = Settings::load_from(path.clone());
+        assert_eq!(a.export.clip_dir.as_deref(), Some(clips.as_path()));
+        assert_eq!(a.export.image_dir, None);
+        assert_eq!((a.export.gif.long_side, a.export.gif.fps), (640, 10));
+        let sh = a.export.sheet;
+        assert_eq!((sh.columns, sh.rows, sh.width, sh.jpeg_quality), (10, 1, 3840, 100));
+        // 兩個視窗各改了匯出的不同項目：兩個都留下
+        let mut b = Settings::load_from(path.clone());
+        a.export.clip.format = ClipFormat::Mp4;
+        a.save().unwrap();
+        b.export.gif.fps = 25;
+        b.export.image_dir = Some(dir.join("gifs"));
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.export.clip.format, ClipFormat::Mp4, "A 改的格式不能被 B 蓋回去");
+        assert_eq!(back.export.gif.fps, 25);
+        assert_eq!(back.export.image_dir, Some(dir.join("gifs")));
+        assert_eq!(back.export.clip_dir.as_deref(), Some(clips.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shortcut_settings_load_leniently_and_save() {
+        let dir = temp_dir("keys");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.keys
+            .custom
+            .insert("toggle-pause".into(), vec!["Space".into(), "Shift+K".into()]);
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""preset": "vitascope""#), "{text}");
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.keys.custom["toggle-pause"], ["Space", "Shift+K"]);
+        // 一項讀不懂（不是按鍵清單）：只有那一項不讀，其他自己改過的照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "keys": {"custom": {"toggle-pause": 3, "toggle-mute": ["N"], "future-cmd": ["F9"]}}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert!(!s.keys.custom.contains_key("toggle-pause"));
+        assert_eq!(s.keys.custom["toggle-mute"], ["N"]);
+        assert_eq!(s.keys.custom["future-cmd"], ["F9"], "認不得的指令照樣保留");
+        // 新版的預設組（這版沒有）：用影戲的，自己改過的照樣讀進來
+        let s = lenient(r#"{"keys": {"preset": "potplayer-2030", "custom": {"stop": ["S"]}}, "seek_short": 7.0}"#);
+        assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope);
+        assert_eq!(s.keys.custom["stop"], ["S"]);
+        assert_eq!(s.seek_short, 7.0);
+        // 讀檔時整理：去掉重複的、每個指令最多 4 組
+        std::fs::write(
+            &path,
+            r#"{"keys": {"custom": {"stop": ["A", "A", "B", "C", "D", "E"]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load_from(path.clone()).keys.custom["stop"],
+            ["A", "B", "C", "D"]
+        );
+        // 兩個視窗各改了不同的指令：兩個都留下
+        std::fs::remove_file(&path).unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.keys.custom.insert("stop".into(), vec!["S".into()]);
+        a.save().unwrap();
+        b.keys.custom.insert("restart".into(), vec!["Backspace".into()]);
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.keys.custom["stop"], ["S"]);
+        assert_eq!(back.keys.custom["restart"], ["Backspace"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mouse_settings_load_leniently_and_merge() {
+        use crate::keymap::{MouseSettings, WheelMode};
+        // 只寫了快捷鍵（A3 的設定檔）：滑鼠是預設值
+        let s = lenient(r#"{"keys": {"preset": "potplayer", "custom": {"stop": ["S"]}}}"#);
+        assert_eq!(s.keys.mouse, MouseSettings::default());
+        // 一項讀不懂（新版的滾輪動作、不是字串）：只有那一項用預設值，其他照樣讀進來
+        let s = lenient(
+            r#"{"volume": 30.0, "keys": {"custom": {"stop": ["S"]},
+                "mouse": {"wheel": "zoom-2030", "middle": "toggle-mute", "back": 3, "forward": "future-cmd"}}}"#,
+        );
+        assert_eq!(s.volume, 30.0);
+        assert_eq!(s.keys.custom["stop"], ["S"]);
+        assert_eq!(s.keys.mouse.wheel, WheelMode::Volume);
+        assert_eq!(s.keys.mouse.middle, "toggle-mute");
+        assert_eq!(s.keys.mouse.back, "");
+        assert_eq!(s.keys.mouse.forward, "future-cmd", "認不得的指令照樣保留");
+        assert_eq!(s.keys.mouse.click, "toggle-pause");
+        // 存檔、讀回來
+        let dir = temp_dir("mouse");
+        let path = dir.join("settings.json");
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.keys.mouse.middle = "toggle-mute".into();
+        a.keys.mouse.click = String::new();
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""wheel": "volume""#), "{text}");
+        // 另一個視窗改了滾輪：兩個視窗改的都留下
+        b.keys.mouse.wheel = WheelMode::Seek;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.keys.mouse.middle, "toggle-mute");
+        assert_eq!(back.keys.mouse.click, "");
+        assert_eq!(back.keys.mouse.wheel, WheelMode::Seek);
+        // 「還原成預設組…」：滑鼠回到預設，存檔後不會從檔案回來
+        a.keys = a.keys.reset_all();
+        a.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.keys.mouse.middle, "");
+        assert_eq!(back.keys.mouse.click, "toggle-pause");
+        assert_eq!(back.keys.mouse.wheel, WheelMode::Seek, "A 沒改過滾輪：留著 B 改的");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn keys_custom_reset_survives_save() {
+        let dir = temp_dir("keys-reset");
+        let path = dir.join("settings.json");
+        let mut a = Settings::load_from(path.clone());
+        a.keys.custom.insert("stop".into(), vec!["S".into()]);
+        a.keys.custom.insert("restart".into(), vec!["Backspace".into()]);
+        a.save().unwrap();
+        // 另一個視窗也開著，改了別的指令
+        let mut b = Settings::load_from(path.clone());
+        b.keys.custom.insert("toggle-mute".into(), vec!["N".into()]);
+        b.save().unwrap();
+        // 這個視窗還原了「停止」：存檔後不能從檔案裡回來，別的視窗改的照樣留下
+        a.keys.custom.remove("stop");
+        a.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert!(!back.keys.custom.contains_key("stop"), "{:?}", back.keys.custom);
+        assert_eq!(back.keys.custom["restart"], ["Backspace"]);
+        assert_eq!(back.keys.custom["toggle-mute"], ["N"]);
+        // 全部還原
+        a.keys = a.keys.reset_all();
+        a.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.keys.custom.len(), 1, "只剩另一個視窗改的：{:?}", back.keys.custom);
+        assert_eq!(back.keys.custom["toggle-mute"], ["N"]);
+        // 預設組照一般的值合併
+        a.keys.preset = crate::keymap::KeyPreset::Potplayer;
+        a.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""preset": "potplayer""#), "{text}");
+        assert_eq!(
+            Settings::load_from(path).keys.preset,
+            crate::keymap::KeyPreset::Potplayer
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn old_always_on_top_switch_becomes_a_mode() {
+        let dir = temp_dir("on-top-old");
+        let path = dir.join("settings.json");
+        for (old, mode) in [(true, OnTop::Always), (false, OnTop::Never)] {
+            std::fs::write(&path, format!(r#"{{"always_on_top": {old}, "volume": 61.0}}"#)).unwrap();
+            let mut s = Settings::load_from(path.clone());
+            assert_eq!(s.on_top, mode, "always_on_top = {old}");
+            assert_eq!(s.volume, 61.0);
+            // 存檔：寫新的名稱，舊的不再寫
+            s.volume = 62.0;
+            s.save().unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert!(!text.contains("always_on_top"), "{text}");
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["on_top"], serde_json::to_value(mode).unwrap(), "{text}");
+            assert_eq!(Settings::load_from(path.clone()).on_top, mode);
+        }
+        // 逐項讀取（有別的設定讀不懂）時也換過來
+        let s = lenient(r#"{"always_on_top": true, "language": "ja", "volume": 12.0}"#);
+        assert_eq!(s.on_top, OnTop::Always);
+        assert_eq!(s.volume, 12.0);
+        // 新舊都有：以新的為準；舊的不是開關：當成沒有
+        let s = lenient(r#"{"always_on_top": false, "on_top": "while-playing"}"#);
+        assert_eq!(s.on_top, OnTop::WhilePlaying);
+        let s = lenient(r#"{"always_on_top": "yes", "seek_short": 9.0}"#);
+        assert_eq!((s.on_top, s.seek_short), (OnTop::Never, 9.0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn on_top_mode_round_trips_and_unknown_values_load_as_never() {
+        let dir = temp_dir("on-top");
+        let path = dir.join("settings.json");
+        for mode in OnTop::ALL {
+            let mut s = Settings::load_from(path.clone());
+            s.on_top = mode;
+            s.save().unwrap();
+            assert_eq!(Settings::load_from(path.clone()).on_top, mode);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""on_top": "while-playing""#), "{text}");
+        assert_eq!(serde_json::to_value(OnTop::Always).unwrap(), "always");
+        assert_eq!(serde_json::to_value(OnTop::Never).unwrap(), "never");
+        // 新版加的模式（或手動改錯）：不置頂，其他設定照讀
+        let s = lenient(r#"{"on_top": "on-hover", "volume": 33.0, "seek_short": 8.0, "theme": "light"}"#);
+        assert_eq!(s.on_top, OnTop::Never);
+        assert_eq!((s.volume, s.seek_short, s.theme), (33.0, 8.0, ThemeChoice::Light));
+        // 兩個視窗：A 換置頂模式、B 改音量，兩個都留下
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.on_top = OnTop::Always;
+        a.save().unwrap();
+        b.volume = 20.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.on_top, OnTop::Always, "A 改的置頂模式不能被 B 蓋回去");
+        assert_eq!(back.volume, 20.0);
+        // 舊的設定檔、兩個視窗都開著：A 改了模式，B 只改音量，存檔時不會用舊的值蓋回去
+        std::fs::write(&path, r#"{"always_on_top": true}"#).unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.on_top = OnTop::WhilePlaying;
+        a.save().unwrap();
+        b.volume = 40.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.on_top, OnTop::WhilePlaying);
+        assert_eq!(back.volume, 40.0);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("always_on_top"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn side_tab_round_trips_and_unknown_values_load_as_playlist() {
+        let dir = temp_dir("side-tab");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.side_tab = SideTab::Bookmarks;
+        s.show_playlist = true;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""side_tab": "bookmarks""#), "{text}");
+        let back = Settings::load_from(path.clone());
+        assert_eq!((back.side_tab, back.show_playlist), (SideTab::Bookmarks, true));
+        assert_eq!(serde_json::to_value(SideTab::Playlist).unwrap(), "playlist");
+        // 新版加的分頁（或手動改錯）：播放清單，其他設定照讀
+        let s = lenient(r#"{"side_tab": "history", "show_playlist": true, "volume": 31.0}"#);
+        assert_eq!(s.side_tab, SideTab::Playlist);
+        assert!(s.show_playlist);
+        assert_eq!(s.volume, 31.0);
+        // 兩個視窗：A 換分頁、B 改音量，兩個都留下
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.side_tab = SideTab::Playlist;
+        a.save().unwrap();
+        b.volume = 20.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.side_tab, SideTab::Playlist, "A 換的分頁不能被 B 蓋回去");
+        assert_eq!(back.volume, 20.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn on_top_cycle_and_effective_state() {
+        assert_eq!(OnTop::Never.next(), OnTop::Always);
+        assert_eq!(OnTop::Always.next(), OnTop::WhilePlaying);
+        assert_eq!(OnTop::WhilePlaying.next(), OnTop::Never);
+        for playing in [false, true] {
+            assert!(!OnTop::Never.effective(playing));
+            assert!(OnTop::Always.effective(playing));
+            assert_eq!(OnTop::WhilePlaying.effective(playing), playing);
+        }
+        // 開視窗時：只有永遠置頂一開始就置頂，播放時置頂等開始播放
+        assert!(!OnTop::Never.at_launch());
+        assert!(OnTop::Always.at_launch());
+        assert!(!OnTop::WhilePlaying.at_launch());
+    }
+
+    #[test]
+    fn theme_is_saved_and_unknown_values_load_as_dark() {
+        let dir = temp_dir("theme");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.theme = ThemeChoice::Light;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""theme": "light""#), "{text}");
+        assert_eq!(Settings::load_from(path.clone()).theme, ThemeChoice::Light);
+        // 新版加的外觀（或手動改錯）：用深色，其他設定照讀
+        let s = lenient(r#"{"theme": "sepia", "volume": 33.0, "seek_short": 8.0}"#);
+        assert_eq!(s.theme, ThemeChoice::Dark);
+        assert_eq!((s.volume, s.seek_short), (33.0, 8.0));
+        // 兩個視窗：A 換外觀、B 改音量，兩個都留下
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.theme = ThemeChoice::System;
+        a.save().unwrap();
+        b.volume = 20.0;
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(back.theme, ThemeChoice::System, "A 改的外觀不能被 B 蓋回去");
+        assert_eq!(back.volume, 20.0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

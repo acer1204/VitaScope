@@ -44,8 +44,10 @@ impl VitascopeApp {
             let live = mediainfo::read_live(&self.player);
             // 「使用中」的說明（每格幾次更新、影片快多少）也用這次讀到的數字
             self.set_sync_numbers(&live);
+            let mut info = mediainfo::read(&self.player, self.audio_device.clone());
+            info.source = self.info_source();
             self.info_cache = Some(InfoCache {
-                info: mediainfo::read(&self.player, self.audio_device.clone()),
+                info,
                 live,
                 read_at: Instant::now(),
                 lang,
@@ -73,6 +75,9 @@ impl VitascopeApp {
             .interactable(false)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
+                // 蓋在影片上：淺色主題也用深色的樣式
+                crate::theme::dark_overlay(ui);
+                let accent = crate::theme::Palette::of(ui.visuals()).accent;
                 egui::Frame::NONE
                     .fill(Color32::from_black_alpha(190))
                     .corner_radius(6)
@@ -88,10 +93,8 @@ impl VitascopeApp {
                                     for (i, line) in lines.iter().enumerate() {
                                         let head = if i == 0 { *title } else { "" };
                                         ui.add(
-                                            egui::Label::new(
-                                                RichText::new(head).font(font.clone()).color(super::ACCENT),
-                                            )
-                                            .selectable(false),
+                                            egui::Label::new(RichText::new(head).font(font.clone()).color(accent))
+                                                .selectable(false),
                                         );
                                         ui.add(
                                             egui::Label::new(

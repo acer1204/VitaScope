@@ -3,17 +3,25 @@
 //! 播放器用 headless 模式（不出畫面、不出聲音），所以不需要 GPU，CI 也能跑。
 //! 影片畫面本身的渲染另外用 `--shot` 自動截圖驗證。
 
+mod support;
+
 use eframe::egui;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use support::fake_ytdl::{FakeResolver, site_playlist_json};
+use support::http::Server;
 use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
+use vitascope::keymap::Platform;
 use vitascope::pacing::{Plan, Reason, SmoothMode};
-use vitascope::player::{AsyncKey, Options, Player, State, TrackKind};
+use vitascope::player::{AsyncKey, Options, Player, PlayerEvent, State, TrackKind};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
-use vitascope::settings::Settings;
+use vitascope::settings::{OnTop, Settings, SideTab};
+use vitascope::theme::ThemeChoice;
+use vitascope::ytdl::{Failure, Hint, Resolve, YtdlError};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -90,11 +98,19 @@ fn step_until(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&Stat
 
 /// 開啟多軌樣本並等到開始播放
 fn playing_multitrack() -> Harness<'static, VitascopeApp> {
-    let mut h = harness(Some(sample("common/mkv_multitrack.mkv")));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    playing_multitrack_with(settings)
+}
+
+/// 同上，用指定的設定
+fn playing_multitrack_with(settings: Settings) -> Harness<'static, VitascopeApp> {
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
     step_until(&mut h, "開始播放", |s| {
         s.loaded && !s.paused && s.time_pos > 0.0 && !s.tracks.is_empty() && s.video_size.is_some()
     });
-    // 知道影片尺寸後，視窗會調整成影片大小；等版面穩定再找按鈕，不然會點到舊位置
+    // 知道影片尺寸後，視窗會調整成影片大小（畫面設定好才調整，CI 上可能晚好幾幀）；等版面穩定再找按鈕，不然會點到舊位置
+    step_until_app(&mut h, "視窗調整完", |app| !app.window_fit_pending());
     h.run_steps(5);
     h
 }
@@ -255,15 +271,18 @@ fn dropping_subtitle_adds_it_to_current_video() {
     );
 }
 
-/// 按下按鍵（同一幀內），回傳這一幀送給視窗的指令
+/// 按下、放開按鍵（同一幀內），回傳這一幀送給視窗的指令。
+/// 一定要放開：沒放開的鍵再按一次，egui 會當成按住不放的自動重複（開關類的指令不重複）
 fn press_and_get_commands(h: &mut Harness<'_, VitascopeApp>, key: egui::Key) -> Vec<egui::ViewportCommand> {
-    h.input_mut().events.push(egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::NONE,
-    });
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
     h.step();
     h.output()
         .viewport_output
@@ -362,6 +381,12 @@ fn window_fits_each_new_video() {
     step_until(&mut h, "載入 4:3 影片", |s| {
         s.loaded && s.video_size == Some([320, 240])
     });
+    // 畫面設定好（VideoReconfig）才調整視窗：CI 上可能比知道尺寸晚好幾幀，等視窗改了再比
+    let start = Instant::now();
+    while h.ctx.content_rect().size() == first && start.elapsed() < TIMEOUT {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
     h.run_steps(5);
     let second = h.ctx.content_rect().size();
     assert!(
@@ -540,10 +565,12 @@ fn playlist_len(app: &VitascopeApp) -> usize {
     app.playlist().map_or(0, |l| l.len())
 }
 
-/// 等到視窗配合影片尺寸調整完（之後才能用座標點按鈕、開右鍵選單）
+/// 等到視窗配合影片尺寸調整完（之後才能用座標點按鈕、開右鍵選單）。
+/// 畫面設定好才調整視窗，CI 上可能比知道影片尺寸晚好幾幀：調整到一半時選單會移動，點到別的項目
 fn settle(h: &mut Harness<'_, VitascopeApp>, name: &str) {
-    step_until(h, "開始播放、知道影片尺寸", |s| {
-        playing(s, name) && s.video_size.is_some()
+    step_until_app(h, "開始播放、知道影片尺寸、視窗調整完", |app| {
+        let s = &app.player().state;
+        playing(s, name) && s.video_size.is_some() && !app.window_fit_pending()
     });
     h.run_steps(5);
 }
@@ -553,6 +580,17 @@ fn opened(file: PathBuf) -> Harness<'static, VitascopeApp> {
     let mut h = harness(Some(file));
     settle(&mut h, &name);
     h
+}
+
+/// mpv 現在是不是暫停（直接問 mpv）。按鍵、點擊送出的暫停切換（`cycle pause`）是同步的指令，
+/// 送完 mpv 就是新的值；介面的狀態要等屬性通知。用來確定「沒有切換」：不靠等一段時間
+fn paused_now(h: &Harness<'_, VitascopeApp>) -> bool {
+    h.state().player().get_string("pause").unwrap() == "yes"
+}
+
+/// 同 `paused_now`，靜音
+fn muted_now(h: &Harness<'_, VitascopeApp>) -> bool {
+    h.state().player().get_string("mute").unwrap() == "yes"
 }
 
 /// 實際經過一段時間（播放器在背景播放），期間一直更新介面
@@ -1110,8 +1148,8 @@ fn subtitle_encoding_can_be_chosen_by_hand() {
 
     h.get_by_label("字幕").click();
     h.run_steps(2);
-    h.get_by_label_contains("字幕編碼").click();
-    h.run_steps(2);
+    // 等「字幕編碼」出現、把滑鼠移過去打開子選單（等到打開）
+    hover_menu_item(&mut h, "字幕編碼");
     h.get_by_label_contains("自動判斷（Big5）");
     h.get_by_label_contains("GB18030").click();
     h.run_steps(5);
@@ -1125,8 +1163,10 @@ fn subtitle_encoding_can_be_chosen_by_hand() {
 
     h.get_by_label("字幕").click();
     h.run_steps(2);
-    h.get_by_label_contains("字幕編碼").click();
-    h.run_steps(2);
+    // 換過編碼的字幕是新的一條軌道：mpv 的軌道清單更新之後選單才有「字幕編碼」（CI 上可能晚好幾幀）；
+    // 等它出現、打開子選單
+    hover_menu_item(&mut h, "字幕編碼");
+    wait_menu_item_contains(&mut h, "自動判斷");
     h.get_by_label_contains("自動判斷").click();
     h.run_steps(5);
     assert_eq!(subtitle_text_between(&mut h, 1.5, 2.6), "影戲播放器測試");
@@ -1426,59 +1466,165 @@ fn click_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
 
 /// 在影片上按右鍵、捲到選單裡的項目、把滑鼠移到它上面（有子選單的話子選單會打開）
 fn hover_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    wait_window_fit(h);
     h.get_by_label("影片畫面").click_secondary();
     h.run_steps(2);
     hover_menu_item(h, label);
 }
 
-/// 選單已經打開：捲到項目、把滑鼠移到它上面
+/// 選單已經打開：等到項目出現、捲到看得到、把滑鼠移到它上面。有子選單的項目（標籤以 ⏵ 結尾、沒停用）
+/// 等到子選單打開（見 `MenuItem::hover`）
 fn hover_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
-    let screen = h.ctx.content_rect();
-    for _ in 0..10 {
-        let item = h.get_by_label_contains(label).rect();
-        if item.bottom() <= screen.bottom() {
-            break;
-        }
-        let over_menu = egui::pos2(item.center().x, screen.center().y);
-        h.event(egui::Event::PointerMoved(over_menu));
-        h.event(egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: egui::vec2(0.0, -120.0),
-            modifiers: egui::Modifiers::NONE,
-            phase: egui::TouchPhase::Move,
-        });
-        h.run_steps(2);
+    MenuItem::contains(label).hover(h);
+}
+
+/// 知道影片尺寸、視窗還沒配合影片調整的話，等它調整完（畫面設定好才調整，CI 上可能晚好幾幀）。
+/// 選單開著時視窗改大小，選單跟著移動，滑鼠就不在要點的項目上了。還不知道影片尺寸時不等（沒有影像的檔案不會調整）
+fn wait_window_fit(h: &mut Harness<'_, VitascopeApp>) {
+    step_until_app(h, "視窗配合影片調整完", |app| {
+        !app.window_fit_pending() || app.player().state.video_size.is_none()
+    });
+}
+
+/// 等到選單裡有標籤含 `label` 的項目
+fn wait_menu_item_contains(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    MenuItem::contains(label).wait(h);
+}
+
+/// 選單、子選單的項目最多等這麼久（CI 的電腦比較慢；正常的話幾幀就好）
+const MENU_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 選單裡的一個項目：`exact` = 標籤剛好是 `label`，不然是標籤含 `label`
+#[derive(Clone, Copy)]
+struct MenuItem<'a> {
+    label: &'a str,
+    exact: bool,
+}
+
+impl<'a> MenuItem<'a> {
+    fn exact(label: &'a str) -> Self {
+        Self { label, exact: true }
     }
-    // 捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：先移到要點的項目上，等子選單關掉
-    h.get_by_label_contains(label).hover();
-    h.run_steps(3);
+
+    fn contains(label: &'a str) -> Self {
+        Self { label, exact: false }
+    }
+
+    /// 現在畫面上的這一項：範圍、完整的標籤、停用了沒。還沒畫出來時 None
+    fn find(self, h: &Harness<'_, VitascopeApp>) -> Option<(egui::Rect, String, bool)> {
+        let node = if self.exact {
+            h.query_by_label(self.label)
+        } else {
+            h.query_by_label_contains(self.label)
+        }?;
+        let a = node.accesskit_node();
+        Some((node.rect(), a.label().unwrap_or_default().to_string(), a.is_disabled()))
+    }
+
+    /// 等到這一項出現（子選單不一定下一幀就打開：CI 比較慢，選單也可能因為視窗剛改完大小換了位置）
+    fn wait(self, h: &mut Harness<'_, VitascopeApp>) -> (egui::Rect, String, bool) {
+        let start = Instant::now();
+        loop {
+            if let Some(found) = self.find(h) {
+                return found;
+            }
+            assert!(start.elapsed() < MENU_TIMEOUT, "等不到選單裡的「{}」", self.label);
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 等到這一項出現、捲到看得到（選單比視窗長時用滾輪捲）、等它停下來，把滑鼠移到它上面。
+    /// 有子選單的項目等到子選單打開：等的時候每隔幾幀再移過去一次（版面變了、項目換了位置的話，滑鼠已經不在它上面）
+    fn hover(self, h: &mut Harness<'_, VitascopeApp>) {
+        // 之後用完整的標籤找：子選單打開後可能有別的項目也含 `label`（例如「字幕 ⏵」裡的「第二字幕 ⏵」）
+        let (_, full, disabled) = self.wait(h);
+        let me = MenuItem::exact(&full);
+        let screen = h.ctx.content_rect();
+        for _ in 0..10 {
+            let (item, ..) = me.wait(h);
+            if item.bottom() <= screen.bottom() {
+                break;
+            }
+            let over_menu = egui::pos2(item.center().x, screen.center().y);
+            h.event(egui::Event::PointerMoved(over_menu));
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            h.run_steps(2);
+        }
+        // 捲動有動畫：等項目停下來再移過去（不然滑鼠停在動畫途中的位置，項目捲走後就不在它上面了）
+        let (mut last, ..) = me.wait(h);
+        for _ in 0..30 {
+            h.step();
+            let (now, ..) = me.wait(h);
+            if now == last {
+                break;
+            }
+            last = now;
+        }
+        // 捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：先移到要點的項目上，等子選單關掉
+        h.event(egui::Event::PointerMoved(last.center()));
+        h.run_steps(3);
+        if !full.ends_with('⏵') || disabled {
+            return;
+        }
+        let start = Instant::now();
+        let mut frames = 0;
+        while !submenu_open(h, &full) {
+            assert!(start.elapsed() < MENU_TIMEOUT, "「{full}」的子選單一直沒打開");
+            frames += 1;
+            if frames % 10 == 0 {
+                let (header, ..) = me.wait(h);
+                h.event(egui::Event::PointerMoved(header.center()));
+            }
+            h.step();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// 標籤是 `header` 的項目的子選單開著（這一幀畫了它的子選單）。
+/// 子選單是畫面最上層的一個區域，裡面那一層的代號是 egui 從項目的代號算出來的（`SubMenu::id_from_widget_id`）
+fn submenu_open(h: &Harness<'_, VitascopeApp>, header: &str) -> bool {
+    let Some(item) = h.query_by_label(header) else {
+        return false;
+    };
+    let (local, _) = item.accesskit_node().locate();
+    // SAFETY: 不是記憶體安全的問題：值本來就是 egui 的代號（`Id::accesskit_id` 的反過來）
+    let id = unsafe { egui::Id::from_high_entropy_bits(local.0) };
+    let submenu = egui::containers::menu::SubMenu::id_from_widget_id(id).accesskit_id();
+    h.root()
+        .children()
+        .any(|area| area.children().any(|ui| ui.accesskit_node().locate().0 == submenu))
 }
 
 #[test]
 fn always_on_top_from_context_menu_and_keys() {
-    let mut h = playing_multitrack();
-    click_context_item(&mut h, "視窗置頂");
-    let cmds = viewport_commands(&h);
-    assert!(
-        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
-        "{cmds:?}"
-    );
-    assert!(h.state().settings().always_on_top);
-    // Ctrl+T 切回一般
-    h.input_mut().events.push(egui::Event::Key {
-        key: egui::Key::T,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::COMMAND,
-    });
-    h.step();
-    let cmds = viewport_commands(&h);
-    assert!(
-        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
-        "{cmds:?}"
-    );
-    assert!(!h.state().settings().always_on_top);
+    // 右鍵選單「視窗置頂 ▸」的三個選項：各自換模式、送對的視窗層級（播放中：播放時置頂 = 置頂）
+    let dir = TempDir::new("on-top-menu");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(settings);
+    for (item, mode, level) in [
+        ("永遠置頂", OnTop::Always, egui::WindowLevel::AlwaysOnTop),
+        ("不置頂", OnTop::Never, egui::WindowLevel::Normal),
+        ("播放時置頂", OnTop::WhilePlaying, egui::WindowLevel::AlwaysOnTop),
+        ("不置頂", OnTop::Never, egui::WindowLevel::Normal),
+    ] {
+        let levels = pick_on_top_from_menu(&mut h, item);
+        assert_eq!(levels, [level], "{item}");
+        assert_eq!(h.state().settings().on_top, mode, "{item}");
+        assert_eq!(Settings::load_from(path.clone()).on_top, mode, "馬上存檔：{item}");
+        assert_eq!(h.state().osd_text(), Some(mode_osd(mode)));
+    }
+    // Ctrl+T 依序切換：不置頂 → 永遠置頂（其他順序見 ctrl_t_cycles_the_on_top_modes）
+    assert_eq!(press_ctrl_t(&mut h), [egui::WindowLevel::AlwaysOnTop]);
+    assert_eq!(h.state().settings().on_top, OnTop::Always);
 }
 
 #[test]
@@ -1499,6 +1645,433 @@ fn leaving_fullscreen_restores_always_on_top() {
         cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
         "{cmds:?}"
     );
+    // 播放時置頂：播放中離開全螢幕也再設一次（動畫結束後再一次）；暫停中（實際是一般視窗）不設成置頂
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::T);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying);
+    let leave_fullscreen = |h: &mut Harness<'_, VitascopeApp>| {
+        set_fullscreen(h, true);
+        h.input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .fullscreen = Some(false);
+        h.step();
+        window_levels(h)
+    };
+    assert_eq!(leave_fullscreen(&mut h), [egui::WindowLevel::AlwaysOnTop]);
+    assert_eq!(
+        levels_during(&mut h, 1.3),
+        [egui::WindowLevel::AlwaysOnTop],
+        "動畫結束後再設一次"
+    );
+    h.key_press(egui::Key::Space);
+    let levels = levels_until(&mut h, "暫停", |s| s.paused);
+    assert_eq!(levels, [egui::WindowLevel::Normal]);
+    assert_eq!(leave_fullscreen(&mut h), [], "暫停中離開全螢幕不置頂");
+    assert_eq!(levels_during(&mut h, 1.3), []);
+}
+
+/// 這一幀送給視窗的層級指令
+fn window_levels(h: &Harness<'_, VitascopeApp>) -> Vec<egui::WindowLevel> {
+    viewport_commands(h)
+        .into_iter()
+        .filter_map(|c| match c {
+            egui::ViewportCommand::WindowLevel(l) => Some(l),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 一直跑介面幀直到播放器狀態符合條件，回傳這段期間送給視窗的所有層級指令
+fn levels_until(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    cond: impl Fn(&State) -> bool,
+) -> Vec<egui::WindowLevel> {
+    let start = Instant::now();
+    let mut levels = Vec::new();
+    loop {
+        h.step();
+        levels.extend(window_levels(h));
+        if cond(&h.state().player().state) {
+            return levels;
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "等待逾時：{what}\n目前狀態：{:#?}",
+            h.state().player().state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 實際經過一段時間、一直更新介面，回傳期間送給視窗的所有層級指令
+fn levels_during(h: &mut Harness<'_, VitascopeApp>, seconds: f64) -> Vec<egui::WindowLevel> {
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut levels = Vec::new();
+    while Instant::now() < end {
+        h.step();
+        levels.extend(window_levels(h));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    levels
+}
+
+/// 按下、放開 Ctrl（macOS：Cmd）+ T（同一幀內），回傳這一幀送給視窗的層級指令。
+/// 不用 `key_press_modifiers`：它把修飾鍵分成好幾幀送，`output()` 只看得到最後一幀
+fn press_ctrl_t(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::WindowLevel> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::T,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+    }
+    h.step();
+    window_levels(h)
+}
+
+/// 右鍵選單「視窗置頂 ▸」裡選一個模式，回傳那一幀送給視窗的層級指令
+fn pick_on_top_from_menu(h: &mut Harness<'_, VitascopeApp>, item: &str) -> Vec<egui::WindowLevel> {
+    hover_context_item(h, "視窗置頂");
+    h.get_by_label(item).click();
+    h.step();
+    let levels = window_levels(h);
+    h.run_steps(2);
+    levels
+}
+
+fn mode_osd(mode: OnTop) -> &'static str {
+    match mode {
+        OnTop::Never => "視窗置頂：關閉",
+        OnTop::Always => "視窗置頂：永遠",
+        OnTop::WhilePlaying => "視窗置頂：播放時",
+    }
+}
+
+#[test]
+fn on_top_while_playing_follows_playback() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = harness_with(None, settings);
+    assert_eq!(levels_during(&mut h, 0.2), [], "沒有檔案：一般視窗");
+    // 開始播放：置頂（只送一次；拖進檔案的那一幀也算）
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(sample("common/mp4_h264_aac.mp4"))));
+    let levels = levels_until(&mut h, "開始播放", |s| s.loaded && !s.paused && s.time_pos > 0.0);
+    assert_eq!(levels, [egui::WindowLevel::AlwaysOnTop]);
+    h.run_steps(5);
+    // 暫停：一般視窗；繼續：置頂
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    assert_eq!(levels_during(&mut h, 0.2), []);
+    // 暫停中逐格（mpv 會短暫取消暫停、播一格再停）：算暫停，維持一般視窗
+    for _ in 0..3 {
+        let before = h.state().player().state.time_pos;
+        h.key_press(egui::Key::Period);
+        let mut levels = levels_until(&mut h, "逐格前進一格", |s| s.paused && s.time_pos > before);
+        levels.extend(levels_during(&mut h, 0.2));
+        assert_eq!(levels, [], "逐格");
+    }
+    h.key_press(egui::Key::Space);
+    assert_eq!(
+        levels_until(&mut h, "繼續播放", |s| !s.paused),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    // 跳到快結束、播完停在最後一格（keep-open 會暫停）：一般視窗
+    let duration = h.state().player().state.duration.unwrap();
+    let _ = h.state().player().seek_to(duration - 0.3, true);
+    assert_eq!(
+        levels_until(&mut h, "播完停在最後一格", |s| s.eof && s.paused),
+        [egui::WindowLevel::Normal]
+    );
+    assert_eq!(levels_during(&mut h, 0.2), []);
+    // 從頭播放：置頂；停止：一般視窗
+    h.key_press(egui::Key::Home);
+    assert_eq!(
+        levels_until(&mut h, "從頭播放", |s| s.loaded && !s.paused && !s.eof),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    let _ = h.state().player().stop();
+    assert_eq!(levels_until(&mut h, "停止", |s| !s.loaded), [egui::WindowLevel::Normal]);
+    assert_eq!(levels_during(&mut h, 0.2), [], "沒有檔案：維持一般視窗");
+}
+
+#[test]
+fn on_top_level_is_sent_only_when_it_changes() {
+    let mut h = playing_multitrack();
+    assert_eq!(levels_during(&mut h, 0.3), [], "不置頂：什麼都不送");
+    assert_eq!(
+        pick_on_top_from_menu(&mut h, "永遠置頂"),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    assert_eq!(levels_during(&mut h, 0.5), [], "播放中不會一直送");
+    // 播放中從永遠置頂換成播放時置頂：實際一樣是置頂，不用再送
+    assert_eq!(pick_on_top_from_menu(&mut h, "播放時置頂"), []);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying);
+    assert_eq!(levels_during(&mut h, 0.5), []);
+    // 暫停中換成永遠置頂：從一般換成置頂
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    assert_eq!(levels_during(&mut h, 0.3), []);
+    assert_eq!(
+        pick_on_top_from_menu(&mut h, "永遠置頂"),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    assert_eq!(levels_during(&mut h, 0.3), []);
+}
+
+#[test]
+fn ctrl_t_cycles_the_on_top_modes() {
+    let dir = TempDir::new("on-top-keys");
+    let path = dir.0.join("settings.json");
+    for lang in vitascope::i18n::Lang::ALL {
+        let en = lang == vitascope::i18n::Lang::En;
+        let mut settings = Settings::load_from(path.clone());
+        settings.auto_next = false;
+        settings.language = lang;
+        settings.on_top = OnTop::Never;
+        let mut h = playing_multitrack_with(settings);
+        // 播放中：不置頂 → 永遠置頂（置頂）→ 播放時置頂（還是置頂，不用再送）→ 不置頂（一般）
+        for (mode, zh, english, levels) in [
+            (
+                OnTop::Always,
+                "視窗置頂：永遠",
+                "Always on top: always",
+                vec![egui::WindowLevel::AlwaysOnTop],
+            ),
+            (
+                OnTop::WhilePlaying,
+                "視窗置頂：播放時",
+                "Always on top: while playing",
+                vec![],
+            ),
+            (
+                OnTop::Never,
+                "視窗置頂：關閉",
+                "Always on top: off",
+                vec![egui::WindowLevel::Normal],
+            ),
+        ] {
+            assert_eq!(press_ctrl_t(&mut h), levels, "{mode:?}");
+            assert_eq!(h.state().settings().on_top, mode);
+            assert_eq!(h.state().osd_text(), Some(if en { english } else { zh }));
+            assert_eq!(Settings::load_from(path.clone()).on_top, mode, "馬上存檔");
+            h.run_steps(2);
+        }
+    }
+}
+
+#[test]
+fn general_page_on_top_combo_box() {
+    let dir = TempDir::new("on-top-page");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("視窗置頂");
+    h.get_by_value("不置頂").click();
+    h.run_steps(2);
+    h.get_by_label("播放時置頂").click();
+    h.step();
+    // 跟右鍵選單一樣：馬上套用（播放中：置頂）、存檔、提示
+    assert_eq!(window_levels(&h), [egui::WindowLevel::AlwaysOnTop]);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying);
+    assert_eq!(Settings::load_from(path.clone()).on_top, OnTop::WhilePlaying);
+    assert_eq!(h.state().osd_text(), Some("視窗置頂：播放時"));
+    h.run_steps(2);
+    h.get_by_value("播放時置頂").click();
+    h.run_steps(2);
+    h.get_by_label("不置頂").click();
+    h.step();
+    assert_eq!(window_levels(&h), [egui::WindowLevel::Normal]);
+    assert_eq!(Settings::load_from(path).on_top, OnTop::Never);
+    h.run_steps(2);
+    h.get_by_value("不置頂");
+}
+
+#[test]
+fn wayland_refuses_both_on_top_modes() {
+    let refused = "這個桌面環境（Wayland）不支援讓程式自己設定視窗置頂";
+    let wayland = |on_top: OnTop| {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.on_top = on_top;
+        let mut h = harness_launch(
+            Launch {
+                files: vec![sample("common/mkv_multitrack.mkv")],
+                wayland: Some(true),
+                ..Default::default()
+            },
+            settings,
+        );
+        settle(&mut h, "mkv_multitrack.mkv");
+        h
+    };
+    let mut h = wayland(OnTop::Never);
+    // 快捷鍵、右鍵選單、設定視窗：永遠置頂、播放時置頂都不行
+    assert_eq!(press_ctrl_t(&mut h), []);
+    assert_eq!(h.state().settings().on_top, OnTop::Never);
+    assert_eq!(h.state().osd_text(), Some(refused));
+    h.run_steps(2);
+    for item in ["永遠置頂", "播放時置頂"] {
+        assert_eq!(pick_on_top_from_menu(&mut h, item), [], "{item}");
+        assert_eq!(h.state().settings().on_top, OnTop::Never, "{item}");
+        assert_eq!(h.state().osd_text(), Some(refused));
+    }
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("不置頂").click();
+    h.run_steps(2);
+    h.get_by_label("播放時置頂").click();
+    h.step();
+    assert_eq!(h.state().settings().on_top, OnTop::Never);
+    assert_eq!(h.state().osd_text(), Some(refused));
+    assert_eq!(levels_during(&mut h, 0.3), []);
+    // 在別的桌面環境開的置頂（兩種都一樣）：照樣可以用 Ctrl+T 關掉
+    for on_top in [OnTop::Always, OnTop::WhilePlaying] {
+        let mut h = wayland(on_top);
+        assert_eq!(press_ctrl_t(&mut h), [egui::WindowLevel::Normal], "{on_top:?}");
+        assert_eq!(h.state().settings().on_top, OnTop::Never, "{on_top:?}");
+        assert_eq!(h.state().osd_text(), Some("視窗置頂：關閉"));
+    }
+}
+
+/// 一直跑介面幀直到整個播放器符合條件（例如背景掃描完的播放清單），回傳期間送給視窗的層級指令
+fn levels_until_app(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    cond: impl Fn(&VitascopeApp) -> bool,
+) -> Vec<egui::WindowLevel> {
+    let start = Instant::now();
+    let mut levels = Vec::new();
+    loop {
+        h.step();
+        levels.extend(window_levels(h));
+        if cond(h.state()) {
+            return levels;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn on_top_while_playing_stays_on_top_across_file_changes() {
+    // 播放時置頂：換下一個／上一個檔案、播完自動播下一個時，中間不會先變一般視窗再變回置頂
+    let dir = TempDir::new("on-top-switch");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        dir.clip(name);
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = true;
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = harness_with(None, settings);
+    let started = |name: &'static str| move |s: &State| playing(s, name) && !s.paused && !s.eof && s.time_pos > 0.0;
+    // 拖進第1集（不在啟動時開：建立視窗那一幀送的指令看不到）
+    h.input_mut()
+        .dropped_files
+        .push(std::sync::Arc::new(Dropped(dir.0.join("第1集.mp4"))));
+    let mut levels = levels_until(&mut h, "播放第1集", started("第1集.mp4"));
+    levels.extend(levels_until_app(&mut h, "掃描到兩個影片", |app| {
+        playlist_len(app) == 2
+    }));
+    assert_eq!(levels, [egui::WindowLevel::AlwaysOnTop]);
+    h.key_press(egui::Key::PageDown);
+    let mut levels = levels_until(&mut h, "PgDn → 第2集", started("第2集.mp4"));
+    levels.extend(levels_during(&mut h, 0.2));
+    assert_eq!(levels, [], "換下一個檔案");
+    h.key_press(egui::Key::PageUp);
+    let mut levels = levels_until(&mut h, "PgUp → 第1集", started("第1集.mp4"));
+    levels.extend(levels_during(&mut h, 0.2));
+    assert_eq!(levels, [], "換上一個檔案");
+    // 第1集播完（keep-open 停在最後一格、暫停）馬上自動播第2集：不算播完
+    let duration = h.state().player().state.duration.unwrap();
+    let _ = h.state().player().seek_to(duration - 0.3, true);
+    let mut levels = levels_until(&mut h, "自動播第2集", started("第2集.mp4"));
+    levels.extend(levels_during(&mut h, 0.2));
+    assert_eq!(levels, [], "自動播下一個");
+    // 最後一個播完、沒有下一個：停在最後一格，一般視窗
+    let duration = h.state().player().state.duration.unwrap();
+    let _ = h.state().player().seek_to(duration - 0.3, true);
+    let mut levels = levels_until(&mut h, "第2集播完", |s| {
+        playing(s, "第2集.mp4") && s.eof && s.paused
+    });
+    levels.extend(levels_during(&mut h, 0.3));
+    assert_eq!(levels, [egui::WindowLevel::Normal], "清單播完");
+}
+
+#[test]
+fn resuming_right_after_leaving_fullscreen_stays_on_top() {
+    // 播放時置頂：暫停中離開全螢幕、一秒內又繼續播放。macOS 動畫結束時會把層級改回一般，
+    // 這時送的置頂會被蓋掉：動畫結束後要再設一次
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = playing_multitrack_with(settings);
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    set_fullscreen(&mut h, true);
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.step();
+    assert_eq!(window_levels(&h), [], "暫停中離開全螢幕：不置頂");
+    h.key_press(egui::Key::Space);
+    assert_eq!(
+        levels_until(&mut h, "繼續播放", |s| !s.paused),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    assert_eq!(
+        levels_during(&mut h, 1.3),
+        [egui::WindowLevel::AlwaysOnTop],
+        "動畫結束後再設一次"
+    );
+    assert_eq!(levels_during(&mut h, 0.3), []);
+}
+
+#[test]
+fn on_top_submenu_header_shows_the_assigned_key() {
+    // 「視窗置頂 ▸」標題上的按鍵從快捷鍵對照表來：改了就跟著改，沒有指定按鍵就不寫
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    for (keys, header) in [(vec!["F13".to_owned()], "視窗置頂 F13 ⏵"), (vec![], "視窗置頂 ⏵")] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.keys.custom.insert("on-top".into(), keys);
+        let mut h = playing_multitrack_with(settings);
+        h.get_by_label("影片畫面").click_secondary();
+        h.run_steps(2);
+        assert!(h.query_by_label(header).is_some(), "選單上沒有「{header}」");
+        assert!(
+            h.query_by_label(&format!("視窗置頂 {cmd}+T ⏵")).is_none(),
+            "{cmd}+T 已經不是切換視窗置頂"
+        );
+    }
+}
+
+#[test]
+fn theme_note_sits_under_the_appearance_row() {
+    // 偵測不到系統深淺色的提示緊接在「外觀」下面，不會跑到「視窗置頂」底下
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, None);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    let theme = h.get_by_value("跟隨系統").rect();
+    let note = h.get_by_label("偵測不到系統的深淺色設定，暫時用深色").rect();
+    let on_top = h.get_by_label("視窗置頂").rect();
+    assert!(theme.bottom() <= note.top(), "提示在外觀下面：{theme:?} {note:?}");
+    assert!(note.bottom() <= on_top.top(), "提示在視窗置頂上面：{note:?} {on_top:?}");
 }
 
 fn ratio(s: &State) -> f64 {
@@ -1617,7 +2190,8 @@ fn opening_another_file_resets_the_view() {
     h.run_steps(3);
     assert!(h.state().geometry().is_default());
     assert_eq!(prop(&h, "video-zoom"), "0.000000");
-    assert!(prop(&h, "glsl-shaders").is_empty(), "{}", prop(&h, "glsl-shaders"));
+    // 翻轉的著色器在換檔時拿掉（非同步的：等送出的都生效）
+    wait_shader_list(&mut h, "換檔後沒有著色器", |l| l.is_empty());
     step_until(&mut h, "新檔案是原本的 4:3", |s| {
         (ratio(s) - 4.0 / 3.0).abs() < 0.01
     });
@@ -1889,6 +2463,3422 @@ fn opening_an_m3u8_plays_its_list_in_order() {
     assert_eq!(playlist_len(h.state()), 2);
     h.key_press(egui::Key::PageDown);
     step_until(&mut h, "下一個是第1集", |s| playing(s, "第1集.mp4"));
+}
+
+/// 本機的播放清單檔可能是從網路上下載的：裡面能讀本機檔案、執行濾鏡的特殊網址（edl://、av://、memory://）不開
+#[test]
+fn m3u8_entries_with_special_urls_are_dropped() {
+    // 資料夾、檔名有空白（半形、全形）的本機項目照樣留下
+    let dir = three_episodes("m3u unsafe");
+    dir.clip("My Movie (2020).mp4");
+    dir.clip("第\u{3000}4 集.mp4");
+    let list = dir.0.join("清單.m3u8");
+    let first = dir.0.join("第1集.mp4");
+    std::fs::write(
+        &list,
+        format!(
+            "#EXTM3U\nav://lavfi:testsrc2=duration=60\nedl://{}\n第2集.mp4\nmemory://#EXTM3U\n第1集.mp4\n\
+             My Movie (2020).mp4\n{}\n",
+            first.display(),
+            dir.0.join("第\u{3000}4 集.mp4").display()
+        ),
+    )
+    .unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, list);
+    step_until(&mut h, "從第2集開始（前面的特殊網址不開）", |s| {
+        playing(s, "第2集.mp4")
+    });
+    assert_eq!(
+        playlist_names(h.state()),
+        ["第2集.mp4", "第1集.mp4", "My Movie (2020).mp4", "第\u{3000}4 集.mp4"]
+    );
+}
+
+// ───────────── 網路 ─────────────
+
+/// 網路設定啟動時就同步套用（命令列給的第一個網址就要生效；系統的 libmpv 0.37 預設不檢查網站憑證），
+/// 之後改了非同步送出，整理過（逾時的範圍、有換行的標頭）才存、才送
+#[test]
+fn network_settings_reach_mpv_at_startup_and_when_changed() {
+    let mut settings = Settings::default();
+    settings.net.timeout_secs = 7;
+    settings.net.user_agent = "UA-Test/1".into();
+    let mut h = harness_with(None, settings);
+    h.step();
+    let p = h.state().player();
+    assert_eq!(p.get_string("tls-verify").unwrap(), "yes");
+    assert_eq!(p.get_f64("network-timeout").unwrap(), 7.0);
+    assert_eq!(p.get_string("user-agent").unwrap(), "UA-Test/1");
+    h.state_mut().change_net(|n| {
+        n.tls_verify = false;
+        n.timeout_secs = 999;
+        n.user_agent = String::new();
+        n.headers = vec!["X-A: 1, 2".into(), "X-Bad: 1\r\nX-Evil: 2".into()];
+    });
+    step_until_app(&mut h, "改的網路設定送到 mpv", |app| {
+        let p = app.player();
+        p.get_string("tls-verify").is_ok_and(|v| v == "no")
+            && p.mpv()
+                .get_string_list("http-header-fields")
+                .is_ok_and(|l| l == ["X-A: 1, 2"])
+    });
+    let net = &h.state().settings().net;
+    assert_eq!(net.timeout_secs, 120);
+    assert_eq!(net.headers, ["X-A: 1, 2"]);
+    let p = h.state().player();
+    assert_eq!(p.get_f64("network-timeout").unwrap(), 120.0);
+    assert_eq!(
+        p.get_string("user-agent").unwrap(),
+        p.net_defaults().user_agent,
+        "清空 = 播放引擎預設"
+    );
+    assert_eq!(h.state().osd_text(), None, "都設定成功，沒有「無法套用」的提示");
+}
+
+/// 網路選項 mpv 不接受（非同步的回覆是失敗）：忘掉記下的值，下次套用時再送一次。
+/// 記下的值跟 mpv 實際的值不一樣時，不再送就一直是錯的
+#[test]
+fn rejected_network_option_is_sent_again() {
+    let mut h = harness(None);
+    h.step();
+    let opts = vitascope::net::mpv_options(&Settings::default().net, &h.state().player().net_defaults());
+    assert!(
+        h.state_mut().player_mut().apply_net(&opts, false).is_empty(),
+        "啟動時已經送過，沒變的不再送"
+    );
+    // 送一個 mpv 不接受的值（經過介面的非同步設定，回覆依名稱分派）
+    h.state_mut().set_option_async(AsyncKey::Net, "hls-bitrate", "bogus");
+    step_until_app(&mut h, "mpv 回覆設定失敗", |app| {
+        app.osd_text().is_some_and(|t| t.contains("hls-bitrate"))
+    });
+    let sent: Vec<&str> = h
+        .state_mut()
+        .player_mut()
+        .apply_net(&opts, false)
+        .into_iter()
+        .map(|(name, key, r)| {
+            assert_eq!(key, AsyncKey::Net);
+            r.unwrap();
+            name
+        })
+        .collect();
+    assert_eq!(sent, ["hls-bitrate"], "失敗的那一項再送一次，其他的不送");
+}
+
+// ───────────── 開啟網址 ─────────────
+
+/// 同一幀按下、放開一個鍵，回傳這一幀送給視窗的指令（`key_press` 是兩個事件、各跑一幀，指令只留得到後一幀的）
+fn press_in_one_frame(
+    h: &mut Harness<'_, VitascopeApp>,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Vec<egui::ViewportCommand> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+    h.step();
+    viewport_commands(h)
+}
+
+/// 按 Ctrl（⌘）+ U 打開「開啟網址」對話框；回傳按下那一幀送給視窗的指令
+fn open_url_dialog(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    let cmds = press_in_one_frame(h, egui::Modifiers::COMMAND, egui::Key::U);
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open(), "Ctrl+U 打開「開啟網址」");
+    cmds
+}
+
+/// 對話框的輸入框（對話框開著時只有這一個輸入框）
+fn url_field<'a>(h: &'a Harness<'_, VitascopeApp>) -> egui_kittest::Node<'a> {
+    h.get_by_role(egui::accesskit::Role::TextInput)
+}
+
+/// 輸入框的內容換成 `text`（全選再打字）
+fn retype_url(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    url_field(h).type_text(text);
+    h.run_steps(2);
+}
+
+fn playing_url(s: &State, url: &str) -> bool {
+    s.loaded && s.path.as_deref() == Some(url)
+}
+
+fn playlist_items(app: &VitascopeApp) -> Vec<String> {
+    app.playlist()
+        .map(|l| l.items().iter().map(|p| p.to_string_lossy().into_owned()).collect())
+        .unwrap_or_default()
+}
+
+/// Ctrl+U 打開對話框（Windows、Linux 同時讀剪貼簿），輸入框有焦點；Enter 開啟（不是全螢幕），網址記進對話框的清單和最近開啟
+#[test]
+fn ctrl_u_opens_a_url_and_remembers_it() {
+    let server = Server::start();
+    let url = server.file_url("common/mp4_h264_aac.mp4");
+    let mut h = harness(None);
+    h.step();
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    h.get_by_label(&format!("按 {cmd}+U 開啟網址，或按 {cmd}+V 貼上網址"));
+    let cmds = open_url_dialog(&mut h);
+    assert_eq!(
+        cmds.contains(&egui::ViewportCommand::RequestPaste),
+        !cfg!(target_os = "macos"),
+        "Windows、Linux 打開時讀剪貼簿，macOS 不讀：{cmds:?}"
+    );
+    assert!(url_field(&h).is_focused(), "輸入框有焦點，可以直接打字");
+    url_field(&h).type_text(&url);
+    h.run_steps(2);
+    // 開之前看得到實際會開的網址
+    h.get_by_label(&format!("會開啟：{url}"));
+    let cmds = press_in_one_frame(&mut h, egui::Modifiers::NONE, egui::Key::Enter);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "Enter 是開啟，不是全螢幕：{cmds:?}"
+    );
+    assert!(!h.state().url_dialog_open());
+    step_until(&mut h, "播放輸入的網址", |s| playing_url(s, &url));
+    h.run_steps(2);
+    assert_eq!(h.state().history().urls, std::slice::from_ref(&url));
+    assert_eq!(
+        h.state().history().recent,
+        std::slice::from_ref(&url),
+        "載入完成後也加進最近開啟"
+    );
+    assert!(!server.requests_to("/f/common/mp4_h264_aac.mp4").is_empty());
+}
+
+/// 不是網址、不支援的網址：說明原因，「開啟」「加入播放清單」不能按，Enter 也不開（焦點留在輸入框，接著打字）；
+/// 對話框開著時貼上、空白鍵不給後面正在播的影片；按一次 Esc 就關掉（輸入框有焦點也是：egui 的 Window 要按兩次）
+#[test]
+fn url_dialog_explains_bad_input_and_one_escape_closes_it() {
+    let mut h = playing_multitrack();
+    // 不等讀剪貼簿：下面的貼上不會被當成讀剪貼簿的結果拿走（要確定是對話框擋住的）
+    h.state_mut().set_url_prefill_wait(Duration::ZERO);
+    open_url_dialog(&mut h);
+    url_field(&h).type_text("hello world");
+    h.run_steps(2);
+    h.get_by_label("這不是網址");
+    let disabled = |h: &Harness<'_, VitascopeApp>, label: &str| h.get_by_label(label).accesskit_node().is_disabled();
+    assert!(disabled(&h, "開啟") && disabled(&h, "加入播放清單"));
+    for (text, why) in [
+        ("ftp://x.example/a.mp4", "不支援 ftp:// 網址"),
+        ("javascript:alert(1)", "不支援 javascript: 網址"),
+    ] {
+        retype_url(&mut h, text);
+        h.get_by_label(why);
+        assert!(disabled(&h, "開啟"), "{text}");
+    }
+    retype_url(&mut h, "abc");
+    h.get_by_label("這不是網址");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open(), "不是網址時 Enter 不開");
+    // 單行輸入框按 Enter 會交出焦點：打不開時留在輸入框，接著打的字接在後面
+    assert!(url_field(&h).is_focused(), "Enter 打不開時焦點留在輸入框");
+    url_field(&h).type_text(".example.com/a.mp4");
+    h.run_steps(2);
+    assert_eq!(url_field(&h).value().as_deref(), Some("abc.example.com/a.mp4"));
+    h.get_by_label("會開啟：https://abc.example.com/a.mp4");
+    // 點對話框的標題：輸入框沒有焦點（擋住按鍵的只有對話框本身，不是「正在輸入文字」）
+    h.get_by_label("開啟網址").click();
+    h.run_steps(2);
+    assert!(!url_field(&h).is_focused());
+    assert!(h.state().url_dialog_open());
+    // 貼上、空白鍵不給後面的播放器：不開剪貼簿的網址、不暫停、沒有提示
+    let osd = h.state().osd_text().map(str::to_owned);
+    h.event(egui::Event::Paste("https://x.example/a.mp4".into()));
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    let st = &h.state().player().state;
+    assert!(playing(st, "mkv_multitrack.mkv") && !st.paused, "{st:#?}");
+    assert_eq!(h.state().osd_text().map(str::to_owned), osd);
+    // 一次 Esc：輸入框有焦點時也直接關
+    url_field(&h).focus();
+    h.run_steps(2);
+    assert!(url_field(&h).is_focused());
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert!(!h.state().url_dialog_open(), "按一次 Esc 就關");
+    assert!(h.state().history().urls.is_empty());
+}
+
+/// 全螢幕時對話框開著：Esc 只關對話框，不離開全螢幕；再按一次才離開
+#[test]
+fn escape_in_the_url_dialog_keeps_fullscreen() {
+    let mut h = playing_multitrack();
+    set_fullscreen(&mut h, true);
+    open_url_dialog(&mut h);
+    assert!(url_field(&h).is_focused());
+    let cmds = press_in_one_frame(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(!h.state().url_dialog_open());
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    // 輸入框沒有焦點時也一樣（擋住 Esc 的是對話框，不是「正在輸入文字」）
+    open_url_dialog(&mut h);
+    h.get_by_label("開啟網址").click();
+    h.run_steps(2);
+    assert!(!url_field(&h).is_focused());
+    let cmds = press_in_one_frame(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(!h.state().url_dialog_open(), "Esc 關掉對話框");
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+}
+
+/// 打開時讀剪貼簿：是網址就先填好；不是網址就留空（Windows、Linux）
+#[test]
+fn url_dialog_prefills_from_the_clipboard() {
+    if cfg!(target_os = "macos") {
+        // macOS 不讀剪貼簿（系統會跳出隱私提示）：打開時是空的，自己貼上
+        let mut h = harness(None);
+        h.step();
+        let cmds = open_url_dialog(&mut h);
+        assert!(!cmds.contains(&egui::ViewportCommand::RequestPaste));
+        return;
+    }
+    let mut h = harness(None);
+    // 讀剪貼簿的結果一定等得到（CI 很慢時，打開到測試送出貼上可能超過半秒）
+    h.state_mut().set_url_prefill_wait(Duration::from_secs(600));
+    h.step();
+    // 剪貼簿裡不是網址：不填
+    open_url_dialog(&mut h);
+    h.event(egui::Event::Paste("隨便一段文字".into()));
+    h.run_steps(2);
+    assert_eq!(url_field(&h).value().as_deref(), Some(""));
+    assert!(h.query_by_label("這不是網址").is_none(), "沒有填，就沒有錯誤");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 是網址（好幾行的也算）：填進輸入框，換行變成空白
+    open_url_dialog(&mut h);
+    h.event(egui::Event::Paste(
+        "https://a.example/1.m3u8\nhttps://b.example/2.mpd\n".into(),
+    ));
+    h.run_steps(2);
+    assert_eq!(
+        url_field(&h).value().as_deref(),
+        Some("https://a.example/1.m3u8 https://b.example/2.mpd")
+    );
+    h.get_by_label("2 個網址，會變成播放清單：");
+    h.get_by_label("1. https://a.example/1.m3u8");
+    h.get_by_label("2. https://b.example/2.mpd");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 一行的照原樣填（只去掉前後的空白）：全形空白、連續的空白各自換成 %xx，跟直接貼進輸入框一樣
+    open_url_dialog(&mut h);
+    h.event(egui::Event::Paste(
+        " https://x.example/影片\u{3000}第1集  完.mp4\n".into(),
+    ));
+    h.run_steps(2);
+    assert_eq!(
+        url_field(&h).value().as_deref(),
+        Some("https://x.example/影片\u{3000}第1集  完.mp4")
+    );
+    h.get_by_label("會開啟：https://x.example/影片%E3%80%80第1集%20%20完.mp4");
+}
+
+/// 對話框裡貼上好幾個網址：照貼上的順序變成播放清單（依檔名排序的話 mkv 會排在前面）；
+/// 網址沒有影音的副檔名也算（查詢字串、網站的網址）；路徑裡有空白的一個網址會先顯示換成 %20 的樣子
+#[test]
+fn several_urls_become_a_playlist_in_the_given_order() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = format!("{}?v=1", server.file_url("common/mkv_multitrack.mkv"));
+    let mut h = harness(None);
+    // 不等讀剪貼簿：之後的貼上是使用者自己貼進輸入框的
+    h.state_mut().set_url_prefill_wait(Duration::ZERO);
+    h.step();
+    open_url_dialog(&mut h);
+    // 路徑裡有空白、後面沒有別的網址：一個網址，先讓人看到換成 %20 的樣子（C2 的 parse_input）
+    url_field(&h).type_text("https://x.example/a.mp4 some note");
+    h.run_steps(2);
+    h.get_by_label("會開啟：https://x.example/a.mp4%20some%20note");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.step();
+    h.event(egui::Event::Paste(format!("{a}\n{b}")));
+    h.run_steps(2);
+    h.get_by_label("2 個網址，會變成播放清單：");
+    h.get_by_label(&format!("1. {a}"));
+    h.get_by_label(&format!("2. {b}"));
+    h.run_steps(3);
+    h.get_by_label("開啟").click();
+    step_until(&mut h, "播第一個網址", |s| playing_url(s, &a));
+    assert_eq!(playlist_items(h.state()), [a.clone(), b.clone()]);
+    assert_eq!(h.state().history().urls, [a.clone(), b.clone()], "第一個在最前面");
+    // 下一個：沒有副檔名的網址照樣播
+    h.key_press(egui::Key::PageDown);
+    step_until(&mut h, "播第二個網址", |s| playing_url(s, &b));
+}
+
+/// 「加入播放清單」：加到最後，正在播的照樣播
+#[test]
+fn url_dialog_adds_to_the_playlist() {
+    let server = Server::start();
+    let url = server.file_url("common/mkv_multitrack.mkv");
+    let mut h = opened(sample("common/mp4_h264_aac.mp4"));
+    step_until_app(&mut h, "掃描完同資料夾", |app| playlist_len(app) > 1);
+    let before = playlist_len(h.state());
+    open_url_dialog(&mut h);
+    url_field(&h).type_text(&url);
+    // 多了一行「會開啟：…」：按鈕往下移（等版面穩定再點）
+    h.run_steps(5);
+    h.get_by_label("加入播放清單").click();
+    h.run_steps(2);
+    assert!(!h.state().url_dialog_open());
+    assert_eq!(h.state().osd_text(), Some("加入播放清單：1 個檔案"));
+    assert_eq!(
+        h.state().history().urls,
+        std::slice::from_ref(&url),
+        "加入播放清單的也記進對話框的清單"
+    );
+    assert_eq!(playlist_len(h.state()), before + 1);
+    assert_eq!(playlist_items(h.state()).last(), Some(&url));
+    assert!(playing(&h.state().player().state, "mp4_h264_aac.mp4"), "正在播的照樣播");
+}
+
+/// 在播放器上貼上：網址就開；播放清單開著時加到最後（跟拖放一樣）；不是網址、不是路徑的提示一下
+#[test]
+fn pasting_on_the_player_opens_urls() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste("hello world".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("剪貼簿裡沒有網址或檔案路徑"));
+    // macOS 的 Finder 複製檔案時另外放的文字只有檔名：說清楚是少了路徑
+    h.event(egui::Event::Paste("影片 1.mp4".into()));
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("剪貼簿裡只有檔名，沒有完整路徑（請複製路徑或拖放）")
+    );
+    h.event(egui::Event::Paste(format!("  {a}\n")));
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("開啟剪貼簿的網址：mp4_h264_aac.mp4"));
+    step_until(&mut h, "播貼上的網址", |s| playing_url(s, &a));
+    assert!(h.state().history().urls.is_empty(), "對話框的清單只記對話框輸入的");
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(b.clone()));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("加入播放清單：1 個檔案"));
+    assert_eq!(playlist_items(h.state()), [a.clone(), b.clone()]);
+    assert!(playing_url(&h.state().player().state, &a), "正在播的照樣播");
+}
+
+/// 貼上好幾個網址：照貼上的順序變成播放清單（依檔名排序的話 mkv 在前面），提示開了幾個
+#[test]
+fn pasting_several_urls_keeps_their_order() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(format!("{a}\n{b}\n")));
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("開啟剪貼簿的網址：2 個"));
+    step_until(&mut h, "播第一個網址", |s| playing_url(s, &a));
+    assert_eq!(playlist_items(h.state()), [a, b]);
+}
+
+/// 按著 Ctrl+V 不放：自動重複的「貼上」不再開一次（網址不會一直重新連線）；放開 V 或 Ctrl 之後再按才算
+#[test]
+fn holding_paste_opens_the_clipboard_once() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    let b_path = "/f/common/mkv_multitrack.mkv";
+    let mut h = harness(None);
+    h.step();
+    let release_v = || egui::Event::Key {
+        key: egui::Key::V,
+        physical_key: Some(egui::Key::V),
+        pressed: false,
+        repeat: false,
+        modifiers: egui::Modifiers::COMMAND,
+    };
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+    h.event(egui::Event::Paste(a.clone()));
+    step_until(&mut h, "播貼上的網址", |s| playing_url(s, &a));
+    // 還按著：自動重複的「貼上」（剪貼簿換了也一樣）不開。
+    // （同一個網址有沒有重開不用請求數看：mpv 播放中本來就會再讀）
+    h.event(egui::Event::Paste(b.clone()));
+    h.event(egui::Event::Paste(a.clone()));
+    h.run_steps(5);
+    assert!(playing_url(&h.state().player().state, &a), "按著不放不換");
+    assert!(server.requests_to(b_path).is_empty());
+    // 放開 V 再按：開
+    h.event(release_v());
+    h.event(egui::Event::Paste(b.clone()));
+    step_until(&mut h, "放開 V 再貼上", |s| playing_url(s, &b));
+    // 放開 Ctrl 也算放開（V 的放開可能沒收到）
+    h.event(egui::Event::Paste(a.clone()));
+    h.run_steps(3);
+    assert!(playing_url(&h.state().player().state, &b));
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.step();
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::COMMAND));
+    h.event(egui::Event::Paste(a.clone()));
+    step_until(&mut h, "放開 Ctrl 再貼上", |s| playing_url(s, &a));
+    h.event(release_v());
+    h.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+    h.run_steps(2);
+}
+
+/// 貼上（拖放、命令列也一樣）字幕的網址：加到正在播的影片，不是換掉影片
+#[test]
+fn pasted_subtitle_url_is_added_to_the_video() {
+    let server = Server::start();
+    let sub = server.file_url("common/extsub_srt_utf8.srt");
+    let mut h = playing_multitrack();
+    let subs_before = h
+        .state()
+        .player()
+        .state
+        .tracks
+        .iter()
+        .filter(|t| t.kind == TrackKind::Sub)
+        .count();
+    h.event(egui::Event::Paste(sub.clone()));
+    h.step();
+    // 提示會過期：貼上的那一幀就看（不是「開啟剪貼簿的網址」）
+    assert_eq!(h.state().osd_text(), Some("載入字幕：extsub_srt_utf8.srt"));
+    step_until(&mut h, "多一條外部字幕", |s| {
+        s.tracks.iter().filter(|t| t.kind == TrackKind::Sub).count() > subs_before
+            && s.tracks.iter().any(|t| t.kind == TrackKind::Sub && t.external)
+    });
+    assert!(playing(&h.state().player().state, "mkv_multitrack.mkv"), "影片照樣播");
+}
+
+/// 還原上次的播放清單：網址顯示存下的標題（playlist.m3u8 的 #EXTINF），不是網址的最後一段
+#[test]
+fn restored_playlist_shows_saved_titles() {
+    let url = "https://x.example/live/index.m3u8".to_owned();
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            playlist: Some(vitascope::playlist::Playlist::restored(vec![PathBuf::from(&url)], None)),
+            titles: [(url.clone(), "新聞台".to_owned())].into(),
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 新聞台");
+    assert_eq!(h.state().url_title(&url), Some("新聞台"));
+}
+
+/// 貼上的是完整路徑：不先檢查在不在（網路磁碟連不上時會卡住畫面），直接交給 mpv，打不開由它說明原因
+#[test]
+fn pasted_path_opens_without_checking_that_it_exists() {
+    let missing = if cfg!(windows) {
+        r"Z:\不存在\沒有這個檔案.mkv"
+    } else {
+        "/不存在/沒有這個檔案.mkv"
+    };
+    let mut h = harness(None);
+    h.step();
+    // 檔案總管的「複製路徑」會加引號
+    h.event(egui::Event::Paste(format!("\"{missing}\"")));
+    h.step();
+    assert_ne!(h.state().osd_text(), Some("剪貼簿裡沒有網址或檔案路徑"));
+    step_until(&mut h, "交給 mpv 開（開檔失敗）", |s| s.last_error.is_some());
+    h.run_steps(5);
+    let err = h.state().player().state.last_error.clone().unwrap();
+    assert!(err.contains("無法載入檔案"), "{err}");
+    let real = sample("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(real.to_string_lossy().into_owned()));
+    step_until(&mut h, "貼上真的檔案的路徑", |s| {
+        playing(s, "mp4_h264_aac.mp4")
+    });
+}
+
+/// 本機 m3u 的 #EXTINF 標題：清單上的網址顯示標題（本機檔案照樣是檔名），「下一個」的提示也是；
+/// edl:// 之類的特殊網址不開；存成清單檔時網址寫標題
+#[test]
+fn m3u_titles_name_url_entries() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    // 這首有自己的標題（測試歌曲）：清單寫的標題優先
+    let c = server.file_url("general/audio_mp3_cover.mp3");
+    let dir = TempDir::new("m3u url titles");
+    let local = dir.clip("第2集.mp4");
+    let list = dir.0.join("清單.m3u8");
+    std::fs::write(
+        &list,
+        format!(
+            "#EXTM3U\n#EXTINF:-1 tvg-name=\"x, y\",第一台\n{a}\n#EXTINF:-1,特殊\nedl://{}\n\
+             #EXTINF:-1,本機的標題不用\n第2集.mp4\n#EXTINF:-1,第二台\n{b}\n#EXTINF:-1,第三台\n{c}\n",
+            local.display()
+        ),
+    )
+    .unwrap();
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, list);
+    step_until(&mut h, "播清單的第一個網址", |s| playing_url(s, &a));
+    assert_eq!(
+        playlist_items(h.state()),
+        [a.clone(), local.to_string_lossy().into_owned(), b.clone(), c.clone()]
+    );
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 第一台");
+    h.get_by_label("2. 第2集.mp4");
+    h.get_by_label("3. 第二台");
+    h.get_by_label("4. 第三台");
+    assert!(h.query_by_label_contains("特殊").is_none());
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（2/4）：第2集.mp4"));
+    step_until(&mut h, "第2集", |s| playing(s, "第2集.mp4"));
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（3/4）：第二台"));
+    step_until(&mut h, "第二台", |s| playing_url(s, &b));
+    // 影片自己的標題（mp3 的標籤「測試歌曲」）不蓋過清單寫的
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（4/4）：第三台"));
+    step_until(&mut h, "第三台", |s| playing_url(s, &c));
+    h.run_steps(3);
+    assert_eq!(h.state().url_title(&c), Some("第三台"));
+    h.get_by_label("4. 第三台");
+    assert!(h.query_by_label("4. 測試歌曲").is_none());
+    h.state_mut()
+        .on_dialog_result(DialogKind::PlaylistSave, vec![dir.0.join("存檔")]);
+    let saved = std::fs::read_to_string(dir.0.join("存檔.m3u8")).unwrap();
+    assert!(saved.contains(&format!("#EXTINF:-1,第一台\n{a}\n")), "{saved}");
+    assert!(saved.contains(&format!("#EXTINF:-1,第二台\n{b}\n")), "{saved}");
+    assert!(saved.contains(&format!("#EXTINF:-1,第三台\n{c}\n")), "{saved}");
+    assert!(saved.contains("#EXTINF:-1,第2集\n"), "本機檔案寫檔名：{saved}");
+}
+
+/// 最近開啟（右鍵選單、起始畫面）的網址顯示「標題 · 主機」；標題來自影片本身（mp3 的標籤）
+#[test]
+fn recent_list_shows_urls_by_title() {
+    let server = Server::start();
+    let song = server.file_url("general/audio_mp3_cover.mp3");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(song.clone()));
+    step_until(&mut h, "播放網址", |s| playing_url(s, &song));
+    h.run_steps(2);
+    assert_eq!(h.state().history().recent, std::slice::from_ref(&song));
+    assert_eq!(
+        h.state().history().titles.get(&song).map(String::as_str),
+        Some("測試歌曲")
+    );
+    assert_eq!(h.state().url_title(&song), Some("測試歌曲"));
+    let label = "測試歌曲 · 127.0.0.1";
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    open_exact_submenu(&mut h, "最近開啟的檔案 ⏵");
+    h.get_by_label(label);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("⏹").click();
+    step_until(&mut h, "停止", |s| !s.loaded && !s.loading);
+    h.run_steps(2);
+    h.get_by_label(label).click();
+    step_until(&mut h, "從起始畫面再開", |s| playing_url(s, &song));
+}
+
+/// 網址裡有帳號密碼的、關掉「記住開啟過的網址」時：照樣播，但不記進最近開啟、對話框的清單
+#[test]
+fn urls_with_passwords_or_with_remembering_off_are_not_stored() {
+    let server = Server::start();
+    let plain = server.file_url("common/mp4_h264_aac.mp4");
+    let secret = plain.replacen("http://", "http://user:pass@", 1);
+    let mut h = harness(None);
+    h.step();
+    open_url_dialog(&mut h);
+    url_field(&h).type_text(&secret);
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    step_until(&mut h, "播有密碼的網址", |s| playing_url(s, &secret));
+    h.run_steps(2);
+    let hist = h.state().history();
+    assert!(hist.recent.is_empty() && hist.urls.is_empty(), "{hist:?}");
+    h.state_mut().change_net(|n| n.remember_urls = false);
+    open_url_dialog(&mut h);
+    url_field(&h).type_text(&plain);
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    step_until(&mut h, "播一般的網址", |s| playing_url(s, &plain));
+    h.run_steps(2);
+    let hist = h.state().history();
+    assert!(hist.recent.is_empty() && hist.urls.is_empty(), "{hist:?}");
+}
+
+/// 像人一樣雙擊：兩下之間隔幾幀（第一下之後介面先畫幾次，版面變了第二下就點在新的版面上），全部在雙擊的時間內
+fn double_click_with_frames_between(h: &mut Harness<'_, VitascopeApp>, pos: egui::Pos2) {
+    let mut now = h.ctx.input(|i| i.time) + 1.0;
+    let mut frame = |h: &mut Harness<'_, VitascopeApp>, events: &[egui::Event]| {
+        for e in events {
+            h.event(e.clone());
+        }
+        h.input_mut().time = Some(now);
+        h.step();
+        now += 0.02;
+    };
+    frame(
+        h,
+        &[
+            egui::Event::PointerMoved(pos),
+            left_button(pos, true),
+            left_button(pos, false),
+        ],
+    );
+    for _ in 0..4 {
+        frame(h, &[]);
+    }
+    frame(h, &[left_button(pos, true), left_button(pos, false)]);
+    h.input_mut().time = None;
+    h.run_steps(2);
+}
+
+/// 雙擊對話框裡最近的網址：直接開。第一下填進輸入框、多出「會開啟：…」，清單不能因此移動
+/// （第二下才點得到同一列）：一次點在列的上緣（清單往下移就點到上一列），一次點在下緣（往上移就點到下一列）
+#[test]
+fn double_clicking_a_recent_url_opens_it() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_multitrack.mkv");
+    for (url, label, top) in [
+        (&b, "mkv_multitrack.mkv · 127.0.0.1", true),
+        (&a, "mp4_h264_aac.mp4 · 127.0.0.1", false),
+    ] {
+        // 每次都是剛啟動的視窗（播過影片後視窗大小會變）
+        let mut history = vitascope::history::History::default();
+        history.urls = vec![a.clone(), b.clone()];
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        let mut h = harness_launch(
+            Launch {
+                history,
+                ..Default::default()
+            },
+            settings,
+        );
+        h.step();
+        open_url_dialog(&mut h);
+        h.run_steps(3);
+        assert_eq!(url_field(&h).value().as_deref(), Some(""));
+        let rect = h.get_by_label(label).rect();
+        let y = if top { rect.top() + 2.0 } else { rect.bottom() - 2.0 };
+        double_click_with_frames_between(&mut h, egui::pos2(rect.center().x, y));
+        step_until(&mut h, &format!("雙擊 → 開 {label}"), |s| playing_url(s, url));
+        assert!(!h.state().url_dialog_open());
+    }
+}
+
+/// 對話框列出最近輸入的網址（有標題的顯示標題）：點一下填進輸入框，「清除記錄」清掉
+#[test]
+fn url_dialog_lists_recent_urls() {
+    let mut history = vitascope::history::History::default();
+    history.urls = vec![
+        "https://a.example/live/index.m3u8".into(),
+        "https://b.example/v.mp4".into(),
+    ];
+    history
+        .titles
+        .insert("https://a.example/live/index.m3u8".into(), "新聞台".into());
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            history,
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    open_url_dialog(&mut h);
+    h.get_by_label("最近開啟的網址");
+    h.get_by_label("v.mp4 · b.example");
+    h.get_by_label("新聞台 · a.example").click();
+    // 多了一行「會開啟：…」：下面的按鈕往下移（等版面穩定再點）
+    h.run_steps(5);
+    assert_eq!(
+        url_field(&h).value().as_deref(),
+        Some("https://a.example/live/index.m3u8")
+    );
+    h.get_by_label("會開啟：https://a.example/live/index.m3u8");
+    h.get_by_label("清除記錄").click();
+    h.run_steps(2);
+    assert!(h.state().history().urls.is_empty());
+    assert!(h.query_by_label("最近開啟的網址").is_none());
+    assert!(h.state().url_dialog_open(), "清除記錄不關對話框");
+}
+
+/// 右鍵選單「開啟網址…」（按鍵寫在右邊）、控制列 🗁 按右鍵的選單都能打開對話框
+#[test]
+fn open_url_from_the_menu_and_the_folder_button() {
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    let mut h = playing_multitrack();
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label(&format!("開啟網址… {cmd}+U")).click();
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open());
+    h.get_by_label("取消").click();
+    h.run_steps(2);
+    assert!(!h.state().url_dialog_open());
+    h.get_by_label("🗁").click_secondary();
+    h.run_steps(2);
+    h.get_by_label(&format!("開啟檔案… {cmd}+O"));
+    h.get_by_label(&format!("開啟網址… {cmd}+U")).click();
+    h.run_steps(2);
+    assert!(h.state().url_dialog_open());
+}
+
+/// 命令列給的網址（或網址和檔案混在一起）照給的順序，沒有影音副檔名的網址也算
+#[test]
+fn command_line_urls_keep_their_order() {
+    let server = Server::start();
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = format!("{}?id=2", server.file_url("common/mkv_multitrack.mkv"));
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![PathBuf::from(&a), PathBuf::from(&b)],
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "播第一個", |s| playing_url(s, &a));
+    assert_eq!(playlist_items(h.state()), [a, b]);
+}
+
+/// 英文介面：對話框、選單、起始畫面的說明
+#[test]
+fn url_dialog_in_english() {
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.get_by_label(&format!("Press {cmd}+U to open a URL, or {cmd}+V to paste one"));
+    open_url_dialog(&mut h);
+    h.get_by_label("Open URL");
+    h.get_by_label("Add to playlist");
+    h.get_by_label("Cancel");
+    url_field(&h).type_text("hello");
+    h.run_steps(2);
+    h.get_by_label("This is not a URL");
+    assert!(h.get_by_label("Open").accesskit_node().is_disabled());
+    retype_url(&mut h, "https://x.example/a b.mp4");
+    h.get_by_label("Will open: https://x.example/a%20b.mp4");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste("hello".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("The clipboard has no URL or file path"));
+    // 起始畫面中間是說明文字（點到的是文字，不是影片畫面）：先開一個檔案
+    h.event(egui::Event::Paste(
+        sample("common/mp4_h264_aac.mp4").to_string_lossy().into_owned(),
+    ));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    h.get_by_label(&format!("Open URL… {cmd}+U"));
+}
+
+#[test]
+fn ytdl_search_is_lazy_and_never_uses_the_users_tools_folder() {
+    // 自動測試的 Launch 沒有工具資料夾：不找、不碰使用者下載的 yt-dlp；開啟播放器也不會開始找（第一次需要時才在背景找）
+    let mut h = harness(Some(sample("general/audio_flac.flac")));
+    h.run_steps(3);
+    let loc = h.state().ytdl_locator();
+    assert_eq!(loc.tools_dir(), None);
+    assert!(!loc.started(), "開啟播放器時不找 yt-dlp");
+}
+
+// ───────────── 網路播放：連線中、緩衝中、直播、續播、網路上的播放清單、設定 → 網路 ─────────────
+
+/// 網路測試等久一點（CI 的電腦比較慢；連線、緩衝的時間跟網路的速度有關）
+const NET_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 一直跑介面幀，直到畫面上有含 `text` 的文字
+fn step_until_label(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    let start = Instant::now();
+    loop {
+        h.step();
+        if h.query_by_label_contains(text).is_some() {
+            return;
+        }
+        assert!(
+            start.elapsed() < NET_TIMEOUT,
+            "等不到畫面上的「{text}」\n目前狀態：{:#?}",
+            h.state().player().state
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 同 `step_until_app`，等久一點
+fn step_until_net(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&VitascopeApp) -> bool) {
+    let start = Instant::now();
+    while !cond(h.state()) {
+        assert!(
+            start.elapsed() < NET_TIMEOUT,
+            "等待逾時：{what}\n目前狀態：{:#?}",
+            h.state().player().state
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 按控制列的停止鍵（播放中的影片）。先等影片尺寸出來、視窗配合影片改好大小：網址載入後馬上跳轉時，
+/// 第一格畫面（視窗跟著改大小）可能在跳轉之後才到（CI 比較慢）。測試環境照 InnerSize 改畫面大小，
+/// 改的那一幀之前讀到的按鈕位置已經不對，會按不到
+fn click_stop(h: &mut Harness<'_, VitascopeApp>) {
+    step_until_net(h, "知道影片尺寸", |app| app.player().state.video_size.is_some());
+    // 停止鍵的位置連續幾幀不變（視窗改完大小）
+    let start = Instant::now();
+    let (mut last, mut same) = (None, 0);
+    while same < 3 {
+        h.step();
+        let rect = h.get_by_label("⏹").rect();
+        if last == Some(rect) {
+            same += 1;
+        } else {
+            (last, same) = (Some(rect), 0);
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "停止鍵的位置一直在變");
+    }
+    h.get_by_label("⏹").click();
+}
+
+/// 貼上一直不回應的網址（`/slow`），等到「正在連線」出現
+fn connecting(server: &Server, settings: Settings) -> Harness<'static, VitascopeApp> {
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/slow")));
+    step_until_label(&mut h, "正在連線：127.0.0.1…");
+    assert!(h.state().player().net_loading().is_some());
+    h
+}
+
+fn no_auto_next() -> Settings {
+    let mut s = Settings::default();
+    s.auto_next = false;
+    s
+}
+
+/// 網址連線中：一開始（300 毫秒內）不顯示，之後顯示「正在連線：主機…」與「按 Esc 取消」，停止鍵可以按（不用等連上）。
+/// Esc 取消：提示「已取消」，沒有錯誤（不是「無法開啟」），回到起始畫面；伺服器只收到一次請求（沒有重試）
+#[test]
+fn escape_cancels_a_connecting_url() {
+    let server = Server::start();
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/slow")));
+    h.step();
+    assert!(
+        h.query_by_label_contains("正在連線").is_none(),
+        "剛開始連線不顯示（本機檔案、很快就連上的網址不會閃一下）"
+    );
+    step_until_label(&mut h, "正在連線：127.0.0.1…");
+    h.get_by_label("按 Esc 取消");
+    assert!(!h.get_by_label("⏹").accesskit_node().is_disabled(), "連線中可以按停止");
+    // 等 mpv 真的送出請求（CI 比較慢，300 毫秒內不一定送了），之後才能確認取消後沒有重試
+    server.wait_request("/slow", NET_TIMEOUT).expect("連到伺服器");
+    h.key_press(egui::Key::Escape);
+    // 提示只顯示 1.5 秒：CI 上停下來可能比較久，等的時候每一幀記下來
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "取消連線", |app| !app.player().loading_now());
+    run_steps_seen(&mut h, &mut seen, 3);
+    assert_eq!(seen.last_osd(), Some("已取消"));
+    let st = &h.state().player().state;
+    assert!(!st.loaded && st.last_error.is_none(), "取消不是錯誤：{st:#?}");
+    assert!(h.query_by_label_contains("正在連線").is_none());
+    h.get_by_label_contains("拖放到這裡");
+    assert_eq!(server.requests_to("/slow").len(), 1);
+}
+
+/// 連線中畫面的「取消」、控制列的停止鍵都會取消；英文介面的文字
+#[test]
+fn cancel_button_and_stop_cancel_a_connecting_url() {
+    let server = Server::start();
+    let mut h = connecting(&server, no_auto_next());
+    h.get_by_label("取消").click();
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "按「取消」", |app| !app.player().loading_now());
+    run_steps_seen(&mut h, &mut seen, 2);
+    assert_eq!(seen.last_osd(), Some("已取消"));
+    assert!(h.state().player().state.last_error.is_none());
+
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/slow")));
+    step_until_label(&mut h, "Connecting to 127.0.0.1…");
+    h.get_by_label("Press Esc to cancel");
+    h.get_by_label("Cancel");
+    h.get_by_label("⏹").click();
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "按停止", |app| !app.player().loading_now());
+    run_steps_seen(&mut h, &mut seen, 2);
+    assert_eq!(seen.last_osd(), Some("Cancelled"));
+    assert!(h.state().player().state.last_error.is_none());
+}
+
+/// 全螢幕時正在連線：Esc 照樣是離開全螢幕，不會取消（全螢幕看網路上的清單時，接下一個的那幾秒按 Esc 不會停掉）；
+/// 連線中畫面不寫「按 Esc 取消」，「取消」照樣能按
+#[test]
+fn escape_in_fullscreen_while_connecting_leaves_fullscreen() {
+    let server = Server::start();
+    let mut h = harness(None);
+    h.step();
+    set_fullscreen(&mut h, true);
+    h.event(egui::Event::Paste(server.url("/slow")));
+    step_until_label(&mut h, "正在連線：127.0.0.1…");
+    assert!(h.query_by_label("按 Esc 取消").is_none());
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(5);
+    assert!(h.state().player().net_loading().is_some(), "沒有取消");
+    assert_ne!(h.state().osd_text(), Some("已取消"));
+    h.get_by_label("取消").click();
+    step_until_net(&mut h, "按「取消」", |app| !app.player().loading_now());
+}
+
+/// 快取不夠、等資料（伺服器送到檔案的 5% 就不再送）：影片上顯示「緩衝中… N%」（N 是 mpv 的 cache-buffering-state），
+/// 媒體資訊的「來源」也寫緩衝中
+#[test]
+fn buffering_shows_on_the_video() {
+    let server = Server::start();
+    let url = server.url("/stall/5/common/mp4_long.mp4");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "開始播放", |app| playing_url(&app.player().state, &url));
+    step_until_net(&mut h, "播到沒有資料、等快取", |app| {
+        app.player().state.paused_for_cache
+    });
+    let start = Instant::now();
+    loop {
+        h.step();
+        let pct = h.state().player().state.cache_buffering;
+        if let Some(p) = pct
+            && h.query_by_label(&format!("緩衝中… {p}%")).is_some()
+        {
+            break;
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "沒有「緩衝中… {pct:?}%」");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label("來源");
+    h.get_by_label_contains("· 緩衝中");
+}
+
+/// 直播（不能跳轉；這裡是沒有結尾標記的 HLS，FFmpeg 照樣估了一個很短的總長度）：時間寫「直播」；播到結尾（停在最後一格）時提示「直播已結束或連線中斷」；
+/// 媒體資訊的「來源」寫網址、HLS 串流、直播；不記續播的位置
+#[test]
+fn live_streams_are_labelled_and_their_end_is_announced() {
+    if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/hls_vod/index.m3u8")
+        .exists()
+    {
+        eprintln!("略過：沒有 net/hls_vod/index.m3u8（python scripts/gen_samples.py）");
+        return;
+    }
+    let server = Server::start();
+    let url = server.url("/hlslive/net/hls_vod/index.m3u8");
+    // 直播的清單一直沒有新的片段時，FFmpeg 預設要重新讀 1000 次才結束：測試改成 2 次
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("demuxer-lavf-o".into(), "m3u8_hold_counters=2".into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch::default(),
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "開始播放", |app| playing_url(&app.player().state, &url));
+    step_until_label(&mut h, " / 直播");
+    assert!(!h.state().player().state.seekable, "不能跳轉");
+    step_until_net(&mut h, "直播結束的提示", |app| {
+        app.osd_text() == Some("直播已結束或連線中斷")
+    });
+    assert!(h.state().player().state.loaded, "停在最後一格");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label("來源");
+    h.get_by_label(&url);
+    h.get_by_label("HLS 串流 · 直播");
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert!(h.state().history().positions.is_empty(), "直播不記續播的位置");
+}
+
+/// 能跳轉、一分鐘以上的網路影片：從上次的位置繼續。代號是網址去掉 `#` 之後的部分，書籤也用同一個代號；
+/// 「記住開啟過的網址」關掉時不記、不續播；mpv 自己的網址（av://）不記
+#[test]
+fn network_videos_resume_by_key() {
+    let server = Server::start();
+    let key = server.file_url("common/mp4_long.mp4"); // 90 秒
+    let with_fragment = format!("{key}#from-a-page");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(with_fragment.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &with_fragment) && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    h.state_mut().player_mut().seek_to(30.0, true).unwrap();
+    step_until_net(&mut h, "跳到 30 秒", |app| {
+        (app.player().state.time_pos - 30.0).abs() < 2.0
+    });
+    // 書籤跟續播用同一個代號
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks().marks(&key).len(), 1);
+    assert!(h.state().bookmarks().marks(&with_fragment).is_empty());
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    let at = h.state().history().resume_point(&key).expect("記下續播的位置");
+    assert!((at - 30.0).abs() < 3.0, "{at}");
+    assert_eq!(h.state().history().resume_point(&with_fragment), None);
+    // 不帶 # 的同一個網址：從上次的位置繼續，書籤也看得到
+    h.event(egui::Event::Paste(key.clone()));
+    // 續播的提示在載入完成時出現：跳過去可能比提示的 1.5 秒久（CI），等的時候每一幀記下來
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "從上次的位置繼續", |app| {
+        let s = &app.player().state;
+        playing_url(s, &key) && s.time_pos > at - 3.0
+    });
+    assert!(
+        seen.last_osd().is_some_and(|t| t.starts_with("從 00:3")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().bookmarks().marks(&key).len(), 1);
+
+    // 不記網址：不記位置，也不續播
+    h.state_mut().change_net(|n| n.remember_urls = false);
+    h.state_mut().player_mut().seek_to(50.0, true).unwrap();
+    step_until_net(&mut h, "跳到 50 秒", |app| {
+        (app.player().state.time_pos - 50.0).abs() < 2.0
+    });
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert_eq!(h.state().history().resume_point(&key), Some(at), "沒有記新的位置");
+    h.event(egui::Event::Paste(key.clone()));
+    step_until_net(&mut h, "再開一次", |app| playing_url(&app.player().state, &key));
+    h.run_steps(2);
+    // 續播的提示在載入完成時（同一幀）就出現；之後播了一段還在開頭：沒有跳過去
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.starts_with("從")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    step_until_net(&mut h, "播了一段", |app| app.player().state.time_pos > 2.0);
+    assert!(h.state().player().state.time_pos < 20.0, "不續播");
+
+    // mpv 自己的網址：不記（播到 10 秒以上才記得到，用 4 倍速）
+    let lavfi = PathBuf::from("av://lavfi:testsrc2=size=160x90:rate=10:duration=100");
+    let mut h = harness(Some(lavfi));
+    step_until(&mut h, "開始播放", |s| s.loaded);
+    h.state_mut().player_mut().set_speed(4.0).unwrap();
+    step_until_net(&mut h, "播到 12 秒", |app| app.player().state.time_pos > 12.0);
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert!(
+        h.state().history().positions.is_empty(),
+        "{:?}",
+        h.state().history().positions
+    );
+}
+
+/// 網址裡有 token 之類的（記不得的網址）：不記續播的位置，以前記下的也不拿來續播（只會在舊版的紀錄裡）
+#[test]
+fn unstorable_network_urls_are_not_resumed() {
+    let server = Server::start();
+    let url = format!("{}?token=abc123", server.file_url("common/mp4_long.mp4"));
+    let mut history = vitascope::history::History::default();
+    history.positions.push(vitascope::history::Position {
+        path: url.clone(),
+        time: 30.0,
+    });
+    let mut h = harness_launch(
+        Launch {
+            history,
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &url) && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    h.run_steps(2);
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.starts_with("從")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    step_until_net(&mut h, "播了一段", |app| app.player().state.time_pos > 2.0);
+    assert!(h.state().player().state.time_pos < 20.0, "不續播");
+    h.state_mut().player_mut().seek_to(50.0, true).unwrap();
+    step_until_net(&mut h, "跳到 50 秒", |app| {
+        (app.player().state.time_pos - 50.0).abs() < 2.0
+    });
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert_eq!(h.state().history().resume_point(&url), Some(30.0), "沒有記新的位置");
+    assert!(!h.state().history().recent.contains(&url));
+}
+
+/// 伺服器不支援 Range（很多小型伺服器、NAS）：不能跳轉，但有總長度，不是直播（時間照常寫總長度、媒體資訊不寫直播）；
+/// 不能跳轉的網路影片不續播（紀錄留著）、也不記位置
+#[test]
+fn unseekable_network_files_are_not_live_and_not_resumed() {
+    let server = Server::start();
+    let url = server.url("/norange/common/mkv_multitrack.mkv"); // 20 秒
+    // 以前記下的位置（例如那時候伺服器支援 Range）
+    let mut history = vitascope::history::History::default();
+    history.positions.push(vitascope::history::Position {
+        path: url.clone(),
+        time: 30.0,
+    });
+    let mut h = harness_launch(
+        Launch {
+            history,
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &url) && s.duration.is_some_and(|d| d > 19.0)
+    });
+    step_until_net(&mut h, "播了一段", |app| app.player().state.time_pos > 1.0);
+    assert!(!h.state().player().state.seekable, "伺服器不支援 Range：不能跳轉");
+    step_until_label(&mut h, " / 00:20");
+    assert!(h.query_by_label_contains("直播").is_none(), "不是直播");
+    // 不能跳轉：這次不跳，紀錄也不丟（不是因為總長度不合而忘掉）
+    assert_eq!(h.state().history().resume_point(&url), Some(30.0));
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(3);
+    h.get_by_label("來源");
+    let node = h.get_by_label_contains("HTTP · Matroska");
+    let node = node.accesskit_node();
+    let facts = node.label().or_else(|| node.value()).unwrap_or_default();
+    assert!(facts.contains("00:20"), "有總長度：{facts}");
+    assert!(h.query_by_label_contains("直播").is_none());
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+
+    // 能跳轉、一分鐘以上、播到 30 秒，但 mpv 說不能跳轉（直播之類）：停止時不記。
+    // 用假的狀態（mpv 的 seekable 已經送到之後才改，之後不會再送）：不靠找得到一分鐘以上又不能跳轉的樣本
+    let long = server.file_url("common/mp4_long.mp4");
+    h.event(egui::Event::Paste(long.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &long) && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    h.state_mut().player_mut().state.seekable = false;
+    h.state_mut().player_mut().seek_to(30.0, true).unwrap();
+    step_until_net(&mut h, "跳到 30 秒", |app| {
+        (app.player().state.time_pos - 30.0).abs() < 2.0
+    });
+    assert!(!h.state().player().state.seekable);
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    assert_eq!(h.state().history().resume_point(&long), None, "不能跳轉的不記");
+}
+
+/// 網路上的播放清單（IPTV 的 .m3u 網址）：展開成播放清單，標題照 #EXTINF，本機檔案的項目拿掉；
+/// 照一般的開檔播第一個，mpv 自己的清單只剩一個；清單的網址記進最近開啟
+#[test]
+fn remote_m3u_url_becomes_the_playlist() {
+    let server = Server::start();
+    let list = server.url("/m3u");
+    let a = server.file_url("common/mp4_h264_aac.mp4");
+    let b = server.file_url("common/mkv_h264_aac_srt.mkv");
+    let mut h = harness(None);
+    h.step();
+    h.event(egui::Event::Paste(list.clone()));
+    step_until_net(&mut h, "展開清單", |app| {
+        app.osd_text().is_some_and(|t| t.starts_with("播放清單：2 個項目"))
+    });
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播放清單：2 個項目（略過 1 個不能開的項目）")
+    );
+    step_until_net(&mut h, "播第一個", |app| playing_url(&app.player().state, &a));
+    assert_eq!(playlist_items(h.state()), [a.clone(), b.clone()]);
+    assert_eq!(h.state().url_title(&a), Some("第一個"));
+    assert_eq!(
+        h.state().player().get_i64("playlist-count").unwrap(),
+        1,
+        "mpv 的清單只剩一個"
+    );
+    assert!(
+        h.state().history().recent.contains(&list),
+        "{:?}",
+        h.state().history().recent
+    );
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 第一個");
+    h.get_by_label("2. 第二個");
+    assert!(h.query_by_label_contains("本機檔案").is_none());
+    h.key_press(egui::Key::PageDown);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("下一個（2/2）：第二個"));
+    step_until_net(&mut h, "播第二個", |app| playing_url(&app.player().state, &b));
+}
+
+/// 網址的輸入框（設定頁「進階」）：`label` 旁邊的那一個
+fn net_text_field<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .find(|n| {
+            matches!(
+                n.accesskit_node().role(),
+                egui::accesskit::Role::TextInput | egui::accesskit::Role::MultilineTextInput
+            )
+        })
+        .unwrap_or_else(|| panic!("找不到輸入框 {label}"))
+}
+
+/// 設定 → 網路：改了馬上送到 mpv、存檔。HLS / DASH 畫質、快取、逾時、重新連線、憑證、記住網址；
+/// 「進階」的 User-Agent、標頭離開欄位才套用（看不懂的標頭說明哪一行、不送出），換頁時打到一半的也套用；SOCKS proxy 的說明
+#[test]
+fn network_settings_page_changes_reach_mpv() {
+    let dir = TempDir::new("net-settings");
+    let path = dir.0.join("settings.json");
+    let mut h = harness_with(None, Settings::load_from(path.clone()));
+    h.step();
+    open_settings_page(&mut h, "網路");
+    h.get_by_label("串流");
+    combo_box(&h, "HLS / DASH 畫質").click();
+    h.run_steps(2);
+    h.get_by_label("最低").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "hls-bitrate", "min");
+    combo_box(&h, "網路快取").click();
+    h.run_steps(2);
+    h.get_by_label("400 MB").click();
+    h.run_steps(2);
+    step_until_app(&mut h, "快取 400 MB", |app| {
+        app.player().get_i64("demuxer-max-bytes").ok() == Some(400 << 20)
+            && app.player().get_i64("demuxer-max-back-bytes").ok() == Some(133 << 20)
+    });
+    // 逾時：點進去打數字、Enter
+    h.query_all_by_label("連線逾時")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+        .expect("逾時的數字欄")
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text("45".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    step_until_app(&mut h, "逾時 45 秒", |app| {
+        app.player().get_f64("network-timeout").ok() == Some(45.0)
+    });
+    h.get_by_label("連線中斷時自動重新連線").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "stream-lavf-o", "reconnect=0");
+    h.get_by_label("檢查網站憑證（建議）").click();
+    h.run_steps(2);
+    wait_prop(&mut h, "tls-verify", "no");
+    h.get_by_label("記住開啟過的網址（最近開啟、續播）").click();
+    h.run_steps(2);
+    let net = h.state().settings().net.clone();
+    assert_eq!(net.hls_bitrate, vitascope::net::HlsBitrate::Min);
+    assert_eq!((net.cache_mb, net.timeout_secs), (400, 45));
+    assert!(!net.reconnect && !net.tls_verify && !net.remember_urls);
+    assert_eq!(Settings::load_from(path.clone()).net, net, "馬上存檔");
+
+    // 進階（預設收起來）
+    assert!(h.query_by_label("User-Agent").is_none());
+    h.get_by_label("進階").click();
+    h.run_steps(2);
+    net_text_field(&h, "User-Agent").focus();
+    h.run_steps(2);
+    net_text_field(&h, "User-Agent").type_text("UA-Test/2 (x, y) ");
+    h.run_steps(2);
+    assert_ne!(prop(&h, "user-agent"), "UA-Test/2 (x, y)", "打字時還沒套用");
+    net_text_field(&h, "其他 HTTP 標頭").focus();
+    h.run_steps(2);
+    wait_prop(&mut h, "user-agent", "UA-Test/2 (x, y)");
+    net_text_field(&h, "其他 HTTP 標頭").type_text("X-A: 1, 2\nbad line");
+    h.run_steps(2);
+    h.get_by_label("第 2 行不是「名稱: 值」，不會送出");
+    net_text_field(&h, "Proxy").focus();
+    h.run_steps(2);
+    step_until_app(&mut h, "標頭送到 mpv", |app| {
+        app.player()
+            .mpv()
+            .get_string_list("http-header-fields")
+            .is_ok_and(|l| l == ["X-A: 1, 2"])
+    });
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("不會送出").is_none(), "看不懂的那一行拿掉了");
+    net_text_field(&h, "Proxy").type_text("socks5://127.0.0.1:1080");
+    h.run_steps(2);
+    h.get_by_label("播放引擎只支援 HTTP proxy，SOCKS 只有 yt-dlp 會用");
+    // 輸入框還在編輯中就換到別頁：網路頁不畫了，輸入框收不到「離開欄位」，打到一半的也要寫回去
+    h.get_by_label("系統").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("串流").is_none(), "換到系統頁");
+    wait_prop(&mut h, "http-proxy", "socks5://127.0.0.1:1080");
+    let net = h.state().settings().net.clone();
+    assert_eq!(net.user_agent, "UA-Test/2 (x, y)");
+    assert_eq!(net.headers, ["X-A: 1, 2"]);
+    assert_eq!(net.proxy, "socks5://127.0.0.1:1080");
+    assert_eq!(Settings::load_from(path.clone()).net, net, "存檔");
+    assert_eq!(h.state().osd_text(), None, "都設定成功，沒有「無法套用」的提示");
+}
+
+/// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定的網路選項：設定頁停用那一項並說明，其他照樣能改
+#[test]
+fn network_options_set_by_mpv_opts_are_disabled() {
+    let mut h = harness_launch_with(
+        Options {
+            extra: vec![("user-agent".into(), "x".into()), ("tls-verify".into(), "no".into())],
+            keep_open: true,
+            ..Options::headless()
+        },
+        Launch::default(),
+        no_auto_next(),
+    );
+    h.step();
+    assert_eq!(prop(&h, "user-agent"), "x");
+    open_settings_page(&mut h, "網路");
+    assert!(h.get_by_label("檢查網站憑證（建議）").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("連線中斷時自動重新連線").accesskit_node().is_disabled());
+    h.get_by_label("進階").click();
+    h.run_steps(2);
+    assert!(net_text_field(&h, "User-Agent").accesskit_node().is_disabled());
+    assert!(!net_text_field(&h, "Referer").accesskit_node().is_disabled());
+    net_text_field(&h, "User-Agent").hover();
+    h.run_steps(3);
+    h.get_by_label("已由 VITASCOPE_MPV_OPTS 指定");
+    assert_eq!(prop(&h, "tls-verify"), "no", "啟動時不能蓋掉");
+}
+
+/// 英文介面的「設定 → 網路」
+#[test]
+fn network_settings_page_in_english() {
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings);
+    h.step();
+    open_settings_page(&mut h, "Network");
+    h.get_by_label("Streams");
+    combo_box(&h, "HLS / DASH quality");
+    combo_box(&h, "Network cache");
+    h.get_by_label("Check website certificates (recommended)");
+    h.get_by_label("Remember URLs I open (recent list, resume)");
+    h.get_by_label("Advanced").click();
+    h.run_steps(2);
+    net_text_field(&h, "Other HTTP headers").focus();
+    h.run_steps(2);
+    net_text_field(&h, "Other HTTP headers").type_text(
+        "bad
+X-A: 1
+worse",
+    );
+    h.run_steps(2);
+    h.get_by_label("Lines 1, 3 aren't \"Name: value\" and won't be sent");
+}
+
+// ───────────── 網站影片（假的 yt-dlp；不執行程式、不連網） ─────────────
+
+/// 播放器有網路 hook、用假的 yt-dlp（跟真正的播放器一樣）；本機的測試伺服器 127.0.0.1 當成影片網站
+fn site_harness(fake: &Arc<FakeResolver>, settings: Settings) -> Harness<'static, VitascopeApp> {
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch::default(),
+        settings,
+    )
+}
+
+/// 一部 90 秒的網站影片（影音合在一起的 `common/mp4_long.mp4`），代號 `long`：不同的網址解析出同一部影片
+fn long_site_json(base: &str) -> String {
+    format!(
+        r#"{{"id": "long", "title": "很長的網站影片", "extractor_key": "FakeSite", "duration": 90,
+            "url": "{base}/f/common/mp4_long.mp4", "protocol": "http", "vcodec": "avc1", "acodec": "mp4a",
+            "format_id": "18"}}"#
+    )
+}
+
+/// 網頁（`/watch`、`/playlist`）一次都沒被讀
+fn site_page_never_fetched(server: &Server) {
+    let pages: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.starts_with("/watch") || r.path.starts_with("/playlist"))
+        .collect();
+    assert!(pages.is_empty(), "播放器自己去讀了網頁：{pages:#?}");
+}
+
+/// 等 yt-dlp 的時候：影片上寫「正在取得網站影片（yt-dlp）…」（整個播放清單是「正在讀取播放清單」），
+/// Esc 取消（提示「已取消」、不是錯誤、回到起始畫面），背景的解析也收到取消
+#[test]
+fn site_video_connecting_text_and_escape_cancels() {
+    let server = Server::start();
+    let fake = FakeResolver::block(Duration::from_secs(60), false, || Err(YtdlError::NoResponse.into())).arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=slow")));
+    step_until_label(&mut h, "正在取得網站影片（yt-dlp）…");
+    assert!(h.query_by_label_contains("播放清單").is_none());
+    h.get_by_label("按 Esc 取消");
+    assert!(h.state().player().state.net_busy.is_some());
+    h.key_press(egui::Key::Escape);
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "取消", |app| !app.player().loading_now());
+    run_steps_seen(&mut h, &mut seen, 3);
+    assert_eq!(seen.last_osd(), Some("已取消"));
+    let st = &h.state().player().state;
+    assert!(
+        !st.loaded && st.last_error.is_none() && st.net_busy.is_none(),
+        "{st:#?}"
+    );
+    assert!(h.query_by_label_contains("正在取得網站影片").is_none());
+    h.get_by_label_contains("拖放到這裡");
+    let start = Instant::now();
+    while fake.cancelled() == 0 {
+        assert!(start.elapsed() < NET_TIMEOUT, "背景的解析沒有收到取消");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // 載入整個播放清單（比較久）：寫的是讀取播放清單
+    let list = server.url("/watch?v=slow&list=PL1");
+    let mode = vitascope::ytdl::plan::Mode {
+        yes_playlist: true,
+        ..Default::default()
+    };
+    h.state_mut().player_mut().open_with_mode(&list, mode).unwrap();
+    step_until_label(&mut h, "正在讀取播放清單（yt-dlp）…");
+    assert!(h.query_by_label_contains("正在取得網站影片").is_none());
+    h.key_press(egui::Key::Escape);
+    step_until_net(&mut h, "取消播放清單", |app| !app.player().loading_now());
+    while fake.cancelled() < 2 {
+        assert!(start.elapsed() < NET_TIMEOUT * 2, "背景的解析沒有收到取消");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    site_page_never_fetched(&server);
+}
+
+/// 網站影片：標題是網站給的（最近開啟、清單上都用它）；續播、書籤用同一部影片的代號（`ytdl://網站/代號`），
+/// 同一部影片換個網址（分享連結之類）也從上次的位置繼續、看得到書籤（續播的提示不被 yt-dlp 的提醒蓋掉）。
+/// 網址指定了開始的位置（`&t=5`）時從那裡開始、不續播
+#[test]
+fn site_video_title_resume_and_bookmarks_follow_the_video_id() {
+    let server = Server::start();
+    let base = server.url("");
+    let fake = FakeResolver::new(move |req, _| {
+        let mut json = long_site_json(&base);
+        // yt-dlp 把網址的 &t=5 讀成 start_time
+        if req.url.contains("t=5") {
+            json = json.replacen(r#""duration": 90,"#, r#""duration": 90, "start_time": 5,"#, 1);
+        }
+        // 警告裡有提醒：續播的提示優先，不被它蓋掉
+        Ok(support::fake_ytdl::resolved(&json, vec![Hint::NeedsJsRuntime]))
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播網站影片", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.is_some() && s.seekable && s.duration.is_some_and(|d| d > 80.0)
+    });
+    assert_eq!(h.state().url_title(&page), Some("很長的網站影片"));
+    assert!(h.state().history().recent.contains(&page));
+    let key = "ytdl://fakesite/long";
+    h.state_mut().player_mut().seek_to(30.0, true).unwrap();
+    step_until_net(&mut h, "跳到 30 秒", |app| {
+        (app.player().state.time_pos - 30.0).abs() < 2.0
+    });
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks().marks(key).len(), 1, "書籤用影片的代號");
+    assert!(h.state().bookmarks().marks(&page).is_empty());
+    click_stop(&mut h);
+    step_until_net(&mut h, "停止", |app| !app.player().state.loaded);
+    let at = h.state().history().resume_point(key).expect("依影片的代號記下位置");
+    assert!((at - 30.0).abs() < 3.0, "{at}");
+    assert_eq!(h.state().history().resume_point(&page), None);
+    // 同一部影片的另一個網址：從上次的位置繼續，書籤也看得到
+    let share = server.url("/watch?v=long&feature=share");
+    h.event(egui::Event::Paste(share.clone()));
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "從上次的位置繼續", |app| {
+        let s = &app.player().state;
+        playing_url(s, &share) && s.time_pos > at - 3.0
+    });
+    assert!(
+        seen.last_osd().is_some_and(|t| t.starts_with("從 00:3")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().bookmarks().marks(key).len(), 1);
+    assert_eq!(fake.calls(), 2, "不同的網址各問一次");
+    // 網址指定了開始的位置：從 5 秒開始，不跳到上次的位置（30 秒）。等到真的在播（過了 5.5 秒），跳過去的話這時已經在 30 秒
+    let at_five = server.url("/watch?v=long&t=5");
+    h.event(egui::Event::Paste(at_five.clone()));
+    step_until_net(&mut h, "從 5 秒開始播", |app| {
+        let s = &app.player().state;
+        playing_url(s, &at_five) && s.loaded && s.net.is_some() && s.time_pos > 5.5
+    });
+    let t = h.state().player().state.time_pos;
+    assert!(t < 20.0, "跳到了上次的位置：{t}");
+    assert!(
+        h.state()
+            .player()
+            .state
+            .net
+            .as_ref()
+            .is_some_and(|n| n.start_at == Some(5.0))
+    );
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.starts_with("從 00:3")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    site_page_never_fetched(&server);
+}
+
+/// yt-dlp 成功了、但警告說沒有 deno（YouTube 只有部分畫質）：載入後提示一次（之後的提示不會又被它蓋掉）
+#[test]
+fn site_video_warnings_show_once() {
+    if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/video_only.mp4")
+        .exists()
+    {
+        eprintln!("略過 site_video_warnings_show_once：沒有網路測試的樣本（python scripts/gen_samples.py）");
+        return;
+    }
+    let server = Server::start();
+    let page = server.url("/watch?v=vid1");
+    let json = support::fake_ytdl::site_video_json(&server.url(""), &page, "vid1");
+    let fake = FakeResolver::new(move |_, _| Ok(support::fake_ytdl::resolved(&json, vec![Hint::NeedsJsRuntime]))).arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播網站影片", |app| playing_url(&app.player().state, &page));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("YouTube 需要 deno 才能取得全部畫質"));
+    // 換成別的提示（音量）：提醒不再出現
+    h.key_press(egui::Key::ArrowDown);
+    h.run_steps(2);
+    let volume = h.state().osd_text().map(str::to_owned);
+    assert!(volume.as_deref().is_some_and(|t| t.starts_with("音量")), "{volume:?}");
+    // 音量的提示 1.5 秒後消失（CI 上 20 幀可能就超過了）：消失可以，換回提醒不行
+    for _ in 0..20 {
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+        let now = h.state().osd_text();
+        assert!(now.is_none() || now == volume.as_deref(), "提醒又出現了：{now:?}");
+    }
+}
+
+/// 網站影片播不了：起始畫面寫 yt-dlp 說的原因、警告裡的提醒和建議。文字每次畫的時候才產生，換了介面語言也跟著換
+#[test]
+fn site_video_failure_shows_reason_hints_and_follows_the_language() {
+    let server = Server::start();
+    let fake = FakeResolver::fail(Failure {
+        error: YtdlError::Outdated,
+        hints: vec![Hint::NeedsJsRuntime],
+    })
+    .arc();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = site_harness(&fake, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=old")));
+    step_until_label(
+        &mut h,
+        "Can't play the website video: Couldn't get the video (yt-dlp may need an update)",
+    );
+    h.get_by_label("YouTube needs deno for all qualities");
+    // 真正的原因是缺 deno（警告），建議取得 deno、不是更新 yt-dlp
+    h.get_by_label("Install deno 2.3 or newer (deno.com) so YouTube offers every quality");
+    // 換成中文介面：同一個錯誤用中文顯示
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("English").click();
+    h.run_steps(2);
+    h.get_by_label("繁體中文").click();
+    h.run_steps(3);
+    h.get_by_label("無法播放網站影片：無法取得影片（yt-dlp 可能需要更新）");
+    h.get_by_label("YouTube 需要 deno 才能取得全部畫質");
+    assert!(h.query_by_label_contains("Can't play the website video").is_none());
+    site_page_never_fetched(&server);
+}
+
+/// 沒有 yt-dlp：影片網站的網址馬上說明要 yt-dlp、怎麼取得（不去讀網頁）
+#[test]
+fn site_video_without_ytdl_explains_how_to_get_it() {
+    let server = Server::start();
+    let fake = FakeResolver::missing().arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    h.get_by_label_contains("請安裝 yt-dlp");
+    assert!(h.state().player().state.net_need_ytdl);
+    assert_eq!(fake.calls(), 0);
+    site_page_never_fetched(&server);
+}
+
+/// 「設定 → 網路」頁改的設定（檢查網站憑證、逾時）下一次解析網站影片就用（yt-dlp 的 `--no-check-certificates`、
+/// `--socket-timeout`），不用重開影戲
+#[test]
+fn network_page_changes_reach_the_site_resolver() {
+    let server = Server::start();
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    open_settings_page(&mut h, "網路");
+    h.get_by_label("檢查網站憑證（建議）").click();
+    h.run_steps(2);
+    h.query_all_by_label("連線逾時")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::SpinButton)
+        .expect("逾時的數字欄")
+        .focus();
+    h.run_steps(2);
+    h.event(egui::Event::Text("45".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    let net = h.state().settings().net.clone();
+    assert!(!net.tls_verify);
+    assert_eq!(net.timeout_secs, 45);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste(server.url("/watch?v=cfg")));
+    step_until_label(&mut h, "無法播放網站影片");
+    let req = fake.requests().pop().expect("問了 yt-dlp");
+    assert!(!req.tls_verify, "yt-dlp 還在檢查憑證（用的是啟動時的設定）");
+    assert_eq!(req.timeout_secs, 45);
+    site_page_never_fetched(&server);
+}
+
+/// 網站的播放清單：變成影戲的播放清單（照順序、清單寫的標題），開第一部；第一部載入後換成網站給的標題
+#[test]
+fn site_playlist_becomes_our_playlist() {
+    if !std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/video_only.mp4")
+        .exists()
+    {
+        eprintln!("略過 site_playlist_becomes_our_playlist：沒有網路測試的樣本（python scripts/gen_samples.py）");
+        return;
+    }
+    let server = Server::start();
+    let base = server.url("");
+    let list = server.url("/playlist?list=PL1");
+    let p1 = server.url("/watch?v=p1");
+    let p2 = server.url("/watch?v=p2");
+    let list_json = site_playlist_json(&list, &[(p1.clone(), "p1"), (p2.clone(), "p2")]);
+    let (b, l) = (base.clone(), list.clone());
+    let fake = FakeResolver::new(move |req, _| {
+        let text = if req.url == l {
+            list_json.clone()
+        } else {
+            support::fake_ytdl::site_video_json(&b, &req.url, "p")
+        };
+        Ok(support::fake_ytdl::resolved(&text, Vec::new()))
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(list.clone()));
+    step_until_net(&mut h, "開清單的第一部", |app| {
+        playing_url(&app.player().state, &p1)
+    });
+    assert_eq!(playlist_items(h.state()), [p1.clone(), p2.clone()]);
+    assert_eq!(h.state().playlist().and_then(|l| l.current_index()), Some(0));
+    assert_eq!(h.state().url_title(&p2), Some("第 2 部"));
+    assert_eq!(
+        h.state().url_title(&p1),
+        Some(support::fake_ytdl::SITE_TITLE_TEXT),
+        "載入後用網站給的標題"
+    );
+    assert!(h.state().player().state.last_error.is_none());
+    assert!(h.state().history().recent.contains(&list), "清單本身記進最近開啟");
+    site_page_never_fetched(&server);
+}
+
+/// 網站的播放清單到了 yt-dlp 的上限（`-I 1:200`）：提示只載入前 200 個（略過了不能開的、留下的不到 200 個也一樣），
+/// 也說略過了幾個
+#[test]
+fn site_playlist_at_the_limit_says_only_the_first_were_loaded() {
+    let server = Server::start();
+    let list = server.url("/playlist?list=BIG");
+    let max = vitascope::ytdl::PLAYLIST_MAX;
+    let mut items: Vec<(String, String)> = (0..max)
+        .map(|n| (server.url(&format!("/watch?v=b{n}")), format!("b{n}")))
+        .collect();
+    items[5].0 = "file:///etc/passwd".into();
+    let refs: Vec<(String, &str)> = items.iter().map(|(u, id)| (u.clone(), id.as_str())).collect();
+    let list_json = site_playlist_json(&list, &refs);
+    let l = list.clone();
+    let fake = FakeResolver::new(move |req, _| {
+        if req.url == l {
+            Ok(support::fake_ytdl::resolved(&list_json, Vec::new()))
+        } else {
+            Err(YtdlError::Unsupported.into())
+        }
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(list.clone()));
+    step_until_net(&mut h, "變成播放清單", |app| {
+        app.playlist().is_some_and(|_| playlist_items(app).len() == max - 1)
+    });
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播放清單：199 個項目（只載入前 200 個）（略過 1 個不能開的項目）")
+    );
+    site_page_never_fetched(&server);
+}
+
+// ───────────── 網站影片 ▸ 選單、換畫質、「設定 → 網路」的 yt-dlp ─────────────
+
+/// 有網路測試的樣本（`python scripts/gen_samples.py` 的 net 這一組）；沒有就印出原因、回傳 false
+fn has_net_samples(test: &str) -> bool {
+    let ok = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated/net/sub.vtt")
+        .exists();
+    if !ok {
+        eprintln!("略過 {test}：沒有網路測試的樣本（python scripts/gen_samples.py）");
+    }
+    ok
+}
+
+/// 兩種畫質的網站影片（都是影音合在一起的 90 秒 `common/mp4_long.mp4`，網址不同：`?q=hi` 720p、`?q=lo` 360p），
+/// 一個只有聲音的格式（`net/audio_only.m4a`），三個網站字幕（en、ja、zh-TW：開檔時照一般的規則會選繁中）。
+/// yt-dlp 自己挑的是 720p
+fn two_quality_json(base: &str) -> String {
+    let muxed = |id: &str, file: &str, height: u32, tbr: u32| {
+        format!(
+            r#"{{"format_id": "{id}", "url": "{base}/f/common/{file}?q={id}", "protocol": "http",
+                "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "height": {height}, "fps": 24, "tbr": {tbr}}}"#
+        )
+    };
+    format!(
+        r#"{{"id": "two", "title": "兩種畫質", "extractor_key": "FakeSite", "duration": 90,
+            "format_id": "hi", "url": "{base}/f/common/mp4_long.mp4?q=hi", "protocol": "http",
+            "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "height": 720, "fps": 24, "tbr": 2000,
+            "formats": [{}, {},
+              {{"format_id": "a", "url": "{base}/f/net/audio_only.m4a", "protocol": "http", "vcodec": "none",
+                "acodec": "mp4a.40.2", "abr": 128}}],
+            "requested_subtitles": {{
+              "en": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?en", "name": "English"}},
+              "ja": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?ja", "name": "Japanese"}},
+              "zh-TW": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?zh", "name": "中文（台灣）"}}}}}}"#,
+        muxed("hi", "mp4_long.mp4", 720, 2000),
+        muxed("lo", "mp4_long.mp4", 360, 500)
+    )
+}
+
+/// 開兩種畫質的網站影片，等到能跳轉
+fn playing_two_qualities(
+    server: &Server,
+    settings: Settings,
+) -> (Harness<'static, VitascopeApp>, Arc<FakeResolver>, String) {
+    let json = two_quality_json(&server.url(""));
+    let fake = FakeResolver::json(json).arc();
+    let mut h = site_harness(&fake, settings);
+    h.step();
+    let page = server.url("/watch?v=two");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播網站影片", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.is_some() && s.seekable && s.video_size.is_some()
+    });
+    (h, fake, page)
+}
+
+/// 等到子選單打開、裡面有這一項（CI 比較慢：滑鼠移過去之後子選單不一定下一幀就打開）
+fn wait_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    let start = Instant::now();
+    while h.query_all_by_label(label).next().is_none() {
+        assert!(start.elapsed() < MENU_TIMEOUT, "等不到選單裡的「{label}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 在影片上按右鍵、打開「網站影片 ▸」，等它的子選單出來
+fn open_site_menu(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "網站影片");
+    wait_menu_item(h, "選擇畫質 ⏵");
+}
+
+/// 網站影片 ▸ 選擇畫質 ▸ 某一項
+fn pick_site_quality(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    open_site_menu(h);
+    hover_menu_item(h, "選擇畫質");
+    wait_menu_item(h, label);
+    h.get_by_label(label).click();
+    h.step();
+}
+
+/// 網站影片 ▸ 預設畫質 ▸ 某一項（「只播聲音」在「網站影片 ▸」裡也有一個勾選框：點預設畫質的那個圓鈕）
+fn pick_default_quality(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    open_site_menu(h);
+    hover_menu_item(h, "預設畫質");
+    let start = Instant::now();
+    loop {
+        let radio = h
+            .query_all_by_label(label)
+            .find(|n| n.accesskit_node().role() == egui::accesskit::Role::RadioButton);
+        if let Some(radio) = radio {
+            radio.click();
+            break;
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "等不到預設畫質的「{label}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.step();
+}
+
+/// 等待時每一幀看到的 OSD、送出的視窗大小（OSD 1.5 秒就消失：CI 比較慢時等完再看可能已經不見了）
+#[derive(Default)]
+struct Seen {
+    osd: Vec<String>,
+    sizes: Vec<egui::Vec2>,
+}
+
+impl Seen {
+    fn record(&mut self, h: &Harness<'_, VitascopeApp>) {
+        if let Some(t) = h.state().osd_text()
+            && self.osd.last().map(String::as_str) != Some(t)
+        {
+            self.osd.push(t.to_owned());
+        }
+        self.sizes
+            .extend(viewport_commands(h).into_iter().filter_map(|c| match c {
+                egui::ViewportCommand::InnerSize(s) => Some(s),
+                _ => None,
+            }));
+    }
+}
+
+/// 同 `step_until_net`，每一幀記下 OSD、視窗大小
+fn step_until_seen(
+    h: &mut Harness<'_, VitascopeApp>,
+    seen: &mut Seen,
+    what: &str,
+    cond: impl Fn(&VitascopeApp) -> bool,
+) {
+    let start = Instant::now();
+    seen.record(h);
+    while !cond(h.state()) {
+        assert!(
+            start.elapsed() < NET_TIMEOUT,
+            "等待逾時：{what}
+目前狀態：{:#?}",
+            h.state().player().state
+        );
+        h.step();
+        seen.record(h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 同 `step_until_seen`，看的是播放器的狀態
+fn step_until_state_seen(
+    h: &mut Harness<'_, VitascopeApp>,
+    seen: &mut Seen,
+    what: &str,
+    cond: impl Fn(&State) -> bool,
+) {
+    step_until_seen(h, seen, what, |app| cond(&app.player().state));
+}
+
+/// 同 `step_until_label`，每一幀記下 OSD、視窗大小
+fn step_until_label_seen(h: &mut Harness<'_, VitascopeApp>, seen: &mut Seen, text: &str) {
+    let start = Instant::now();
+    seen.record(h);
+    loop {
+        h.step();
+        seen.record(h);
+        if h.query_by_label_contains(text).is_some() {
+            return;
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "等不到畫面上的「{text}」");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 跑 `n` 幀，每一幀記下 OSD、視窗大小
+fn run_steps_seen(h: &mut Harness<'_, VitascopeApp>, seen: &mut Seen, n: usize) {
+    for _ in 0..n {
+        h.step();
+        seen.record(h);
+    }
+}
+
+impl Seen {
+    /// 最後看到的提示（等的時間比提示顯示的 1.5 秒長時，提示可能已經消失了：看的是消失前的那一個）
+    fn last_osd(&self) -> Option<&str> {
+        self.osd.last().map(String::as_str)
+    }
+}
+
+/// 正在播的網站影片用的格式是這個
+fn playing_format(app: &VitascopeApp, page: &str, id: &str) -> bool {
+    let s = &app.player().state;
+    playing_url(s, page)
+        && s.net
+            .as_ref()
+            .is_some_and(|n| !n.audio_only && n.chosen.iter().any(|f| f.format_id.as_deref() == Some(id)))
+}
+
+/// 讀過這個網址（伺服器收到過；查詢字串也比對）
+fn fetched(server: &Server, path: &str) -> bool {
+    !server.requests_to(path).is_empty()
+}
+
+/// 網站影片 ▸ 選擇畫質：列出網站的畫質，選了就從現在的位置接著播（不再問 yt-dlp、不續播、沒有「下一個」的提示），
+/// 暫停、字幕延遲、A-B 重播、選的字幕、畫面的調整（長寬比、翻轉）都保留，跟 PotPlayer 一樣
+#[test]
+fn site_quality_switch_keeps_pause_delay_ab_subtitle_and_view() {
+    if !has_net_samples("site_quality_switch_keeps_pause_delay_ab_subtitle_and_view") {
+        return;
+    }
+    let server = Server::start();
+    let (mut h, fake, page) = playing_two_qualities(&server, no_auto_next());
+    assert!(fetched(&server, "/f/common/mp4_long.mp4?q=hi"), "yt-dlp 挑的是 720p");
+    // 換畫質之前：選日文字幕（開檔時照規則選的是繁中）、第二字幕英文、字幕延遲、A-B、長寬比 16:9、左右翻轉，停在 10 秒
+    let sub_id = |h: &Harness<'_, VitascopeApp>, lang: &str| {
+        h.state()
+            .player()
+            .state
+            .tracks_of(TrackKind::Sub)
+            .find(|t| t.lang.as_deref() == Some(lang))
+            .map(|t| t.id)
+            .unwrap_or_else(|| panic!("網站的字幕 {lang}"))
+    };
+    assert_eq!(
+        h.state()
+            .player()
+            .state
+            .selected(TrackKind::Sub)
+            .and_then(|t| t.lang.clone())
+            .as_deref(),
+        Some("zh-TW")
+    );
+    let (ja, en) = (sub_id(&h, "ja"), sub_id(&h, "en"));
+    h.state_mut()
+        .player_mut()
+        .select_track(TrackKind::Sub, Some(ja))
+        .unwrap();
+    h.state_mut().player_mut().set_secondary_sub(Some(en)).unwrap();
+    h.state_mut().player_mut().set_sub_delay(0.5).unwrap();
+    h.state_mut().player_mut().set_ab_loop(Some(5.0), Some(15.0)).unwrap();
+    h.key_press(egui::Key::A);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(3);
+    h.key_press(egui::Key::Space);
+    step_until_net(&mut h, "暫停", |app| app.player().state.paused);
+    paused_at(&mut h, 10.0);
+    assert_eq!(h.state().geometry().aspect, Some(0));
+    assert!(h.state().geometry().hflip);
+
+    pick_site_quality(&mut h, "360p · AVC");
+    // 點的那一幀的視窗大小不算：那一幀先處理 mpv 的事件、調整視窗，最後才處理點擊（開始換畫質）。
+    // 例如上面改長寬比之後 mpv 的第二次 VideoReconfig 剛好在這一幀到，照規則調整視窗高度，跟換畫質無關
+    let mut seen = Seen::default();
+    seen.record(&h);
+    seen.sizes.clear();
+    h.step();
+    step_until_seen(&mut h, &mut seen, "換成 360p", |app| playing_format(app, &page, "lo"));
+    assert!(fetched(&server, "/f/common/mp4_long.mp4?q=lo"));
+    // 載入完成後還原：選的字幕要等網站的字幕軌出現
+    step_until_seen(&mut h, &mut seen, "還原日文字幕", |app| {
+        app.player()
+            .state
+            .selected(TrackKind::Sub)
+            .and_then(|t| t.lang.as_deref())
+            == Some("ja")
+    });
+    h.run_steps(3);
+    seen.record(&h);
+    let p = h.state().player();
+    assert_eq!(p.get_string("pause").unwrap(), "yes", "暫停中換畫質：還是暫停");
+    let t = p.get_f64("time-pos").unwrap();
+    assert!((t - 10.0).abs() < 1.0, "接著 10 秒播：{t}");
+    assert_eq!(p.get_f64("sub-delay").unwrap(), 0.5);
+    assert_eq!(p.ab_loop_points(), [Some(5.0), Some(15.0)]);
+    let secondary: i64 = p.get_string("secondary-sid").unwrap().parse().expect("第二字幕保留");
+    assert_eq!(secondary, sub_id(&h, "en"));
+    assert_eq!(h.state().geometry().aspect, Some(0), "長寬比保留");
+    assert!(h.state().geometry().hflip, "翻轉保留");
+    step_until_seen(&mut h, &mut seen, "翻轉的著色器", |app| {
+        app.player()
+            .shader_list()
+            .unwrap()
+            .iter()
+            .any(|f| f.ends_with("hflip.glsl"))
+    });
+    // 長寬比套用完（mpv 換檔時還原了，要再設一次）、再多等一下：視窗不跟著調整
+    step_until_seen(&mut h, &mut seen, "長寬比 16:9", |app| {
+        app.player()
+            .get_f64("video-aspect-override")
+            .is_ok_and(|a| (a - 16.0 / 9.0).abs() < 0.01)
+    });
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(800) {
+        h.step();
+        seen.record(&h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(seen.sizes.is_empty(), "換畫質不調整視窗大小：{:?}", seen.sizes);
+    assert_eq!(fake.calls(), 1, "換畫質用之前的格式清單，不再問 yt-dlp");
+    assert_eq!(seen.osd, ["畫質：360p · AVC"], "不是續播、不是「下一個」");
+    assert_eq!(h.state().playlist().map(|l| l.len()), Some(1), "播放清單不變");
+    // 換回「自動」（yt-dlp 挑的）：一樣不再問
+    pick_site_quality(&mut h, "自動（最高）");
+    step_until_net(&mut h, "換回自動", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page)
+            && s.net
+                .as_ref()
+                .is_some_and(|n| n.choice == vitascope::ytdl::plan::Choice::Default)
+    });
+    assert_eq!(fake.calls(), 1);
+    // 載入中按了播放（重開時設好了暫停）：載入完成時不再暫停回去。
+    // 播放清單的設定改成整個清單之後換畫質：重開的還是這部影片（不問 yt-dlp 播放清單）
+    h.state_mut()
+        .change_net(|n| n.list_mode = vitascope::ytdl::ListMode::Playlist);
+    step_until_net(&mut h, "還是暫停", |app| app.player().state.paused);
+    pick_site_quality(&mut h, "360p · AVC");
+    h.state_mut().player_mut().set_pause(false).unwrap();
+    step_until_net(&mut h, "又換成 360p", |app| {
+        playing_format(app, &page, "lo") && app.player().state.loaded
+    });
+    // 載入完成時的還原做完（字幕還原成日文）之後
+    step_until_net(&mut h, "還原日文字幕", |app| {
+        app.player()
+            .state
+            .selected(TrackKind::Sub)
+            .and_then(|t| t.lang.as_deref())
+            == Some("ja")
+    });
+    h.run_steps(3);
+    assert_eq!(
+        h.state().player().get_string("pause").unwrap(),
+        "no",
+        "載入中按了播放：照使用者的"
+    );
+    assert_eq!(fake.calls(), 1, "換畫質不因為播放清單的設定再問 yt-dlp");
+    assert!(fake.requests().iter().all(|r| !r.playlist));
+    assert_eq!(h.state().playlist().map(|l| l.len()), Some(1));
+    site_page_never_fetched(&server);
+}
+
+/// 剛改長寬比（接下來一小段時間的 VideoReconfig 會調整視窗高度）就換畫質：送出開新檔之後、新檔案的 StartFile 之前
+/// 才收到的 VideoReconfig 是舊檔案的（很慢的電腦上會分在不同批），不拿來調整視窗。macOS CI 上發生過
+#[test]
+fn stale_video_reconfig_during_a_quality_switch_does_not_refit() {
+    if !has_net_samples("stale_video_reconfig_during_a_quality_switch_does_not_refit") {
+        return;
+    }
+    let server = Server::start();
+    let (mut h, _fake, page) = playing_two_qualities(&server, no_auto_next());
+    wait_window_fit(&mut h);
+    h.key_press(egui::Key::A);
+    h.step();
+    assert_eq!(h.state().geometry().aspect, Some(0));
+    // 改長寬比之後的 VideoReconfig 照規則調整視窗；等它做完
+    step_until_app(&mut h, "改長寬比的 VideoReconfig", |app| {
+        app.player()
+            .get_string("video-aspect-override")
+            .is_ok_and(|v| v.starts_with("1.77"))
+            && !app.window_fit_pending()
+    });
+    // 對照：還沒換畫質時，這段時間內的 VideoReconfig 會調整視窗（不然下面的檢查沒有意義）
+    h.state_mut().deliver_player_event(PlayerEvent::VideoReconfig);
+    assert!(h.state().window_fit_pending(), "改長寬比之後的 VideoReconfig 調整視窗");
+    step_until_app(&mut h, "調整完", |app| !app.window_fit_pending());
+
+    pick_site_quality(&mut h, "360p · AVC");
+    assert!(h.state().player().loading_now(), "送出了開新檔");
+    assert!(!h.state().player().state.loading, "新檔案的 StartFile 還沒處理");
+    h.state_mut().deliver_player_event(PlayerEvent::VideoReconfig);
+    assert!(
+        !h.state().window_fit_pending(),
+        "換畫質途中舊檔案的 VideoReconfig 不調整視窗"
+    );
+    let mut seen = Seen::default();
+    seen.record(&h);
+    step_until_seen(&mut h, &mut seen, "換成 360p", |app| playing_format(app, &page, "lo"));
+    h.run_steps(3);
+    seen.record(&h);
+    assert_eq!(seen.sizes, Vec::<egui::Vec2>::new(), "換畫質不調整視窗大小");
+    assert_eq!(h.state().geometry().aspect, Some(0), "長寬比保留");
+}
+
+/// 網站影片 ▸ 預設畫質（存檔；正在播「自動」時照新的預設換，不用再問 yt-dlp）、只播聲音、複製網址、在瀏覽器開啟
+#[test]
+fn site_menu_default_quality_audio_only_copy_and_browser() {
+    if !has_net_samples("site_menu_default_quality_audio_only_copy_and_browser") {
+        return;
+    }
+    let server = Server::start();
+    let dir = TempDir::new("site-menu");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let (mut h, fake, page) = playing_two_qualities(&server, settings);
+    // 字幕關掉：換畫質之後還是關著（不然開檔時會照一般的規則選一條）
+    h.state_mut().player_mut().select_track(TrackKind::Sub, None).unwrap();
+    step_until_app(&mut h, "關掉字幕", |app| {
+        app.player().get_string("sid").is_ok_and(|v| v == "no")
+    });
+    use vitascope::ytdl::{SiteQuality, plan::Choice};
+    let auto = |app: &VitascopeApp| {
+        app.player()
+            .state
+            .net
+            .as_ref()
+            .is_some_and(|n| n.choice == Choice::Default)
+    };
+    // 預設畫質 ▸ 最高 360p：存檔，正在播的「自動」換成 360p（從格式清單挑，不再問 yt-dlp）
+    pick_default_quality(&mut h, "最高 360p");
+    assert_eq!(h.state().settings().net.quality, SiteQuality::P360);
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["net"]["quality"], "p360");
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "照新的預設換成 360p", |app| {
+        playing_format(app, &page, "lo") && app.player().state.loaded
+    });
+    assert_eq!(seen.osd, ["預設畫質：最高 360p"]);
+    assert_eq!(h.state().player().get_string("sid").unwrap(), "no", "字幕還是關著");
+    assert_eq!(fake.calls(), 1);
+    // 還是「自動」：選單上勾「自動（最高 360p）」，再改預設畫質也跟著換
+    assert!(auto(h.state()), "照預設畫質挑的還是「自動」");
+    open_site_menu(&mut h);
+    hover_menu_item(&mut h, "選擇畫質");
+    wait_menu_item(&mut h, "自動（最高 360p）");
+    assert_eq!(
+        h.get_by_label("自動（最高 360p）").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    assert_eq!(
+        h.get_by_label("360p · AVC").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    pick_default_quality(&mut h, "最高 720p");
+    step_until_net(&mut h, "照新的預設換回 720p", |app| {
+        playing_format(app, &page, "hi") && app.player().state.loaded && auto(app)
+    });
+    assert_eq!(fake.calls(), 1);
+    // 自己選了畫質：改預設畫質只存檔，這部影片不換
+    pick_site_quality(&mut h, "360p · AVC");
+    step_until_net(&mut h, "選 360p", |app| {
+        playing_format(app, &page, "lo") && app.player().state.loaded
+    });
+    assert!(!auto(h.state()));
+    let hi_requests = server.requests_to("/f/common/mp4_long.mp4?q=hi").len();
+    pick_default_quality(&mut h, "最高 1080p");
+    assert_eq!(h.state().settings().net.quality, SiteQuality::P1080);
+    assert_eq!(h.state().osd_text(), Some("預設畫質：最高 1080p"));
+    // 重開的話選的那一幀就送出開檔了
+    assert!(!h.state().player().loading_now(), "自己選的畫質不換：沒有重開");
+    wait_real(&mut h, 1.0);
+    assert!(playing_format(h.state(), &page, "lo"), "自己選的畫質不換");
+    assert!(h.state().player().state.loaded);
+    assert_eq!(
+        server.requests_to("/f/common/mp4_long.mp4?q=hi").len(),
+        hi_requests,
+        "沒有重開"
+    );
+    // 只播聲音：沒有影像，讀的是聲音的格式
+    open_site_menu(&mut h);
+    h.get_by_label("只播聲音").click();
+    h.step();
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "只播聲音", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.as_ref().is_some_and(|n| n.audio_only)
+    });
+    assert!(fetched(&server, "/f/net/audio_only.m4a"));
+    assert_eq!(seen.osd, ["只播聲音：開啟"]);
+    assert_eq!(fake.calls(), 1, "只播聲音也用之前的格式清單");
+    // 預設畫質是只播聲音時取消「只播聲音」：改播最高的畫質（「自動」也只有聲音）
+    pick_default_quality(&mut h, "只播聲音");
+    assert_eq!(h.state().settings().net.quality, SiteQuality::AudioOnly);
+    open_site_menu(&mut h);
+    h.get_by_label("只播聲音").click();
+    h.step();
+    step_until_net(&mut h, "取消只播聲音", |app| {
+        playing_format(app, &page, "hi") && app.player().state.loaded
+    });
+    assert!(!auto(h.state()));
+    assert_eq!(fake.calls(), 1);
+    // 複製網址、在瀏覽器開啟：網頁的網址
+    open_site_menu(&mut h);
+    h.get_by_label("複製網址").click();
+    h.step();
+    let copied = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .any(|c| matches!(c, egui::OutputCommand::CopyText(t) if *t == page));
+    assert!(copied, "{:?}", h.output().platform_output.commands);
+    assert_eq!(h.state().osd_text(), Some("已複製網址"));
+    open_site_menu(&mut h);
+    h.get_by_label("在瀏覽器開啟").click();
+    h.step();
+    let opened = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .any(|c| matches!(c, egui::OutputCommand::OpenUrl(u) if u.url == page));
+    assert!(opened, "{:?}", h.output().platform_output.commands);
+    site_page_never_fetched(&server);
+}
+
+/// 「網站影片 ▸」只在播網站影片時出現；一般的網址、本機檔案沒有
+#[test]
+fn site_menu_only_for_site_videos() {
+    let server = Server::start();
+    let mut h = harness(None);
+    h.step();
+    let url = server.file_url("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &url) && s.video_size.is_some()
+    });
+    h.run_steps(5);
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("音效");
+    assert!(h.query_by_label_contains("網站影片").is_none());
+}
+
+/// 沒有 yt-dlp、關掉了 yt-dlp：起始畫面說明原因，「網路設定…」打開「設定 → 網路」（找不到 yt-dlp、怎麼安裝）；
+/// 在那裡打開「用 yt-dlp 播放網站影片」，再開一次就播
+#[test]
+fn site_video_problems_offer_the_network_settings() {
+    let server = Server::start();
+    let missing = FakeResolver::missing().arc();
+    let mut h = site_harness(&missing, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    h.get_by_label("網站影片（yt-dlp）");
+    // 自動測試不找使用者電腦上的 yt-dlp：找不到、說明怎麼安裝
+    step_until_label(&mut h, "找不到 yt-dlp");
+    assert_eq!(
+        h.query_all_by_label_contains("請安裝 yt-dlp").count(),
+        2,
+        "起始畫面、設定頁都說明怎麼安裝"
+    );
+    h.get_by_label_contains("請安裝 deno");
+    site_page_never_fetched(&server);
+
+    // 關掉了：說明在設定裡關掉了；打開之後再開一次就播
+    if !has_net_samples("site_video_problems_offer_the_network_settings") {
+        return;
+    }
+    let page = server.url("/watch?v=vid1");
+    let fake = FakeResolver::json(support::fake_ytdl::site_video_json(&server.url(""), &page, "vid1")).arc();
+    let mut settings = no_auto_next();
+    settings.net.ytdl = false;
+    let mut h = site_harness(&fake, settings);
+    h.step();
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "網站影片需要 yt-dlp（已在「設定 → 網路」關閉）");
+    h.get_by_label_contains("打開「用 yt-dlp 播放網站影片」");
+    assert_eq!(fake.calls(), 0);
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    click_in_view(&mut h, "用 yt-dlp 播放網站影片");
+    assert!(h.state().settings().net.ytdl);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "打開之後就播", |app| {
+        playing_url(&app.player().state, &page)
+    });
+    assert_eq!(fake.calls(), 1);
+    site_page_never_fetched(&server);
+}
+
+/// 其他網頁（不是已知的影片網站）打不開、又沒有 yt-dlp：說明裡提一句要 yt-dlp，起始畫面也有「網路設定…」
+#[test]
+fn web_page_without_ytdl_offers_the_network_settings() {
+    let server = Server::start();
+    let missing = FakeResolver::missing().arc();
+    let resolver: Arc<dyn Resolve> = missing.clone();
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: Vec::new(),
+            ..Options::headless()
+        },
+        Launch::default(),
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(server.url("/html")));
+    step_until_label(&mut h, "（網站上的影片要用 yt-dlp 播放）");
+    assert!(!h.state().player().state.net_need_ytdl, "不是已知的影片網站");
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    h.get_by_label("網站影片（yt-dlp）");
+    step_until_label(&mut h, "找不到 yt-dlp");
+}
+
+/// 「設定 → 網路」的網站影片：找 yt-dlp 的時候顯示「搜尋中…」，找到後顯示版本與來源（沒有 deno 時說明）；
+/// 選擇檔案（Windows 只能選 .exe；只看路徑，在不在由背景確認）、改用自動找到的；預設畫質、編碼、Cookie、字幕、
+/// 播放清單的設定下一次解析就用
+#[test]
+fn network_page_ytdl_section() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use vitascope::ytdl::{Located, Locator, SearchEnv, Source, Tools, Version};
+    let gate = Arc::new(AtomicBool::new(false));
+    let open = gate.clone();
+    let locator = Locator::with_finder(
+        None,
+        Arc::new(move |env: &SearchEnv| {
+            let until = Instant::now() + Duration::from_secs(60);
+            while !open.load(Ordering::SeqCst) && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut t = Tools::none(env);
+            let chosen = env.user_path.as_ref().map(|p| p.to_string_lossy().into_owned());
+            match chosen.as_deref() {
+                // 指定的檔案不見了，也沒有別的
+                Some(p) if p.contains("gone") => return t,
+                // 指定的檔案不能用：改用自動找到的（很舊的版本、太舊的 deno）
+                Some(p) if p.contains("broken") => {
+                    t.ytdl = Some(Located::new("/usr/bin/yt-dlp", Source::System));
+                    t.ytdl_version = Version::parse("2020.01.01");
+                    t.deno_too_old = Some((
+                        PathBuf::from("/usr/bin/deno"),
+                        vitascope::ytdl::locate::DenoVersion::parse("deno 2.1.0 (stable)").unwrap(),
+                    ));
+                    return t;
+                }
+                Some(p) => t.ytdl = Some(Located::new(p, Source::UserPath)),
+                None => t.ytdl = Some(Located::new("/usr/bin/yt-dlp", Source::System)),
+            }
+            t.ytdl_version = Version::parse("2026.08.19");
+            t
+        }),
+    );
+    let dir = TempDir::new("ytdl-section");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch {
+            ytdl: Some(locator.clone()),
+            ..Default::default()
+        },
+        settings,
+    );
+    h.step();
+    assert!(!locator.started(), "打開設定頁之前不找");
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp：搜尋中…");
+    gate.store(true, Ordering::SeqCst);
+    step_until_label(&mut h, "yt-dlp 2026.08.19（另外安裝的）");
+    h.get_by_label("沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質");
+
+    // 選擇檔案：存進設定、重新找，用指定的那一個
+    let chosen = if cfg!(windows) {
+        PathBuf::from(r"C:\tools\yt-dlp.exe")
+    } else {
+        PathBuf::from("/opt/tools/yt-dlp")
+    };
+    let answer = chosen.clone();
+    let seen = record_dialogs(&mut h, move |_| Some(vec![answer.clone()]));
+    click_in_view(&mut h, "選擇檔案…");
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::YtdlPath, Pick::File)]);
+    assert_eq!(h.state().settings().net.ytdl_path.as_deref(), Some(chosen.as_path()));
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["net"]["ytdl_path"], chosen.to_string_lossy().as_ref());
+    step_until_label(&mut h, "yt-dlp 2026.08.19（指定的檔案）");
+    // 只看路徑就知道不能用的：不存、說明原因
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![PathBuf::from("bin/yt-dlp")]);
+    h.run_steps(2);
+    h.get_by_label("要選完整的路徑");
+    if cfg!(windows) {
+        h.state_mut()
+            .on_dialog_result(DialogKind::YtdlPath, vec![PathBuf::from(r"C:\tools\yt-dlp.cmd")]);
+        h.run_steps(2);
+        h.get_by_label("請選 yt-dlp 的執行檔（.exe），不能用指令檔");
+    }
+    assert_eq!(h.state().settings().net.ytdl_path.as_deref(), Some(chosen.as_path()));
+    // 指定的檔案不能用（背景確認的）：說明改用自動找到的；很久沒更新的 yt-dlp、太舊的 deno 也說明
+    let other = |name: &str| {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\tools\{name}\yt-dlp.exe"))
+        } else {
+            PathBuf::from(format!("/opt/{name}/yt-dlp"))
+        }
+    };
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![other("broken")]);
+    step_until_label(&mut h, "指定的檔案不存在或不能執行，改用自動找到的");
+    h.get_by_label("yt-dlp 2020.01.01（另外安裝的）");
+    h.get_by_label_contains("這個 yt-dlp 已經");
+    h.get_by_label("deno 2.1.0 太舊（要 2.3 以上），YouTube 只有部分畫質");
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![other("gone")]);
+    step_until_label(&mut h, "找不到 yt-dlp（指定的檔案不存在或不能執行）");
+    h.state_mut()
+        .on_dialog_result(DialogKind::YtdlPath, vec![chosen.clone()]);
+    step_until_label(&mut h, "yt-dlp 2026.08.19（指定的檔案）");
+    assert!(h.query_by_label_contains("指定的檔案不存在").is_none());
+    click_in_view(&mut h, "改用自動找到的");
+    assert_eq!(h.state().settings().net.ytdl_path, None);
+    assert!(h.query_by_label("要選完整的路徑").is_none());
+    step_until_label(&mut h, "yt-dlp 2026.08.19（另外安裝的）");
+
+    // 網站影片的偏好
+    combo_in_view(&mut h, "預設畫質");
+    h.get_by_label("最高 720p").click();
+    h.run_steps(2);
+    combo_in_view(&mut h, "影像編碼");
+    h.get_by_label("H.264 優先（相容性最好）").click();
+    h.run_steps(2);
+    combo_in_view(&mut h, "瀏覽器的 Cookie");
+    h.get_by_label("Firefox").click();
+    h.run_steps(2);
+    click_in_view(&mut h, "也載入自動產生的字幕");
+    click_in_view(&mut h, "整個播放清單");
+    let net = h.state().settings().net.clone();
+    assert_eq!(net.quality, vitascope::ytdl::SiteQuality::P720);
+    assert_eq!(net.codec, vitascope::ytdl::CodecPref::H264);
+    assert_eq!(net.cookies_from, Some(vitascope::ytdl::Browser::Firefox));
+    assert!(net.auto_subs);
+    assert_eq!(net.list_mode, vitascope::ytdl::ListMode::Playlist);
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved["net"]["cookies_from"], "firefox");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    let server = Server::start();
+    h.event(egui::Event::Paste(server.url("/watch?v=prefs")));
+    step_until_label(&mut h, "無法播放網站影片");
+    let req = fake.requests().pop().expect("問了 yt-dlp");
+    assert_eq!(req.quality, vitascope::ytdl::SiteQuality::P720);
+    assert_eq!(req.codec, vitascope::ytdl::CodecPref::H264);
+    assert_eq!(req.cookies_from, Some(vitascope::ytdl::Browser::Firefox));
+    assert!(req.subs && req.auto_subs && req.playlist);
+    site_page_never_fetched(&server);
+}
+
+// ───────────── 影戲下載 yt-dlp、deno（本機的測試伺服器當成 GitHub；不連到真的 GitHub、不執行任何程式） ─────────────
+
+/// 只看工具資料夾的尋找：影戲下載的 yt-dlp 的第一行當成版本（`release::fake_ytdl`），有 deno 就當成 2.9.7。
+/// 不執行任何程式、不找使用者電腦上的
+fn tools_locator(tools: PathBuf) -> vitascope::ytdl::Locator {
+    use vitascope::ytdl::locate::{Deno, DenoVersion};
+    use vitascope::ytdl::{Located, SearchEnv, Source, Tools, Version};
+    vitascope::ytdl::Locator::with_finder(
+        Some(tools),
+        Arc::new(|env: &SearchEnv| {
+            let mut t = Tools::none(env);
+            if let Some(p) = env.managed_ytdl().filter(|p| p.is_file()) {
+                t.ytdl_version = std::fs::read(&p)
+                    .ok()
+                    .and_then(|b| Version::parse(&String::from_utf8_lossy(&b[..b.len().min(64)])));
+                t.ytdl = Some(Located::new(p, Source::Managed));
+            }
+            if let Some(p) = env.managed_deno().filter(|p| p.is_file()) {
+                t.deno = Some(Deno {
+                    path: p,
+                    version: DenoVersion::parse("deno 2.9.7").unwrap(),
+                    managed: true,
+                });
+            }
+            t
+        }),
+    )
+}
+
+/// 網站影片 + 能下載 yt-dlp、deno：測試伺服器同時是影片網站與假的 GitHub，工具資料夾是暫存的
+fn tools_harness(
+    fake: &Arc<FakeResolver>,
+    server: &Server,
+    tools: &std::path::Path,
+    installer: bool,
+    settings: Settings,
+) -> Harness<'static, VitascopeApp> {
+    tools_harness_with(
+        fake,
+        server,
+        tools_locator(tools.to_path_buf()),
+        tools,
+        installer,
+        settings,
+    )
+}
+
+/// 同 `tools_harness`，用給的 `Locator`（測試自己留一份，可以等背景的尋找做完）
+fn tools_harness_with(
+    fake: &Arc<FakeResolver>,
+    server: &Server,
+    locator: vitascope::ytdl::Locator,
+    tools: &std::path::Path,
+    installer: bool,
+    settings: Settings,
+) -> Harness<'static, VitascopeApp> {
+    use vitascope::ytdl::install::Installer;
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch {
+            ytdl: Some(locator),
+            installer: installer.then(|| Arc::new(Installer::with_base(tools.to_path_buf(), &server.url("")))),
+            ..Default::default()
+        },
+        settings,
+    )
+}
+
+/// 工具資料夾裡下載到一半的暫存檔
+fn partial_downloads(tools: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(tools)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".vitascope-download"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 往 GitHub（測試伺服器上的假發佈）的請求
+fn release_requests(server: &Server) -> Vec<String> {
+    server
+        .requests()
+        .into_iter()
+        .map(|r| r.path)
+        .filter(|p| p.contains("/releases/"))
+        .collect()
+}
+
+/// 沒有 yt-dlp：起始畫面有「下載 yt-dlp…」，先問過（來源、大小、放在哪裡；Esc 不下載、也不連網），
+/// 同意後下載、核對，做完再開一次那個網址就播
+#[test]
+fn missing_ytdl_is_downloaded_on_request_and_the_video_plays() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("get-ytdl");
+    let tools = dir.0.join("tools");
+    let content = support::release::fake_ytdl("2026.10.01", 300_000);
+    support::release::publish_ytdl(&server, "2026.10.01", &content, None);
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    let json = long_site_json(&server.url(""));
+    let have = ytdl.clone();
+    let fake = FakeResolver::new(move |_, _| {
+        if have.is_file() {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Missing.into())
+        }
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    // 能下載：按鈕取代「請安裝…」的說明；「網路設定…」還在
+    assert!(h.query_by_label_contains("請安裝 yt-dlp").is_none());
+    h.get_by_label("網路設定…");
+    h.get_by_label("下載 yt-dlp…").click();
+    h.run_steps(2);
+    h.get_by_label("下載 yt-dlp？");
+    let (mb, _) = Tool::Ytdl.sizes_mb(Os::current());
+    h.get_by_label_contains(&format!("github.com/yt-dlp/yt-dlp）下載最新版的 yt-dlp，約 {mb} MB"));
+    h.get_by_label(tools.display().to_string().as_str());
+    // 對話框開著：按鍵不會傳到播放器；Esc 只關對話框、不下載
+    assert!(release_requests(&server).is_empty(), "問之前不連網");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("下載 yt-dlp？").is_none());
+    h.run_steps(5);
+    assert!(release_requests(&server).is_empty(), "取消了：不連網");
+    assert!(!h.state().install_running());
+    // 同意：下載、做完再開一次
+    h.get_by_label("下載 yt-dlp…").click();
+    h.run_steps(2);
+    h.get_by_label("下載").click();
+    h.run_steps(2);
+    step_until_net(&mut h, "下載好、再開一次網址就播", |app| {
+        playing_url(&app.player().state, &page)
+    });
+    assert_eq!(std::fs::read(&ytdl).unwrap(), content);
+    assert!(partial_downloads(&tools).is_empty());
+    assert_eq!(fake.calls(), 2, "下載前一次、下載後再開一次");
+    // 設定頁：找到影戲下載的那一份，可以更新、移除
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp 2026.10.01（影戲下載的）");
+    h.get_by_label("立即更新");
+    h.get_by_label("移除…");
+    assert!(h.query_by_label_contains("下載 yt-dlp（約").is_none());
+}
+
+/// 網站影片因為 yt-dlp 太舊播不了：影戲下載的那一份直接「更新 yt-dlp 再試一次」（不另外問，也不寫 `yt-dlp -U` 的說明），
+/// 更新後再開一次就播。播放中「網站影片 ▸ 更新 yt-dlp」：已經是最新版就不下載
+#[test]
+fn outdated_managed_ytdl_updates_and_tries_again() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("update-ytdl");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    std::fs::write(&ytdl, support::release::fake_ytdl("2026.01.01", 1000)).unwrap();
+    let newer = support::release::fake_ytdl("2026.10.01", 200_000);
+    support::release::publish_ytdl(&server, "2026.10.01", &newer, None);
+    let json = long_site_json(&server.url(""));
+    let file = ytdl.clone();
+    let fake = FakeResolver::new(move |_, _| {
+        let now = std::fs::read(&file).unwrap_or_default();
+        if now.starts_with(b"2026.10.01") {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Outdated.into())
+        }
+    })
+    .arc();
+    let locator = tools_locator(tools.clone());
+    let mut h = tools_harness_with(&fake, &server, locator.clone(), &tools, true, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "無法播放網站影片：無法取得影片（yt-dlp 可能需要更新）");
+    step_until_label(&mut h, "更新 yt-dlp 再試一次");
+    assert!(
+        h.query_by_label_contains("yt-dlp -U").is_none(),
+        "影戲下載的：按鈕取代說明"
+    );
+    // 剛下載（檔案時間是現在）：版本雖然舊，不提醒「很久沒更新」
+    assert!(h.query_by_label_contains("天沒更新").is_none());
+    h.get_by_label("更新 yt-dlp 再試一次").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("下載 yt-dlp？").is_none(), "更新不另外問");
+    step_until_net(&mut h, "更新後再開一次就播", |app| {
+        playing_url(&app.player().state, &page)
+    });
+    assert_eq!(std::fs::read(&ytdl).unwrap(), newer);
+    assert_eq!(fake.calls(), 2);
+    // 更新之後在背景重新找 yt-dlp：找完、知道現在是新版之後才按「更新 yt-dlp」（還在找的時候讀到的是更新前的版本，
+    // 會再下載一次；CI 上找得比較慢）
+    let found = locator.wait(NET_TIMEOUT).and_then(|t| t.ytdl_version);
+    assert_eq!(found.map(|v| v.to_string()).as_deref(), Some("2026.10.01"));
+    h.step();
+
+    // 播放中：網站影片 ▸ 更新 yt-dlp（影戲下載的才有）；已經是最新版：不下載
+    let asset = support::release::download_path(Tool::Ytdl, "2026.10.01", support::release::asset(Tool::Ytdl));
+    let downloads = |s: &Server| s.requests().iter().filter(|r| r.path == asset).count();
+    assert_eq!(downloads(&server), 1);
+    open_site_menu(&mut h);
+    hover_menu_item(&mut h, "更新 yt-dlp");
+    h.get_by_label("更新 yt-dlp").click();
+    h.step();
+    // 在背景查最新版（本機的假 GitHub）：等做完、看做完時的提示
+    let mut seen = Seen::default();
+    step_until_seen(&mut h, &mut seen, "檢查完", |app| !app.install_running());
+    run_steps_seen(&mut h, &mut seen, 2);
+    assert_eq!(
+        seen.last_osd(),
+        Some("yt-dlp 已經是最新版（2026.10.01）"),
+        "{:?}",
+        seen.osd
+    );
+    assert_eq!(downloads(&server), 1, "已經是最新版：不下載");
+    assert!(playing_url(&h.state().player().state, &page), "不影響播放");
+}
+
+/// 影戲下載的 yt-dlp 超過 30 天沒更新（版本舊、檔案的時間也舊）：網站影片播不了時、設定頁都提醒，
+/// 「立即更新」查過已經是最新版之後就不再提醒（檔案的時間更新）。沒有下載的方法時照舊寫怎麼更新
+#[test]
+fn stale_managed_ytdl_is_reminded() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("stale-ytdl");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    std::fs::write(&ytdl, support::release::fake_ytdl("2020.01.01", 1000)).unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(90 * 86_400);
+    std::fs::File::options()
+        .write(true)
+        .open(&ytdl)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    // 網站最新的就是這一版（yt-dlp 偶爾很久才發佈一次）
+    support::release::publish_ytdl(
+        &server,
+        "2020.01.01",
+        &support::release::fake_ytdl("2020.01.01", 1000),
+        None,
+    );
+    let fake = FakeResolver::fail(YtdlError::NotABot.into()).arc();
+
+    // 沒有下載的方法：說明怎麼更新（Remedy::UpdateYtdl），沒有按鈕
+    let mut h = tools_harness(&fake, &server, &tools, false, no_auto_next());
+    h.step();
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp 2020.01.01（影戲下載的）");
+    h.get_by_label_contains("請更新 yt-dlp（yt-dlp -U");
+    assert!(h.query_by_label("立即更新").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "無法播放網站影片：網站要求確認不是機器人");
+    step_until_label(&mut h, "影戲下載的 yt-dlp 已經");
+    assert!(h.query_by_label("更新 yt-dlp 再試一次").is_none());
+    drop(h);
+
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "無法播放網站影片：網站要求確認不是機器人");
+    // 原因的建議（Cookie）照舊，多一句很久沒更新、可以更新再試一次
+    step_until_label(&mut h, "天沒更新，網站改版後可能播不了");
+    h.get_by_label_contains("在「設定 → 網路」選擇從瀏覽器讀 Cookie");
+    h.get_by_label("更新 yt-dlp 再試一次");
+    h.get_by_label("網路設定…").click();
+    h.run_steps(3);
+    step_until_label(&mut h, "yt-dlp 2020.01.01（影戲下載的）");
+    h.get_by_label_contains("可以按「立即更新」");
+    assert!(release_requests(&server).is_empty(), "提醒不連網");
+    click_in_view(&mut h, "立即更新");
+    step_until_app(&mut h, "檢查完", |app| {
+        app.osd_text() == Some("yt-dlp 已經是最新版（2020.01.01）")
+    });
+    // 檢查過了：不再提醒。檢查完會重新找 yt-dlp，找的時候設定頁先不畫這一段（提醒也看不到）：
+    // 看的是找完之後才畫的那一幀
+    let start = Instant::now();
+    loop {
+        let searched = !h.state().ytdl_locator().searching();
+        h.step();
+        if searched && h.query_by_label_contains("可以按「立即更新」").is_none() {
+            break;
+        }
+        assert!(start.elapsed() < NET_TIMEOUT, "還在提醒");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let touched = std::fs::metadata(&ytdl).unwrap().modified().unwrap();
+    assert!(touched > long_ago + Duration::from_secs(86_400));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("天沒更新").is_none());
+    assert!(h.query_by_label("更新 yt-dlp 再試一次").is_none());
+}
+
+/// 「設定 → 網路」：沒有 deno 時「下載 deno（約 N MB）…」，先問過（寫解開後的大小）；下載中有進度、可以取消
+/// （不留下暫存檔）；失敗時寫原因；下載好之後可以移除（先確認）
+#[test]
+fn network_page_downloads_cancels_and_removes_deno() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("get-deno");
+    let tools = dir.0.join("tools");
+    // 壓縮不了的 2 MB：zip 也是 2.0 MB，送到 1 MB 停住，進度的數字是確定的
+    let exe = incompressible(2 << 20);
+    let zip = support::release::deno_zip(&exe);
+    assert_eq!(format!("{:.1}", zip.len() as f64 / 1048576.0), "2.0");
+    support::release::publish_deno(&server, "v2.9.7", &zip);
+    let zip_path = support::release::download_path(Tool::Deno, "v2.9.7", support::release::asset(Tool::Deno));
+    // 送到一半就停住
+    server.put(&zip_path, support::http::Canned::ok(zip.clone()).stall_after(1 << 20));
+    let fake = FakeResolver::fail(YtdlError::Unsupported.into()).arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質");
+    let (mb, disk) = Tool::Deno.sizes_mb(Os::current());
+    let button = format!("下載 deno（約 {mb} MB）…");
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載 deno？");
+    h.get_by_label_contains(&format!("解開後約 {disk} MB"));
+    h.get_by_label("下載").click();
+    h.run_steps(2);
+    // 收到一半：已收到、總共（zip 的大小）
+    step_until_label(&mut h, "下載 deno：1.0 / 2.0 MB");
+    assert!(h.state().install_running());
+    assert!(
+        h.query_by_label(&button)
+            .is_none_or(|b| b.accesskit_node().is_disabled()),
+        "下載中不能再按"
+    );
+    // 進度在設定頁的捲動區裡：先捲到看得見（字型不同時版面高度不同）
+    click_in_view(&mut h, "取消下載");
+    step_until_net(&mut h, "取消了", |app| !app.install_running());
+    assert_eq!(h.state().osd_text(), Some("已取消下載"));
+    let deno = tools.join(Tool::Deno.file_name(Os::current()));
+    assert!(!deno.exists());
+    assert!(partial_downloads(&tools).is_empty(), "{:?}", partial_downloads(&tools));
+
+    // 被改過的檔案（檢查碼不符）：寫出原因，不留下檔案
+    server.put(
+        &zip_path,
+        support::http::Canned::ok(support::release::deno_zip(b"tampered")),
+    );
+    // 做完會重新找 yt-dlp、deno：找完（按鈕回來）才按
+    step_until_label(&mut h, &button);
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載").click();
+    step_until_label(&mut h, "無法下載 deno：下載的檔案檢查失敗（雜湊不符），已刪除");
+    assert!(!deno.exists());
+
+    // 正常的：下載、解開，找到影戲下載的 deno；可以移除
+    server.put(&zip_path, support::http::Canned::ok(zip.clone()));
+    // 做完會重新找 yt-dlp、deno：找完（按鈕回來）才按
+    step_until_label(&mut h, &button);
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載").click();
+    // 提示在下載做完時出現，設定頁的這一行要等重新找完：CI 上可能比提示的 1.5 秒久，等的時候每一幀記下來
+    let mut seen = Seen::default();
+    step_until_label_seen(&mut h, &mut seen, "JavaScript 執行環境（YouTube 需要）：deno 2.9.7");
+    assert!(
+        h.query_by_label_contains("無法下載 deno").is_none(),
+        "成功之後不再寫上次的失敗"
+    );
+    assert_eq!(std::fs::read(&deno).unwrap(), exe);
+    assert_eq!(seen.last_osd(), Some("已下載 deno 2.9.7"));
+    click_in_view(&mut h, "移除 deno…");
+    h.get_by_label("移除影戲下載的 deno？");
+    h.get_by_label("移除").click();
+    let mut seen = Seen::default();
+    step_until_label_seen(
+        &mut h,
+        &mut seen,
+        "沒有 deno（JavaScript 執行環境）：YouTube 只有部分畫質",
+    );
+    assert!(!deno.exists());
+    assert_eq!(seen.last_osd(), Some("已移除影戲下載的 deno"));
+}
+
+/// 英文介面：起始畫面的按鈕、同意下載的對話框
+#[test]
+fn download_dialog_in_english() {
+    let server = Server::start();
+    let dir = TempDir::new("get-en");
+    let tools = dir.0.join("tools");
+    let fake = FakeResolver::missing().arc();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = tools_harness(&fake, &server, &tools, true, settings);
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=x")));
+    step_until_label(&mut h, "Website videos need yt-dlp");
+    h.get_by_label("Download yt-dlp…").click();
+    h.run_steps(2);
+    h.get_by_label("Download yt-dlp?");
+    h.get_by_label_contains("Downloads the latest yt-dlp from GitHub (github.com/yt-dlp/yt-dlp)");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Download yt-dlp?").is_none());
+    assert!(release_requests(&server).is_empty());
+}
+
+/// 壓縮不了的內容（下載的進度跟 zip 的大小一樣）
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// 起始畫面按的下載：進度與「取消下載」畫在起始畫面（只有一份）；檢查碼不符時在起始畫面寫原因，
+/// 開了別的網址就不再寫。等的時候使用者開了別的檔案在播：做完不搶（不再開一次播不了的網址）
+#[test]
+fn start_screen_download_progress_cancel_and_failure() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("start-get-ytdl");
+    let tools = dir.0.join("tools");
+    // 2 MB：送到 1 MB 停住，進度的數字是確定的
+    let content = support::release::fake_ytdl("2026.10.01", 2 << 20);
+    support::release::publish_ytdl(&server, "2026.10.01", &content, None);
+    let asset = support::release::download_path(Tool::Ytdl, "2026.10.01", support::release::asset(Tool::Ytdl));
+    server.put(&asset, support::http::Canned::ok(content.clone()).stall_after(1 << 20));
+    let ytdl = tools.join(Tool::Ytdl.file_name(Os::current()));
+    let json = long_site_json(&server.url(""));
+    let have = ytdl.clone();
+    let fake = FakeResolver::new(move |_, _| {
+        if have.is_file() {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Missing.into())
+        }
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    let page = server.url("/watch?v=a");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    let download = |h: &mut Harness<'_, VitascopeApp>| {
+        h.get_by_label("下載 yt-dlp…").click();
+        h.run_steps(2);
+        h.get_by_label("下載").click();
+        h.run_steps(2);
+    };
+    download(&mut h);
+    // 進度在起始畫面，只有一份（設定頁沒開）；下載的按鈕換成進度
+    step_until_label(&mut h, "下載 yt-dlp：1.0 / 2.0 MB");
+    h.get_by_label("下載 yt-dlp：1.0 / 2.0 MB");
+    assert!(h.query_by_label("下載 yt-dlp…").is_none());
+    h.get_by_label("取消下載").click();
+    h.run_steps(2);
+    step_until_net(&mut h, "取消了", |app| !app.install_running());
+    assert_eq!(h.state().osd_text(), Some("已取消下載"));
+    assert!(!ytdl.exists());
+    assert!(partial_downloads(&tools).is_empty(), "{:?}", partial_downloads(&tools));
+    assert!(h.query_by_label_contains("無法下載").is_none(), "取消不算失敗");
+    h.get_by_label("下載 yt-dlp…");
+
+    // 被改過的檔案：起始畫面寫原因，可以再試
+    server.put(
+        &asset,
+        support::http::Canned::ok(support::release::fake_ytdl("2026.10.01", 5000)),
+    );
+    download(&mut h);
+    let failed = "無法下載 yt-dlp：下載的檔案檢查失敗（雜湊不符），已刪除";
+    step_until_label(&mut h, failed);
+    h.get_by_label(failed);
+    h.get_by_label("下載 yt-dlp…");
+    assert_eq!(fake.calls(), 1, "失敗了：不再開一次");
+    // 開了別的網址：上一次下載的失敗跟它無關，不再寫
+    let other = server.url("/watch?v=b");
+    h.event(egui::Event::Paste(other.clone()));
+    step_until_net(&mut h, "另一個網址也需要 yt-dlp", |app| {
+        app.player().opening() == Some(other.as_str()) && app.player().state.net_need_ytdl
+    });
+    step_until_label(&mut h, "網站影片需要 yt-dlp");
+    h.run_steps(3);
+    assert!(h.query_by_label(failed).is_none(), "別的網址不寫上一次的失敗");
+
+    // 等正在用 yt-dlp 的程序時，使用者開了本機的檔案在播：做完不搶（不再開一次網址）
+    server.put(&asset, support::http::Canned::ok(content.clone()));
+    let lock = vitascope::ytdl::run::tool_lock(&ytdl);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let held = lock
+        .shared_until(&never, Instant::now() + Duration::from_secs(120))
+        .unwrap();
+    download(&mut h);
+    step_until_label(&mut h, "yt-dlp：等待 yt-dlp 結束…");
+    let calls = fake.calls();
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until(&mut h, "本機的檔案在播", |s| playing(s, "audio_flac.flac"));
+    drop(held);
+    step_until_net(&mut h, "下載好了", |app| !app.install_running());
+    // 重開的話做完的那一幀就送出開檔了（不靠下面等的那幾幀）
+    assert!(!h.state().player().loading_now(), "沒有再開一次網址");
+    assert_eq!(h.state().osd_text(), Some("已下載 yt-dlp 2026.10.01"));
+    assert_eq!(std::fs::read(&ytdl).unwrap(), content);
+    h.run_steps(10);
+    assert!(
+        playing(&h.state().player().state, "audio_flac.flac"),
+        "還在播本機的檔案"
+    );
+    assert_eq!(fake.calls(), calls, "沒有再開一次網址");
+}
+
+/// 網站影片缺 deno：起始畫面「下載 deno…」取代「請安裝 deno」的說明。從設定頁開始下載時，起始畫面不畫按鈕與進度，
+/// 照舊寫說明；取消後按鈕回來
+#[test]
+fn start_screen_offers_deno_and_keeps_the_advice_while_settings_download() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("start-get-deno");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    // 影戲下載的 yt-dlp（剛下載的），沒有 deno
+    std::fs::write(
+        tools.join(Tool::Ytdl.file_name(Os::current())),
+        support::release::fake_ytdl("2026.10.01", 1000),
+    )
+    .unwrap();
+    let zip = support::release::deno_zip(&incompressible(1 << 20));
+    support::release::publish_deno(&server, "v2.9.7", &zip);
+    let zip_path = support::release::download_path(Tool::Deno, "v2.9.7", support::release::asset(Tool::Deno));
+    server.put(
+        &zip_path,
+        support::http::Canned::ok(zip.clone()).stall_after(zip.len() / 2),
+    );
+    let fake = FakeResolver::fail(YtdlError::NeedsJsRuntime.into()).arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=yt")));
+    step_until_label(&mut h, "無法播放網站影片：YouTube 需要 JavaScript 執行環境（deno）");
+    step_until_label(&mut h, "下載 deno…");
+    let advice = "請安裝 deno 2.3 以上";
+    assert!(h.query_by_label_contains(advice).is_none(), "按鈕取代說明");
+    assert!(
+        h.query_by_label("更新 yt-dlp 再試一次").is_none(),
+        "缺 deno：更新 yt-dlp 沒有用"
+    );
+
+    // 從設定頁下載：起始畫面不畫按鈕、不畫進度，說明回來
+    open_settings_page(&mut h, "網路");
+    let (mb, _) = Tool::Deno.sizes_mb(Os::current());
+    // 設定頁的 yt-dlp、deno 在找完之後才畫（找的時候是「搜尋中…」）
+    let button = format!("下載 deno（約 {mb} MB）…");
+    step_until_label(&mut h, &button);
+    click_in_view(&mut h, &button);
+    h.get_by_label("下載").click();
+    h.run_steps(2);
+    // 等到收到一半、停住（進度不再變）：收到回應之前沒有總大小，進度從轉圈換成進度條時「取消下載」換了位置與代號，
+    // 那時候點會點不到（CI 上回應比較慢）
+    let mib = |b: usize| b as f64 / 1048576.0;
+    step_until_label(
+        &mut h,
+        &format!("下載 deno：{:.1} / {:.1} MB", mib(zip.len() / 2), mib(zip.len())),
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert!(h.state().install_running());
+    assert!(h.query_by_label_contains("下載 deno：").is_none(), "進度在設定頁");
+    assert!(h.query_by_label("下載 deno…").is_none());
+    h.get_by_label_contains(advice);
+
+    // 取消後：按鈕回來，說明不寫
+    open_settings_page(&mut h, "網路");
+    click_in_view(&mut h, "取消下載");
+    step_until_net(&mut h, "取消了", |app| !app.install_running());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    h.get_by_label("下載 deno…");
+    assert!(h.query_by_label_contains(advice).is_none());
+    assert!(!tools.join(Tool::Deno.file_name(Os::current())).exists());
+}
+
+/// 錯誤本身看不出原因、但 yt-dlp 的警告說它可能太舊（解不開網站的驗證）：影戲下載的那一份也有「更新 yt-dlp 再試一次」
+#[test]
+fn outdated_warnings_offer_the_update_too() {
+    use vitascope::paths::Os;
+    use vitascope::ytdl::install::Tool;
+    let server = Server::start();
+    let dir = TempDir::new("hint-update");
+    let tools = dir.0.join("tools");
+    std::fs::create_dir_all(&tools).unwrap();
+    std::fs::write(
+        tools.join(Tool::Ytdl.file_name(Os::current())),
+        support::release::fake_ytdl("2026.10.01", 1000),
+    )
+    .unwrap();
+    let fake = FakeResolver::fail(Failure {
+        error: YtdlError::Other("Unable to extract video data".into()),
+        hints: vec![Hint::Outdated],
+    })
+    .arc();
+    let mut h = tools_harness(&fake, &server, &tools, true, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=sig")));
+    step_until_label(&mut h, "無法播放網站影片：yt-dlp：Unable to extract video data");
+    h.get_by_label("yt-dlp 可能需要更新");
+    step_until_label(&mut h, "更新 yt-dlp 再試一次");
+    assert!(
+        h.query_by_label_contains("天沒更新").is_none(),
+        "剛下載的：不是因為很久沒更新"
+    );
+    assert!(release_requests(&server).is_empty(), "只在按下時連網");
+}
+
+/// 自己安裝的 yt-dlp：影戲不更新、不移除（太舊時照舊寫 `yt-dlp -U` 的說明，沒有「更新 yt-dlp 再試一次」；
+/// 設定頁沒有「立即更新」「移除…」；「網站影片 ▸」沒有「更新 yt-dlp」），也不會下載一份蓋過它
+#[test]
+fn user_installed_ytdl_is_never_updated_or_removed() {
+    use vitascope::ytdl::{Located, SearchEnv, Source, Tools, Version};
+    let server = Server::start();
+    let dir = TempDir::new("user-ytdl");
+    let tools = dir.0.join("tools");
+    let locator = vitascope::ytdl::Locator::with_finder(
+        Some(tools.clone()),
+        Arc::new(|env: &SearchEnv| {
+            let mut t = Tools::none(env);
+            t.ytdl = Some(Located::new("/usr/bin/yt-dlp", Source::System));
+            t.ytdl_version = Version::parse("2020.01.01");
+            t
+        }),
+    );
+    let json = long_site_json(&server.url(""));
+    let fake = FakeResolver::new(move |req, _| {
+        if req.url.contains("v=long") {
+            Ok(support::fake_ytdl::resolved(&json, Vec::new()))
+        } else {
+            Err(YtdlError::Outdated.into())
+        }
+    })
+    .arc();
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    let mut h = harness_launch_with(
+        Options {
+            keep_open: true,
+            net_hooks: true,
+            net_resolver: Some(resolver),
+            net_sites: vec!["127.0.0.1".into()],
+            ..Options::headless()
+        },
+        Launch {
+            ytdl: Some(locator),
+            installer: Some(Arc::new(vitascope::ytdl::install::Installer::with_base(
+                tools.clone(),
+                &server.url(""),
+            ))),
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    h.event(egui::Event::Paste(server.url("/watch?v=old")));
+    step_until_label(&mut h, "無法播放網站影片：無法取得影片（yt-dlp 可能需要更新）");
+    h.get_by_label_contains("請更新 yt-dlp（yt-dlp -U");
+    h.run_steps(5);
+    assert!(h.query_by_label("更新 yt-dlp 再試一次").is_none());
+    assert!(h.query_by_label("下載 yt-dlp…").is_none());
+
+    open_settings_page(&mut h, "網路");
+    step_until_label(&mut h, "yt-dlp 2020.01.01（另外安裝的）");
+    h.get_by_label_contains("這個 yt-dlp 已經");
+    assert!(h.query_by_label("立即更新").is_none());
+    assert!(h.query_by_label("移除…").is_none());
+    assert!(h.query_by_label_contains("下載 yt-dlp（約").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    let page = server.url("/watch?v=long");
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "播放中", |app| playing_url(&app.player().state, &page));
+    open_site_menu(&mut h);
+    h.get_by_label("在瀏覽器開啟");
+    assert!(h.query_by_label("更新 yt-dlp").is_none(), "自己安裝的不在這裡更新");
+    assert!(release_requests(&server).is_empty(), "從來沒連到 GitHub");
+    assert!(!tools.exists(), "沒有下載任何東西");
+}
+
+/// 網址含登入資訊（token）時的書籤：只放在記憶體、不寫進 bookmarks.json（跟最近開啟、續播一樣），
+/// 第一個書籤提示一次；一般的網址照常存檔
+#[test]
+fn bookmarks_on_urls_with_sign_in_data_stay_in_memory() {
+    let server = Server::start();
+    let dir = TempDir::new("private-marks");
+    let store = dir.0.join("bookmarks.json");
+    let mut h = harness_launch(
+        Launch {
+            bookmarks: vitascope::bookmarks::Bookmarks::load_from(store.clone()),
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    h.step();
+    let secret = format!("{}?token=abc123", server.file_url("common/mp4_long.mp4"));
+    h.event(egui::Event::Paste(secret.clone()));
+    step_until_net(&mut h, "播網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &secret) && s.seekable && s.video_size.is_some()
+    });
+    h.key_press(egui::Key::Space);
+    step_until_net(&mut h, "暫停", |app| app.player().state.paused);
+    paused_at(&mut h, 10.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("這個網址含登入資訊，書籤只保留到關閉影戲"));
+    paused_at(&mut h, 20.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert!(
+        h.state().osd_text().is_some_and(|t| t.starts_with("新增書籤")),
+        "只提示一次：{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().bookmarks().marks(&secret).len(), 2);
+    // 一般的網址照常存
+    let plain = server.file_url("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(plain.clone()));
+    step_until_net(&mut h, "播一般的網址", |app| {
+        let s = &app.player().state;
+        playing_url(s, &plain) && s.seekable && s.video_size.is_some()
+    });
+    h.key_press(egui::Key::Space);
+    step_until_net(&mut h, "暫停", |app| app.player().state.paused);
+    paused_at(&mut h, 1.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert!(h.state().bookmarks().flush(TIMEOUT), "背景存檔");
+    let text = std::fs::read_to_string(&store).unwrap();
+    assert!(
+        !text.contains("token=abc123"),
+        "含 token 的網址寫進了 bookmarks.json：{text}"
+    );
+    assert!(text.contains("mp4_h264_aac.mp4"), "{text}");
+    // 回到含 token 的網址：這次執行期間書籤還在（開檔時不從磁碟讀回、蓋掉）
+    h.event(egui::Event::Paste(secret.clone()));
+    step_until_net(&mut h, "再播一次", |app| {
+        let s = &app.player().state;
+        playing_url(s, &secret) && s.seekable
+    });
+    h.run_steps(5);
+    assert!(h.state().bookmarks().flush(TIMEOUT));
+    h.run_steps(2);
+    assert_eq!(h.state().bookmarks().marks(&secret).len(), 2);
+}
+
+/// 網址同時是影片和播放清單（`&list=`）：先只播這部影片；網站影片 ▸ 載入整個播放清單：整個清單變成播放清單，
+/// 從這部影片開始
+#[test]
+fn site_menu_loads_the_whole_playlist() {
+    if !has_net_samples("site_menu_loads_the_whole_playlist") {
+        return;
+    }
+    let server = Server::start();
+    let base = server.url("");
+    let page = server.url("/watch?v=p2&list=PL1");
+    let p1 = server.url("/watch?v=p1");
+    let p2 = server.url("/watch?v=p2");
+    let list_json = site_playlist_json(&page, &[(p1.clone(), "p1"), (p2.clone(), "p2")]);
+    let fake = FakeResolver::new(move |req, _| {
+        let text = if req.playlist {
+            list_json.clone()
+        } else {
+            support::fake_ytdl::site_video_json(&base, &req.url, "p")
+        };
+        Ok(support::fake_ytdl::resolved(&text, Vec::new()))
+    })
+    .arc();
+    let mut h = site_harness(&fake, no_auto_next());
+    h.step();
+    h.event(egui::Event::Paste(page.clone()));
+    step_until_net(&mut h, "只播這部影片", |app| {
+        let s = &app.player().state;
+        playing_url(s, &page) && s.net.is_some() && s.video_size.is_some()
+    });
+    h.run_steps(5);
+    assert!(!fake.requests()[0].playlist);
+    open_site_menu(&mut h);
+    h.get_by_label("載入整個播放清單").click();
+    h.step();
+    step_until_net(&mut h, "整個清單", |app| playing_url(&app.player().state, &p2));
+    assert_eq!(playlist_items(h.state()), [p1.clone(), p2.clone()]);
+    assert_eq!(
+        h.state().playlist().and_then(|l| l.current_index()),
+        Some(1),
+        "從網址的 v= 開始"
+    );
+    assert!(fake.requests().iter().any(|r| r.url == page && r.playlist));
+    site_page_never_fetched(&server);
+}
+
+/// 英文介面：網站影片的選單、設定頁
+#[test]
+fn site_menu_and_ytdl_settings_in_english() {
+    if !has_net_samples("site_menu_and_ytdl_settings_in_english") {
+        return;
+    }
+    let server = Server::start();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let (mut h, _fake, _page) = playing_two_qualities(&server, settings);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Website video");
+    wait_menu_item(&mut h, "Default quality ⏵");
+    for label in ["Audio only", "Copy URL", "Open in browser"] {
+        h.get_by_label(label);
+    }
+    hover_menu_item(&mut h, "Choose quality");
+    wait_menu_item(&mut h, "Automatic (Best)");
+    h.get_by_label("360p · AVC");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_settings_page(&mut h, "Network");
+    h.get_by_label("Website videos (yt-dlp)");
+    h.get_by_label("Play website videos with yt-dlp");
+    step_until_label(&mut h, "yt-dlp not found");
+    for label in ["Default quality", "Video codec", "Browser cookies"] {
+        combo_box(&h, label);
+    }
 }
 
 // ───────────── 媒體資訊 ─────────────
@@ -2447,6 +6437,674 @@ fn single_window_can_be_switched_off_on_the_system_page() {
     assert!(!h.state().settings().single_instance);
 }
 
+// ───────────── 外觀：深色／淺色 ─────────────
+
+/// 「切換深色／淺色」預設沒有按鍵：測試在設定裡指定 F12（也順便測自己改的按鍵）
+fn with_theme_key(mut settings: Settings) -> Settings {
+    settings.keys.custom.insert("cycle-theme".into(), vec!["F12".into()]);
+    settings
+}
+
+/// 按 F12（`with_theme_key`）切換深色／淺色
+fn cycle_theme(h: &mut Harness<'_, VitascopeApp>) {
+    h.key_press(egui::Key::F12);
+    h.step();
+}
+
+/// 跟真正的播放器（eframe）一樣：建立 App 之前主題偏好是「跟隨系統」（egui 的預設），之後也沒有人改它；
+/// 作業系統回報的深淺色是 `system`（Windows、macOS 有，Linux 是 None）。
+/// kittest 建好 App 之後會自己把主題設成深色，這裡改回 App 設的，不然測不出系統是淺色時的問題
+fn harness_like_eframe(settings: Settings, system: Option<egui::Theme>) -> Harness<'static, VitascopeApp> {
+    harness_like_eframe_launch(Launch::default(), settings, system)
+}
+
+/// 同上，啟動時開 `launch` 的檔案
+fn harness_like_eframe_launch(
+    launch: Launch,
+    settings: Settings,
+    system: Option<egui::Theme>,
+) -> Harness<'static, VitascopeApp> {
+    let player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    let set_by_app = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = set_by_app.clone();
+    let mut h = Harness::builder().with_size([960.0, 600.0]).build_eframe(move |cc| {
+        cc.egui_ctx.set_theme(egui::ThemePreference::System);
+        let app = VitascopeApp::new(cc, player, settings, launch);
+        *seen.lock().unwrap() = Some(cc.egui_ctx.options(|o| o.theme_preference));
+        app
+    });
+    let pref = set_by_app.lock().unwrap().expect("建立了 App");
+    h.ctx.set_theme(pref);
+    h.input_mut().system_theme = system;
+    h.run_steps(2);
+    h
+}
+
+/// 這一幀畫的、整個蓋住 `rect` 的長方形的底色（由下往上：最後畫的在前面）
+fn fills_covering(h: &Harness<'_, VitascopeApp>, rect: egui::Rect) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, rect: egui::Rect, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Rect(r) if r.rect.expand(0.5).contains_rect(rect) => out.push(r.fill),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, rect, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &h.output().shapes {
+        walk(&clipped.shape, rect, &mut out);
+    }
+    out.reverse();
+    out
+}
+
+/// 這一幀畫的、內容包含 `text` 的字用的顏色（同樣的字可能畫在好幾個地方，例如 OSD）
+fn text_colors(h: &Harness<'_, VitascopeApp>, text: &str) -> Vec<egui::Color32> {
+    fn walk(shape: &egui::Shape, text: &str, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text().contains(text) => {
+                out.extend(t.galley.job.sections.iter().map(|s| s.format.color));
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, text, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for clipped in &h.output().shapes {
+        walk(&clipped.shape, text, &mut out);
+    }
+    assert!(!out.is_empty(), "這一幀沒有畫「{text}」");
+    out
+}
+
+/// 這一幀有沒有畫底色是 `fill` 的長方形
+fn has_rect_filled(h: &Harness<'_, VitascopeApp>, fill: egui::Color32) -> bool {
+    fn walk(shape: &egui::Shape, fill: egui::Color32) -> bool {
+        match shape {
+            egui::Shape::Rect(r) => r.fill == fill,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|s| walk(s, fill)),
+            _ => false,
+        }
+    }
+    h.output().shapes.iter().any(|c| walk(&c.shape, fill))
+}
+
+fn luma(c: egui::Color32) -> u32 {
+    (u32::from(c.r()) * 299 + u32::from(c.g()) * 587 + u32::from(c.b()) * 114) / 1000
+}
+
+/// 控制列（影片畫面下面那一條）的底色
+fn control_bar_fill(h: &Harness<'_, VitascopeApp>) -> egui::Color32 {
+    let video = h.get_by_label("影片畫面").rect();
+    let below = egui::Rect::from_min_size(
+        egui::pos2(video.left() + 4.0, video.bottom() + 2.0),
+        egui::vec2(4.0, 4.0),
+    );
+    *fills_covering(h, below).first().expect("控制列有底色")
+}
+
+/// 播放清單面板（影片畫面右邊）的底色：取面板左邊的留白，不會碰到按鈕、清單項目
+fn playlist_fill(h: &Harness<'_, VitascopeApp>) -> egui::Color32 {
+    let video = h.get_by_label("影片畫面").rect();
+    let inside = egui::Rect::from_center_size(egui::pos2(video.right() + 5.0, video.center().y), egui::vec2(2.0, 2.0));
+    *fills_covering(h, inside).first().expect("播放清單有底色")
+}
+
+#[test]
+fn dark_choice_is_not_flipped_by_a_light_system() {
+    // v0.3.0 的問題：系統是淺色的 Windows、macOS 上，第一幀就換成 egui 的淺色樣式，
+    // 蓋在寫死的深色控制列上（控制列的時間、按鈕變成深灰字配深色底）
+    let h = harness_like_eframe(Settings::default(), Some(egui::Theme::Light));
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert!(h.ctx.global_style().visuals.dark_mode, "介面是深色的樣式");
+    assert_eq!(
+        h.state().palette().panel,
+        egui::Color32::from_gray(24),
+        "深色跟以前一樣"
+    );
+    assert_eq!(control_bar_fill(&h), egui::Color32::from_gray(24));
+}
+
+#[test]
+fn light_choice_from_the_settings_file_on_a_dark_system() {
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::Light;
+    let h = harness_like_eframe(settings, Some(egui::Theme::Dark));
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(!h.ctx.global_style().visuals.dark_mode);
+    assert!(luma(control_bar_fill(&h)) > 200, "淺色的控制列");
+}
+
+#[test]
+fn follow_system_uses_the_reported_theme() {
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, Some(egui::Theme::Light));
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(luma(control_bar_fill(&h)) > 200);
+    // 系統換成深色（Windows 的設定、macOS 的外觀）：跟著換
+    h.input_mut().system_theme = Some(egui::Theme::Dark);
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(control_bar_fill(&h), egui::Color32::from_gray(24));
+    // 設定頁不提示（系統有回報）
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_value("跟隨系統");
+    assert!(h.query_by_label_contains("偵測不到系統的深淺色設定").is_none());
+}
+
+#[test]
+fn follow_system_without_a_system_answer_is_dark_with_a_note() {
+    // Linux：作業系統不回報深淺色，暫時用深色，設定頁說明
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(settings, None);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("偵測不到系統的深淺色設定，暫時用深色");
+}
+
+#[test]
+fn theme_setting_switches_and_saves() {
+    let dir = TempDir::new("theme-setting");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(playlist_fill(&h), egui::Color32::from_gray(28), "深色的播放清單");
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("外觀");
+    h.get_by_value("深色").click();
+    h.run_steps(2);
+    h.get_by_label("淺色").click();
+    h.run_steps(3);
+    // 馬上換、馬上存
+    assert_eq!(h.state().settings().theme, ThemeChoice::Light);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(!h.ctx.global_style().visuals.dark_mode);
+    assert_eq!(Settings::load_from(path.clone()).theme, ThemeChoice::Light);
+    assert!(luma(control_bar_fill(&h)) > 200, "控制列跟著主題");
+    assert!(luma(playlist_fill(&h)) > 200, "播放清單也是：{:?}", playlist_fill(&h));
+    // 影片畫面還是黑的
+    let video = h.get_by_label("影片畫面").rect();
+    assert_eq!(
+        fills_covering(&h, video.shrink(8.0)).first(),
+        Some(&egui::Color32::BLACK)
+    );
+    assert_eq!(h.state().palette().video, egui::Color32::BLACK);
+    // 跟隨系統
+    h.get_by_value("淺色").click();
+    h.run_steps(2);
+    h.get_by_label("跟隨系統").click();
+    h.run_steps(3);
+    assert_eq!(Settings::load_from(path).theme, ThemeChoice::System);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "自動測試沒有系統的回報：深色");
+}
+
+#[test]
+fn idle_screen_stays_dark_in_the_light_theme() {
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::Light;
+    settings.auto_next = false;
+    // 開檔失敗：起始畫面上顯示錯誤訊息（錯誤色依樣式選深色或淺色的一組）
+    let launch = Launch {
+        files: vec![PathBuf::from("Z:/不存在/沒有這個檔案.mkv")],
+        ..Default::default()
+    };
+    let mut h = harness_like_eframe_launch(launch, settings, None);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    step_until(&mut h, "開檔失敗", |s| s.last_error.is_some());
+    h.run_steps(5);
+    let video = h.get_by_label("影片畫面").rect();
+    assert_eq!(
+        fills_covering(&h, video.shrink(8.0)).first(),
+        Some(&egui::Color32::BLACK)
+    );
+    h.get_by_label_contains("拖放到這裡");
+    // 畫在黑色的影片畫面上：用深色樣式的錯誤色（淺色主題的深紅色在黑底上看不清楚）
+    let dark = vitascope::theme::Palette::of(&egui::Visuals::dark());
+    let light = vitascope::theme::Palette::of(&egui::Visuals::light());
+    let colors = text_colors(&h, "無法載入檔案");
+    assert!(colors.contains(&dark.problem), "{colors:?}");
+    assert!(!colors.contains(&light.problem), "{colors:?}");
+}
+
+#[test]
+fn media_info_stays_dark_in_the_light_theme() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), with_theme_key(settings));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    // 標題用深色樣式的強調色（半透明黑底上的亮藍色），不是淺色主題的深藍色
+    let dark = vitascope::theme::Palette::of(&egui::Visuals::dark());
+    let light = vitascope::theme::Palette::of(&egui::Visuals::light());
+    let colors = text_colors(&h, "播放流暢度");
+    assert!(colors.contains(&dark.accent), "{colors:?}");
+    assert!(!colors.contains(&light.accent), "{colors:?}");
+}
+
+#[test]
+fn ab_section_follows_the_theme() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(with_theme_key(settings));
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 設定起點", |s| s.ab_loop[0].is_some());
+    let a = h.state().player().state.ab_loop[0].unwrap();
+    step_until(&mut h, "播放半秒", |s| s.time_pos > a + 0.5);
+    h.key_press(egui::Key::L);
+    step_until(&mut h, "L 設定終點", |s| s.ab_loop[1].is_some());
+    h.run_steps(2);
+    // 淺色主題用深一點的琥珀色（原本的顏色跟淺灰的進度條底差不多亮）
+    let dark = vitascope::theme::Palette::of(&egui::Visuals::dark());
+    let light = vitascope::theme::Palette::of(&egui::Visuals::light());
+    assert!(has_rect_filled(&h, light.ab.gamma_multiply(0.6)), "淺色的 A-B 區段");
+    assert!(!has_rect_filled(&h, dark.ab.gamma_multiply(0.6)));
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert!(has_rect_filled(&h, dark.ab.gamma_multiply(0.6)), "深色跟以前一樣");
+}
+
+#[test]
+fn fullscreen_controls_stay_dark_in_the_light_theme() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), with_theme_key(settings));
+    settle(&mut h, "mp4_long.mp4");
+    // 暫停：全螢幕播放中滑鼠不動 2 秒控制列會藏起來（CI 的機器慢，載入就可能超過 2 秒）
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    let button_fill = |h: &Harness<'_, VitascopeApp>| {
+        let rect = h.get_by_label("⛶").rect();
+        *fills_covering(h, egui::Rect::from_center_size(rect.center(), egui::vec2(2.0, 2.0)))
+            .first()
+            .expect("按鈕有底色")
+    };
+    // 視窗模式：控制列跟著主題，按鈕是淺色的
+    assert!(luma(button_fill(&h)) > 180, "{:?}", button_fill(&h));
+    // 全螢幕：控制列蓋在影片上，一律是深色的
+    set_fullscreen(&mut h, true);
+    assert!(luma(button_fill(&h)) < 100, "{:?}", button_fill(&h));
+}
+
+#[test]
+fn cycle_theme_switches_dark_and_light() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(None, with_theme_key(settings));
+    h.step();
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Light);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert_eq!(h.state().osd_text(), Some("外觀：淺色"));
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Dark);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(h.state().osd_text(), Some("外觀：深色"));
+    // 跟隨系統（系統是淺色）：換成跟現在看到的相反
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(with_theme_key(settings), Some(egui::Theme::Light));
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Dark);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+}
+
+#[test]
+fn theme_labels_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.theme = ThemeChoice::System;
+    let mut h = harness_like_eframe(with_theme_key(settings), None);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Appearance");
+    h.get_by_label("Couldn't detect the system's light/dark setting; using dark for now");
+    h.get_by_value("Follow the system").click();
+    h.run_steps(2);
+    h.get_by_label("Dark");
+    h.get_by_label("Light").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().theme, ThemeChoice::Light);
+    cycle_theme(&mut h);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Appearance: dark"));
+}
+
+// ───────────── 快捷鍵對照表 ─────────────
+
+/// 這一幀有沒有畫出內容剛好是 `text` 的文字
+fn painted(h: &Harness<'_, VitascopeApp>, text: &str) -> bool {
+    fn walk(shape: &egui::Shape, text: &str) -> bool {
+        match shape {
+            egui::Shape::Text(t) => t.galley.text() == text,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|s| walk(s, text)),
+            _ => false,
+        }
+    }
+    h.output().shapes.iter().any(|c| walk(&c.shape, text))
+}
+
+#[test]
+fn custom_shortcut_moves_the_key_and_the_menu_hint() {
+    let dir = TempDir::new("custom-keys");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        dir.clip(name);
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("next-file".into(), vec!["N".into()]);
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    step_until(&mut h, "播放第1集", |s| playing(s, "第1集.mp4"));
+    step_until_app(&mut h, "掃描到兩個影片", |app| playlist_len(app) == 2);
+    settle(&mut h, "第1集.mp4");
+    assert_eq!(h.state().keymap().hint(vitascope::keymap::Command::NextFile), "N");
+    // 右鍵選單上「下一個檔案」的按鍵跟著改；沒改的照舊
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    assert!(painted(&h, "N"), "選單上寫 N");
+    assert!(!painted(&h, "PgDn"), "PgDn 已經不是下一個檔案");
+    assert!(painted(&h, "PgUp"));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!egui::Popup::is_any_open(&h.ctx), "Esc 先關選單");
+    // PgDn 不再換檔，N 才會（換檔的話按鍵那一幀就送出開檔了）
+    h.key_press(egui::Key::PageDown);
+    h.run_steps(5);
+    assert!(!h.state().player().loading_now(), "PgDn 沒有開別的檔案");
+    wait_real(&mut h, 0.3);
+    assert!(playing(&h.state().player().state, "第1集.mp4"));
+    h.key_press(egui::Key::N);
+    step_until(&mut h, "N → 第2集", |s| playing(s, "第2集.mp4"));
+}
+
+#[test]
+fn unbound_restart_drops_the_resume_hint() {
+    let long = sample("common/mp4_long.mp4"); // 90 秒
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    // 空陣列 = 不指定按鍵
+    settings.keys.custom.insert("restart".into(), vec![]);
+    let mut h = harness_with(Some(long.clone()), settings);
+    step_until(&mut h, "開始播放", |s| {
+        playing(s, "mp4_long.mp4") && s.time_pos > 0.0
+    });
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::ArrowRight);
+    step_until(&mut h, "前進 30 秒", |s| s.time_pos >= 29.0);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    step_until(&mut h, "換檔", |s| playing(s, "mp4_h264_aac.mp4"));
+    drop_file(&mut h, long);
+    step_until_app(&mut h, "續播的提示", |app| {
+        app.osd_text().is_some_and(|t| t.contains("繼續播放"))
+    });
+    let osd = h.state().osd_text().unwrap().to_owned();
+    assert!(
+        !osd.contains("從頭播放") && !osd.contains('（'),
+        "沒有按鍵就不寫括號：{osd}"
+    );
+    step_until(&mut h, "從上次的位置繼續", |s| s.time_pos >= 28.0);
+    // Home 不再從頭播放
+    h.key_press(egui::Key::Home);
+    h.run_steps(5);
+    // 從頭播放的話按鍵那一幀就提示、送出精準跳轉（`position_now` 是跳轉的目標）
+    assert_ne!(h.state().osd_text(), Some("從頭播放"));
+    assert!(h.state().player().position_now() >= 28.0);
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.time_pos >= 28.0);
+}
+
+#[test]
+fn about_dialog_takes_the_keys_and_esc_closes_only_it() {
+    let mut h = playing_multitrack();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.key_press(egui::Key::F1);
+    h.run_steps(2);
+    h.get_by_label("acer1204/VitaScope");
+    // 對話框開著：空白鍵不會暫停
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert!(!paused_now(&h));
+    assert!(!h.state().player().state.paused);
+    // Esc 只關對話框，設定視窗還開著
+    h.key_press(egui::Key::Escape);
+    h.step();
+    assert!(h.query_by_label("acer1204/VitaScope").is_none(), "對話框關掉了");
+    // 關掉對話框的下一幀，按鍵照常有作用
+    h.key_press(egui::Key::Space);
+    h.step();
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.get_by_label("一般");
+    // 下一個 Esc 才關設定視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_none(), "設定視窗關掉了");
+}
+
+#[test]
+fn key_hints_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings.clone());
+    h.step();
+    let open = if cfg!(target_os = "macos") { "Cmd+O" } else { "Ctrl+O" };
+    h.get_by_label(&format!("Drop a video here, or press {open} to open a file"));
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    for key in [open, "Space", "PgUp", "PgDn", "L"] {
+        assert!(painted(&h, key), "{key}");
+    }
+}
+
+#[test]
+fn esc_closes_one_window_at_a_time_in_order() {
+    let mut h = playing_multitrack();
+    let panel = |h: &Harness<'_, VitascopeApp>| h.query_by_label("控制面板").is_some();
+    let settings = |h: &Harness<'_, VitascopeApp>| h.query_by_label("一般").is_some();
+    let info = |h: &Harness<'_, VitascopeApp>| h.query_by_label_contains("640×360（16:9）").is_some();
+    assert!(!panel(&h) && !settings(&h) && !info(&h));
+    // 媒體資訊、設定、控制面板都開著
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::F1);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    assert!(panel(&h) && settings(&h) && info(&h));
+    // Esc 一次關一個：控制面板 → 設定 → 媒體資訊
+    let mut open = Vec::new();
+    for _ in 0..3 {
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        open.push([panel(&h), settings(&h), info(&h)]);
+    }
+    assert_eq!(
+        open,
+        [[false, true, true], [false, false, true], [false, false, false]],
+        "[控制面板, 設定, 媒體資訊]"
+    );
+}
+
+#[test]
+fn a_key_counts_once_per_frame() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    h.step();
+    let press = |key, modifiers, repeat| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat,
+        modifiers,
+    };
+    // 介面卡住時累積的 E（含自動重複、多按了 Shift）：跟以前的 consume_key 一樣，同一幀只加一次
+    for (mods, repeat) in [
+        (egui::Modifiers::NONE, false),
+        (egui::Modifiers::NONE, true),
+        (egui::Modifiers::SHIFT, true),
+    ] {
+        h.input_mut().events.push(press(egui::Key::E, mods, repeat));
+    }
+    // 不同的按鍵各算各的
+    h.input_mut()
+        .events
+        .push(press(egui::Key::U, egui::Modifiers::NONE, false));
+    h.step();
+    h.run_steps(2);
+    assert_eq!(h.state().adjust().brightness, 1);
+    assert_eq!(h.state().adjust().saturation, 1);
+}
+
+#[test]
+fn a_custom_delete_key_does_not_take_delete_from_the_playlist() {
+    let dir = three_episodes("panel-delete-custom");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings
+        .keys
+        .custom
+        .insert("toggle-pause".into(), vec!["Delete".into()]);
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    h.get_by_label("1. 第1集.mp4").click();
+    h.run_steps(2);
+    // 清單開著：Delete 是移出清單（固定的按鍵），不是自己指定的暫停
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+    assert!(!paused_now(&h), "Delete 沒有暫停");
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused);
+    // 清單關著：Delete 就是自己指定的指令
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    h.key_press(egui::Key::Delete);
+    step_until(&mut h, "Delete 暫停", |s| s.paused);
+    assert_eq!(playlist_names(h.state()), ["第2集.mp4", "第3集.mp4"]);
+}
+
+/// 選單已經打開：捲到標籤剛好是 `label` 的子選單、把滑鼠移上去打開它（`hover_menu_item` 比對的是部分文字）
+fn open_exact_submenu(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    MenuItem::exact(label).hover(h);
+}
+
+/// 右鍵選單、子選單上每個按鍵說明都跟 v0.3.0 一樣，而且接在對的項目上（標籤 = 「項目 按鍵」）
+#[test]
+fn menu_shortcut_hints_match_v030() {
+    let mac = cfg!(target_os = "macos");
+    let (cmd, alt) = if mac { ("Cmd", "Option") } else { ("Ctrl", "Alt") };
+    let crop = if mac { "Control+Q" } else { "Ctrl+Q" };
+    let info = if mac { "Cmd+I" } else { "Ctrl+F1" };
+    let mut h = opened(sample("common/mkv_chapters.mkv"));
+    step_until(&mut h, "讀到三個章節", |s| s.chapters.len() == 3);
+    let expect = |h: &Harness<'_, VitascopeApp>, labels: &[String]| {
+        for l in labels {
+            assert!(h.query_by_label(l).is_some(), "選單上沒有「{l}」");
+        }
+    };
+    // 每個子選單都重新開一次選單：視窗窄的時候，開著的子選單會蓋住主選單的其他項目
+    let reopen = |h: &mut Harness<'_, VitascopeApp>| {
+        if egui::Popup::is_any_open(&h.ctx) {
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+        }
+        h.get_by_label("影片畫面").click_secondary();
+        h.run_steps(2);
+    };
+    reopen(&mut h);
+    assert!(h.query_by_label("暫停 空白鍵").is_some() || h.query_by_label("播放 空白鍵").is_some());
+    expect(
+        &h,
+        &[
+            format!("開啟檔案… {cmd}+O"),
+            "停止".into(),
+            "上一個檔案 PgUp".into(),
+            "下一個檔案 PgDn".into(),
+            "逐格前進 .".into(),
+            "逐格後退 ,".into(),
+            "A-B 重播：設定起點 L".into(),
+            "全螢幕 F".into(),
+            "播放清單 F6".into(),
+            format!("媒體資訊 {info}"),
+            // 子選單：按鍵寫在標題上（依序切換三種模式）
+            format!("視窗置頂 {cmd}+T ⏵"),
+            "設定… F5".into(),
+            "關於影戲 F1".into(),
+        ],
+    );
+    open_exact_submenu(&mut h, "章節 ⏵");
+    expect(&h, &[format!("上一章 / 下一章：{cmd}+PgUp / PgDn")]);
+    reopen(&mut h);
+    open_exact_submenu(&mut h, "畫質 ⏵");
+    expect(&h, &[format!("影像調整… {alt}+G"), "還原影像調整 Q".into()]);
+    reopen(&mut h);
+    open_exact_submenu(&mut h, "擷取畫面 ⏵");
+    expect(
+        &h,
+        &[format!("存到截圖資料夾 {cmd}+E"), format!("複製到剪貼簿 {cmd}+C")],
+    );
+    reopen(&mut h);
+    open_exact_submenu(&mut h, "畫面 ⏵");
+    expect(
+        &h,
+        &[
+            "放大 9".into(),
+            "縮小 1".into(),
+            "重設縮放（100%） 5".into(),
+            format!("左右翻轉（鏡像） {cmd}+Z"),
+            format!("上下翻轉 {cmd}+P"),
+            format!("重設畫面 {alt}+Backspace"),
+        ],
+    );
+    open_exact_submenu(&mut h, "移動畫面 ⏵");
+    expect(
+        &h,
+        &[
+            format!("左移 {alt}+←"),
+            format!("右移 {alt}+→"),
+            format!("上移 {alt}+↑"),
+            format!("下移 {alt}+↓"),
+            format!("置中 {cmd}+5"),
+        ],
+    );
+    hover_menu_item(&mut h, "畫面比例（");
+    expect(&h, &[format!("A 或 {cmd}+F6 依序切換")]);
+    hover_menu_item(&mut h, "裁切（");
+    expect(&h, &[format!("{crop} 依序切換")]);
+    hover_menu_item(&mut h, "旋轉（");
+    expect(&h, &[format!("{alt}+K 依序旋轉")]);
+}
+
 // ───────────── 單一執行個體 ─────────────
 
 #[test]
@@ -2957,10 +7615,7 @@ fn smooth_env_override_stands_down() {
         assert_eq!(prop(&h, name), value, "{name}");
         assert_eq!(h.state().pacing_sets(), 0, "{name}：一個設定都不送");
         // 選單、設定頁的選項停用
-        h.get_by_label("影片畫面").click_secondary();
-        h.run_steps(2);
-        h.get_by_label("畫質 ⏵").hover();
-        h.run_steps(3);
+        open_picture_menu(&mut h);
         let item = h.get_by_label("流暢播放（已由 VITASCOPE_MPV_OPTS 指定）");
         assert!(item.accesskit_node().is_disabled(), "{name}");
         h.key_press(egui::Key::Escape);
@@ -3005,10 +7660,7 @@ fn smooth_pacing_off_stands_down() {
     assert_eq!(status.describe(), "未使用：已由 VITASCOPE_PACING=off 關閉");
     assert_eq!(h.state().pacing_sets(), 0);
     sync_options_untouched(&h);
-    h.get_by_label("影片畫面").click_secondary();
-    h.run_steps(2);
-    h.get_by_label("畫質 ⏵").hover();
-    h.run_steps(3);
+    open_picture_menu(&mut h);
     assert!(
         h.get_by_label("流暢播放（VITASCOPE_PACING=off）")
             .accesskit_node()
@@ -3146,8 +7798,7 @@ fn picture_menu_has_smooth_checkbox() {
         let picture = h.get_by_label("畫質 ⏵");
         assert!(picture.rect().top() >= view.bottom() - 1.0);
         assert!(!picture.accesskit_node().is_disabled(), "沒開檔也能用");
-        picture.hover();
-        h.run_steps(3);
+        hover_menu_item(h, "畫質 ⏵");
     };
     open_menu(&mut h);
     h.get_by_label("流暢播放（119.88 Hz）").click();
@@ -3467,7 +8118,7 @@ fn picture_keys_adjust_and_reset() {
         wait_for_png(&mut h, &dir.0, 1);
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::T);
         h.run_steps(2);
-        assert!(h.state().settings().always_on_top, "Ctrl+T 視窗置頂");
+        assert_eq!(h.state().settings().on_top, OnTop::Always, "Ctrl+T 視窗置頂：永遠置頂");
         h.key_press_modifiers(egui::Modifiers::COMMAND, Key::I);
         h.run_steps(2);
         h.get_by_label_contains("640×360（16:9）");
@@ -3621,6 +8272,7 @@ fn open_picture_menu(h: &mut Harness<'_, VitascopeApp>) {
 
 /// 同上，但在影片畫面的左下角按右鍵（控制面板開著時，畫面中間會被面板蓋住）
 fn open_picture_menu_from_corner(h: &mut Harness<'_, VitascopeApp>) {
+    wait_window_fit(h);
     let video = h.get_by_label("影片畫面").rect();
     let pos = video.left_bottom() + egui::vec2(30.0, -30.0);
     h.event(egui::Event::PointerMoved(pos));
@@ -3948,6 +8600,7 @@ fn picture_page_renders_in_english() {
     assert!(h.query_by_label_contains("亮度").is_none(), "沒有中文");
 }
 
+/// 設定頁改成可以編輯、一個指令一列（A3）：原本找「W / E」這種成對的說明，改成找每一列的名稱和按鍵按鈕
 #[test]
 fn shortcuts_page_lists_the_picture_keys() {
     let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
@@ -3956,24 +8609,32 @@ fn shortcuts_page_lists_the_picture_keys() {
             vitascope::i18n::Lang::ZhTw,
             "快捷鍵",
             [
-                "亮度 - / +",
-                "對比 - / +",
-                "飽和度 - / +",
-                "色相 - / +",
+                "亮度 −",
+                "亮度 +",
+                "對比 −",
+                "對比 +",
+                "飽和度 −",
+                "飽和度 +",
+                "色相 −",
+                "色相 +",
                 "影像調整還原",
-                "控制面板（影像調整、等化器）",
+                "控制面板",
             ],
         ),
         (
             vitascope::i18n::Lang::En,
             "Shortcuts",
             [
-                "Brightness - / +",
-                "Contrast - / +",
-                "Saturation - / +",
-                "Hue - / +",
+                "Brightness −",
+                "Brightness +",
+                "Contrast −",
+                "Contrast +",
+                "Saturation −",
+                "Saturation +",
+                "Hue −",
+                "Hue +",
                 "Reset image adjustments",
-                "Control panel (image adjustments, equalizer)",
+                "Control panel",
             ],
         ),
     ] {
@@ -3985,13 +8646,1129 @@ fn shortcuts_page_lists_the_picture_keys() {
         h.run_steps(2);
         h.get_by_label(page).click();
         h.run_steps(2);
-        for key in ["W / E", "R / T", "Y / U", "I / O", "Q", &format!("{alt} + G")] {
+        for key in ["W", "E", "R", "T", "Y", "U", "I", "O", "Q", &format!("{alt}+G")] {
             h.get_by_label(key);
         }
         for row in rows {
             h.get_by_label(row);
         }
     }
+}
+
+// ───────────── 快捷鍵設定頁、PotPlayer 預設組 ─────────────
+
+const RECORDING: &str = "請按下新的按鍵…（Esc 取消）";
+
+/// 打開「設定 → 快捷鍵」（`page` 是分頁的名稱，看介面語言）；`search` 不是空的就輸入搜尋，
+/// 只留下符合的指令（按鈕才不會在捲動區外面、「+」這種按鈕才只有一個）
+fn shortcuts_page(h: &mut Harness<'_, VitascopeApp>, page: &str, search: &str) {
+    if h.query_by_label(page).is_none() {
+        h.key_press(egui::Key::F5);
+        h.run_steps(2);
+    }
+    h.get_by_label(page).click();
+    h.run_steps(2);
+    if !search.is_empty() {
+        h.get_by_role(egui::accesskit::Role::TextInput).focus();
+        h.run_steps(1);
+        h.get_by_role(egui::accesskit::Role::TextInput).type_text(search);
+        h.run_steps(2);
+    }
+}
+
+/// 同一幀按下、放開（含修飾鍵），回傳這一幀送給視窗的指令
+fn press_mods_and_get_commands(
+    h: &mut Harness<'_, VitascopeApp>,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Vec<egui::ViewportCommand> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+    h.step();
+    viewport_commands(h)
+}
+
+#[test]
+fn shortcut_record_adds_a_chord() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    // 只按了修飾鍵還不算
+    h.key_press(egui::Key::ShiftLeft);
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::K);
+    h.run_steps(2);
+    assert!(h.query_by_label(RECORDING).is_none(), "錄好了");
+    assert_eq!(h.state().settings().keys.custom["toggle-pause"], ["Space", "Shift+K"]);
+    h.get_by_label("Shift+K");
+    h.get_by_label("•");
+    // 馬上生效（設定視窗開著也一樣）
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::K);
+    step_until(&mut h, "Shift+K 暫停", |s| s.paused);
+    // 這一列還原：Shift+K 不再有作用，空白鍵照舊
+    h.get_by_label("↺").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    assert!(h.query_by_label("Shift+K").is_none());
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::K);
+    h.run_steps(5);
+    assert!(paused_now(&h), "Shift+K 不再切換");
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "Shift+K 不再切換");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "空白鍵繼續播放", |s| !s.paused);
+    // 移除一組按鍵：空白鍵不再暫停，存成「不指定」
+    h.get_by_label("×").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.custom["toggle-pause"], Vec::<String>::new());
+    h.get_by_label("（未指定）");
+    h.key_press(egui::Key::Space);
+    h.run_steps(5);
+    assert!(!paused_now(&h), "空白鍵不再暫停");
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused, "空白鍵不再暫停");
+}
+
+#[test]
+fn shortcut_conflict_moves_the_key() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    // 取消：兩個指令都不變
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::M);
+    h.run_steps(2);
+    h.get_by_label("M 已經用在「靜音」。");
+    h.get_by_label("取消").click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("已經用在").is_none());
+    assert!(h.state().settings().keys.custom.is_empty());
+    // 改到這裡：M 變成播放／暫停，靜音沒有按鍵
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::M);
+    h.run_steps(2);
+    h.get_by_label("改到這裡").click();
+    h.run_steps(2);
+    let keys = &h.state().settings().keys;
+    assert_eq!(keys.custom["toggle-pause"], ["Space", "M"]);
+    assert_eq!(keys.custom["toggle-mute"], Vec::<String>::new());
+    assert!(
+        h.state()
+            .keymap()
+            .chords(vitascope::keymap::Command::ToggleMute)
+            .is_empty()
+    );
+    h.key_press(egui::Key::M);
+    step_until(&mut h, "M 暫停", |s| s.paused);
+    assert!(!muted_now(&h), "M 不再是靜音");
+    assert!(!h.state().player().state.muted, "M 不再是靜音");
+}
+
+#[test]
+fn reserved_chord_is_refused() {
+    let mac = cfg!(target_os = "macos");
+    let cmd = if mac { "Cmd" } else { "Ctrl" };
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+V、{cmd}+X 不能指定"));
+    if cfg!(target_os = "windows") {
+        h.get_by_label("Ctrl+Insert、Shift+Insert、Shift+Delete 會當成 Ctrl+C、Ctrl+V、Ctrl+X");
+    }
+    // 真正的程式裡 Ctrl+V、Ctrl+X 不是按鍵事件：egui-winit 送的是貼上（剪貼簿有文字時）、剪下
+    for (event, key) in [(egui::Event::Paste("文字".into()), "V"), (egui::Event::Cut, "X")] {
+        h.event(event);
+        h.run_steps(2);
+        h.get_by_label(&format!("{cmd}+{key} 是系統保留的按鍵，不能指定"));
+        h.get_by_label(RECORDING);
+    }
+    // 原始的按鍵事件（介面測試、其他平台）也一樣
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::V);
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+V 是系統保留的按鍵，不能指定"));
+    if mac {
+        h.key_press_modifiers(egui::Modifiers::MAC_CMD | egui::Modifiers::COMMAND, egui::Key::Q);
+        h.run_steps(2);
+        h.get_by_label("Cmd+Q 是系統保留的按鍵，不能指定");
+    }
+    assert!(h.state().settings().keys.custom.is_empty());
+    // Ctrl+C 從「複製」來，可以指定：它是擷取畫面（剪貼簿）的，所以先問
+    h.event(egui::Event::Copy);
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+C 已經用在「擷取畫面（剪貼簿）」。"));
+    h.get_by_label("取消").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    assert!(!paused_now(&h));
+    assert!(!h.state().player().state.paused);
+}
+
+#[test]
+fn recording_esc_cancels_and_keeps_the_window_open() {
+    let mut h = playing_multitrack();
+    set_fullscreen(&mut h, true);
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    // Esc 只取消錄按鍵：設定視窗還開著、不離開全螢幕
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    assert!(h.query_by_label(RECORDING).is_none());
+    h.get_by_label("一般");
+    assert!(h.state().settings().keys.custom.is_empty());
+    // 下一個 Esc 才關設定視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_none());
+    // 錄的時候 F5 也是被錄的按鍵，不是開關設定視窗
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_some(), "設定視窗還開著");
+    h.get_by_label("F5 已經用在「設定」。");
+}
+
+#[test]
+fn potplayer_preset_rebinds_f_and_d() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("PotPlayer 風格").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().keys.preset,
+        vitascope::keymap::KeyPreset::Potplayer
+    );
+    assert!(h.query_by_label_contains("你改過的").is_none(), "沒有改過的快捷鍵");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // F / D 逐格
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t0 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::F);
+    step_until(&mut h, "F 逐格前進", |s| s.paused && s.time_pos > t0 + 0.01);
+    let t1 = h.state().player().state.time_pos;
+    assert!(t1 - t0 < 0.2, "只前進一格：{t0} → {t1}");
+    h.key_press(egui::Key::D);
+    step_until(&mut h, "D 逐格後退", |s| s.paused && s.time_pos < t1 - 0.01);
+    // Enter、Alt+Enter 全螢幕
+    for mods in [egui::Modifiers::NONE, egui::Modifiers::ALT] {
+        let cmds = press_mods_and_get_commands(&mut h, mods, egui::Key::Enter);
+        assert!(
+            cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+            "{mods:?} {cmds:?}"
+        );
+    }
+    // Backspace 從頭播放（播放清單沒開）
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "前進 5 秒", |s| s.time_pos > 4.0);
+    h.key_press(egui::Key::Backspace);
+    step_until(&mut h, "Backspace 從頭播放", |s| !s.paused && s.time_pos < 2.0);
+    // 選單上的按鍵跟著換
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("全螢幕 Enter").is_some());
+    assert!(h.query_by_label("逐格前進 F").is_some());
+}
+
+#[test]
+fn potplayer_ab_keys_set_points() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.preset = vitascope::keymap::KeyPreset::Potplayer;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t1 = h.state().player().state.time_pos;
+    // [ 設定起點：就是按下時的時間（不是字幕提早）
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "[ 設定起點", |s| {
+        s.ab_loop[0].is_some_and(|a| (a - t1).abs() < 0.05) && s.ab_loop[1].is_none()
+    });
+    assert!(h.state().osd_text().unwrap().starts_with("A-B 重播：起點"));
+    assert_eq!(h.state().player().state.sub_delay, 0.0);
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "前進", |s| s.time_pos > t1 + 3.0);
+    h.run_steps(5);
+    // 關鍵影格跳轉：mpv 先報跳轉的目標，落在哪一格晚一點才知道（CI 上可能晚好幾幀）
+    wait_seek_done(&mut h, "前進的跳轉做完");
+    let t2 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::CloseBracket);
+    step_until(&mut h, "] 設定終點", |s| {
+        s.ab_loop[0].is_some_and(|a| (a - t1).abs() < 0.05) && s.ab_loop[1].is_some_and(|b| (b - t2).abs() < 0.05)
+    });
+    assert!(h.state().osd_text().unwrap().contains('→'));
+    // \ 取消
+    h.key_press(egui::Key::Backslash);
+    step_until(&mut h, "\\ 取消", |s| s.ab_loop == [None, None]);
+    assert_eq!(h.state().osd_text(), Some("取消 A-B 重播"));
+    // 只設終點；再設一個在它後面的起點：舊的終點拿掉（重新開始一段）
+    h.key_press(egui::Key::CloseBracket);
+    step_until(&mut h, "只有終點", |s| {
+        s.ab_loop[0].is_none() && s.ab_loop[1].is_some()
+    });
+    assert!(h.state().osd_text().unwrap().starts_with("A-B 重播：終點"));
+    h.key_press(egui::Key::ArrowRight);
+    step_until(&mut h, "再前進", |s| s.time_pos > t2 + 3.0);
+    h.run_steps(5);
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "新的起點、沒有終點", |s| {
+        s.ab_loop[0].is_some_and(|a| a > t2 + 3.0) && s.ab_loop[1].is_none()
+    });
+    // 字幕同步：Shift+. 延後、Shift+, 提早、/ 歸零
+    for _ in 0..2 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Period);
+    }
+    step_until(&mut h, "Shift+. 兩次", |s| close_to(s.sub_delay, 0.2));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::Comma);
+    step_until(&mut h, "Shift+, 一次", |s| close_to(s.sub_delay, 0.1));
+    h.key_press(egui::Key::Slash);
+    step_until(&mut h, "/ 歸零", |s| close_to(s.sub_delay, 0.0));
+}
+
+#[test]
+fn reset_to_preset_asks_first_and_the_dialog_takes_the_keys() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings
+        .keys
+        .custom
+        .insert("toggle-pause".into(), vec!["Space".into(), "K".into()]);
+    settings.keys.custom.insert("next-file".into(), vec!["N".into()]);
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("你改過的 2 個快捷鍵（標 •）換預設組時照樣保留");
+    h.get_by_label("還原成預設組…").click();
+    h.run_steps(2);
+    h.get_by_label("把所有快捷鍵還原成「影戲」的預設值？");
+    // 對話框開著：空白鍵不會暫停，Esc 只關對話框
+    h.key_press(egui::Key::Space);
+    h.run_steps(3);
+    assert!(!paused_now(&h), "對話框開著時空白鍵不能暫停");
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.paused, "對話框開著時空白鍵不能暫停");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("預設值？").is_none(), "Esc 關掉對話框");
+    h.get_by_label("一般");
+    assert_eq!(h.state().settings().keys.custom.len(), 2, "取消：不變");
+    // 再開一次，按「還原」
+    h.get_by_label("還原成預設組…").click();
+    h.run_steps(2);
+    h.get_by_label("還原").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    assert_eq!(h.state().keymap().hint(vitascope::keymap::Command::NextFile), "PgDn");
+    assert!(h.query_by_label_contains("你改過的").is_none());
+    // 對話框關掉之後按鍵照常
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+}
+
+#[test]
+fn non_repeatable_commands_ignore_auto_repeat() {
+    let mut h = playing_multitrack();
+    let key = |h: &mut Harness<'_, VitascopeApp>, key, pressed| {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    };
+    // 按住空白鍵：第一下暫停，之後的自動重複（egui 看到沒放開的鍵又按下，標成重複）不再切換
+    for _ in 0..2 {
+        key(&mut h, egui::Key::Space, true);
+    }
+    key(&mut h, egui::Key::Space, false);
+    assert!(paused_now(&h), "只暫停一次");
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "只暫停一次");
+    // 音量這類照樣重複：按住 ↓ 三下
+    let v0 = h.state().player().state.volume;
+    for _ in 0..3 {
+        key(&mut h, egui::Key::ArrowDown, true);
+    }
+    key(&mut h, egui::Key::ArrowDown, false);
+    step_until(&mut h, "音量 −15", |s| close_to(s.volume, v0 - 15.0));
+}
+
+/// 按著鍵的時候切到別的視窗（例如 Ctrl+O 開了檔案對話框）就收不到放開：回來再按同一個鍵是新的一下，不是自動重複
+#[test]
+fn a_key_held_when_the_window_loses_focus_works_again_afterwards() {
+    let mut h = playing_multitrack();
+    let space = |h: &mut Harness<'_, VitascopeApp>| {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        h.step();
+    };
+    // 按下空白鍵（暫停），還沒放開視窗就失去焦點
+    space(&mut h);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.event(egui::Event::WindowFocused(false));
+    h.step();
+    h.event(egui::Event::WindowFocused(true));
+    h.step();
+    // 回來再按：繼續播放
+    space(&mut h);
+    step_until(&mut h, "繼續播放", |s| !s.paused);
+}
+
+#[test]
+fn menu_hints_follow_the_keymap() {
+    let dir = TempDir::new("menu-hints");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        dir.clip(name);
+    }
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    step_until_app(&mut h, "掃描到兩個影片", |app| playlist_len(app) == 2);
+    settle(&mut h, "第1集.mp4");
+    // 把下一個檔案的 PgDn 換成 N
+    shortcuts_page(&mut h, "快捷鍵", "下一個檔案");
+    h.get_by_label("PgDn").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.key_press(egui::Key::N);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.custom["next-file"], ["N"]);
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 控制列按鈕的提示
+    h.get_by_label("⏭").hover();
+    h.run_steps(3);
+    h.get_by_label("下一個檔案（N）");
+    // 右鍵選單
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    assert!(h.query_by_label("下一個檔案 N").is_some());
+    assert!(h.query_by_label("下一個檔案 PgDn").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::N);
+    step_until(&mut h, "N → 第2集", |s| playing(s, "第2集.mp4"));
+}
+
+/// 新的指令（預設沒有按鍵）指定按鍵後都有作用
+#[test]
+fn new_commands_work_once_bound() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    for (id, key) in [
+        ("sub-delay-reset", "F13"),
+        ("audio-delay-reset", "F14"),
+        ("next-audio-track", "F15"),
+        ("next-subtitle", "F16"),
+        ("gamma-up", "F17"),
+        ("gamma-down", "F18"),
+        ("fill-window", "F19"),
+        ("toggle-eq", "F20"),
+        ("toggle-smooth", "F21"),
+        ("ab-set-start", "F22"),
+        ("ab-clear", "F23"),
+        ("load-subtitle", "F24"),
+        ("screenshot-as", "F25"),
+    ] {
+        settings.keys.custom.insert(id.into(), vec![key.into()]);
+    }
+    let mut h = playing_multitrack_with(settings);
+    // 延遲歸零
+    h.key_press(egui::Key::CloseBracket);
+    h.key_press(egui::Key::Equals);
+    step_until(&mut h, "字幕、音訊延遲 +0.1", |s| {
+        close_to(s.sub_delay, 0.1) && close_to(s.audio_delay, 0.1)
+    });
+    h.key_press(egui::Key::F13);
+    step_until(&mut h, "字幕延遲歸零", |s| close_to(s.sub_delay, 0.0));
+    h.key_press(egui::Key::F14);
+    step_until(&mut h, "音訊延遲歸零", |s| close_to(s.audio_delay, 0.0));
+    // 下一條音軌：日本語 → 國語 → 日本語
+    let audio = |s: &State| s.selected(TrackKind::Audio).and_then(|t| t.title.clone());
+    step_until(&mut h, "第一條音軌", |s| audio(s).as_deref() == Some("日本語"));
+    h.key_press(egui::Key::F15);
+    step_until(&mut h, "換成國語", |s| audio(s).as_deref() == Some("國語"));
+    h.key_press(egui::Key::F15);
+    step_until(&mut h, "繞回日本語", |s| audio(s).as_deref() == Some("日本語"));
+    // 下一個字幕：第一個 → 第二個 → 關閉 → 第一個
+    let subs: Vec<i64> = h
+        .state()
+        .player()
+        .state
+        .tracks_of(TrackKind::Sub)
+        .map(|t| t.id)
+        .collect();
+    let (first, second) = (subs[0], subs[1]);
+    step_until(&mut h, "第一個字幕", |s| s.sid == Some(first));
+    h.key_press(egui::Key::F16);
+    step_until(&mut h, "第二個字幕", |s| s.sid == Some(second));
+    h.key_press(egui::Key::F16);
+    let mut seen = Seen::default();
+    step_until_state_seen(&mut h, &mut seen, "關閉字幕", |s| s.sid.is_none());
+    assert_eq!(seen.last_osd(), Some("字幕：關閉"));
+    h.key_press(egui::Key::F16);
+    step_until(&mut h, "回到第一個", |s| s.sid == Some(first));
+    // Gamma
+    h.key_press(egui::Key::F17);
+    h.key_press(egui::Key::F17);
+    h.key_press(egui::Key::F18);
+    h.run_steps(2);
+    assert_eq!(h.state().adjust().gamma, 1);
+    // 填滿視窗、等化器、流暢播放
+    h.key_press(egui::Key::F19);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("填滿視窗：開啟"));
+    let eq = h.state().settings().audio.eq.enabled;
+    h.key_press(egui::Key::F20);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().audio.eq.enabled, !eq);
+    let smooth = h.state().settings().smooth;
+    h.key_press(egui::Key::F21);
+    h.run_steps(2);
+    assert_ne!(h.state().settings().smooth, smooth);
+    // A-B：只設起點，再取消
+    h.key_press(egui::Key::F22);
+    step_until(&mut h, "設定起點", |s| s.ab_loop[0].is_some());
+    h.key_press(egui::Key::F23);
+    step_until(&mut h, "取消", |s| s.ab_loop == [None, None]);
+    // 載入字幕檔…、另存截圖…：開的是各自的對話框（取消）
+    let seen = record_dialogs(&mut h, |_| None);
+    // 先跑幾幀讓按鍵生效：對話框在背景執行緒開，沒開之前 dialogs_done 會馬上回傳
+    h.key_press(egui::Key::F24);
+    h.run_steps(2);
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::LoadSubtitle, Pick::File)]);
+    h.key_press(egui::Key::F25);
+    h.run_steps(2);
+    assert_eq!(
+        dialogs_done(&mut h, &seen),
+        [(DialogKind::ScreenshotSaveAs, Pick::Save)]
+    );
+}
+
+#[test]
+fn shortcuts_page_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "Shortcuts", "");
+    for label in [
+        "Preset:",
+        "VitaScope",
+        "PotPlayer style",
+        "Reset to the preset…",
+        "Fixed keys (can't be changed)",
+        "A-B loop: set start",
+        "Reset subtitle delay",
+        "Next audio track",
+        "Save screenshot as…",
+    ] {
+        h.get_by_label(label);
+    }
+    shortcuts_page(&mut h, "Shortcuts", "Play / pause");
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label("Press the new key… (Esc to cancel)");
+    h.get_by_label(&format!("{cmd}+V and {cmd}+X can't be assigned"));
+    h.event(egui::Event::Cut);
+    h.run_steps(2);
+    h.get_by_label(&format!("{cmd}+X is reserved by the system and can't be assigned"));
+    h.key_press(egui::Key::M);
+    h.run_steps(2);
+    h.get_by_label("M is already used for “Mute”.");
+    h.get_by_label("Use it here").click();
+    h.run_steps(2);
+    h.get_by_label("Your 2 changed shortcuts (marked •) are kept when you switch presets");
+    h.get_by_label("Reset to the preset…").click();
+    h.run_steps(2);
+    h.get_by_label("Reset all shortcuts to the “VitaScope” defaults?");
+    h.get_by_label("Reset").click();
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty());
+    // 只改了一個：英文是單數
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::K);
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.override_count(), 1);
+    h.get_by_label("Your 1 changed shortcut (marked •) is kept when you switch presets");
+}
+
+/// 固定的按鍵清單：macOS 的 Backspace 只在快捷鍵沒用到它時才是「從清單移除」（PotPlayer 風格是從頭播放）
+#[test]
+fn fixed_keys_list_follows_the_backspace_binding() {
+    let mac = cfg!(target_os = "macos");
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label(if mac { "Delete / Backspace" } else { "Delete" });
+    h.get_by_label("PotPlayer 風格").click();
+    h.run_steps(2);
+    h.get_by_label("Delete");
+    assert!(h.query_by_label("Delete / Backspace").is_none());
+}
+
+/// 換預設組：自己改過的照樣保留，而且比預設組優先（PotPlayer 的 F 是逐格前進，但自己把逐格前進改成 G 了）
+#[test]
+fn switching_presets_keeps_changed_keys() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("next-file".into(), vec!["N".into()]);
+    settings.keys.custom.insert("frame-next".into(), vec!["G".into()]);
+    let custom = settings.keys.custom.clone();
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("你改過的 2 個快捷鍵（標 •）換預設組時照樣保留");
+    h.get_by_label("PotPlayer 風格").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().keys.preset,
+        vitascope::keymap::KeyPreset::Potplayer
+    );
+    assert_eq!(h.state().settings().keys.custom, custom, "改過的不變");
+    h.get_by_label("你改過的 2 個快捷鍵（標 •）換預設組時照樣保留");
+    let keymap = h.state().keymap();
+    assert_eq!(
+        keymap.lookup(egui::Key::N, egui::Modifiers::NONE),
+        Some(vitascope::keymap::Command::NextFile)
+    );
+    assert_eq!(keymap.hint(vitascope::keymap::Command::NextFile), "N");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    // G 逐格前進（自己改的）；F 沒有作用（預設組的 F 被自己改的取代）；D 是 PotPlayer 的逐格後退
+    wait_seek_done(&mut h, "暫停在一格上");
+    let t0 = h.state().player().state.time_pos;
+    h.key_press(egui::Key::G);
+    step_until(&mut h, "G 逐格前進", |s| s.paused && s.time_pos > t0 + 0.01);
+    h.run_steps(3);
+    wait_seek_done(&mut h, "逐格做完");
+    let t1 = h.state().player().state.time_pos;
+    let frame = t1 - t0;
+    let cmds = press_and_get_commands(&mut h, egui::Key::F);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    wait_real(&mut h, 0.3);
+    assert_eq!(h.state().player().state.time_pos, t1, "F 不再逐格");
+    // 不靠等多久：再按 G，mpv 照順序逐格（F 也逐格的話一共前進兩格），所以只該前進一格
+    h.key_press(egui::Key::G);
+    step_until(&mut h, "G 再逐格前進", |s| s.paused && s.time_pos > t1 + 0.01);
+    h.run_steps(3);
+    wait_seek_done(&mut h, "逐格做完");
+    let t2 = h.state().player().state.time_pos;
+    assert!((t2 - t1 - frame).abs() < frame / 2.0, "F 不再逐格：{t0} → {t1} → {t2}");
+    h.key_press(egui::Key::D);
+    step_until(&mut h, "D 逐格後退", |s| s.paused && s.time_pos < t2 - 0.01);
+}
+
+/// 錄到一半換到別的分頁：不錄了（不然看不到在錄，下一個按鍵卻被錄走、其他快捷鍵也都沒反應）
+#[test]
+fn changing_settings_page_stops_recording() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "播放／暫停");
+    h.get_by_label("+").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.get_by_label("一般").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::K);
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty(), "K 沒有被錄走");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "空白鍵照常暫停", |s| s.paused);
+    shortcuts_page(&mut h, "快捷鍵", "");
+    assert!(h.query_by_label(RECORDING).is_none());
+}
+
+/// 搜尋也比對按鍵；錄到一半點搜尋框就不錄了（打的字不會被錄成按鍵）
+#[test]
+fn shortcut_search_matches_keys_and_stops_recording() {
+    let mut h = playing_multitrack();
+    shortcuts_page(&mut h, "快捷鍵", "PgDn");
+    h.get_by_label("下一個檔案");
+    h.get_by_label("下一章");
+    assert!(h.query_by_label("播放／暫停").is_none());
+    assert!(h.query_by_label("上一個檔案").is_none());
+    // 開始錄「下一個檔案」，再點搜尋框、打字
+    h.get_by_label("PgDn").click();
+    h.run_steps(2);
+    h.get_by_label(RECORDING);
+    h.get_by_role(egui::accesskit::Role::TextInput).click();
+    h.run_steps(2);
+    assert!(h.query_by_label(RECORDING).is_none(), "點搜尋框就不錄了");
+    h.key_press(egui::Key::K);
+    h.event(egui::Event::Text("k".into()));
+    h.run_steps(2);
+    assert!(h.state().settings().keys.custom.is_empty(), "K 沒有被錄走");
+    assert!(h.query_by_label_contains("已經用在").is_none());
+    // 打的字進了搜尋框（「PgDnk」什麼都找不到）
+    assert!(h.query_by_label("下一個檔案").is_none());
+}
+
+/// 先放開 Shift 再放開符號鍵：Windows 放開時收到的是沒有 Shift 的鍵（按下 `?`、放開 `/`）。
+/// 按著的鍵要用實體按鍵記，不然 `?` 一直算「按著」，之後每一次按都被當成自動重複
+#[test]
+fn shifted_symbol_keys_work_again_after_shift_is_released_first() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("toggle-mute".into(), vec!["?".into()]);
+    settings
+        .keys
+        .custom
+        .insert("toggle-pause".into(), vec!["Space".into(), "Cmd+C".into()]);
+    settings.keys.custom.insert("copy-frame".into(), vec![]);
+    let mut h = playing_multitrack_with(settings);
+    let key = |h: &mut Harness<'_, VitascopeApp>, key, physical, pressed, modifiers| {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: Some(physical),
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+        h.step();
+    };
+    let shift = egui::Modifiers::SHIFT;
+    let none = egui::Modifiers::NONE;
+    key(&mut h, egui::Key::Questionmark, egui::Key::Slash, true, shift);
+    key(&mut h, egui::Key::Slash, egui::Key::Slash, false, none);
+    step_until(&mut h, "? 靜音", |s| s.muted);
+    key(&mut h, egui::Key::Questionmark, egui::Key::Slash, true, shift);
+    key(&mut h, egui::Key::Slash, egui::Key::Slash, false, none);
+    step_until(&mut h, "再按一次 ? 取消靜音", |s| !s.muted);
+    // 按住 Ctrl+C：自動重複時每一下都是一個「複製」，開關類的指令只算第一下
+    let command = egui::Modifiers::COMMAND;
+    for _ in 0..2 {
+        h.event(egui::Event::Copy);
+        h.step();
+    }
+    assert!(paused_now(&h), "只暫停一次");
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "只暫停一次");
+    // 放開 C 再按：再切換一次
+    key(&mut h, egui::Key::C, egui::Key::C, false, command);
+    h.event(egui::Event::Copy);
+    step_until(&mut h, "再按一次 Ctrl+C 繼續播放", |s| !s.paused);
+}
+
+/// 設定的 A-B 終點一定會繞回起點：終點用 mpv 自己的時間、不能四捨五入（24 fps 的 1.0833… 寫成「1.083333」
+/// 就比那一格早，mpv 認定已經過了終點，永遠不繞回去）
+#[test]
+fn ab_end_point_set_on_a_frame_loops_back() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.preset = vitascope::keymap::KeyPreset::Potplayer;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    step_until(&mut h, "開始播放", |s| s.loaded && !s.paused && s.time_pos > 0.1);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.key_press(egui::Key::OpenBracket);
+    step_until(&mut h, "[ 設定起點", |s| s.ab_loop[0].is_some());
+    let a = h.state().player().ab_loop_points()[0].unwrap();
+    // 播一秒再暫停（這個短片只有開頭一個關鍵影格，往前跳會跳到片尾）
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "播一秒", |s| !s.paused && s.time_pos > a + 1.0);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "再暫停", |s| s.paused);
+    h.run_steps(5);
+    // 逐格到一格：時間寫成小數 6 位會比它小（大約每兩格就有一格）
+    let now = |h: &Harness<'_, VitascopeApp>| h.state().player().get_f64("time-pos").unwrap();
+    let rounded_down = |t: f64| format!("{t:.6}").parse::<f64>().unwrap() < t;
+    let mut b = now(&h);
+    for _ in 0..8 {
+        if rounded_down(b) {
+            break;
+        }
+        h.key_press(egui::Key::F);
+        step_until(&mut h, "F 逐格前進", |s| s.paused && s.time_pos > b + 0.01);
+        h.run_steps(3);
+        b = now(&h);
+    }
+    assert!(rounded_down(b), "找不到這樣的一格：{b}");
+    h.key_press(egui::Key::CloseBracket);
+    step_until(&mut h, "] 設定終點", |s| s.ab_loop[1].is_some());
+    assert_eq!(
+        h.state().player().ab_loop_points(),
+        [Some(a), Some(b)],
+        "就是那一格的時間"
+    );
+    // 繼續播放：馬上到終點、繞回起點
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "繞回起點，或是播過終點", |s| {
+        !s.paused && (s.time_pos < b - 0.5 || s.time_pos > b + 0.8)
+    });
+    let t = h.state().player().state.time_pos;
+    assert!(t < b - 0.5, "播到終點要繞回起點 {a}：現在 {t}，終點 {b}");
+}
+
+/// 新指令有按鍵時，選單、設定頁上也寫出來（沒有按鍵時跟以前一樣）
+#[test]
+fn menus_show_the_keys_of_new_commands() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    for (id, key) in [
+        ("fill-window", "F19"),
+        ("toggle-eq", "F20"),
+        ("toggle-smooth", "F21"),
+        ("sub-delay-reset", "F13"),
+        ("load-subtitle", "F24"),
+        ("screenshot-as", "F22"),
+        ("seek-back", "J"),
+        ("seek-forward", "L"),
+    ] {
+        settings.keys.custom.insert(id.into(), vec![key.into()]);
+    }
+    let mut h = playing_multitrack_with(settings);
+    // 畫面 → 裁切 → 填滿視窗
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("畫面 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label_contains("裁切").click();
+    h.run_steps(2);
+    h.get_by_label("填滿視窗（裁掉黑邊） F19");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 字幕 → 字幕延遲的說明、載入字幕檔…
+    hover_context_item(&mut h, "字幕 ⏵");
+    h.get_by_label("載入字幕檔… F24");
+    h.get_by_label_contains("字幕延遲").click();
+    h.run_steps(2);
+    h.get_by_label("快捷鍵 [ / ]，歸零 F13。正數 = 字幕晚一點出現");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 擷取畫面 → 另存新檔…
+    hover_context_item(&mut h, "擷取畫面 ⏵");
+    h.get_by_label("擷取畫面 ⏵").click();
+    h.run_steps(2);
+    h.get_by_label("另存新檔… F22");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 畫質 → 流暢播放、音效 → 等化器：勾選框後面寫按鍵
+    open_picture_menu(&mut h);
+    h.get_by_label("F21");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_sound_menu(&mut h);
+    h.get_by_label("F20");
+    h.get_by_label("等化器");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 設定 → 播放：跳轉秒數的標題
+    open_settings_page(&mut h, "播放");
+    h.get_by_label("J / L 跳轉");
+    let cmd = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
+    h.get_by_label(&format!("{cmd}+← / → 跳轉"));
+}
+
+// ───────────── 滑鼠按鍵（設定 → 快捷鍵 → 滑鼠） ─────────────
+
+/// 在影片畫面中間按一下滑鼠的 `button`（按下、放開在同一幀）
+fn click_video_with(h: &mut Harness<'_, VitascopeApp>, button: egui::PointerButton) {
+    h.get_by_label("影片畫面").click_button(button);
+    h.step();
+}
+
+/// 在影片畫面上捲動滾輪 `lines` 格（往上為正）
+fn wheel_video(h: &mut Harness<'_, VitascopeApp>, lines: f32) {
+    h.get_by_label("影片畫面").hover();
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, lines),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+#[test]
+fn mouse_middle_side_buttons_and_wheel_bindings() {
+    use vitascope::keymap::WheelMode;
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.click = String::new();
+    settings.keys.mouse.middle = "toggle-mute".into();
+    settings.keys.mouse.back = "speed-down".into();
+    settings.keys.mouse.forward = "speed-up".into();
+    settings.keys.mouse.wheel = WheelMode::Seek;
+    // 不用預設的 5 秒：確定每格跳的是「跳轉秒數」
+    settings.seek_short = 3.0;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    // 單擊 = 不動作：不會繼續播放
+    click_video_with(&mut h, egui::PointerButton::Primary);
+    h.run_steps(3);
+    assert!(paused_now(&h), "單擊不動作");
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "單擊不動作");
+    // 中鍵 = 靜音
+    click_video_with(&mut h, egui::PointerButton::Middle);
+    step_until(&mut h, "中鍵靜音", |s| s.muted);
+    // 側鍵：下一頁加快、上一頁減慢
+    click_video_with(&mut h, egui::PointerButton::Extra2);
+    step_until(&mut h, "側鍵（下一頁）加快", |s| close_to(s.speed, 1.1));
+    click_video_with(&mut h, egui::PointerButton::Extra1);
+    step_until(&mut h, "側鍵（上一頁）減慢", |s| close_to(s.speed, 1.0));
+    // 滾輪 = 跳轉：往上一格前進 3 秒（跳轉秒數），音量不變。
+    // 相對跳轉會落在關鍵影格上（這個檔案只有 0 秒、10.4 秒兩個），跳了幾秒看 OSD，位置只看方向
+    let t0 = h.state().player().state.time_pos;
+    wheel_video(&mut h, 2.0);
+    let osd = h.state().osd_text().unwrap_or_default();
+    assert!(osd.starts_with("▶▶ 前進 6 秒"), "往上兩格 × 3 秒：{osd}");
+    step_until(&mut h, "滾輪往上：往前跳", |s| s.time_pos > t0 + 1.0);
+    wait_seek_done(&mut h, "往前跳的跳轉做完");
+    let t1 = h.state().player().state.time_pos;
+    wheel_video(&mut h, -1.0);
+    let osd = h.state().osd_text().unwrap_or_default();
+    assert!(osd.starts_with("◀◀ 後退 3 秒"), "往下一格 × 3 秒：{osd}");
+    step_until(&mut h, "往下一格：往回跳", |s| s.time_pos < t1 - 1.0);
+    assert_eq!(h.state().player().state.volume, 100.0, "滾輪不再調音量");
+    // 滾輪 = 不動作
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.wheel = WheelMode::None;
+    let mut h = playing_multitrack_with(settings);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let t0 = h.state().player().state.time_pos;
+    let osd0 = h.state().osd_text().map(str::to_owned);
+    // 先往上（音量已經是 100%，跳轉會跳到 10.4 秒），再往下（音量會變 90%）
+    for lines in [2.0, -2.0] {
+        wheel_video(&mut h, lines);
+        let osd = h.state().osd_text().map(str::to_owned);
+        assert!(
+            osd.is_none() || osd == osd0,
+            "滾輪 {lines} 格不顯示跳轉 / 音量：{osd:?}"
+        );
+        h.run_steps(3);
+        // 音量是同步設定的：直接問 mpv（跳轉、調音量都會在同一幀提示，上面已經確定沒有）
+        let volume = h.state().player().get_f64("volume").unwrap();
+        assert_eq!(volume, 100.0, "滾輪 {lines} 格不調音量");
+        wait_real(&mut h, 0.3);
+        let st = &h.state().player().state;
+        assert_eq!(st.volume, 100.0, "滾輪 {lines} 格不調音量");
+        assert!(
+            (st.time_pos - t0).abs() < 0.05,
+            "滾輪 {lines} 格不跳轉：{t0} → {}",
+            st.time_pos
+        );
+    }
+}
+
+/// 預設：雙擊畫面只切換全螢幕（第一下單擊已經暫停了，雙擊時切回來）
+#[test]
+fn double_click_on_the_video_goes_fullscreen_without_pausing() {
+    let mut h = playing_multitrack();
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    assert_eq!(h.state().osd_text(), None, "不顯示暫停 / 播放");
+    assert!(!paused_now(&h), "雙擊不暫停");
+    wait_real(&mut h, 0.4);
+    assert!(!h.state().player().state.paused, "雙擊不暫停");
+}
+
+/// 單擊 = 靜音：雙擊時也要把第一下的靜音切回來，結果只有全螢幕改變
+#[test]
+fn double_click_undoes_a_mute_click() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.click = "toggle-mute".into();
+    let mut h = playing_multitrack_with(settings);
+    click_video_with(&mut h, egui::PointerButton::Primary);
+    step_until(&mut h, "單擊靜音", |s| s.muted);
+    h.run_steps(3);
+    assert!(!h.state().player().state.paused, "單擊不暫停");
+    // 靜音中雙擊：還是靜音，切換全螢幕
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    assert_eq!(h.state().osd_text(), None, "不顯示靜音 / 取消靜音");
+    assert!(muted_now(&h), "雙擊不改變靜音");
+    assert!(!paused_now(&h));
+    wait_real(&mut h, 0.4);
+    let st = &h.state().player().state;
+    assert!(st.muted, "雙擊不改變靜音");
+    assert!(!st.paused);
+}
+
+/// 單擊 = 靜音、雙擊 = 不動作：點兩下是靜音再取消靜音（第二下照第一下之前的值設回去）
+#[test]
+fn double_click_bound_to_nothing_with_a_mute_click_mutes_and_unmutes() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.click = "toggle-mute".into();
+    settings.keys.mouse.double_click = String::new();
+    let mut h = playing_multitrack_with(settings);
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "{cmds:?}"
+    );
+    assert_eq!(h.state().osd_text(), Some("取消靜音"), "第二下取消靜音");
+    h.run_steps(3);
+    assert!(!muted_now(&h), "靜音再取消靜音");
+    assert!(!paused_now(&h));
+    wait_real(&mut h, 0.4);
+    let st = &h.state().player().state;
+    assert!(!st.muted, "靜音再取消靜音");
+    assert!(!st.paused);
+    // 再點一下：照常靜音
+    click_video_with(&mut h, egui::PointerButton::Primary);
+    step_until(&mut h, "第三下靜音", |s| s.muted);
+}
+
+/// 雙擊 = 不動作：點兩下就是單擊兩下（暫停再播放），不切換全螢幕
+#[test]
+fn double_click_bound_to_nothing_is_two_clicks() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.mouse.double_click = String::new();
+    let mut h = playing_multitrack_with(settings);
+    let pos = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, pos);
+    let cmds = viewport_commands(&h);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::Fullscreen(_))),
+        "{cmds:?}"
+    );
+    assert!(h.state().osd_text().is_some(), "第二下照樣是單擊（顯示播放 / 暫停）");
+    assert!(!paused_now(&h), "暫停又播放");
+    wait_real(&mut h, 0.4);
+    assert!(!h.state().player().state.paused, "暫停又播放");
+}
+
+/// 設定頁的滑鼠區：改中鍵、滾輪馬上生效、存檔；「還原成預設組…」連滑鼠一起還原
+#[test]
+fn mouse_settings_page_changes_and_resets() {
+    use vitascope::keymap::{MouseSettings, WheelMode};
+    let dir = TempDir::new("mouse-page");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("common/mkv_multitrack.mkv")), settings);
+    settle(&mut h, "mkv_multitrack.mkv");
+    shortcuts_page(&mut h, "快捷鍵", "滑鼠");
+    // 只剩滑鼠的設定（搜尋「滑鼠」）；預設是單擊播放／暫停、雙擊全螢幕、滾輪音量
+    assert!(h.query_by_label("播放／暫停").is_none(), "鍵盤的指令不在搜尋結果裡");
+    for (label, value) in [
+        ("單擊畫面", "播放／暫停"),
+        ("雙擊畫面", "全螢幕"),
+        ("中鍵", "不動作"),
+        ("側鍵（上一頁）", "不動作"),
+        ("側鍵（下一頁）", "不動作"),
+        ("在畫面上捲動滾輪", "音量"),
+    ] {
+        let combo = combo_box(&h, label);
+        assert_eq!(combo.accesskit_node().value().as_deref(), Some(value), "{label}");
+    }
+    // 中鍵改成靜音（任何指令都可以選，清單很長，要捲到看得到）
+    combo_in_view(&mut h, "中鍵");
+    h.get_by_label("靜音").scroll_to_me();
+    h.run_steps(3);
+    h.get_by_label("靜音").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse.middle, "toggle-mute");
+    assert_eq!(combo_box(&h, "中鍵").accesskit_node().value().as_deref(), Some("靜音"));
+    // 單擊只能選開關：清單裡沒有全螢幕
+    combo_in_view(&mut h, "單擊畫面");
+    assert!(h.query_by_label("全螢幕").is_none(), "單擊不能選全螢幕");
+    h.get_by_label("不動作").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse.click, "");
+    // 滾輪改成跳轉
+    combo_in_view(&mut h, "在畫面上捲動滾輪");
+    h.get_by_label("跳轉（每格 5 秒）").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse.wheel, WheelMode::Seek);
+    // 馬上存檔
+    let saved = Settings::load_from(path.clone()).keys.mouse;
+    assert_eq!(saved.middle, "toggle-mute");
+    assert_eq!(saved.click, "");
+    assert_eq!(saved.wheel, WheelMode::Seek);
+    // 關掉設定，馬上生效：中鍵靜音
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    click_video_with(&mut h, egui::PointerButton::Middle);
+    step_until(&mut h, "中鍵靜音", |s| s.muted);
+    // 還原成預設組：滑鼠也還原（對話框寫明）
+    shortcuts_page(&mut h, "快捷鍵", "");
+    h.get_by_label("還原成預設組…").scroll_to_me();
+    h.run_steps(5);
+    h.get_by_label("還原成預設組…").click();
+    h.run_steps(2);
+    h.get_by_label("把所有快捷鍵還原成「影戲」的預設值？");
+    h.get_by_label("滑鼠的設定也一起還原。");
+    h.get_by_label("還原").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().keys.mouse, MouseSettings::default());
+    assert_eq!(Settings::load_from(path).keys.mouse, MouseSettings::default());
+    // 固定的按鍵清單不再寫單擊、雙擊、滾輪（可以改了）
+    assert!(h.query_by_label("切換全螢幕").is_none());
+}
+
+#[test]
+fn mouse_settings_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    settings.keys.mouse.forward = "future-command-2030".into();
+    let mut h = playing_multitrack_with(settings);
+    shortcuts_page(&mut h, "Shortcuts", "mouse");
+    h.get_by_label("Mouse");
+    for (label, value) in [
+        ("Click on the video", "Play / pause"),
+        ("Double-click on the video", "Fullscreen"),
+        ("Middle button", "Do nothing"),
+        ("Back button", "Do nothing"),
+        // 新版的指令：照原樣寫出來，不會被改掉
+        ("Forward button", "future-command-2030"),
+        ("Wheel over the video", "Volume"),
+    ] {
+        let combo = combo_box(&h, label);
+        assert_eq!(combo.accesskit_node().value().as_deref(), Some(value), "{label}");
+    }
+    combo_in_view(&mut h, "Wheel over the video");
+    h.get_by_label("Seek (5 s per notch)");
+    h.get_by_label("Do nothing").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().keys.mouse.wheel,
+        vitascope::keymap::WheelMode::None
+    );
+    assert_eq!(h.state().settings().keys.mouse.forward, "future-command-2030");
+    // 捲回最上面（選滾輪時捲到下面了）再按「還原成預設組…」
+    h.get_by_label("Reset to the preset…").scroll_to_me();
+    h.run_steps(5);
+    h.get_by_label("Reset to the preset…").click();
+    h.run_steps(2);
+    h.get_by_label("Mouse settings are reset too.");
 }
 
 // ───────────── 畫質：去交錯、去色帶、銳化、縮放演算法、HDR ─────────────
@@ -4002,6 +9779,7 @@ fn pick_picture_item(h: &mut Harness<'_, VitascopeApp>, path: &[&str], item: &st
     for sub in path {
         hover_menu_item(h, sub);
     }
+    wait_menu_item(h, item);
     h.get_by_label(item).click();
     h.run_steps(2);
 }
@@ -5323,6 +11101,7 @@ fn shader_section_in_english() {
 
 /// 開右鍵選單、把滑鼠移到「音效」上（子選單打開）。有檔案時在影片中間按，沒有時在左上角按（中間是起始畫面的按鈕）
 fn open_sound_menu(h: &mut Harness<'_, VitascopeApp>) {
+    wait_window_fit(h);
     if h.state().player().state.loaded {
         h.get_by_label("影片畫面").click_secondary();
     } else {
@@ -5347,6 +11126,7 @@ fn pick_sound_item(h: &mut Harness<'_, VitascopeApp>, path: &[&str], item: &str)
     for sub in path {
         hover_menu_item(h, sub);
     }
+    wait_menu_item(h, item);
     h.get_by_label(item).click();
     h.run_steps(2);
 }
@@ -5737,8 +11517,8 @@ fn sound_menu_device_items() {
     assert_eq!(saved_audio(&path)["device_label"], "USB DAC");
     // 媒體資訊的輸出裝置：顯示裝置的說明；面板開著時換裝置也跟著換（每秒重讀）
     h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
-    h.run_steps(2);
-    h.get_by_label_contains("· USB DAC");
+    // 面板打開時讀一次裝置（mpv 換裝置是非同步的：CI 上可能還沒換好，等下一次重讀）
+    step_until_label(&mut h, "· USB DAC");
     pick_sound_item(&mut h, &["輸出裝置"], "內建喇叭");
     wait_prop(&mut h, "audio-device", SPEAKERS.0);
     let start = Instant::now();
@@ -5855,6 +11635,9 @@ fn sound_ui_in_english() {
     ] {
         h.get_by_label(label);
     }
+    // 換了裝置：mpv 重開音訊輸出，直通要等新的輸出開好（CI 上不一定兩幀就好）
+    step_until(&mut h, "換裝置後又是直通", |s| s.audio_spdif.is_some());
+    step_until_label(&mut h, "Active: AC-3");
     h.get_by_label("Active: AC-3");
     assert!(h.query_by_label_contains("音").is_none(), "沒有中文");
 }
@@ -5975,6 +11758,20 @@ fn disabled_filters(h: &Harness<'_, VitascopeApp>) -> Vec<String> {
         .filter(|e| e.contains("Disabling filter"))
         .cloned()
         .collect()
+}
+
+/// 濾鏡失敗的紀錄穩定下來（1 秒內沒有新的，最多等 5 秒）之後的內容
+fn settled_disabled_filters(h: &mut Harness<'_, VitascopeApp>) -> Vec<String> {
+    let mut last = disabled_filters(h);
+    for _ in 0..5 {
+        wait_real(h, 1.0);
+        let now = disabled_filters(h);
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    last
 }
 
 #[test]
@@ -6587,8 +12384,10 @@ fn unpredicted_spdif_clears_and_revives_the_eq_chain() {
     wait_af(&mut h, "直通開始之後清空", str::is_empty);
     wait_real(&mut h, 0.3);
     assert_eq!(prop(&h, "af"), "", "直通中沒有濾鏡");
-    // 濾鏡在清空之前可能已經碰到直通的資料、失敗了（預測不到，沒辦法事先清空）：記下來，之後比對內容
-    let mut failed = disabled_filters(&h);
+    // 濾鏡在清空之前可能已經碰到直通的資料、失敗了（預測不到，沒辦法事先清空）：記下來，之後比對內容。
+    // af 屬性先變成空的，舊的濾鏡鏈要等音訊執行緒重建才拆掉，失敗的紀錄可能晚一點才到（CI 的 macOS 上超過 0.3 秒）：
+    // 等紀錄一秒內沒有再變才記下
+    let mut failed = settled_disabled_filters(&mut h);
     // 關掉直通（舊的引擎要重新開檔）：等化器回來，不再失敗
     h.state().player().mpv().set_property("audio-spdif", "").unwrap();
     if !h.state().engine_caps().spdif_live {
@@ -6937,6 +12736,134 @@ fn audio_output_failure_keeps_playing_with_a_notice() {
     });
 }
 
+/// 電腦慢的時候，新檔案的 StartFile 跟它的音訊輸出開不起來（改用 null）的通知在同一批事件裡：
+/// 不能當成上一個檔案改用了 null（第一個檔案沒有上一個，不重開）。macOS CI 上發生過（重開了一次）
+#[test]
+fn audio_fallback_in_the_same_batch_as_its_start_is_not_retried() {
+    let (_dir, _path, mut h) = sound_harness_with(
+        "sound-ao-same-batch",
+        None,
+        Some(&[SPEAKERS]),
+        &[
+            ("ao", ""),
+            ("audio-device", "wasapi/{00000000-0000-0000-0000-00000000dead}"),
+            LOOP_FILE,
+        ],
+        |_| {},
+    );
+    // 開檔（送出 loadfile），然後先不跑介面：直接問 mpv，等它改用 null。這時 StartFile 和改用 null 的通知都還沒處理，
+    // 下一幀一起處理（像是很慢的電腦）
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    let start = Instant::now();
+    while h.state().player().get_string("current-ao").ok().as_deref() != Some("null") {
+        assert!(start.elapsed() < TIMEOUT, "mpv 沒有改用 null");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    step_until_app(&mut h, "提示沒有聲音", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+    });
+    assert!(h.state().player().audio_fell_back());
+    assert_eq!(h.state().audio_output_retries(), 0, "第一個檔案沒有上一個：不重開");
+}
+
+/// 反過來：上一個檔案快結束時才改用 null，那個通知排在新檔案的 StartFile 後面（mpv 先送完排著的事件才送變了的屬性）。
+/// StartFile 時看到的還是真正的輸出，但新檔案沿用的是 null：要重開一次，不然新檔案一直沒有聲音
+#[test]
+fn audio_fallback_reported_after_the_next_start_is_retried() {
+    // 真正的輸出用 pcm（寫到空裝置，每個平台都開得起來）；改成寫不進去的路徑再重開，就開不起來、改用 null
+    let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let (dir, _path, mut h) = sound_harness_with(
+        "sound-ao-late-fallback",
+        None,
+        Some(&[SPEAKERS]),
+        &[("ao", "pcm"), ("ao-pcm-file", null_device), LOOP_FILE],
+        |_| {},
+    );
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    // pcm 不照時間播（寫多快播多快）：一開始就暫停（播著的話 mpv 重開 pcm 時常常停在沒有音訊輸出）。
+    // 暫停中 mpv 照樣開音訊輸出
+    h.state().player().set_pause(true).unwrap();
+    step_until(&mut h, "開著真正的輸出", |s| {
+        s.loaded && s.paused && s.current_ao.as_deref() == Some("pcm")
+    });
+    assert!(!h.state().player().audio_fell_back());
+    // 先不跑介面：上一個檔案的輸出改用 null，接著開下一個檔案、等 mpv 開始它（path 在送出 StartFile 之後才換），
+    // 下一幀一起處理：StartFile 先到，改用 null 的通知在後面
+    let missing = dir.0.join("missing").join("out.wav");
+    let player = h.state().player();
+    player
+        .set_option_if_changed("ao-pcm-file", &missing.to_string_lossy())
+        .unwrap();
+    player
+        .command_async_keyed(AsyncKey::AudioDevice, &["ao-reload"])
+        .unwrap();
+    let start = Instant::now();
+    let mut reloaded = Instant::now();
+    while player.get_string("current-ao").ok().as_deref() != Some("null") {
+        // 重開的那一刻剛好沒有音訊輸出（例如正在重開）時 mpv 不做：等一下再要一次
+        if reloaded.elapsed() > Duration::from_secs(2) {
+            player
+                .command_async_keyed(AsyncKey::AudioDevice, &["ao-reload"])
+                .unwrap();
+            reloaded = Instant::now();
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "mpv 沒有改用 null：{:?} {:?} {:?} {:?}",
+            player.get_string("current-ao"),
+            player.get_string("pause"),
+            player.get_string("core-idle"),
+            player.recent_errors()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let next = sample("general/audio_wav.wav");
+    h.state_mut().player_mut().open(&next.to_string_lossy()).unwrap();
+    let player = h.state().player();
+    let start = Instant::now();
+    while player.get_string("path").ok().map(PathBuf::from) != Some(next.clone()) {
+        assert!(start.elapsed() < TIMEOUT, "mpv 沒有開始下一個檔案");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.state().audio_output_retries(), 0);
+    h.step();
+    assert_eq!(h.state().audio_output_retries(), 1, "上一個檔案改用了 null：換檔時重開");
+    step_until_app(&mut h, "還是開不起來：提示", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+    });
+    assert_eq!(h.state().audio_output_retries(), 1);
+    // 真正的輸出又開得起來了（寫回空裝置）：之後的檔案不再重開（StartFile 那一刻記下的只算那一次，不留給之後的檔案）
+    h.state()
+        .player()
+        .set_option_if_changed("ao-pcm-file", null_device)
+        .unwrap();
+    let start = Instant::now();
+    let mut reloaded: Option<Instant> = None;
+    while h.state().player().state.current_ao.as_deref() != Some("pcm") {
+        if reloaded.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+            h.state()
+                .player()
+                .command_async_keyed(AsyncKey::AudioDevice, &["ao-reload"])
+                .unwrap();
+            reloaded = Some(Instant::now());
+        }
+        assert!(start.elapsed() < TIMEOUT, "真正的輸出沒有再開起來");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!h.state().player().audio_fell_back());
+    let retries = h.state().audio_output_retries();
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    step_until(&mut h, "下一個檔案開好、用真正的輸出", |s| {
+        playing(s, "audio_flac.flac") && s.current_ao.as_deref() == Some("pcm")
+    });
+    assert_eq!(
+        h.state().audio_output_retries(),
+        retries,
+        "上一個檔案用的是真正的輸出：換檔時不重開"
+    );
+}
+
 #[test]
 fn audio_output_failure_in_exclusive_mode_mentions_it() {
     // 開著獨佔模式時開不起來：提示可能是獨佔模式不被允許
@@ -7158,8 +13085,8 @@ fn each_button_opens_its_file_dialog() {
         vec![path_str(&invert), path_str(&keep)]
     );
     assert!(!h.state().player().state.paused, "選完照樣在播");
-    // 設定 → 截圖 → 變更…
-    h.get_by_label("截圖").click();
+    // 設定 → 截圖與匯出 → 變更…（D3：「截圖」頁改名「截圖與匯出」）
+    h.get_by_label("截圖與匯出").click();
     h.run_steps(2);
     click_in_view(&mut h, "變更…");
     assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::ScreenshotDir, Pick::Folder)]);
@@ -7345,4 +13272,3022 @@ fn save_as_screenshot_waits_for_the_open_dialog() {
     assert_eq!(h.state().dialog_pending(), Some(DialogKind::Open));
     req.reply.send(None).unwrap();
     step_until_app(&mut h, "取消", |app| app.dialog_pending().is_none());
+}
+
+// ───────────── 書籤 ─────────────
+
+/// 目前檔案的書籤時間
+fn mark_times(h: &Harness<'_, VitascopeApp>) -> Vec<f64> {
+    let app = h.state();
+    let key = app.player().state.path.clone().unwrap_or_default();
+    app.bookmarks().marks(&key).iter().map(|m| m.time).collect()
+}
+
+/// 暫停中精準跳到 `t`，等畫面跟上
+fn paused_at(h: &mut Harness<'_, VitascopeApp>, t: f64) {
+    h.state().player().seek_to(t, true).unwrap();
+    step_until(h, "跳到指定的時間", |s| {
+        s.paused && (s.time_pos - t).abs() < 0.05
+    });
+    h.run_steps(3);
+}
+
+/// 暫停中等跳轉做完：mpv 不在跳轉中，介面看到的位置也跟 mpv 的一樣（播放中位置一直在變，不能用）。
+/// 關鍵影格跳轉時 mpv 先把位置報成跳轉的目標，實際落在哪一格晚一點才知道
+fn wait_seek_done(h: &mut Harness<'_, VitascopeApp>, what: &str) {
+    step_until_app(h, what, |app| {
+        let p = app.player();
+        p.get_string("seeking").is_ok_and(|v| v == "no")
+            && p.get_f64("time-pos").is_ok_and(|t| (t - p.state.time_pos).abs() < 1e-6)
+    });
+}
+
+/// 開 90 秒的樣本、暫停
+fn paused_long() -> Harness<'static, VitascopeApp> {
+    let mut h = opened(sample("common/mp4_long.mp4"));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h
+}
+
+#[test]
+fn bookmark_key_adds_and_says_why_not() {
+    // 沒有開檔：提示先開影片
+    let mut h = harness(None);
+    h.run_steps(2);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("請先開啟影片"));
+    let mut h = paused_long();
+    // 還沒有書籤：上一個 / 下一個說明怎麼加（按鍵從對照表來）；不會換檔
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("這個檔案還沒有書籤（按 P 新增）"));
+    assert!(
+        playing(&h.state().player().state, "mp4_long.mp4"),
+        "Shift+PgDn 不是下一個檔案"
+    );
+    paused_at(&mut h, 12.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("新增書籤 00:12"));
+    assert_eq!(mark_times(&h), [12.0]);
+    // 同一個位置（0.5 秒內）不重複加
+    paused_at(&mut h, 12.3);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("00:12 已經有書籤"));
+    assert_eq!(mark_times(&h), [12.0]);
+    assert!(paused_now(&h), "加書籤不影響暫停");
+    assert!(h.state().player().state.paused, "加書籤不影響暫停");
+}
+
+/// 書籤的時間是按下 P 那一刻 mpv 的時間（不是介面看到的狀態：跳轉剛送出時還是跳轉前的），
+/// 上一個 / 下一個書籤精準跳到那一格
+#[test]
+fn bookmark_jump_is_exact() {
+    let mut h = paused_long();
+    for target in [3.2, 7.9] {
+        // 跳轉送出後馬上按 P，同一幀處理（不等介面看到新的位置）。兩次跳轉不到 0.3 秒：
+        // mpv 可能還沒開始做這一次（等上一次的畫面），書籤照樣在這次的目標
+        h.state().player().seek_to(target, true).unwrap();
+        h.key_press(egui::Key::P);
+        h.step();
+        let times = mark_times(&h);
+        assert!(
+            times.iter().any(|t| (t - target).abs() < 0.05),
+            "書籤要在 {target}：{times:?}"
+        );
+    }
+    assert_eq!(mark_times(&h).len(), 2);
+    paused_at(&mut h, 0.0);
+    for (key, want, osd) in [
+        (egui::Key::PageDown, 3.2, "書籤 1/2：00:03"),
+        (egui::Key::PageDown, 7.9, "書籤 2/2：00:08"),
+        (egui::Key::PageUp, 3.2, "書籤 1/2：00:03"),
+    ] {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, key);
+        // 提示在按鍵時出現：跳轉在 CI 上可能比提示的 1.5 秒久，等的時候每一幀記下來
+        let mut seen = Seen::default();
+        step_until_state_seen(&mut h, &mut seen, osd, |s| (s.time_pos - want).abs() < 0.05);
+        assert_eq!(seen.last_osd(), Some(osd));
+        // 跳轉途中的畫面時間可能先到、之後才真的停在那一格：等跳轉做完再確認
+        wait_seek_done(&mut h, "跳到書籤");
+        let s = &h.state().player().state;
+        assert!(
+            (s.time_pos - want).abs() < 0.05 && s.paused,
+            "停在 {want}：{}",
+            s.time_pos
+        );
+    }
+    // 前面、後面沒有了
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("前面沒有書籤"));
+    paused_at(&mut h, 7.9);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("後面沒有書籤"));
+    assert!((h.state().player().state.time_pos - 7.9).abs() < 0.05);
+}
+
+/// 進度條上這個顏色的小三角形（書籤標記）的中心 x
+fn marker_xs(h: &Harness<'_, VitascopeApp>) -> Vec<f32> {
+    fn walk(shape: &egui::Shape, color: egui::Color32, out: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Path(p) if p.fill == color && p.points.len() == 3 => {
+                out.push(p.points.iter().map(|q| q.x).sum::<f32>() / 3.0);
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, color, out)),
+            _ => {}
+        }
+    }
+    let color = h.state().palette().bookmark;
+    let mut out = Vec::new();
+    for c in &h.output().shapes {
+        walk(&c.shape, color, &mut out);
+    }
+    out
+}
+
+#[test]
+fn bookmark_marker_shows_its_name_and_click_snaps() {
+    let mut h = paused_long();
+    assert!(marker_xs(&h).is_empty());
+    paused_at(&mut h, 30.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    paused_at(&mut h, 60.0);
+    let bar = h.get_by_label("進度").rect();
+    let x = bar.left() + bar.width() * (30.0 / 90.0);
+    let xs = marker_xs(&h);
+    assert_eq!(xs.len(), 1, "畫一個標記");
+    assert!((xs[0] - x).abs() < 1.0, "標記在 30 秒的位置：{} / {x}", xs[0]);
+    // 停在標記附近：時間換成書籤
+    let near = egui::pos2(x + 3.0, bar.center().y);
+    h.event(egui::Event::PointerMoved(near));
+    h.run_steps(2);
+    assert!(painted(&h, "00:30 · 書籤"), "停在標記上顯示書籤");
+    // 點標記旁邊 3 點：精準跳到書籤的時間（不是點的位置）
+    h.event(left_button(near, true));
+    h.event(left_button(near, false));
+    h.step();
+    step_until(&mut h, "跳到書籤", |s| (s.time_pos - 30.0).abs() < 0.05);
+    wait_seek_done(&mut h, "跳到書籤的跳轉做完");
+    assert!((h.state().player().state.time_pos - 30.0).abs() < 0.05);
+    // 離標記遠一點：照點的位置跳，時間照舊顯示
+    let far = egui::pos2(x + 40.0, bar.center().y);
+    h.event(egui::Event::PointerMoved(far));
+    h.run_steps(2);
+    assert!(!painted(&h, "00:30 · 書籤"));
+    h.event(left_button(far, true));
+    h.event(left_button(far, false));
+    h.step();
+    let want = 90.0 * f64::from((far.x - bar.left()) / bar.width());
+    step_until(&mut h, "照點的位置跳", |s| (s.time_pos - want).abs() < 0.3);
+    assert!((h.state().player().state.time_pos - 30.0).abs() > 1.0);
+    // 拖曳經過標記：放開時跳到的是滑鼠的位置，時間也照滑鼠的位置顯示（不換成書籤）
+    wait_real(&mut h, 0.4);
+    let close = egui::pos2(x + 4.0, bar.center().y);
+    h.event(left_button(far, true));
+    h.step();
+    for i in 1..=10 {
+        h.event(egui::Event::PointerMoved(far.lerp(close, i as f32 / 10.0)));
+        h.step();
+    }
+    h.run_steps(2);
+    assert!(!painted(&h, "00:30 · 書籤"), "拖曳中不換成書籤");
+    let pointer = 90.0 * f64::from((close.x - bar.left()) / bar.width());
+    assert!(painted(&h, &vitascope::app::fmt_time(pointer)), "顯示滑鼠位置的時間");
+    h.event(left_button(close, false));
+    h.step();
+    step_until(&mut h, "放開：跳到滑鼠的位置", |s| {
+        (s.time_pos - pointer).abs() < 0.1
+    });
+    // 放開後滑鼠還停在標記附近：又顯示書籤
+    h.run_steps(2);
+    assert!(painted(&h, "00:30 · 書籤"));
+}
+
+/// 連按「下一個書籤」：每按一次前進一個（上一次的跳轉 mpv 還沒做時，從它的目標往後找）
+#[test]
+fn bookmark_steps_add_up_when_pressed_quickly() {
+    let mut h = paused_long();
+    for t in [10.0, 20.0, 30.0, 40.0] {
+        paused_at(&mut h, t);
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+    }
+    assert_eq!(mark_times(&h), [10.0, 20.0, 30.0, 40.0]);
+    paused_at(&mut h, 0.0);
+    for _ in 0..3 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+        h.step();
+    }
+    assert_eq!(h.state().osd_text(), Some("書籤 3/4：00:30"));
+    step_until(&mut h, "停在第三個書籤", |s| (s.time_pos - 30.0).abs() < 0.05);
+    wait_seek_done(&mut h, "跳到第三個書籤的跳轉做完");
+    let s = &h.state().player().state;
+    assert!((s.time_pos - 30.0).abs() < 0.05 && s.paused, "{}", s.time_pos);
+    // 往回連按兩次：回到第一個
+    for _ in 0..2 {
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+        h.step();
+    }
+    assert_eq!(h.state().osd_text(), Some("書籤 1/4：00:10"));
+    step_until(&mut h, "回到第一個書籤", |s| (s.time_pos - 10.0).abs() < 0.05);
+}
+
+/// 不是精準跳轉（沒有記下目標）時，P 也是問 mpv 按下那一刻的 time-pos，不是介面記下的狀態。
+/// 介面的狀態故意改成錯的（暫停中 mpv 不會再送 time-pos，下一幀也不會被蓋掉）：書籤要在 mpv 真正的位置。
+/// 不靠「跳轉做完了、介面還沒看到」這種時間差，慢的機器上結果一樣
+#[test]
+fn bookmark_time_comes_from_mpv_not_the_ui_state() {
+    let mut h = paused_long();
+    paused_at(&mut h, 10.0);
+    // 離上一次精準跳轉超過 0.35 秒：不再用跳轉的目標，改問 mpv
+    wait_real(&mut h, 0.5);
+    h.state_mut().player_mut().state.time_pos = 123.0;
+    h.key_press(egui::Key::P);
+    h.step();
+    let times = mark_times(&h);
+    assert_eq!(times.len(), 1, "{times:?}");
+    assert!((times[0] - 10.0).abs() < 0.05, "書籤要在 mpv 的位置：{times:?}");
+}
+
+#[test]
+fn bookmarks_context_submenu_adds_and_jumps() {
+    let mut h = paused_long();
+    // 沒有書籤：子選單說還沒有，寫出上一個 / 下一個的按鍵
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label("這個檔案還沒有書籤");
+    h.get_by_label("上一個 / 下一個書籤：Shift+PgUp / PgDn");
+    let first = h.state().player().state.time_pos;
+    h.get_by_label("新增書籤 P").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some(format!("新增書籤 {}", vitascope::app::fmt_time(first)).as_str())
+    );
+    assert_eq!(mark_times(&h).len(), 1);
+    let first = mark_times(&h)[0];
+    paused_at(&mut h, 45.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    paused_at(&mut h, 70.0);
+    // 子選單列出書籤（時間），點了跳過去
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label("00:45").click();
+    let mut seen = Seen::default();
+    run_steps_seen(&mut h, &mut seen, 2);
+    step_until_state_seen(&mut h, &mut seen, "跳到 45 秒", |s| (s.time_pos - 45.0).abs() < 0.05);
+    assert_eq!(seen.last_osd(), Some("書籤 2/2：00:45"));
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label(&vitascope::app::fmt_time(first)).click();
+    h.run_steps(2);
+    step_until(&mut h, "跳到第一個", |s| (s.time_pos - first).abs() < 0.05);
+    assert!(paused_now(&h));
+    assert!(h.state().player().state.paused);
+}
+
+#[test]
+fn bookmark_menu_without_a_file_is_disabled() {
+    let mut h = harness(None);
+    h.run_steps(2);
+    // 起始畫面中間是提示文字：在影片畫面的角落按右鍵
+    let corner = h.get_by_label("影片畫面").rect().left_top() + egui::vec2(20.0, 20.0);
+    h.event(egui::Event::PointerMoved(corner));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: corner,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+    hover_menu_item(&mut h, "書籤 ⏵");
+    assert!(
+        h.get_by_label("新增書籤 P").accesskit_node().is_disabled(),
+        "沒有開檔不能加"
+    );
+    assert!(h.query_by_label("這個檔案還沒有書籤").is_none());
+}
+
+#[test]
+fn unseekable_sources_cannot_be_bookmarked() {
+    // 經過 FFmpeg 的 file 協定、告訴它不能跳轉（像直播、不支援 Range 的伺服器）
+    let url = format!("lavf://file:{}", sample("common/mp4_long.mp4").display());
+    for (lang, cant_add, cant_jump, video, menu, add) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            "這個檔案不能跳轉，無法加書籤",
+            "這個檔案不能跳轉",
+            "影片畫面",
+            "書籤 ⏵",
+            "新增書籤 P",
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            "This file isn't seekable, so it can't be bookmarked",
+            "This file isn't seekable",
+            "Video",
+            "Bookmarks ⏵",
+            "Add bookmark P",
+        ),
+    ] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let opts = Options {
+            keep_open: true,
+            extra: vec![("stream-lavf-o".into(), "seekable=0".into())],
+            ..Options::headless()
+        };
+        // 之前（例如能跳轉時）加的書籤：跳不過去
+        let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+        bookmarks.add(&url, 50.0).unwrap();
+        let launch = Launch {
+            files: vec![PathBuf::from(&url)],
+            bookmarks,
+            ..Default::default()
+        };
+        let mut h = harness_launch_with(opts, launch, settings);
+        step_until(&mut h, "載入完成", |s| s.loaded && s.duration.is_some());
+        h.run_steps(3);
+        assert!(!h.state().player().state.seekable, "這個來源不能跳轉");
+        assert_eq!(mark_times(&h), [50.0]);
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+        assert_eq!(h.state().osd_text(), Some(cant_add));
+        assert_eq!(mark_times(&h), [50.0]);
+        h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+        h.run_steps(2);
+        assert_eq!(h.state().osd_text(), Some(cant_jump));
+        h.get_by_label(video).click_secondary();
+        h.run_steps(2);
+        hover_menu_item(&mut h, menu);
+        let node = h.get_by_label(add);
+        assert!(node.accesskit_node().is_disabled());
+        node.hover();
+        h.run_steps(3);
+        assert!(h.query_by_label(cant_add).is_some(), "停在上面說明為什麼不能加");
+    }
+}
+
+#[test]
+fn bookmarks_are_saved_to_their_file() {
+    let dir = TempDir::new("bookmarks");
+    let store = dir.0.join("bookmarks.json");
+    let video = dir.clip("影片.mp4");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let launch = Launch {
+        files: vec![video.clone()],
+        bookmarks: vitascope::bookmarks::Bookmarks::load_from(store.clone()),
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    settle(&mut h, "影片.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    paused_at(&mut h, 1.5);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    let key = h.state().player().state.path.clone().unwrap();
+    assert!(h.state().bookmarks().flush(TIMEOUT), "背景存檔");
+    let saved = vitascope::bookmarks::Bookmarks::load_from(store);
+    let marks = saved.marks(&key);
+    assert_eq!(marks.len(), 1);
+    assert!((marks[0].time - 1.5).abs() < 0.05);
+    let file = saved.file(&key).unwrap();
+    assert_eq!(file.path, key, "存的是完整路徑");
+    assert_eq!(file.size, Some(std::fs::metadata(&video).unwrap().len()));
+}
+
+#[test]
+fn bookmarks_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings.clone());
+    h.run_steps(2);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Open a video first"));
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "pause", |s| s.paused);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    h.run_steps(2);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("No bookmarks in this file yet (press P to add one)")
+    );
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Bookmarks ⏵");
+    h.get_by_label("No bookmarks in this file yet");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    paused_at(&mut h, 20.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Bookmark added at 00:20"));
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("There's already a bookmark at 00:20"));
+    paused_at(&mut h, 50.0);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageDown);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("No more bookmarks after this point"));
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    // 提示在按鍵時出現：跳轉在 CI 上可能比提示的 1.5 秒久，等的時候每一幀記下來
+    let mut seen = Seen::default();
+    step_until_state_seen(&mut h, &mut seen, "back to 20 s", |s| (s.time_pos - 20.0).abs() < 0.05);
+    assert_eq!(seen.last_osd(), Some("Bookmark 1/1: 00:20"));
+    wait_seek_done(&mut h, "jump done");
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("No bookmarks before this point"));
+    paused_at(&mut h, 50.0);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Bookmarks ⏵");
+    h.get_by_label("Add bookmark P");
+    h.get_by_label("Previous / next bookmark: Shift+PgUp / PgDn");
+    h.get_by_label("00:20");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 進度條上的標記
+    let bar = h.get_by_label("Progress").rect();
+    let x = bar.left() + bar.width() * (20.0 / 90.0);
+    h.event(egui::Event::PointerMoved(egui::pos2(x, bar.center().y)));
+    h.run_steps(2);
+    assert!(painted(&h, "00:20 · Bookmark"));
+}
+
+/// 存檔失敗：使用者加書籤時提示一次，記憶體裡照樣保留；之後開檔時的讀回（順便重試）失敗不再提示
+#[test]
+fn bookmark_save_failure_is_shown_for_the_users_own_change_only() {
+    for (lang, failed) in [
+        (vitascope::i18n::Lang::ZhTw, "無法儲存書籤："),
+        (vitascope::i18n::Lang::En, "Couldn't save bookmarks: "),
+    ] {
+        let dir = TempDir::new(&format!("bookmark-save-fails-{}", failed.len()));
+        // 存檔的資料夾其實是一個檔案：寫不進去
+        let blocked = dir.0.join("blocked");
+        std::fs::write(&blocked, "不是資料夾").unwrap();
+        let a = dir.clip("a.mp4");
+        dir.clip("b.mp4");
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let launch = Launch {
+            files: vec![a],
+            bookmarks: vitascope::bookmarks::Bookmarks::load_from(blocked.join("bookmarks.json")),
+            ..Default::default()
+        };
+        let mut h = harness_launch(launch, settings);
+        settle(&mut h, "a.mp4");
+        step_until_app(&mut h, "掃描到兩個檔案", |app| playlist_len(app) == 2);
+        h.key_press(egui::Key::P);
+        step_until_app(&mut h, "存檔失敗的提示", |app| {
+            app.osd_text().is_some_and(|t| t.starts_with(failed))
+        });
+        assert_eq!(mark_times(&h).len(), 1, "記憶體裡照樣保留");
+        step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+        // 換到下一個檔案：讀回 b 的書籤時順便重試存檔（還是失敗），使用者這次沒有動書籤，不提示
+        h.key_press(egui::Key::PageDown);
+        step_until(&mut h, "換到 b", |s| playing(s, "b.mp4"));
+        assert!(h.state().bookmarks().flush(TIMEOUT));
+        h.run_steps(3);
+        assert!(
+            !h.state().osd_text().is_some_and(|t| t.starts_with(failed)),
+            "{:?}",
+            h.state().osd_text()
+        );
+    }
+}
+
+/// 選單只列出目前位置附近的 20 個書籤，標出目前的那一個，多的寫總數
+#[test]
+fn bookmark_submenu_lists_twenty_around_the_current_mark() {
+    // 開檔時會換成絕對路徑（Windows 上斜線也會統一）：書籤的代號跟著用
+    let long = vitascope::playlist::absolute(&sample("common/mp4_long.mp4"));
+    let key = long.to_string_lossy().into_owned();
+    for (lang, video, menu, total) in [
+        (vitascope::i18n::Lang::ZhTw, "影片畫面", "書籤 ⏵", "共 25 個書籤"),
+        (vitascope::i18n::Lang::En, "Video", "Bookmarks ⏵", "25 bookmarks in all"),
+    ] {
+        let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+        for i in 1..=25 {
+            bookmarks.add(&key, 3.0 * f64::from(i)).unwrap();
+        }
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let launch = Launch {
+            files: vec![long.clone()],
+            bookmarks,
+            ..Default::default()
+        };
+        let mut h = harness_launch(launch, settings);
+        settle(&mut h, "mp4_long.mp4");
+        h.key_press(egui::Key::Space);
+        step_until(&mut h, "暫停", |s| s.paused);
+        assert_eq!(mark_times(&h).len(), 25);
+        // 40 秒：目前的書籤是 39 秒那個（第 13 個），列出第 3 到第 22 個（9 秒到 66 秒）
+        paused_at(&mut h, 40.0);
+        h.get_by_label(video).click_secondary();
+        h.run_steps(2);
+        hover_menu_item(&mut h, menu);
+        h.get_by_label(total);
+        for (label, listed) in [("00:06", false), ("00:09", true), ("01:06", true), ("01:09", false)] {
+            assert_eq!(h.query_by_label(label).is_some(), listed, "{label}");
+        }
+        assert_eq!(
+            h.get_by_label("00:39").accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::True),
+            "目前的書籤"
+        );
+        assert_eq!(
+            h.get_by_label("00:42").accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::False)
+        );
+    }
+}
+
+/// 一個檔案的書籤滿了（1000 個）：說滿了，不加
+#[test]
+fn full_bookmark_list_says_so() {
+    let dir = TempDir::new("bookmarks-full");
+    let clip = dir.clip("影片.mp4");
+    let key = clip.to_string_lossy().into_owned();
+    for (lang, full) in [
+        (vitascope::i18n::Lang::ZhTw, "這個檔案的書籤已經滿了（1000 個）"),
+        (vitascope::i18n::Lang::En, "This file already has 1000 bookmarks"),
+    ] {
+        let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+        for i in 0..vitascope::bookmarks::MAX_MARKS {
+            bookmarks.add(&key, 100.0 + i as f64).unwrap();
+        }
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        let launch = Launch {
+            files: vec![clip.clone()],
+            bookmarks,
+            ..Default::default()
+        };
+        let mut h = harness_launch(launch, settings);
+        settle(&mut h, "影片.mp4");
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+        assert_eq!(h.state().osd_text(), Some(full));
+        assert_eq!(mark_times(&h).len(), vitascope::bookmarks::MAX_MARKS);
+    }
+}
+
+/// 開檔時讀回磁碟上這個檔案的書籤：同時開著的另一個視窗加的也看得到
+#[test]
+fn bookmarks_from_another_window_show_up_when_the_file_opens() {
+    let dir = TempDir::new("bookmarks-other-window");
+    let store = dir.0.join("bookmarks.json");
+    let video = dir.clip("影片.mp4");
+    let ours = vitascope::bookmarks::Bookmarks::load_from(store.clone());
+    // 這邊讀完書籤檔之後，另一個視窗加了一個
+    let mut other = vitascope::bookmarks::Bookmarks::load_from(store);
+    other.add(&video.to_string_lossy(), 2.0).unwrap();
+    assert!(other.flush(TIMEOUT));
+    assert!(ours.marks(&video.to_string_lossy()).is_empty());
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let launch = Launch {
+        files: vec![video],
+        bookmarks: ours,
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    settle(&mut h, "影片.mp4");
+    step_until_app(&mut h, "讀回另一個視窗加的書籤", |app| {
+        let key = app.player().state.path.clone().unwrap_or_default();
+        app.bookmarks().marks(&key).len() == 1
+    });
+    assert_eq!(mark_times(&h), [2.0]);
+}
+
+/// 網路串流也一樣：開檔時依續播的代號（網址去掉 `#` 之後的部分，跟加書籤用的一樣）讀回另一個視窗加的書籤
+#[test]
+fn bookmarks_from_another_window_show_up_for_a_url_by_its_key() {
+    let dir = TempDir::new("bookmarks-other-window-url");
+    let store = dir.0.join("bookmarks.json");
+    let server = Server::start();
+    let key = server.file_url("common/mp4_h264_aac.mp4");
+    let url = format!("{key}#from-a-page");
+    let ours = vitascope::bookmarks::Bookmarks::load_from(store.clone());
+    // 這邊讀完書籤檔之後，另一個視窗在同一個網址（不含 #）加了一個
+    let mut other = vitascope::bookmarks::Bookmarks::load_from(store);
+    other.add(&key, 2.0).unwrap();
+    assert!(other.flush(TIMEOUT));
+    assert!(ours.marks(&key).is_empty());
+    let launch = Launch {
+        files: vec![PathBuf::from(&url)],
+        bookmarks: ours,
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, no_auto_next());
+    step_until_net(&mut h, "讀回另一個視窗加的書籤", |app| {
+        playing_url(&app.player().state, &url) && app.bookmarks().marks(&key).len() == 1
+    });
+    assert!(h.state().bookmarks().marks(&url).is_empty());
+}
+
+// ───────────── 書籤分頁（側邊面板） ─────────────
+
+/// 目前檔案的書籤名稱
+fn mark_names(h: &Harness<'_, VitascopeApp>) -> Vec<String> {
+    let app = h.state();
+    let key = app.player().state.path.clone().unwrap_or_default();
+    app.bookmarks().marks(&key).iter().map(|m| m.name.clone()).collect()
+}
+
+/// 側邊面板目前的分頁（面板關著是 None）
+fn side_tab(h: &Harness<'_, VitascopeApp>) -> Option<SideTab> {
+    let s = h.state().settings();
+    s.show_playlist.then_some(s.side_tab)
+}
+
+/// 視窗的寬度指令（打開、關掉側邊面板時視窗跟著變寬、變窄）
+fn inner_width(cmds: &[egui::ViewportCommand]) -> Option<f32> {
+    cmds.iter().find_map(|c| match c {
+        egui::ViewportCommand::InnerSize(s) => Some(s.x),
+        _ => None,
+    })
+}
+
+/// 在輸入框裡打字：每個字都像真的鍵盤一樣先送按鍵（按下、放開）再送文字。
+/// 按鍵是快捷鍵的字（P、O、空白鍵…）不能變成快捷鍵
+fn type_like_a_keyboard(h: &mut Harness<'_, VitascopeApp>, text: &str) {
+    for c in text.chars() {
+        let key = match c {
+            ' ' => Some(egui::Key::Space),
+            _ => egui::Key::from_name(&c.to_ascii_uppercase().to_string()),
+        };
+        if let Some(key) = key {
+            for pressed in [true, false] {
+                h.event(egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+        }
+        h.event(egui::Event::Text(c.to_string()));
+        h.step();
+    }
+    h.run_steps(2);
+}
+
+/// 雙擊書籤分頁的一列（改名）。`double_click` 把 egui 的時間停在雙擊的那一刻：之後交還給 egui 自己算，
+/// 不然之後每一次點擊都在雙擊的時間內（又變成改名）
+fn double_click_row(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    let pos = h.get_by_label(label).rect().center();
+    double_click(h, pos);
+    h.input_mut().time = None;
+    h.run_steps(2);
+}
+
+/// 開 90 秒的樣本、暫停，在 `times` 秒各加一個書籤，按 H 打開書籤分頁
+fn bookmarks_tab_with(times: &[f64]) -> Harness<'static, VitascopeApp> {
+    let mut h = paused_long();
+    for &t in times {
+        paused_at(&mut h, t);
+        h.key_press(egui::Key::P);
+        h.run_steps(2);
+    }
+    assert_eq!(mark_times(&h).len(), times.len());
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    h
+}
+
+#[test]
+fn bookmark_key_adds_and_panel_lists() {
+    let mut h = paused_long();
+    let list_len = playlist_len(h.state());
+    paused_at(&mut h, 12.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("新增書籤 00:12"));
+    // H：打開側邊面板的書籤分頁（一般視窗跟播放清單一樣變寬）
+    let before = h.ctx.content_rect().width();
+    let cmds = press_and_get_commands(&mut h, egui::Key::H);
+    assert_eq!(inner_width(&cmds), Some(before + 280.0), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    h.get_by_label("書籤（1）");
+    // 雙擊改名：打字時 P（新增書籤）、O（色相）、空白鍵（暫停）都只是文字
+    double_click_row(&mut h, "00:12");
+    assert!(h.ctx.text_edit_focused(), "改名的輸入框拿到焦點");
+    type_like_a_keyboard(&mut h, "OP end");
+    assert_eq!(mark_times(&h), [12.0], "P 沒有新增書籤");
+    assert!(paused_now(&h), "空白鍵沒有切換暫停");
+    assert!(h.state().player().state.paused, "空白鍵沒有切換暫停");
+    assert_eq!(h.state().adjust().hue, 0, "O 沒有調色相");
+    // Enter 改好（不是全螢幕）
+    let cmds = press_and_get_commands(&mut h, egui::Key::Enter);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["OP end"]);
+    assert!(!h.ctx.text_edit_focused());
+    // 選取後 Delete 刪掉（播放清單不受影響）
+    h.get_by_label("00:12  OP end").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(mark_times(&h).is_empty());
+    assert_eq!(playlist_len(h.state()), list_len, "Delete 刪的是書籤，不是清單裡的項目");
+    h.get_by_label("書籤（0）");
+    h.get_by_label("按 P 在目前的位置新增書籤");
+}
+
+#[test]
+fn bookmark_panel_tab_and_f6_switch() {
+    let dir = three_episodes("side-tabs");
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    let before = h.ctx.content_rect().width();
+    // F6：播放清單分頁（標題跟以前一樣）
+    let cmds = press_and_get_commands(&mut h, egui::Key::F6);
+    assert_eq!(inner_width(&cmds), Some(before + 280.0), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    h.get_by_label("播放清單（1/3）");
+    h.get_by_label("1. 第1集.mp4");
+    // H：換到書籤分頁，視窗大小不變
+    let cmds = press_and_get_commands(&mut h, egui::Key::H);
+    assert_eq!(inner_width(&cmds), None, "換分頁不改視窗大小：{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    h.get_by_label("書籤（0）");
+    h.get_by_label("播放清單（1/3）");
+    assert!(h.query_by_label("1. 第1集.mp4").is_none(), "書籤分頁不列清單");
+    // F6 換回播放清單；點分頁的標題也能換
+    let cmds = press_and_get_commands(&mut h, egui::Key::F6);
+    assert_eq!(inner_width(&cmds), None, "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    h.get_by_label("書籤（0）").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    // 書籤分頁時，右鍵選單的「播放清單」、控制列的 ☰ 不是選取的樣子
+    assert_eq!(
+        h.get_by_label("☰").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    hover_context_item(&mut h, "播放清單 F6");
+    assert_eq!(
+        h.get_by_label("播放清單 F6").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False)
+    );
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("播放清單 F6").is_none(), "Esc 關掉選單");
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    // 已經在書籤分頁：H 關掉面板（視窗變回原來的寬度）
+    let cmds = press_and_get_commands(&mut h, egui::Key::H);
+    let narrowed = inner_width(&cmds).expect("關閉時視窗變窄");
+    assert!((narrowed - before).abs() < 2.0, "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None);
+    assert!(h.query_by_label("書籤（0）").is_none());
+    assert_eq!(h.state().settings().side_tab, SideTab::Bookmarks, "記得上次的分頁");
+    // F6：打開到播放清單分頁；× 關閉
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    h.get_by_label("1. 第1集.mp4");
+    h.get_by_label("×").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None);
+}
+
+/// 上次關閉時開著書籤分頁：啟動時還是書籤分頁
+#[test]
+fn bookmarks_tab_is_remembered() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    settings.side_tab = SideTab::Bookmarks;
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    h.get_by_label("書籤（0）");
+    h.get_by_label("按 P 在目前的位置新增書籤");
+    assert!(h.query_by_label_contains("1. ").is_none(), "不是播放清單分頁");
+}
+
+/// 改名：Esc 不改（也不離開全螢幕），點別的地方（輸入框沒有焦點了）就改好
+#[test]
+fn bookmark_rename_esc_cancels_and_blur_commits() {
+    let mut h = bookmarks_tab_with(&[12.0, 30.0]);
+    set_fullscreen(&mut h, true);
+    double_click_row(&mut h, "00:12");
+    type_like_a_keyboard(&mut h, "abc");
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["", ""], "Esc 不改");
+    assert!(!h.ctx.text_edit_focused());
+    h.get_by_label("00:12");
+    // 再按一次 Esc 才離開全螢幕
+    let cmds = press_and_get_commands(&mut h, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    set_fullscreen(&mut h, false);
+    // 改名到一半點分頁的標題：改好
+    double_click_row(&mut h, "00:30");
+    type_like_a_keyboard(&mut h, "ED");
+    h.get_by_label("書籤（2）").click();
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["", "ED"]);
+    h.get_by_label("00:30  ED");
+    // 改名到一半按控制列的 ☰（換到播放清單分頁，輸入框不見了）：也是改好
+    double_click_row(&mut h, "00:12");
+    type_like_a_keyboard(&mut h, "OP");
+    h.get_by_label("☰").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    assert_eq!(mark_names(&h), ["OP", "ED"]);
+    h.key_press(egui::Key::H);
+    h.run_steps(2);
+    h.get_by_label("00:12  OP");
+    assert!(!h.ctx.text_edit_focused(), "回到書籤分頁時不是改名的樣子");
+}
+
+#[test]
+fn bookmark_row_context_menu() {
+    let mut h = bookmarks_tab_with(&[10.0, 40.0]);
+    paused_at(&mut h, 60.0);
+    // 跳到這裡
+    h.get_by_label("00:40").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("跳到這裡").click();
+    let mut seen = Seen::default();
+    step_until_state_seen(&mut h, &mut seen, "跳到 40 秒", |s| (s.time_pos - 40.0).abs() < 0.05);
+    assert_eq!(seen.last_osd(), Some("書籤 2/2：00:40"));
+    // 複製時間
+    h.get_by_label("00:10").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("複製時間").click();
+    h.step();
+    let copied = h.output().platform_output.commands.iter().find_map(|c| match c {
+        egui::OutputCommand::CopyText(t) => Some(t.clone()),
+        _ => None,
+    });
+    assert_eq!(copied.as_deref(), Some("00:10"));
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("已複製時間：00:10"));
+    // 改名
+    h.get_by_label("00:10").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("改名").click();
+    h.run_steps(3);
+    assert!(h.ctx.text_edit_focused());
+    type_like_a_keyboard(&mut h, "op");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["op", ""]);
+    // 刪除
+    h.get_by_label("00:10  op").click_secondary();
+    h.run_steps(2);
+    h.get_by_label("刪除 Delete").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [40.0]);
+    h.get_by_label("書籤（1）");
+}
+
+/// 「全部刪除…」先問：對話框開著時空白鍵不暫停、Esc 只關對話框
+#[test]
+fn delete_all_bookmarks_asks_first() {
+    let mut h = bookmarks_tab_with(&[10.0, 20.0, 30.0]);
+    assert!(h.state().player().state.paused);
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("全部刪除…").click();
+    h.run_steps(2);
+    h.get_by_label("刪除這個檔案的 3 個書籤？");
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    assert!(paused_now(&h), "對話框開著時空白鍵不暫停");
+    wait_real(&mut h, 0.3);
+    assert!(h.state().player().state.paused, "對話框開著時空白鍵不暫停");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(
+        h.query_by_label("刪除這個檔案的 3 個書籤？").is_none(),
+        "Esc 關掉對話框"
+    );
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks), "面板還開著");
+    assert_eq!(mark_times(&h).len(), 3, "取消：書籤都還在");
+    // 這次真的刪
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("全部刪除…").click();
+    h.run_steps(2);
+    h.get_by_label("刪除").click();
+    h.run_steps(2);
+    assert!(mark_times(&h).is_empty());
+    assert_eq!(h.state().osd_text(), Some("已刪除 3 個書籤"));
+    h.get_by_label("書籤（0）");
+    // 沒有書籤時「全部刪除…」不能按
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    assert!(h.get_by_label("全部刪除…").accesskit_node().is_disabled());
+}
+
+#[test]
+fn bookmarks_tab_empty_states_and_add_button() {
+    // 沒有開檔
+    let mut h = harness(None);
+    h.run_steps(2);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("沒有開啟檔案");
+    assert!(h.get_by_label("+ 新增書籤（P）").accesskit_node().is_disabled());
+    // 有檔案、還沒有書籤：說怎麼加；按下面的按鈕新增
+    let mut h = paused_long();
+    paused_at(&mut h, 25.0);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("按 P 在目前的位置新增書籤");
+    h.get_by_label("+ 新增書籤（P）").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [25.0]);
+    assert_eq!(h.state().osd_text(), Some("新增書籤 00:25"));
+    h.get_by_label("00:25");
+    // 點一列：精準跳到那個書籤
+    paused_at(&mut h, 70.0);
+    h.get_by_label("00:25").click();
+    step_until(&mut h, "跳到 25 秒", |s| (s.time_pos - 25.0).abs() < 0.05);
+    assert!(paused_now(&h), "跳過去照樣暫停");
+    assert!(h.state().player().state.paused, "跳過去照樣暫停");
+}
+
+/// 沒有名稱的書籤：在有名稱的章節裡時，淡淡地寫章節名稱
+#[test]
+fn unnamed_bookmark_shows_its_chapter() {
+    let mut h = opened(sample("common/mkv_chapters.mkv"));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    paused_at(&mut h, 5.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("00:05");
+    assert!(painted(&h, "本篇"), "第二章的名稱");
+}
+
+#[test]
+fn bookmarks_context_submenu_opens_the_list() {
+    let mut h = paused_long();
+    hover_context_item(&mut h, "書籤 ⏵");
+    h.get_by_label("書籤清單 H").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Bookmarks));
+    hover_context_item(&mut h, "書籤 ⏵");
+    let item = h.get_by_label("書籤清單 H");
+    assert_eq!(item.accesskit_node().toggled(), Some(egui::accesskit::Toggled::True));
+    item.click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None, "再按一次關掉");
+}
+
+/// 側邊面板開著、但是在書籤分頁：拖放進來的影片直接播（看不到清單，不偷偷加到清單最後）
+#[test]
+fn dropping_onto_the_bookmarks_tab_plays_the_file() {
+    let dir = three_episodes("bookmarks-drop");
+    let extra = TempDir::new("bookmarks-drop-extra");
+    let more = extra.clip("番外1.mp4");
+    let mut h = harness(Some(dir.0.join("第1集.mp4")));
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    // 拖到視窗上（還沒放開）：說的是「放開以播放」
+    h.input_mut().hovered_files.push(egui::HoveredFile {
+        path: Some(more.clone()),
+        ..Default::default()
+    });
+    h.run_steps(2);
+    assert!(painted(&h, "放開以播放"), "看不到清單：放開是播放");
+    assert!(!painted(&h, "放開以加入播放清單"));
+    h.input_mut().hovered_files.clear();
+    h.run_steps(2);
+    drop_file(&mut h, more);
+    step_until(&mut h, "播放番外1", |s| playing(s, "番外1.mp4"));
+}
+
+/// PotPlayer 風格：Backspace 是從頭播放。清單開著、選過一列、滑鼠在畫面上時按 Backspace：
+/// 從頭播放，清單不變（macOS 的 Backspace 不會變成「從清單移除」，P-B6）
+#[test]
+fn backspace_restarts_with_the_potplayer_preset_and_keeps_the_list() {
+    let dir = TempDir::new("backspace-potplayer");
+    for name in ["第1集.mp4", "第2集.mp4"] {
+        std::fs::copy(sample("common/mp4_long.mp4"), dir.0.join(name)).unwrap();
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.preset = vitascope::keymap::KeyPreset::Potplayer;
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    settle(&mut h, "第1集.mp4");
+    step_until_app(&mut h, "掃描到兩個影片", |app| playlist_len(app) == 2);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    // 選取清單的第 2 項（單擊只是選取）
+    h.get_by_label("2. 第2集.mp4").click();
+    h.run_steps(2);
+    // 滑鼠移到畫面上，播到 30 秒
+    let video = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(video));
+    h.state().player().seek_to(30.0, true).unwrap();
+    step_until(&mut h, "播到 30 秒", |s| s.time_pos > 29.0);
+    assert!(
+        !h.state().side_backspace_removes(Platform::Mac),
+        "PotPlayer 風格用到 Backspace：macOS 也不是移除"
+    );
+    h.key_press(egui::Key::Backspace);
+    step_until(&mut h, "Backspace 從頭播放", |s| !s.paused && s.time_pos < 2.0);
+    assert_eq!(playlist_names(h.state()), ["第1集.mp4", "第2集.mp4"], "清單不變");
+    assert!(playing(&h.state().player().state, "第1集.mp4"));
+}
+
+/// macOS 的 Backspace（影戲預設組沒用到它）：只在滑鼠在面板上、或最後點的是面板時才移除選取的項目（P-B6）。
+/// 規則在每個平台都檢查（`side_backspace_removes(Platform::Mac)`）；真的按 Backspace 只有 macOS 會移除
+#[test]
+fn mac_backspace_removes_only_when_the_panel_is_active() {
+    let mac = cfg!(target_os = "macos");
+    let dir = three_episodes("backspace-gate");
+    let mut h = playlist_panel_open(&dir);
+    let removes = |h: &Harness<'_, VitascopeApp>| h.state().side_backspace_removes(Platform::Mac);
+    assert!(!removes(&h), "還沒點過面板、滑鼠也不在面板上");
+    // 點了清單的一列：最後點的是面板
+    h.get_by_label("3. 第3集.mp4").click();
+    h.run_steps(2);
+    assert!(removes(&h));
+    assert!(
+        !h.state().side_backspace_removes(Platform::Windows),
+        "Windows、Linux 用 Delete"
+    );
+    let video = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(video));
+    h.run_steps(2);
+    assert!(removes(&h), "滑鼠移開了，但最後點的還是面板");
+    // 點了畫面（暫停）：不再是面板
+    h.get_by_label("影片畫面").click();
+    h.run_steps(2);
+    assert!(!removes(&h), "最後點的是畫面、滑鼠也在畫面上");
+    h.key_press(egui::Key::Backspace);
+    h.run_steps(2);
+    assert_eq!(playlist_len(h.state()), 3, "Backspace 沒有移除");
+    // 滑鼠移到面板上（沒有點）：可以移除
+    let row = h.get_by_label("2. 第2集.mp4").rect().center();
+    h.event(egui::Event::PointerMoved(row));
+    h.run_steps(2);
+    assert!(removes(&h), "滑鼠在面板上");
+    h.key_press(egui::Key::Backspace);
+    h.run_steps(2);
+    if mac {
+        assert_eq!(
+            playlist_names(h.state()),
+            ["第1集.mp4", "第2集.mp4"],
+            "macOS：移除選取的第3集"
+        );
+    } else {
+        assert_eq!(playlist_len(h.state()), 3, "其他平台的 Backspace 不移除");
+    }
+    // 面板關著：不移除
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    assert!(!removes(&h));
+}
+
+#[test]
+fn bookmarks_tab_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(None, settings.clone());
+    h.run_steps(2);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("Bookmarks (0)");
+    h.get_by_label("No file is open");
+    h.get_by_label("+ Add bookmark (P)");
+    let mut h = harness_with(Some(sample("common/mp4_long.mp4")), settings);
+    settle(&mut h, "mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "pause", |s| s.paused);
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    h.get_by_label("Press P to bookmark the current position");
+    paused_at(&mut h, 20.0);
+    h.get_by_label("+ Add bookmark (P)").click();
+    h.run_steps(2);
+    h.get_by_label("Bookmarks (1)");
+    h.get_by_label("00:20").click_secondary();
+    h.run_steps(2);
+    for item in ["Jump here", "Rename", "Copy time"] {
+        h.get_by_label(item);
+    }
+    h.get_by_label("Delete Delete");
+    h.get_by_label("Copy time").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Time copied: 00:20"));
+    // 分頁、「…」停在上面的說明
+    h.get_by_label("Bookmarks (1)").hover();
+    h.run_steps(3);
+    h.get_by_label("Bookmark list (H)");
+    h.get_by_label("…").hover();
+    h.run_steps(3);
+    h.get_by_label("Add or delete bookmarks");
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("Add bookmark P");
+    h.get_by_label("Delete selected Delete");
+    h.get_by_label("Delete all…").click();
+    h.run_steps(2);
+    h.get_by_label("Delete the bookmark of this file?");
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [20.0]);
+    // 右鍵選單「Bookmarks ▸」的書籤清單
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Bookmarks ⏵");
+    assert_eq!(
+        h.get_by_label("Bookmark list H").accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+}
+
+/// Delete 刪掉選取的書籤之後，選取移到下一個（可以連按 Delete）；刪掉最後一個時選前一個
+#[test]
+fn bookmark_delete_moves_the_selection() {
+    let mut h = bookmarks_tab_with(&[10.0, 20.0, 30.0]);
+    h.get_by_label("00:20").click();
+    h.run_steps(2);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [10.0, 30.0]);
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [10.0], "選取移到下一個（30 秒）");
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(mark_times(&h).is_empty(), "刪掉最後一個時選前一個");
+    // 沒有選取：Delete 什麼都不做
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    h.get_by_label("書籤（0）");
+}
+
+/// 改名到一半點了別的東西（上面的一列、新增、另一個分頁、×）：改名改好，點的那一下也照做
+#[test]
+fn bookmark_rename_blur_keeps_the_click_that_caused_it() {
+    let mut h = bookmarks_tab_with(&[10.0, 20.0, 30.0]);
+    // 點上面的一列：改好，也跳到那一列
+    double_click_row(&mut h, "00:20");
+    type_like_a_keyboard(&mut h, "mid");
+    h.get_by_label("00:10").click();
+    step_until(&mut h, "跳到 10 秒", |s| (s.time_pos - 10.0).abs() < 0.05);
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["", "mid", ""]);
+    assert!(!h.ctx.text_edit_focused());
+    // 點下面的「+ 新增書籤」：改好，也加了書籤
+    double_click_row(&mut h, "00:30");
+    type_like_a_keyboard(&mut h, "end");
+    // 雙擊的第一下跳到了 30 秒：改名中換到 45 秒再新增
+    paused_at(&mut h, 45.0);
+    assert!(h.ctx.text_edit_focused());
+    h.get_by_label("+ 新增書籤（P）").click();
+    h.run_steps(2);
+    assert_eq!(mark_times(&h), [10.0, 20.0, 30.0, 45.0]);
+    assert_eq!(mark_names(&h), ["", "mid", "end", ""]);
+    // 點播放清單分頁：改好，也換了分頁
+    double_click_row(&mut h, "00:10");
+    type_like_a_keyboard(&mut h, "op");
+    h.get_by_label_contains("播放清單（").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), Some(SideTab::Playlist));
+    assert_eq!(mark_names(&h), ["op", "mid", "end", ""]);
+    // 點 ×：改好，也關了面板
+    h.key_press(egui::Key::H);
+    h.run_steps(3);
+    double_click_row(&mut h, "00:45");
+    type_like_a_keyboard(&mut h, "x");
+    h.get_by_label("×").click();
+    h.run_steps(2);
+    assert_eq!(side_tab(&h), None);
+    assert_eq!(mark_names(&h), ["op", "mid", "end", "x"]);
+}
+
+/// 開著書籤分頁播 `file`、暫停；`marks` 是事先放好的書籤（檔案、時間），不用一個一個跳過去按 P
+fn bookmarks_tab_launch(file: PathBuf, marks: &[(&PathBuf, &[f64])]) -> Harness<'static, VitascopeApp> {
+    let mut bookmarks = vitascope::bookmarks::Bookmarks::default();
+    for (path, times) in marks {
+        for &t in *times {
+            bookmarks.add(&path.to_string_lossy(), t).unwrap();
+        }
+    }
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.show_playlist = true;
+    settings.side_tab = SideTab::Bookmarks;
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let launch = Launch {
+        files: vec![file],
+        bookmarks,
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    settle(&mut h, &name);
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.run_steps(2);
+    h
+}
+
+/// 改名到一半把那一列捲到看不見（只畫看得到的列，輸入框也跟著不見）：跟點了別的地方一樣，改好，
+/// 不會一直停在沒有焦點的改名樣子
+#[test]
+fn bookmark_rename_commits_when_scrolled_out_of_view() {
+    // 放到暫存資料夾：書籤依播放器看到的路徑記（樣本的路徑混了 / 與 \）
+    let dir = TempDir::new("bookmarks-rename-scroll");
+    let video = dir.0.join("影片.mp4");
+    std::fs::copy(sample("common/mp4_long.mp4"), &video).unwrap();
+    let times: Vec<f64> = (1..=80).map(f64::from).collect();
+    let mut h = bookmarks_tab_launch(video.clone(), &[(&video, &times)]);
+    h.get_by_label("書籤（80）");
+    double_click_row(&mut h, "00:01");
+    type_like_a_keyboard(&mut h, "first");
+    assert!(h.ctx.text_edit_focused());
+    // 滑鼠在清單上，往下捲到底
+    let over = h.get_by_label("00:03").rect().center();
+    let wheel = |h: &mut Harness<'_, VitascopeApp>, dy: f32| {
+        h.event(egui::Event::PointerMoved(over));
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, dy),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.run_steps(10);
+    };
+    wheel(&mut h, -5000.0);
+    assert!(h.query_by_label("00:01").is_none(), "第一列捲到看不見了");
+    h.get_by_label("01:20");
+    assert_eq!(mark_names(&h)[0], "first", "捲走了就改好");
+    assert!(!h.ctx.text_edit_focused());
+    // 捲回來：不是改名的樣子
+    wheel(&mut h, 5000.0);
+    h.get_by_label("00:01  first");
+    assert!(!h.ctx.text_edit_focused());
+}
+
+/// 改名到一半換了檔案（拖放進來的影片）：改好的是原來那個檔案的書籤
+#[test]
+fn bookmark_rename_commits_when_the_file_changes() {
+    let dir = TempDir::new("bookmarks-rename-file");
+    let (one, two) = (dir.clip("第1集.mp4"), dir.clip("第2集.mp4"));
+    let mut h = bookmarks_tab_launch(one.clone(), &[(&one, &[1.0]), (&two, &[2.0])]);
+    double_click_row(&mut h, "00:01");
+    type_like_a_keyboard(&mut h, "x");
+    drop_file(&mut h, two.clone());
+    step_until(&mut h, "播放第2集", |s| playing(s, "第2集.mp4"));
+    h.run_steps(3);
+    let marks = |p: &PathBuf| h.state().bookmarks().marks(&p.to_string_lossy()).to_vec();
+    assert_eq!(marks(&one)[0].name, "x", "第1集的書籤改好了");
+    assert_eq!(marks(&two)[0].name, "", "第2集的書籤沒有被改");
+    assert!(!h.ctx.text_edit_focused());
+    h.get_by_label("00:02");
+}
+
+/// 「全部刪除…」開著時換了檔案（例如自動接下一個）：刪的是開對話框時那個檔案的書籤
+#[test]
+fn delete_all_bookmarks_deletes_the_file_it_was_opened_for() {
+    let dir = TempDir::new("bookmarks-clear-file");
+    let (one, two) = (dir.clip("第1集.mp4"), dir.clip("第2集.mp4"));
+    let mut h = bookmarks_tab_launch(one.clone(), &[(&one, &[1.0, 3.0]), (&two, &[2.0])]);
+    h.get_by_label("…").click();
+    h.run_steps(2);
+    h.get_by_label("全部刪除…").click();
+    h.run_steps(2);
+    h.get_by_label("刪除這個檔案的 2 個書籤？");
+    drop_file(&mut h, two.clone());
+    step_until(&mut h, "播放第2集", |s| playing(s, "第2集.mp4"));
+    h.run_steps(3);
+    h.get_by_label("刪除").click();
+    h.run_steps(2);
+    let count = |p: &PathBuf| h.state().bookmarks().marks(&p.to_string_lossy()).len();
+    assert_eq!(count(&one), 0, "刪的是第1集的");
+    assert_eq!(count(&two), 1, "第2集的還在");
+    assert_eq!(h.state().osd_text(), Some("已刪除 2 個書籤"));
+    h.get_by_label("書籤（1）");
+}
+
+/// 改名時 Delete、Backspace 是編輯文字，不是刪掉書籤。滑鼠在面板上，不打字時 macOS 的 Backspace 會移除：
+/// 擋下來的是「正在打字」
+#[test]
+fn delete_and_backspace_in_the_rename_box_edit_the_text() {
+    let mut h = bookmarks_tab_with(&[12.0, 30.0]);
+    double_click_row(&mut h, "00:12");
+    type_like_a_keyboard(&mut h, "abcd");
+    assert!(h.state().side_backspace_removes(Platform::Mac));
+    // Backspace 刪掉 d；Home 到最前面；Delete 刪掉 a
+    for key in [egui::Key::Backspace, egui::Key::Home, egui::Key::Delete] {
+        h.key_press(key);
+        h.run_steps(2);
+    }
+    assert_eq!(mark_times(&h), [12.0, 30.0], "書籤都還在");
+    assert!(h.ctx.text_edit_focused(), "還在改名");
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(mark_names(&h), ["bc", ""]);
+    // 從頭播放會在按鍵那一幀同步取消暫停：直接問 mpv
+    assert!(paused_now(&h), "Home 沒有從頭播放");
+    assert!(h.state().player().state.paused, "Home 沒有從頭播放");
+}
+
+/// 不能跳轉的來源：書籤分頁說為什麼不能加，「+ 新增書籤」不能按
+#[test]
+fn unseekable_source_in_the_bookmarks_tab() {
+    let url = format!("lavf://file:{}", sample("common/mp4_long.mp4").display());
+    for (lang, cant_add, add) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            "這個檔案不能跳轉，無法加書籤",
+            "+ 新增書籤（P）",
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            "This file isn't seekable, so it can't be bookmarked",
+            "+ Add bookmark (P)",
+        ),
+    ] {
+        let mut settings = Settings::default();
+        settings.auto_next = false;
+        settings.language = lang;
+        settings.show_playlist = true;
+        settings.side_tab = SideTab::Bookmarks;
+        let opts = Options {
+            keep_open: true,
+            extra: vec![("stream-lavf-o".into(), "seekable=0".into())],
+            ..Options::headless()
+        };
+        let launch = Launch {
+            files: vec![PathBuf::from(&url)],
+            ..Default::default()
+        };
+        let mut h = harness_launch_with(opts, launch, settings);
+        step_until(&mut h, "載入完成", |s| s.loaded && s.duration.is_some());
+        h.run_steps(3);
+        assert!(!h.state().player().state.seekable, "這個來源不能跳轉");
+        h.get_by_label(cant_add);
+        assert!(h.get_by_label(add).accesskit_node().is_disabled());
+    }
+}
+
+// ───────────── 匯出：啟動時清掉上次留下的暫存檔 ─────────────
+
+#[test]
+fn startup_sweeps_old_partial_export_files() {
+    let tmp = TempDir::new("export-sweep");
+    let cache = tmp.0.join("cache");
+    let export_cache = cache.join("export");
+    let clips = tmp.0.join("clips");
+    let images = tmp.0.join("images");
+    for d in [&export_cache, &clips, &images] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(2 * 3600);
+    let make = |p: &std::path::Path, aged: bool| {
+        std::fs::write(p, b"x").unwrap();
+        if aged {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+    };
+    // 當掉、被強制結束時留下的（一小時以上沒動過）：刪掉
+    let gone = [
+        export_cache.join("a.4242-1.vitascope-part.mkv"),
+        export_cache.join("mpv-cache-AbC123.dat"),
+        clips.join("b.4242-2.vitascope-part.mp4"),
+        images.join("c.4242-3.vitascope-part.gif"),
+    ];
+    // 還在寫的（別的影戲正在匯出）、使用者自己的檔案：留著
+    let kept = [
+        (clips.join("d.4242-4.vitascope-part.mkv"), false),
+        (clips.join("舊的影片.mkv"), true),
+        (images.join("舊的截圖.png"), true),
+    ];
+    for p in &gone {
+        make(p, true);
+    }
+    for (p, aged) in &kept {
+        make(p, *aged);
+    }
+    let mut settings = Settings::default();
+    settings.export.clip_dir = Some(clips.clone());
+    settings.export.image_dir = Some(images.clone());
+    let launch = Launch {
+        cache_root: Some(cache.clone()),
+        ..Default::default()
+    };
+    let mut h = harness_launch(launch, settings);
+    assert_eq!(h.state().export_cache_dir(), Some(export_cache.clone()));
+    // 在背景清（資料夾可能在網路磁碟上）：等它做完
+    step_until_app(&mut h, "清完上次留下的暫存檔", |app| {
+        app.leftover_sweep_finished()
+    });
+    for p in &gone {
+        assert!(!p.exists(), "{} 要刪掉", p.display());
+    }
+    for (p, _) in &kept {
+        assert!(p.exists(), "{} 不能刪", p.display());
+    }
+}
+
+#[test]
+fn tests_and_shots_without_a_cache_folder_sweep_nothing() {
+    // 自動測試、--shot 沒有快取資料夾：不清任何東西（不碰使用者的「影片」「圖片」資料夾）
+    let tmp = TempDir::new("export-nosweep");
+    let old = tmp.0.join("a.4242-1.vitascope-part.mkv");
+    std::fs::write(&old, b"x").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 3600))
+        .unwrap();
+    let mut settings = Settings::default();
+    settings.export.clip_dir = Some(tmp.0.clone());
+    let mut h = harness_with(None, settings);
+    h.run_steps(2);
+    assert_eq!(h.state().export_cache_dir(), None);
+    assert!(h.state().leftover_sweep_finished(), "沒有開始清");
+    assert!(old.exists());
+}
+
+// ───────────── 匯出：視窗、右鍵選單「匯出 ▸」、「設定 → 截圖與匯出」 ─────────────
+
+/// 片段的工作最多等多久（CI 的機器很慢）
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// 開 `file`、等它開始播；片段存到暫存資料夾的 clips，設定存在暫存資料夾的 settings.json。
+/// 回傳（暫存資料夾、片段資料夾、設定檔、介面）
+fn export_harness(name: &str, file: &str) -> (TempDir, PathBuf, PathBuf, Harness<'static, VitascopeApp>) {
+    export_harness_with(name, file, |_| {})
+}
+
+fn export_harness_with(
+    name: &str,
+    file: &str,
+    change: impl FnOnce(&mut Settings),
+) -> (TempDir, PathBuf, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let clips = dir.0.join("clips");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.export.clip_dir = Some(clips.clone());
+    change(&mut settings);
+    let mut h = harness_with(Some(sample(file)), settings);
+    let file_name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+    settle(&mut h, &file_name);
+    (dir, clips, path, h)
+}
+
+/// 右鍵選單「匯出 ▸ 儲存片段…」，等匯出視窗打開
+fn open_export_window(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "匯出");
+    wait_menu_item(h, "儲存片段…");
+    h.get_by_label("儲存片段…").click();
+    step_until_app(h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+}
+
+/// 匯出視窗的文字欄位（左邊的名稱是它的無障礙標籤）
+fn export_field<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::TextInput)
+        .unwrap_or_else(|| panic!("找不到欄位 {label}"))
+}
+
+/// 下拉選單現在選的（顯示的文字）
+fn combo_value(h: &Harness<'_, VitascopeApp>, label: &str) -> String {
+    combo_box(h, label).accesskit_node().value().unwrap_or_default()
+}
+
+/// 捲到看得到、把滑鼠移到上面，等滑鼠停留的說明出現（停用的按鈕的說明）
+fn hover_until_tooltip(h: &mut Harness<'_, VitascopeApp>, label: &str, tooltip: &str) {
+    h.get_by_label(label).scroll_to_me();
+    h.run_steps(15);
+    // 只移過去一次：一直送滑鼠移動，egui 會當成還在移動，不顯示說明
+    h.get_by_label(label).hover();
+    let start = Instant::now();
+    while h.query_by_label(tooltip).is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「{label}」上沒有出現說明「{tooltip}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 匯出視窗的文字欄位現在的內容
+fn field_value(h: &Harness<'_, VitascopeApp>, label: &str) -> String {
+    export_field(h, label).accesskit_node().value().unwrap_or_default()
+}
+
+/// 在匯出視窗的欄位裡打字（全選後取代）、按 Enter
+fn type_export_field(h: &mut Harness<'_, VitascopeApp>, label: &str, text: &str) {
+    export_field(h, label).scroll_to_me();
+    h.run_steps(15);
+    export_field(h, label).focus();
+    h.run_steps(2);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.run_steps(1);
+    h.event(egui::Event::Text(text.into()));
+    h.run_steps(1);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(3);
+}
+
+/// 等到 mpv 的 A-B 重播點是 `want`（直接問 mpv）
+fn wait_ab(h: &mut Harness<'_, VitascopeApp>, what: &str, want: [Option<f64>; 2]) {
+    step_until_app(h, what, |app| {
+        let got = app.player().ab_loop_points();
+        got.iter().zip(want).all(|(g, w)| match (g, w) {
+            (Some(g), Some(w)) => (g - w).abs() < 0.001,
+            (None, None) => true,
+            _ => false,
+        })
+    });
+}
+
+/// 暫停中跳到 `t` 秒（精確），等 mpv 停在那裡
+fn seek_exact(h: &mut Harness<'_, VitascopeApp>, t: f64) {
+    h.state().player().seek_to(t, true).unwrap();
+    step_until_app(h, "跳到指定的位置", |app| {
+        app.player().get_f64("time-pos").is_ok_and(|p| (p - t).abs() < 0.001)
+    });
+}
+
+/// 等到正在做的匯出結束（做完、失敗、取消）
+fn wait_export_done(h: &mut Harness<'_, VitascopeApp>) {
+    let start = Instant::now();
+    while h.state().export_busy() {
+        assert!(start.elapsed() < EXPORT_TIMEOUT, "等不到匯出結束");
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.run_steps(2);
+}
+
+/// 資料夾裡的檔名（沒有資料夾時是空的）
+fn dir_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// 背景工作在觀察點（`TestHooks`）停住，等測試放行：到了送出參數（暫存檔；沒有時是空的），
+/// 放行 = 丟掉 `release`（之後再到觀察點也不停）
+struct Gate {
+    reached: std::sync::mpsc::Receiver<PathBuf>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+type GateHook = Arc<dyn Fn(PathBuf) + Send + Sync>;
+
+fn gate() -> (Gate, GateHook) {
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let (reached_tx, release_rx) = (std::sync::Mutex::new(reached_tx), std::sync::Mutex::new(release_rx));
+    let hook: GateHook = Arc::new(move |p| {
+        let _ = reached_tx.lock().unwrap().send(p);
+        // 測試寫錯時不要永遠卡住
+        let _ = release_rx.lock().unwrap().recv_timeout(EXPORT_TIMEOUT);
+    });
+    (
+        Gate {
+            reached,
+            release: Some(release),
+        },
+        hook,
+    )
+}
+
+impl Gate {
+    /// 一直更新介面，直到背景工作停在觀察點
+    fn wait(&self, h: &mut Harness<'_, VitascopeApp>) -> PathBuf {
+        let start = Instant::now();
+        loop {
+            if let Ok(p) = self.reached.try_recv() {
+                h.run_steps(2);
+                return p;
+            }
+            assert!(start.elapsed() < EXPORT_TIMEOUT, "背景工作一直沒到觀察點");
+            h.step();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn release(&mut self) {
+        self.release = None;
+    }
+}
+
+#[test]
+fn export_menu_is_disabled_without_a_file_and_says_why_it_cannot_save() {
+    // 沒開檔：「匯出 ▸」整個停用（跟「擷取畫面」一樣）
+    let mut h = harness(None);
+    h.run_steps(2);
+    // 起始畫面中間是說明文字：在畫面的角落按右鍵
+    let corner = h.get_by_label("影片畫面").rect().min + egui::vec2(20.0, 20.0);
+    h.event(egui::Event::PointerMoved(corner));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: corner,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.run_steps(2);
+    let (_, label, disabled) = MenuItem::contains("匯出").wait(&mut h);
+    assert!(disabled, "{label} 沒開檔時要停用");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 使用者開的 EDL（主播放器的時間對不到檔案）：選單看得到「儲存片段…」，但停用並說明原因
+    let tmp = TempDir::new("export-edl");
+    let src = sample("general/mkv_h264_gop2.mkv").to_string_lossy().into_owned();
+    let entry = format!("%{}%{src}", src.len());
+    let edl = tmp.0.join("list.edl");
+    std::fs::write(&edl, format!("# mpv EDL v0\n{entry},0,3\n{entry},6,3\n")).unwrap();
+    let mut h = harness(Some(edl));
+    settle(&mut h, "list.edl");
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "儲存片段…");
+    assert!(
+        h.get_by_label("儲存片段…").accesskit_node().is_disabled(),
+        "EDL 不能存片段"
+    );
+    hover_until_tooltip(
+        &mut h,
+        "儲存片段…",
+        "這個檔案用了章節連結（ordered chapters），不能匯出",
+    );
+    // 片段資料夾的項目照樣能用
+    assert!(!h.get_by_label("開啟片段資料夾").accesskit_node().is_disabled());
+}
+
+#[test]
+fn export_range_fields_are_the_ab_loop() {
+    let (_dir, _clips, _path, mut h) = export_harness("export-range", "common/mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    // 還沒設定範圍：開始停用，說明要先設定
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    assert_eq!(field_value(&h, "起點"), "");
+    // 按 L（視窗開著、沒在打字）：欄位顯示 A-B 重播的起點
+    h.key_press(egui::Key::L);
+    step_until_app(&mut h, "L 設定起點", |app| {
+        app.player().ab_loop_points()[0].is_some()
+    });
+    h.run_steps(2);
+    let a = h.state().player().ab_loop_points()[0].unwrap();
+    assert_eq!(field_value(&h, "起點"), vitascope::export::format_time(a));
+    // 打字改起點（分:秒、小數）
+    type_export_field(&mut h, "起點", "0:01.5");
+    wait_ab(&mut h, "起點改成 1.5 秒", [Some(1.5), None]);
+    // 終點比起點早：對調
+    type_export_field(&mut h, "終點", "0.5");
+    wait_ab(&mut h, "起點、終點對調", [Some(0.5), Some(1.5)]);
+    assert_eq!(field_value(&h, "起點"), "00:00:00.500");
+    assert_eq!(field_value(&h, "終點"), "00:00:01.500");
+    h.get_by_label_contains("長度 1.0 秒");
+    // 超過結尾：拉回影片的長度（不會變成「範圍外」的失敗）
+    type_export_field(&mut h, "終點", "99:00:00");
+    let duration = h.state().player().state.duration.unwrap();
+    wait_ab(&mut h, "終點拉回結尾", [Some(0.5), Some(duration)]);
+    // 看不懂的：說明，A-B 不變，欄位回到原本的時間
+    type_export_field(&mut h, "起點", "abc");
+    h.get_by_label_contains("看不懂的時間");
+    assert_eq!(h.state().player().ab_loop_points(), [Some(0.5), Some(duration)]);
+    assert_eq!(field_value(&h, "起點"), "00:00:00.500");
+    // 「目前位置」：停在確定的位置（不靠播了多久）再按。先按終點的：A-B 變了，剛才起點打錯的說明不再顯示
+    seek_exact(&mut h, 5.0);
+    h.query_all_by_label("目前位置").nth(1).unwrap().click();
+    wait_ab(&mut h, "終點換成目前位置", [Some(0.5), Some(5.0)]);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("看不懂的時間").is_none());
+    // 起點的「目前位置」（跟原本的 A 不一樣的位置）
+    seek_exact(&mut h, 3.0);
+    h.query_all_by_label("目前位置").next().unwrap().click();
+    wait_ab(&mut h, "起點換成目前位置", [Some(3.0), Some(5.0)]);
+    // 範圍設好了：可以開始
+    assert!(!h.get_by_label("開始匯出").accesskit_node().is_disabled());
+}
+
+#[test]
+fn export_clip_end_to_end() {
+    let (_dir, clips, _path, mut h) = export_harness("export-clip", "general/mkv_h264_gop2.mkv");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "3");
+    type_export_field(&mut h, "終點", "6.5");
+    wait_ab(&mut h, "範圍 3–6.5 秒", [Some(3.0), Some(6.5)]);
+    h.run_steps(2);
+    // 檔名照來源與範圍產生，格式照來源（MKV）；註明不含字幕
+    assert_eq!(field_value(&h, "檔名"), "mkv_h264_gop2 00.00.03-00.00.06");
+    h.get_by_label(".mkv");
+    h.get_by_label_contains("片段只包含影像與一條音軌，不含字幕");
+    let estimate = |h: &Harness<'_, VitascopeApp>| {
+        h.query_by_label_contains("預估大小")
+            .and_then(|n| n.accesskit_node().value())
+    };
+    let with_video = estimate(&h).expect("有影像時顯示預估大小");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    // 結果：提示（做完的那一幀設定的）、視窗裡的實際範圍（依關鍵影格：每 2 秒一個，從 2 秒開始）、開啟的按鈕
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：mkv_h264_gop2 00.00.03-00.00.06.mkv（"),
+        "{osd}"
+    );
+    let saved = clips.join("mkv_h264_gop2 00.00.03-00.00.06.mkv");
+    assert!(saved.exists(), "{:?}", dir_names(&clips));
+    h.get_by_label_contains("完成：mkv_h264_gop2 00.00.03-00.00.06.mkv");
+    h.get_by_label_contains("實際範圍：00:00:02.000");
+    h.get_by_label("不重新編碼：起點、終點對齊關鍵影格，片段可能比選的長幾秒");
+    h.get_by_label("開啟檔案");
+    h.get_by_label("在資料夾中顯示");
+    assert_eq!(dir_names(&clips), ["mkv_h264_gop2 00.00.03-00.00.06.mkv"]);
+
+    // 再存一次：只要聲音、自己取的檔名（不能用的字元換掉）→ 依音訊格式存成 .m4a
+    h.get_by_label_contains("影像（h264").click();
+    h.run_steps(2);
+    assert_eq!(combo_value(&h, "格式"), "自動（M4A）");
+    // 只有聲音：預估大小不是影片檔的比例（用音軌的位元率；不知道時不顯示）
+    let audio_only = estimate(&h);
+    assert_ne!(audio_only.as_deref(), Some(with_video.as_str()), "只有聲音的預估大小");
+    type_export_field(&mut h, "檔名", "我的:片段");
+    h.get_by_label(".m4a");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let audio = clips.join("我的_片段.m4a");
+    assert!(audio.exists(), "{:?}", dir_names(&clips));
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(osd.starts_with("已儲存片段：我的_片段.m4a"), "{osd}");
+    // 只有聲音：沒有關鍵影格的說明
+    assert!(
+        h.query_by_label_contains("不重新編碼：起點、終點對齊關鍵影格")
+            .is_none()
+    );
+    assert!(dir_names(&clips).iter().all(|n| !n.contains(".vitascope-part.")));
+}
+
+#[test]
+fn export_formats_that_cannot_hold_the_tracks_are_disabled() {
+    // 設定裡的格式放不下這個檔案（TS 放不下 VP9）：視窗改用自動，不是開始了才失敗
+    let (_dir, clips, path, mut h) = export_harness_with("export-format", "common/webm_vp9_opus.webm", |s| {
+        s.export.clip.format = vitascope::export::ClipFormat::Ts;
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    // 自動 = 照來源（WebM）
+    assert_eq!(combo_value(&h, "格式"), "自動（WebM）");
+    h.get_by_label(".webm");
+    // 開始匯出也用自動（不是設定裡放不下的 TS）
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：webm_vp9_opus 00.00.00-00.00.02.webm"),
+        "{osd}"
+    );
+    assert_eq!(dir_names(&clips), ["webm_vp9_opus 00.00.00-00.00.02.webm"]);
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    // 只有聲音：選 MKA 只用在這次，不改設定裡（有影像的片段用的）格式
+    h.get_by_label_contains("影像（vp9").click();
+    h.run_steps(2);
+    combo_in_view(&mut h, "格式");
+    h.get_by_label("MKA").click();
+    h.run_steps(3);
+    assert_eq!(combo_value(&h, "格式"), "MKA");
+    h.get_by_label(".mka");
+    assert_eq!(
+        h.state().settings().export.clip.format,
+        vitascope::export::ClipFormat::Ts,
+        "只有聲音時選的格式不存進設定"
+    );
+    h.get_by_label_contains("影像（vp9").click();
+    h.run_steps(2);
+    assert_eq!(combo_value(&h, "格式"), "自動（WebM）");
+    combo_in_view(&mut h, "格式");
+    assert!(h.get_by_label("TS").accesskit_node().is_disabled(), "TS 放不下 VP9");
+    hover_until_tooltip(&mut h, "TS", "TS 不能放 vp9，請改用 MKV");
+    // MKV 放得下：選了存進設定，視窗用它
+    h.get_by_label("MKV").click();
+    h.run_steps(3);
+    assert_eq!(
+        h.state().settings().export.clip.format,
+        vitascope::export::ClipFormat::Mkv
+    );
+    assert_eq!(saved(&path)["export"]["clip"]["format"], "mkv");
+    h.get_by_label(".mkv");
+    // 匯出用的就是選的 MKV
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：webm_vp9_opus 00.00.00-00.00.02.mkv"),
+        "{osd}"
+    );
+    assert!(
+        clips.join("webm_vp9_opus 00.00.00-00.00.02.mkv").exists(),
+        "{:?}",
+        dir_names(&clips)
+    );
+}
+
+#[test]
+fn export_settings_page_changes_the_clip_folder_and_format() {
+    let dir = TempDir::new("export-settings");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(None, settings);
+    let chosen = dir.0.join("我的片段");
+    let answer = chosen.clone();
+    let seen = record_dialogs(&mut h, move |kind| {
+        (kind == DialogKind::ExportClipDir).then(|| vec![answer.clone()])
+    });
+    // 「截圖」頁改名「截圖與匯出」
+    open_settings_page(&mut h, "截圖與匯出");
+    h.get_by_label("片段資料夾");
+    assert!(h.get_by_label("用預設的片段資料夾").accesskit_node().is_disabled());
+    click_in_view(&mut h, "變更片段資料夾…");
+    assert_eq!(dialogs_done(&mut h, &seen), [(DialogKind::ExportClipDir, Pick::Folder)]);
+    assert_eq!(h.state().settings().export.clip_dir.as_deref(), Some(chosen.as_path()));
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    assert_eq!(saved(&path)["export"]["clip_dir"], chosen.to_string_lossy().as_ref());
+    h.get_by_label(chosen.to_string_lossy().as_ref());
+    // 還原預設
+    click_in_view(&mut h, "用預設的片段資料夾");
+    assert_eq!(h.state().settings().export.clip_dir, None);
+    assert_eq!(saved(&path)["export"]["clip_dir"], serde_json::Value::Null);
+    // 片段的格式
+    combo_in_view(&mut h, "片段的格式");
+    h.get_by_label("MP4").click();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().export.clip.format,
+        vitascope::export::ClipFormat::Mp4
+    );
+    assert_eq!(saved(&path)["export"]["clip"]["format"], "mp4");
+    // 截圖的部分照舊（按鈕的名稱沒有跟片段的混在一起）
+    h.get_by_label("變更…");
+    h.get_by_label("還原預設");
+}
+
+#[test]
+fn export_clip_command_and_escape() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("export-clip".into(), vec!["F9".into()]);
+    let mut h = harness_with(None, settings);
+    h.run_steps(2);
+    // 沒開檔：只提示
+    h.key_press(egui::Key::F9);
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("先開啟影片才能匯出"));
+    assert!(!h.state().export_open());
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    // 選單上的按鍵從快捷鍵對照表來
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "儲存片段… F9");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F9);
+    step_until_app(&mut h, "F9 打開匯出視窗", |app| app.export_open());
+    // Esc 一次關一個：控制面板 → 匯出視窗 → 設定
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("一般");
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::G);
+    h.run_steps(2);
+    h.get_by_label("控制面板");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("控制面板").is_none(), "先關控制面板");
+    assert!(h.state().export_open(), "匯出視窗還開著");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open(), "再按一次關匯出視窗");
+    assert!(h.query_by_label("一般").is_some(), "設定視窗還開著");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("一般").is_none(), "最後關設定視窗");
+}
+
+#[test]
+fn export_cancel_and_one_export_at_a_time() {
+    let (_dir, clips, _path, mut h) = export_harness("export-cancel", "common/mp4_long.mp4");
+    let (mut gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        on_ready: Some(Arc::new(move |_: &vitascope::mpv::Mpv| hook(PathBuf::new()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "3");
+    wait_ab(&mut h, "範圍 1–3 秒", [Some(1.0), Some(3.0)]);
+    click_in_view(&mut h, "開始匯出");
+    // 匯出用的 mpv 開好、停在讀取之前
+    gate.wait(&mut h);
+    assert!(h.state().export_busy());
+    // 一次只做一個：開始停用並說明
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "正在匯出，請等這一個做完");
+    // 關掉視窗不會取消；再打開看得到進度
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open());
+    assert!(h.state().export_busy(), "關掉視窗不取消");
+    open_export_window(&mut h);
+    assert!(
+        !h.get_by_label("取消匯出").accesskit_node().is_disabled(),
+        "讀取中可以取消"
+    );
+    click_in_view(&mut h, "取消匯出");
+    gate.release();
+    wait_export_done(&mut h);
+    assert_eq!(h.state().osd_text(), Some("已取消匯出"));
+    h.get_by_label("已取消匯出");
+    assert!(dir_names(&clips).is_empty(), "取消後不留檔案：{:?}", dir_names(&clips));
+    // 做完之後可以再開始
+    assert!(!h.get_by_label("開始匯出").accesskit_node().is_disabled());
+}
+
+#[test]
+fn export_writing_cannot_be_cancelled() {
+    let (_dir, clips, _path, mut h) = export_harness("export-writing", "common/mp4_h264_aac.mp4");
+    let (mut gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        on_dump: Some(Arc::new(move || hook(PathBuf::new()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(&mut h, "開始匯出");
+    gate.wait(&mut h);
+    // 寫檔中（dump-cache 停不下來）：取消停用並說明
+    assert!(h.get_by_label("取消匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "取消匯出", "寫入中無法中斷");
+    // 關掉視窗不會取消：視窗關著做完，照樣存好、顯示提示（寫完之後如果被取消，結果會是「已取消匯出」）
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open());
+    assert!(h.state().export_busy(), "關掉視窗不取消");
+    gate.release();
+    wait_export_done(&mut h);
+    assert!(!h.state().export_open(), "做完時不會自己打開視窗");
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：mp4_h264_aac 00.00.00-00.00.02.mp4"),
+        "{osd}"
+    );
+    assert_eq!(dir_names(&clips), ["mp4_h264_aac 00.00.00-00.00.02.mp4"]);
+}
+
+#[test]
+fn export_works_when_the_player_has_turned_the_sound_off() {
+    // 只有聲音（加上專輯封面）的檔案、主播放器關掉了聲音（aid=no）：選單照樣能用，在視窗裡選了音軌就能開始
+    let (_dir, clips, _path, mut h) = export_harness("export-muted", "general/audio_mp3_cover.mp3");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.state().player().select_track(TrackKind::Audio, None).unwrap();
+    step_until(&mut h, "關掉聲音", |s| s.selected(TrackKind::Audio).is_none());
+    h.run_steps(2);
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "儲存片段…");
+    assert!(
+        !h.get_by_label("儲存片段…").accesskit_node().is_disabled(),
+        "檔案裡有放得進片段的音軌"
+    );
+    h.get_by_label("儲存片段…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    // 預設跟著主播放器（沒有聲音）：開始停用，說明要選軌道
+    assert_eq!(combo_value(&h, "聲音"), "不包含");
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "至少要包含影像或聲音");
+    // 選了音軌：可以開始
+    combo_in_view(&mut h, "聲音");
+    h.get_by_label_contains("#1").click();
+    h.run_steps(3);
+    assert!(combo_value(&h, "聲音").starts_with("#1"), "{}", combo_value(&h, "聲音"));
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：audio_mp3_cover 00.00.00-00.00.02."),
+        "{osd}"
+    );
+    assert_eq!(dir_names(&clips).len(), 1, "{:?}", dir_names(&clips));
+}
+
+#[test]
+fn export_tracks_follow_the_player_until_changed_and_reset_per_file() {
+    let (_dir, clips, _path, mut h) = export_harness("export-tracks", "common/mkv_multitrack.mkv");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let select_audio = |h: &mut Harness<'_, VitascopeApp>, id: i64| {
+        h.state().player().select_track(TrackKind::Audio, Some(id)).unwrap();
+        step_until(h, "換音軌", |s| {
+            s.selected(TrackKind::Audio).map(|t| t.id) == Some(id)
+        });
+        h.run_steps(2);
+    };
+    // 開視窗之前在「音軌」選單換了音軌：片段放正在聽的那一條
+    select_audio(&mut h, 2);
+    open_export_window(&mut h);
+    let audio = |h: &Harness<'_, VitascopeApp>| combo_value(h, "聲音");
+    assert!(audio(&h).starts_with("#2"), "{}", audio(&h));
+    // 視窗開著時換：沒在視窗裡選過就跟著換
+    select_audio(&mut h, 1);
+    assert!(audio(&h).starts_with("#1"), "{}", audio(&h));
+    // 自己選了「不包含」：之後主播放器換音軌也不變
+    combo_in_view(&mut h, "聲音");
+    h.get_by_label("不包含").click();
+    h.run_steps(3);
+    select_audio(&mut h, 2);
+    assert_eq!(audio(&h), "不包含");
+    // 只放影像（自己選的）：不說明「片段沒有聲音」
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "3");
+    wait_ab(&mut h, "範圍 1–3 秒", [Some(1.0), Some(3.0)]);
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存片段：mkv_multitrack 00.00.01-00.00.03.mkv"),
+        "{osd}"
+    );
+    h.get_by_label_contains("完成：mkv_multitrack");
+    assert!(
+        h.query_by_label_contains("片段沒有聲音").is_none(),
+        "自己選了不包含聲音，不用說明"
+    );
+    assert_eq!(dir_names(&clips), ["mkv_multitrack 00.00.01-00.00.03.mkv"]);
+    // 自己取的檔名、選的軌道只用在這個檔案：換檔案後重新產生、回到預設
+    type_export_field(&mut h, "檔名", "自訂名稱");
+    assert_eq!(field_value(&h, "檔名"), "自訂名稱");
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4"));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.run_steps(3);
+    assert!(h.state().export_open(), "換檔案時視窗照樣開著");
+    assert!(audio(&h).starts_with("#1"), "{}", audio(&h));
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "1.5");
+    wait_ab(&mut h, "範圍 0.5–1.5 秒", [Some(0.5), Some(1.5)]);
+    h.run_steps(2);
+    assert_eq!(field_value(&h, "檔名"), "mp4_h264_aac 00.00.00-00.00.01");
+}
+
+#[test]
+fn exit_during_export_cleans_up() {
+    // 關閉影戲（介面測試：丟掉整個 App）時匯出做到一半：取消、刪掉暫存檔，也不會變成正式的檔案
+    let (_dir, clips, _path, mut h) = export_harness("export-exit", "common/mp4_h264_aac.mp4");
+    let (mut gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        after_dump: Some(Arc::new(move |temp: &std::path::Path| hook(temp.to_path_buf()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_export_window(&mut h);
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "2");
+    wait_ab(&mut h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(&mut h, "開始匯出");
+    // 寫好了、還沒檢查、還沒換成正式的名稱：資料夾裡只有暫存檔
+    let temp = gate.wait(&mut h);
+    assert!(temp.exists(), "{}", temp.display());
+    assert!(vitascope::save::is_part(&temp.file_name().unwrap().to_string_lossy()));
+    assert_eq!(dir_names(&clips).len(), 1);
+    drop(h);
+    // 背景工作還停在觀察點也一樣：丟掉 App 時等一下就刪掉暫存檔
+    assert!(!temp.exists(), "關閉時沒有刪掉暫存檔：{:?}", dir_names(&clips));
+    gate.release();
+    // 放行之後背景工作發現檔案不見了、結束：不會留下任何檔案
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        assert!(dir_names(&clips).is_empty(), "{:?}", dir_names(&clips));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn export_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Save clip…");
+    h.get_by_label("Open the clips folder");
+    h.get_by_label("Save clip…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    assert_eq!(combo_value(&h, "Format"), "Automatic (MP4)");
+    for label in ["Range", "Tracks", "Start export", "Current position"] {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("找不到 {label}"));
+    }
+    h.get_by_label_contains("Clips contain the video and one audio track only");
+    export_field(&h, "Start");
+    export_field(&h, "File name");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Screenshots and export").click();
+    h.run_steps(2);
+    h.get_by_label("Change the clips folder…");
+    h.get_by_label("Clip format");
+}
+
+// ───────────── 匯出：轉成 GIF ─────────────
+
+/// 開 `file`、等它開始播；GIF 存到暫存資料夾的 gifs，片段存到 clips，設定存在暫存資料夾的 settings.json。
+/// 回傳（暫存資料夾、GIF 資料夾、設定檔、介面）
+fn gif_harness(name: &str, file: &str) -> (TempDir, PathBuf, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let gifs = dir.0.join("gifs");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.export.clip_dir = Some(dir.0.join("clips"));
+    settings.export.image_dir = Some(gifs.clone());
+    let mut h = harness_with(Some(sample(file)), settings);
+    let file_name = PathBuf::from(file).file_name().unwrap().to_string_lossy().into_owned();
+    settle(&mut h, &file_name);
+    (dir, gifs, path, h)
+}
+
+/// 這個播放引擎能不能轉 GIF（Linux 的系統 libmpv 不一定有 gif 編碼器、palettegen）
+fn gif_engine(h: &Harness<'_, VitascopeApp>, test: &str) -> bool {
+    let caps = h.state().engine_caps();
+    let ok = caps.gif && caps.palettegen;
+    if !ok {
+        eprintln!("略過 {test}：播放引擎不能轉 GIF");
+    }
+    ok
+}
+
+/// 右鍵選單「匯出 ▸ 轉成 GIF…」，等匯出視窗打開在 GIF 分頁
+fn open_gif_window(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "匯出");
+    wait_menu_item(h, "轉成 GIF…");
+    h.get_by_label("轉成 GIF…").click();
+    step_until_app(h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+}
+
+#[test]
+fn export_gif_end_to_end_and_choices_are_remembered() {
+    let (_dir, gifs, path, mut h) = gif_harness("export-gif", "common/mkv_multitrack.mkv");
+    if !gif_engine(&h, "export_gif_end_to_end_and_choices_are_remembered") {
+        return;
+    }
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    step_until(&mut h, "顯示字幕", |s| s.sid.is_some());
+    open_gif_window(&mut h);
+    // 預設：長邊 480、15 fps、包含字幕；640×360 的影片 → 480×270
+    assert_eq!(combo_value(&h, "大小（長邊）"), "480 px");
+    assert_eq!(combo_value(&h, "格率"), "15 fps");
+    h.get_by_label("→ 480×270");
+    h.get_by_label_contains("旋轉、翻轉跟畫面一樣");
+    // 範圍就是 A-B 重播（跟片段的分頁一樣）
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "2.5");
+    wait_ab(&mut h, "範圍 1–2.5 秒", [Some(1.0), Some(2.5)]);
+    h.run_steps(2);
+    assert_eq!(field_value(&h, "檔名"), "mkv_multitrack 00.00.01-00.00.02");
+    h.get_by_label(".gif");
+    // 改大小、格率、不含字幕：存進設定（記住上次的選擇）
+    combo_in_view(&mut h, "大小（長邊）");
+    h.get_by_label("320 px").click();
+    h.run_steps(3);
+    combo_in_view(&mut h, "格率");
+    h.get_by_label("10 fps").click();
+    h.run_steps(3);
+    let subs = "包含字幕（目前顯示的字幕，含外觀與延遲）";
+    assert!(!h.get_by_label(subs).accesskit_node().is_disabled());
+    click_in_view(&mut h, subs);
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    let gif = h.state().settings().export.gif;
+    assert_eq!((gif.long_side, gif.fps, gif.subtitles), (320, 10, false));
+    assert_eq!(saved(&path)["export"]["gif"]["long_side"], 320);
+    assert_eq!(saved(&path)["export"]["gif"]["fps"], 10);
+    assert_eq!(saved(&path)["export"]["gif"]["subtitles"], false);
+    h.get_by_label("→ 320×180");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("已儲存 GIF：mkv_multitrack 00.00.01-00.00.02.gif（"),
+        "{osd}"
+    );
+    let saved_gif = gifs.join("mkv_multitrack 00.00.01-00.00.02.gif");
+    let info = vitascope::export::gif::gif_info(&std::fs::read(&saved_gif).unwrap()).expect("不是完整的 GIF");
+    assert_eq!((info.width, info.height), (320, 180));
+    assert!((14..=16).contains(&info.frames), "{} 格", info.frames);
+    h.get_by_label_contains("完成：mkv_multitrack 00.00.01-00.00.02.gif");
+    assert!(h.query_by_label_contains("實際範圍").is_none(), "GIF 沒有對齊關鍵影格");
+    h.get_by_label("開啟檔案");
+    h.get_by_label("在資料夾中顯示");
+    assert_eq!(dir_names(&gifs), ["mkv_multitrack 00.00.01-00.00.02.gif"]);
+    // 分頁：回到片段（範圍一樣），再回到 GIF
+    h.get_by_label("片段").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("大小（長邊）").is_none());
+    h.get_by_label_contains("片段只包含影像與一條音軌");
+    h.get_by_label("GIF").click();
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+}
+
+#[test]
+fn export_gif_length_cap_and_disabled_reasons() {
+    let (_dir, _gifs, _path, mut h) = gif_harness("export-gif-cap", "common/mp4_long.mp4");
+    if !gif_engine(&h, "export_gif_length_cap_and_disabled_reasons") {
+        return;
+    }
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_gif_window(&mut h);
+    // 沒有字幕：「包含字幕」停用並說明
+    let subs = "包含字幕（目前顯示的字幕，含外觀與延遲）";
+    assert!(h.get_by_label(subs).accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, subs, "目前沒有顯示字幕");
+    // 超過 30 秒：開始停用，說明要縮短
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "45");
+    wait_ab(&mut h, "範圍 1–45 秒", [Some(1.0), Some(45.0)]);
+    h.run_steps(2);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "GIF 最長 30 秒，請縮短 A-B 段落");
+    // 剛好 30 秒：可以開始
+    type_export_field(&mut h, "終點", "31");
+    wait_ab(&mut h, "範圍 1–31 秒", [Some(1.0), Some(31.0)]);
+    h.run_steps(2);
+    assert!(!h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // 只有聲音的檔案：「轉成 GIF…」停用並說明（儲存片段照樣能用）
+    drop_file(&mut h, sample("general/audio_mp3_cover.mp3"));
+    step_until(&mut h, "開始播放 mp3", |s| {
+        playing(s, "audio_mp3_cover.mp3") && !s.tracks.is_empty()
+    });
+    h.run_steps(5);
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "轉成 GIF…");
+    assert!(h.get_by_label("轉成 GIF…").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("儲存片段…").accesskit_node().is_disabled());
+    // 選單裡的項目：直接把滑鼠移過去（捲動會讓子選單關掉）
+    h.get_by_label("轉成 GIF…").hover();
+    let start = Instant::now();
+    while h.query_by_label("這個檔案沒有影像").is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「轉成 GIF…」上沒有出現說明");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// GIF 的觀察點：編碼用的 mpv 開好之後，等它把畫面寫進 GIF 資料夾裡的暫存檔（每格一個色盤：一開始就寫；
+/// 整段一個色盤要讀完才寫），再把暫存檔交給 `hook`（停在那裡等測試放行）。等不到時交出空的路徑（測試會失敗）
+fn gif_gate_after_first_write(gifs: &std::path::Path, hook: GateHook) -> vitascope::export::gif::TestHooks {
+    let gifs = gifs.to_path_buf();
+    vitascope::export::gif::TestHooks {
+        palette: Some(vitascope::export::gif::PaletteMode::PerFrame),
+        on_ready: Some(Arc::new(move |_: &vitascope::mpv::Mpv| {
+            let start = Instant::now();
+            let part = loop {
+                let found = dir_names(&gifs)
+                    .into_iter()
+                    .find(|n| vitascope::save::is_part(n))
+                    .map(|n| gifs.join(n))
+                    .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > 0));
+                match found {
+                    Some(p) => break p,
+                    None if start.elapsed() > EXPORT_TIMEOUT => break PathBuf::new(),
+                    None => std::thread::sleep(Duration::from_millis(20)),
+                }
+            };
+            hook(part)
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn export_gif_follows_the_rotation_and_the_hdr_settings() {
+    // 畫面轉了 90°、「畫質 → HDR」選了曲線與目標亮度：GIF 是直的，照這些設定轉成一般畫面（從介面一路傳到背景工作）
+    let hdr = "general/mkv_hevc10_hdr10_mid.mkv";
+    // 預設的「自動」：FFmpeg 沒有，GIF 用 Hable（不說跟「畫質 → HDR」一樣）
+    let (_auto_dir, _gifs, _path, mut h) = gif_harness("export-gif-hdr-auto", hdr);
+    if !gif_engine(&h, "export_gif_follows_the_rotation_and_the_hdr_settings") {
+        return;
+    }
+    let caps = h.state().engine_caps();
+    let tonemap = caps.zscale && caps.tonemap;
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    open_gif_window(&mut h);
+    if tonemap {
+        h.get_by_label(
+            "HDR 影片會轉成一般畫面（Hable，目標亮度 203 nits）；「畫質 → HDR」的曲線「自動」GIF 做不到，改用 Hable",
+        );
+        assert!(h.query_by_label_contains("跟「畫質 → HDR」一樣").is_none());
+    } else {
+        h.get_by_label_contains("亮部");
+    }
+    drop(h);
+
+    let dir = TempDir::new("export-gif-hdr");
+    let gifs = dir.0.join("gifs");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.image_dir = Some(gifs.clone());
+    settings.export.gif.long_side = 320;
+    settings.export.gif.fps = 10;
+    settings.video.tone.curve = vitascope::picture::ToneCurve::Mobius;
+    settings.video.tone.target_peak = Some(100);
+    let mut h = harness_with(Some(sample(hdr)), settings);
+    settle(&mut h, "mkv_hevc10_hdr10_mid.mkv");
+    let vf: Arc<std::sync::Mutex<String>> = Arc::default();
+    let seen = vf.clone();
+    h.state_mut()
+        .set_export_gif_test_hooks(vitascope::export::gif::TestHooks {
+            on_ready: Some(Arc::new(move |mpv: &vitascope::mpv::Mpv| {
+                *seen.lock().unwrap() = mpv.get_string("vf").unwrap_or_default();
+            })),
+            ..Default::default()
+        });
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    // Alt+K：畫面轉 90°（320×240 → 直的）
+    h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
+    step_until(&mut h, "Alt+K：轉 90°，變直的", |s| {
+        s.video_size == Some([240, 320])
+    });
+    open_gif_window(&mut h);
+    h.get_by_label("→ 240×320");
+    if tonemap {
+        h.get_by_label("HDR 影片會轉成一般畫面（Mobius，目標亮度 100 nits，跟「畫質 → HDR」一樣）");
+    }
+    type_export_field(&mut h, "起點", "0.5");
+    type_export_field(&mut h, "終點", "1.5");
+    wait_ab(&mut h, "範圍 0.5–1.5 秒", [Some(0.5), Some(1.5)]);
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let saved = dir_names(&gifs);
+    assert_eq!(saved.len(), 1, "{saved:?}，{:?}", h.state().osd_text());
+    let info = vitascope::export::gif::gif_info(&std::fs::read(gifs.join(&saved[0])).unwrap()).expect("不是完整的 GIF");
+    assert_eq!((info.width, info.height), (240, 320), "轉了 90° 的畫面是直的");
+    let vf = vf.lock().unwrap().clone();
+    assert!(
+        vf.contains("transpose=clock") || vf.contains("rotate=PI/2"),
+        "沒有順時針轉 90°：{vf}"
+    );
+    if tonemap {
+        assert!(vf.contains("npl=100") && vf.contains("tonemap=tonemap=mobius"), "{vf}");
+    }
+}
+
+#[test]
+fn export_gif_cancel_and_one_export_at_a_time() {
+    let (_dir, gifs, _path, mut h) = gif_harness("export-gif-cancel", "common/mp4_long.mp4");
+    if !gif_engine(&h, "export_gif_cancel_and_one_export_at_a_time") {
+        return;
+    }
+    let (mut gate, hook) = gate();
+    h.state_mut()
+        .set_export_gif_test_hooks(gif_gate_after_first_write(&gifs, hook));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_gif_window(&mut h);
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "20");
+    wait_ab(&mut h, "範圍 1–20 秒", [Some(1.0), Some(20.0)]);
+    click_in_view(&mut h, "開始匯出");
+    // 編碼用的 mpv 開好、寫了一部分的暫存檔，停在觀察點
+    let temp = gate.wait(&mut h);
+    assert!(temp.exists(), "暫存檔：{temp:?}，資料夾：{:?}", dir_names(&gifs));
+    assert_eq!(dir_names(&gifs).len(), 1, "{:?}", dir_names(&gifs));
+    assert!(h.state().export_busy());
+    // 一次只做一個：GIF、片段的開始都停用
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "正在匯出，請等這一個做完");
+    h.get_by_label("片段").click();
+    h.run_steps(3);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    // 轉 GIF 時可以取消
+    assert!(!h.get_by_label("取消匯出").accesskit_node().is_disabled());
+    click_in_view(&mut h, "取消匯出");
+    gate.release();
+    wait_export_done(&mut h);
+    assert_eq!(h.state().osd_text(), Some("已取消匯出"));
+    assert!(dir_names(&gifs).is_empty(), "取消後不留檔案：{:?}", dir_names(&gifs));
+}
+
+#[test]
+fn exit_during_gif_export_cleans_up() {
+    // 關閉影戲（丟掉整個 App）時 GIF 轉到一半：取消、刪掉暫存檔，也不會變成正式的檔案
+    let (_dir, gifs, _path, mut h) = gif_harness("export-gif-exit", "common/mp4_long.mp4");
+    if !gif_engine(&h, "exit_during_gif_export_cleans_up") {
+        return;
+    }
+    let (mut gate, hook) = gate();
+    h.state_mut()
+        .set_export_gif_test_hooks(gif_gate_after_first_write(&gifs, hook));
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    open_gif_window(&mut h);
+    type_export_field(&mut h, "起點", "1");
+    type_export_field(&mut h, "終點", "20");
+    wait_ab(&mut h, "範圍 1–20 秒", [Some(1.0), Some(20.0)]);
+    click_in_view(&mut h, "開始匯出");
+    let temp = gate.wait(&mut h);
+    // 暫存檔在 GIF 資料夾裡、已經寫了一部分（還沒換成正式的名稱）
+    assert!(temp.exists(), "暫存檔：{temp:?}，資料夾：{:?}", dir_names(&gifs));
+    assert!(vitascope::save::is_part(&temp.file_name().unwrap().to_string_lossy()));
+    assert_eq!(dir_names(&gifs).len(), 1, "{:?}", dir_names(&gifs));
+    drop(h);
+    gate.release();
+    // 放行之後背景工作發現已經取消、叫 mpv 停下來：暫存檔刪掉，不會留下任何檔案
+    let start = Instant::now();
+    while !dir_names(&gifs).is_empty() {
+        assert!(
+            start.elapsed() < EXPORT_TIMEOUT,
+            "關閉後留下檔案：{:?}",
+            dir_names(&gifs)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // 之後也不會再出現
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        assert!(dir_names(&gifs).is_empty(), "{:?}", dir_names(&gifs));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn export_settings_page_changes_the_gif_folder() {
+    let dir = TempDir::new("export-gif-settings");
+    let path = dir.0.join("settings.json");
+    let shots = dir.0.join("截圖");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.screenshot_dir = Some(shots.clone());
+    let mut h = harness_with(None, settings);
+    let chosen = dir.0.join("我的 GIF");
+    let answer = chosen.clone();
+    let seen = record_dialogs(&mut h, move |kind| {
+        (kind == DialogKind::ExportImageDir).then(|| vec![answer.clone()])
+    });
+    open_settings_page(&mut h, "截圖與匯出");
+    h.get_by_label("GIF 資料夾");
+    // 預設跟截圖放在一起（截圖資料夾改了也跟著）
+    assert!(h.query_all_by_label(shots.to_string_lossy().as_ref()).count() >= 2);
+    assert!(h.get_by_label("用預設的 GIF 資料夾").accesskit_node().is_disabled());
+    click_in_view(&mut h, "變更 GIF 資料夾…");
+    assert_eq!(
+        dialogs_done(&mut h, &seen),
+        [(DialogKind::ExportImageDir, Pick::Folder)]
+    );
+    assert_eq!(h.state().settings().export.image_dir.as_deref(), Some(chosen.as_path()));
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    assert_eq!(saved(&path)["export"]["image_dir"], chosen.to_string_lossy().as_ref());
+    h.get_by_label(chosen.to_string_lossy().as_ref());
+    // 片段的資料夾沒有跟著改
+    assert_eq!(h.state().settings().export.clip_dir, None);
+    click_in_view(&mut h, "用預設的 GIF 資料夾");
+    assert_eq!(h.state().settings().export.image_dir, None);
+    assert_eq!(saved(&path)["export"]["image_dir"], serde_json::Value::Null);
+}
+
+#[test]
+fn export_gif_command_menu_shortcut_and_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("export-gif".into(), vec!["F10".into()]);
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    // 選單上的按鍵從快捷鍵對照表來；GIF 資料夾的項目
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "轉成 GIF… F10");
+    h.get_by_label("開啟 GIF 資料夾");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 快捷鍵打開在 GIF 分頁
+    h.key_press(egui::Key::F10);
+    step_until_app(&mut h, "F10 打開匯出視窗", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+
+    // 英文介面
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Make GIF…");
+    h.get_by_label("Open the GIF folder");
+    h.get_by_label("Make GIF…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    for label in ["Size (long side)", "Frame rate", "Start export", "GIF", "Clip"] {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("找不到 {label}"));
+    }
+    h.get_by_label_contains("Rotation and flips follow the picture");
+    h.get_by_label("Include subtitles (as shown, with style and delay)");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("Screenshots and export").click();
+    h.run_steps(2);
+    h.get_by_label("GIF folder");
+    h.get_by_label("Change the GIF folder…");
+    h.get_by_label("Use the default GIF folder");
+
+    // HDR 影片、「畫質 → HDR」是自動：英文的說明（GIF 用 Hable）
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("general/mkv_hevc10_hdr10_mid.mkv")), settings);
+    settle(&mut h, "mkv_hevc10_hdr10_mid.mkv");
+    let caps = h.state().engine_caps();
+    if !(caps.gif && caps.palettegen && caps.zscale && caps.tonemap) {
+        eprintln!("略過英文的 HDR 說明：播放引擎沒有 GIF 或色調映射的濾鏡");
+        return;
+    }
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Make GIF…");
+    h.get_by_label("Make GIF…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label(
+        "HDR video is converted to SDR (Hable, target 203 nits); GIFs can't use the \"Auto\" curve from Video quality → HDR, so they use Hable",
+    );
+}
+
+// ───────────── 匯出：縮圖總覽圖 ─────────────
+
+/// 右鍵選單「匯出 ▸ 縮圖總覽圖…」，等匯出視窗打開在縮圖總覽圖分頁
+fn open_sheet_window(h: &mut Harness<'_, VitascopeApp>) {
+    hover_context_item(h, "匯出");
+    wait_menu_item(h, "縮圖總覽圖…");
+    h.get_by_label("縮圖總覽圖…").click();
+    step_until_app(h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("欄數");
+}
+
+/// 縮圖總覽圖的觀察點：取完第一格之後停住，等測試放行（`hook` 收到空的路徑）
+fn sheet_gate_after_first_cell(hook: GateHook) -> vitascope::export::sheet::TestHooks {
+    vitascope::export::sheet::TestHooks {
+        on_cell: Some(Arc::new(move |i, _, _| {
+            if i == 0 {
+                hook(PathBuf::new());
+            }
+        })),
+        ..Default::default()
+    }
+}
+
+/// 下拉選單裡選 `item`（選單打開時才有的項目）
+fn pick_combo(h: &mut Harness<'_, VitascopeApp>, combo: &str, item: &str) {
+    combo_in_view(h, combo);
+    wait_menu_item(h, item);
+    h.query_all_by_label(item)
+        .find(|n| n.accesskit_node().role() != egui::accesskit::Role::ComboBox)
+        .unwrap_or_else(|| panic!("下拉選單「{combo}」裡沒有「{item}」"))
+        .click();
+    h.run_steps(3);
+}
+
+#[test]
+fn export_sheet_end_to_end_and_choices_are_remembered() {
+    let (_dir, gifs, path, mut h) = gif_harness("export-sheet", "common/mkv_multitrack.mkv");
+    open_sheet_window(&mut h);
+    // 預設：4 欄 × 5 列、1920 寬、時間標記、標頭、JPEG；旁邊顯示實際的大小（標頭：檔名、大小／長度／格式、影像、聲音）
+    assert_eq!(combo_value(&h, "欄數"), "4");
+    assert_eq!(combo_value(&h, "列數"), "5");
+    assert_eq!(combo_value(&h, "寬度"), "1920 px");
+    assert_eq!(combo_value(&h, "圖檔格式"), "JPEG");
+    h.get_by_label("共 20 張");
+    let header = vitascope::export::sheet::header_for(h.state().player(), None);
+    assert_eq!(header.len(), 4, "{header:?}");
+    let l = vitascope::export::sheet::layout(1920, 4, 5, 640.0 / 360.0, 4);
+    h.get_by_label(&format!("→ {}×{}", l.size.0, l.size.1));
+    h.get_by_label(&format!("每張 {}×{}", l.cell.0, l.cell.1));
+    for on in ["時間標記", "標頭（檔名、大小、長度、格式）"] {
+        assert_eq!(
+            h.get_by_label(on).accesskit_node().toggled(),
+            Some(egui::accesskit::Toggled::True),
+            "{on}"
+        );
+    }
+    // 沒有 A-B：「只取 A-B 段落」停用並說明
+    let ab = "只取 A-B 段落";
+    assert!(h.get_by_label(ab).accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, ab, "先設定 A-B 重播的起點和終點");
+    // 檔名照來源產生（不含範圍），存在 GIF 資料夾
+    assert_eq!(field_value(&h, "檔名"), "mkv_multitrack 縮圖");
+    h.get_by_label(".jpg");
+    h.get_by_label_contains("時間標記是每張實際的時間");
+    // 改欄、列、寬度、格式：存進設定（記住上次的選擇），大小跟著變
+    pick_combo(&mut h, "欄數", "3");
+    pick_combo(&mut h, "列數", "2");
+    pick_combo(&mut h, "寬度", "1280 px");
+    pick_combo(&mut h, "圖檔格式", "PNG");
+    click_in_view(&mut h, "標頭（檔名、大小、長度、格式）");
+    let sheet = h.state().settings().export.sheet;
+    assert_eq!((sheet.columns, sheet.rows, sheet.width), (3, 2, 1280));
+    assert_eq!(sheet.format, vitascope::export::ImageFormat::Png);
+    assert!(!sheet.header && sheet.timestamps);
+    let saved =
+        |p: &PathBuf| -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap() };
+    assert_eq!(saved(&path)["export"]["sheet"]["columns"], 3);
+    assert_eq!(saved(&path)["export"]["sheet"]["format"], "png");
+    assert_eq!(saved(&path)["export"]["sheet"]["header"], false);
+    let l = vitascope::export::sheet::layout(1280, 3, 2, 640.0 / 360.0, 0);
+    h.get_by_label(&format!("→ {}×{}", l.size.0, l.size.1));
+    h.get_by_label(".png");
+    assert!(h.query_by_label("品質").is_none(), "PNG 沒有品質");
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert_eq!(osd, "已儲存縮圖總覽圖：mkv_multitrack 縮圖.png");
+    let first = gifs.join("mkv_multitrack 縮圖.png");
+    let img = vitascope::screenshot::decode_png(&first).unwrap();
+    assert_eq!((img.w as u32, img.h as u32), l.size);
+    h.get_by_label_contains("完成：mkv_multitrack 縮圖.png");
+    assert!(h.query_by_label_contains("實際範圍").is_none());
+    h.get_by_label("開啟檔案");
+    h.get_by_label("在資料夾中顯示");
+
+    // 設定了 A-B：可以只取 A-B 段落（不存進設定）；再存一次不覆蓋
+    h.state().player().set_ab_loop(Some(2.0), Some(6.0)).unwrap();
+    wait_ab(&mut h, "A-B 2–6 秒", [Some(2.0), Some(6.0)]);
+    h.run_steps(2);
+    let ab_label = "只取 A-B 段落（00:00:02.000 – 00:00:06.000）";
+    assert!(!h.get_by_label(ab_label).accesskit_node().is_disabled());
+    click_in_view(&mut h, ab_label);
+    assert_eq!(
+        h.get_by_label(ab_label).accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    assert!(saved(&path)["export"]["sheet"].get("ab").is_none());
+    // 勾選從介面一路傳到背景工作：3 × 2 = 6 格都取 A-B 裡的點（2 + 4/7 秒起），取到的也在那附近
+    type Seen = std::sync::Mutex<Vec<(usize, f64, Option<f64>)>>;
+    let seen: Arc<Seen> = Arc::default();
+    let s = seen.clone();
+    h.state_mut()
+        .set_export_sheet_test_hooks(vitascope::export::sheet::TestHooks {
+            on_cell: Some(Arc::new(move |i, t, at| s.lock().unwrap().push((i, t, at)))),
+            ..Default::default()
+        });
+    click_in_view(&mut h, "開始匯出");
+    wait_export_done(&mut h);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert_eq!(osd, "已儲存縮圖總覽圖：mkv_multitrack 縮圖 (2).png");
+    let cells = seen.lock().unwrap().clone();
+    assert_eq!(cells.len(), 6, "{cells:?}");
+    let gap = 4.0 / 7.0;
+    for (n, &(i, t, at)) in cells.iter().enumerate() {
+        assert_eq!(i, n);
+        assert!(
+            (t - (2.0 + gap * (n + 1) as f64)).abs() < 1e-6,
+            "第 {i} 格的目標 {t}：{cells:?}"
+        );
+        let at = at.unwrap_or_else(|| panic!("第 {i} 格取不到：{cells:?}"));
+        assert!((at - t).abs() <= gap / 2.0 + 0.01, "第 {i} 格：目標 {t}，實際 {at}");
+    }
+    assert_eq!(
+        dir_names(&gifs),
+        ["mkv_multitrack 縮圖 (2).png", "mkv_multitrack 縮圖.png"]
+    );
+    // 分頁：GIF（範圍、大小）、片段都還在
+    h.get_by_label("GIF").click();
+    h.run_steps(3);
+    h.get_by_label("大小（長邊）");
+    assert!(h.query_by_label("欄數").is_none());
+    h.get_by_label("縮圖總覽圖").click();
+    h.run_steps(3);
+    h.get_by_label("欄數");
+
+    // 換檔：「只取 A-B」回到沒勾（新的檔案設定了 A-B 也一樣，要再勾一次）
+    let ab_label = "只取 A-B 段落";
+    assert_eq!(
+        h.query_all_by_label_contains(ab_label)
+            .next()
+            .unwrap()
+            .accesskit_node()
+            .toggled(),
+        Some(egui::accesskit::Toggled::True),
+        "換檔前還勾著"
+    );
+    let next = sample("common/mp4_h264_aac.mp4");
+    h.state_mut().player_mut().open(&next.to_string_lossy()).unwrap();
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.state().player().set_ab_loop(Some(1.0), Some(3.0)).unwrap();
+    wait_ab(&mut h, "新的檔案 A-B 1–3 秒", [Some(1.0), Some(3.0)]);
+    h.run_steps(2);
+    let ab_label = "只取 A-B 段落（00:00:01.000 – 00:00:03.000）";
+    assert!(!h.get_by_label(ab_label).accesskit_node().is_disabled());
+    assert_eq!(
+        h.get_by_label(ab_label).accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False),
+        "換檔後不再只取 A-B"
+    );
+    assert_eq!(field_value(&h, "檔名"), "mp4_h264_aac 縮圖");
+}
+
+#[test]
+fn export_sheet_hdr_note_names_the_curve_it_uses() {
+    // 預設的「自動」：FFmpeg 的 tonemap 沒有，總覽圖用 Hable（跟 GIF 一樣，不說跟「畫質 → HDR」一樣）
+    let hdr = "general/mkv_hevc10_hdr10_mid.mkv";
+    let (_dir, _gifs, _path, mut h) = gif_harness("export-sheet-hdr-auto", hdr);
+    let caps = h.state().engine_caps();
+    if !(caps.zscale && caps.tonemap) {
+        eprintln!("略過：這個播放引擎沒有 zscale、tonemap");
+        return;
+    }
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    open_sheet_window(&mut h);
+    h.get_by_label(
+        "HDR 影片會轉成一般畫面（Hable，目標亮度 203 nits）；「畫質 → HDR」的曲線「自動」總覽圖做不到，改用 Hable",
+    );
+    assert!(h.query_by_label_contains("跟「畫質 → HDR」一樣").is_none());
+    drop(h);
+    // FFmpeg 也有的曲線（Mobius）：照設定，說一樣
+    let dir = TempDir::new("export-sheet-hdr-mobius");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.image_dir = Some(dir.0.join("gifs"));
+    settings.video.tone.curve = vitascope::picture::ToneCurve::Mobius;
+    settings.video.tone.target_peak = Some(100);
+    let mut h = harness_with(Some(sample(hdr)), settings);
+    settle(&mut h, "mkv_hevc10_hdr10_mid.mkv");
+    step_until(&mut h, "知道是 HDR", |s| s.video_hdr);
+    open_sheet_window(&mut h);
+    h.get_by_label("HDR 影片會轉成一般畫面（Mobius，目標亮度 100 nits，跟「畫質 → HDR」一樣）");
+    assert!(h.query_by_label_contains("做不到").is_none());
+}
+
+#[test]
+fn export_sheet_rows_are_capped_and_disabled_reasons() {
+    // 直拍影片、一欄、3840 寬：每格最高 1280，整張圖最高 16384 → 列數變少，說明為什麼
+    let dir = TempDir::new("export-sheet-caps");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.image_dir = Some(dir.0.join("gifs"));
+    settings.export.sheet.columns = 1;
+    settings.export.sheet.rows = 20;
+    settings.export.sheet.width = 3840;
+    let mut h = harness_with(Some(sample("common/mov_hevc_aac_rot90.mov")), settings);
+    settle(&mut h, "mov_hevc_aac_rot90.mov");
+    open_sheet_window(&mut h);
+    let rows: u32 = combo_value(&h, "列數").parse().unwrap();
+    assert!((2..20).contains(&rows), "列數 {rows}");
+    h.get_by_label_contains(&format!("這個寬度、欄數最多 {rows} 列"));
+    let size = h
+        .query_all_by_label_contains("→ ")
+        .find_map(|n| {
+            let node = n.accesskit_node();
+            node.label()
+                .map(|l| l.to_string())
+                .or_else(|| node.value().map(|v| v.to_string()))
+        })
+        .expect("沒有顯示大小");
+    let (w, hgt) = size.trim_start_matches("→ ").split_once('×').unwrap();
+    let (w, hgt): (u32, u32) = (w.parse().unwrap(), hgt.parse().unwrap());
+    assert!(hgt <= vitascope::export::sheet::MAX_HEIGHT && w < 3840, "{size}");
+    // 設定裡的列數不變（換成多欄時還是 20 列）
+    assert_eq!(h.state().settings().export.sheet.rows, 20);
+    pick_combo(&mut h, "欄數", "10");
+    assert_eq!(combo_value(&h, "列數"), "20");
+    assert!(h.query_by_label_contains("這個寬度、欄數最多").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // 只有聲音的檔案：「縮圖總覽圖…」停用並說明
+    drop_file(&mut h, sample("general/audio_mp3_cover.mp3"));
+    step_until(&mut h, "開始播放 mp3", |s| {
+        playing(s, "audio_mp3_cover.mp3") && !s.tracks.is_empty()
+    });
+    h.run_steps(5);
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "縮圖總覽圖…");
+    assert!(h.get_by_label("縮圖總覽圖…").accesskit_node().is_disabled());
+    h.get_by_label("縮圖總覽圖…").hover();
+    let start = Instant::now();
+    while h.query_by_label("這個檔案沒有影像").is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「縮圖總覽圖…」上沒有出現說明");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn export_sheet_cancel_one_at_a_time_and_exit() {
+    let (_dir, gifs, _path, mut h) = gif_harness("export-sheet-cancel", "common/mp4_long.mp4");
+    let (mut first, hook) = gate();
+    h.state_mut()
+        .set_export_sheet_test_hooks(sheet_gate_after_first_cell(hook));
+    open_sheet_window(&mut h);
+    click_in_view(&mut h, "開始匯出");
+    first.wait(&mut h);
+    assert!(h.state().export_busy());
+    // 進度：擷取畫面（第一格取完、還沒回報）
+    h.get_by_label_contains("擷取畫面 0/20");
+    // 一次只做一個：縮圖總覽圖、GIF 的開始都停用
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    hover_until_tooltip(&mut h, "開始匯出", "正在匯出，請等這一個做完");
+    h.get_by_label("GIF").click();
+    h.run_steps(3);
+    assert!(h.get_by_label("開始匯出").accesskit_node().is_disabled());
+    // 擷取中可以取消
+    assert!(!h.get_by_label("取消匯出").accesskit_node().is_disabled());
+    click_in_view(&mut h, "取消匯出");
+    first.release();
+    wait_export_done(&mut h);
+    assert_eq!(h.state().osd_text(), Some("已取消匯出"));
+    assert!(dir_names(&gifs).is_empty(), "取消後不留檔案：{:?}", dir_names(&gifs));
+
+    // 關閉影戲（丟掉整個 App）時還在擷取：取消（停在下一格之前），不會留下檔案
+    let (mut second, hook) = gate();
+    let gated = sheet_gate_after_first_cell(hook).on_cell.unwrap();
+    let cells = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // 背景工作的執行緒結束時，它帶著的觀察點（和這個）跟著丟掉：看得出工作真的結束了
+    let alive = Arc::new(());
+    let job_alive = Arc::downgrade(&alive);
+    let counted = cells.clone();
+    h.state_mut()
+        .set_export_sheet_test_hooks(vitascope::export::sheet::TestHooks {
+            on_cell: Some(Arc::new(move |i, t, at| {
+                let _ = &alive;
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                gated(i, t, at);
+            })),
+            ..Default::default()
+        });
+    h.get_by_label("縮圖總覽圖").click();
+    h.run_steps(3);
+    click_in_view(&mut h, "開始匯出");
+    second.wait(&mut h);
+    drop(h);
+    second.release();
+    // 等背景工作結束（慢的電腦也夠久），途中、結束後都沒有檔案，而且第一格之後一格都沒再取
+    let start = Instant::now();
+    while job_alive.upgrade().is_some() {
+        assert!(start.elapsed() < EXPORT_TIMEOUT, "關閉後背景工作沒有結束");
+        assert!(dir_names(&gifs).is_empty(), "關閉後留下檔案：{:?}", dir_names(&gifs));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(dir_names(&gifs).is_empty(), "關閉後留下檔案：{:?}", dir_names(&gifs));
+    assert_eq!(
+        cells.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "關閉時沒有取消：又取了別的格子"
+    );
+}
+
+#[test]
+fn export_sheet_command_menu_shortcut_and_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("export-sheet".into(), vec!["F10".into()]);
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    // 選單上的按鍵從快捷鍵對照表來
+    hover_context_item(&mut h, "匯出");
+    wait_menu_item(&mut h, "縮圖總覽圖… F10");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 快捷鍵打開在縮圖總覽圖分頁
+    h.key_press(egui::Key::F10);
+    step_until_app(&mut h, "F10 打開匯出視窗", |app| app.export_open());
+    h.run_steps(3);
+    h.get_by_label("欄數");
+    // 「設定 → 截圖與匯出」：縮圖總覽圖也存在 GIF 資料夾
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    open_settings_page(&mut h, "截圖與匯出");
+    h.get_by_label_contains("縮圖總覽圖也存在這裡");
+
+    // 英文介面
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(sample("common/mp4_h264_aac.mp4")), settings);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Export");
+    wait_menu_item(&mut h, "Thumbnail sheet…");
+    h.get_by_label("Thumbnail sheet…").click();
+    step_until_app(&mut h, "匯出視窗打開", |app| app.export_open());
+    h.run_steps(3);
+    for label in [
+        "Columns",
+        "Rows",
+        "Width",
+        "Timestamps",
+        "Header (name, size, length, format)",
+        "Only the A-B range",
+        "Image format",
+        "Quality",
+        "Start export",
+        "Thumbnail sheet",
+    ] {
+        h.query_all_by_label(label)
+            .next()
+            .unwrap_or_else(|| panic!("找不到 {label}"));
+    }
+    h.get_by_label("20 pictures");
+    // 整句（一個空格接下一句，不是一大段空白）
+    h.get_by_label(
+        "Rotation and flips follow the picture; image adjustments, shaders, zoom and crop are not applied. \
+         Each timestamp is the picture's actual time.",
+    );
+    assert_eq!(field_value(&h, "File name"), "mp4_h264_aac thumbnails");
 }
