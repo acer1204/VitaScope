@@ -395,12 +395,7 @@ impl VitascopeApp {
         self.osd(crate::tf!("重複播放：{name}", "Repeating: {name}"));
     }
 
-    /// 播放結束了（清單播完、沒開自動播放下一個、剩下的都開不起來）。「播完後」的動作之後從這裡開始
-    pub(super) fn playback_finished(&mut self) {
-        self.finished_count += 1;
-    }
-
-    /// 測試用：播放結束（[`Self::playback_finished`]）了幾次
+    /// 測試用：播放結束（[`Self::playback_finished`]，「播完後」的動作從那裡開始）了幾次
     #[doc(hidden)]
     pub fn playback_finished_count(&self) -> u64 {
         self.finished_count

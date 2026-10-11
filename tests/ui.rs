@@ -11,6 +11,7 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use support::fake_power::FakePower;
 use support::fake_ytdl::{FakeResolver, site_playlist_json};
 use support::http::Server;
 use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
@@ -22,6 +23,7 @@ use vitascope::playlist::{Playlist, Repeat};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::{OnTop, Settings, SideTab};
+use vitascope::system_power::{AfterPlayback, Avail, PowerCaps, PowerError};
 use vitascope::theme::ThemeChoice;
 use vitascope::ytdl::{Failure, Hint, Resolve, YtdlError};
 
@@ -9602,11 +9604,10 @@ fn menus_show_the_keys_of_new_commands() {
         settings.keys.custom.insert(id.into(), vec![key.into()]);
     }
     let mut h = playing_multitrack_with(settings);
-    // 畫面 → 裁切 → 填滿視窗
+    // 畫面 → 裁切 → 填滿視窗（選單比 421 高的視窗長，「畫面 ⏵」要先捲到看得到；「擷取畫面 ⏵」也含「畫面 ⏵」）
     h.get_by_label("影片畫面").click_secondary();
     h.run_steps(2);
-    h.get_by_label("畫面 ⏵").click();
-    h.run_steps(2);
+    MenuItem::exact("畫面 ⏵").hover(&mut h);
     h.get_by_label_contains("裁切").click();
     h.run_steps(2);
     h.get_by_label("填滿視窗（裁掉黑邊） F19");
@@ -15438,7 +15439,8 @@ fn export_menu_is_disabled_without_a_file_and_says_why_it_cannot_save() {
         h.get_by_label("儲存片段…").accesskit_node().is_disabled(),
         "EDL 不能存片段"
     );
-    hover_until_tooltip(
+    // 子選單裡的項目：不捲動（選單比視窗長時捲的是外面的選單，「匯出 ⏵」移走、子選單就關了）
+    hover_menu_tooltip(
         &mut h,
         "儲存片段…",
         "這個檔案用了章節連結（ordered chapters），不能匯出",
@@ -17310,4 +17312,368 @@ fn repeat_is_locked_while_mpv_opts_loop_the_file() {
     h.run_steps(2);
     assert!(!h.get_by_label("重複播放：單一檔案").accesskit_node().is_disabled());
     assert_eq!(h.state().player().get_string("loop-file").unwrap(), "no", "影戲不動它");
+}
+
+// ───────────── 播完後：右鍵選單、設定頁、控制列的 ⏳、快捷鍵、等匯出 ─────────────
+
+/// 在影片上按右鍵、打開「播完後：… ▸」（標題寫著選好的動作，例如「播完後：不做任何事 ⏵」）
+fn open_after_menu(h: &mut Harness<'_, VitascopeApp>, title: &str) {
+    hover_context_item(h, "播完後");
+    let (_, full, _) = MenuItem::contains("播完後").wait(h);
+    assert_eq!(full, format!("{title} ⏵"), "選單的標題寫著選好的動作");
+    wait_menu_item(h, "只對這次有效");
+}
+
+/// 選單（子選單、下拉選單）開著：把滑鼠移到項目上，等說明出現（不捲動：捲動時子選單可能關掉）
+fn hover_menu_tooltip(h: &mut Harness<'_, VitascopeApp>, label: &str, tooltip: &str) {
+    h.get_by_label(label).hover();
+    let start = Instant::now();
+    while h.query_by_label(tooltip).is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「{label}」上沒有出現說明「{tooltip}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 一個 3 秒的片段開始播放（不自動接下一個），暫停（播完會開始倒數）
+fn after_ui_case(name: &str, launch: Launch, mut settings: Settings) -> (TempDir, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![dir.clip("a.mp4")],
+            ..launch
+        },
+        settings,
+    );
+    settle(&mut h, "a.mp4");
+    pause_now(&mut h);
+    (dir, h)
+}
+
+/// 從暫停的地方播到結尾：先播起來、等介面看到在播，再跳到快結束的地方。
+/// 先跳再播的話，慢的電腦可能在兩幀之間就播完了：介面沒看到「在播」，不算播完
+fn play_to_the_end(h: &mut Harness<'_, VitascopeApp>) {
+    h.state().player().set_pause(false).unwrap();
+    step_until(h, "播起來", |s| s.loaded && !s.paused && !s.eof);
+    let d = h.state().player().state.duration.unwrap();
+    h.state().player().seek_to(d - 0.3, true).unwrap();
+}
+
+#[test]
+fn after_playback_menu_offers_close_but_no_power_actions_without_a_system() {
+    let dir = TempDir::new("after-menu-settings");
+    let path = dir.0.join("settings.json");
+    let (_clip, mut h) = after_ui_case("after-menu", Launch::default(), Settings::load_from(path.clone()));
+    let saved = std::fs::read(&path).ok();
+    open_after_menu(&mut h, "播完後：不做任何事");
+    assert!(toggled(&h, "不做任何事"));
+    h.get_by_label("關閉影戲");
+    for hidden in ["睡眠", "休眠", "關機"] {
+        assert!(
+            h.query_by_label(hidden).is_none(),
+            "沒有讓電腦睡眠、關機的方法（自動測試）：不列出「{hidden}」"
+        );
+    }
+    click_order_item(&mut h, "關閉影戲");
+    assert_eq!(h.state().after_playback(), AfterPlayback::Close);
+    assert_eq!(h.state().osd_text(), Some("播完後：關閉影戲"));
+    assert_eq!(std::fs::read(&path).ok(), saved, "只對這次有效：不寫設定檔");
+    open_after_menu(&mut h, "播完後：關閉影戲");
+    assert!(toggled(&h, "關閉影戲"));
+    click_order_item(&mut h, "不做任何事");
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert_eq!(h.state().osd_text(), Some("播完後：不做任何事"));
+}
+
+#[test]
+fn power_actions_in_the_menu_follow_what_the_system_supports() {
+    let fake = Arc::new(FakePower::new(PowerCaps {
+        sleep: Avail::Yes,
+        hibernate: Avail::No(PowerError::NotSupported),
+        shutdown: Avail::No(PowerError::NoPermission),
+    }));
+    let (_dir, mut h) = after_ui_case(
+        "after-caps",
+        Launch {
+            system: Some(fake.clone()),
+            ..Default::default()
+        },
+        Settings::default(),
+    );
+    open_after_menu(&mut h, "播完後：不做任何事");
+    // 系統支援哪些是在背景問的
+    let start = Instant::now();
+    while h.get_by_label("睡眠").accesskit_node().is_disabled() {
+        assert!(start.elapsed() < TIMEOUT, "一直沒問到系統支援哪些");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(h.query_by_label("休眠").is_none(), "系統不支援休眠：不列出");
+    assert!(h.get_by_label("關機").accesskit_node().is_disabled(), "不能關機：停用");
+    hover_menu_tooltip(&mut h, "關機", "沒有權限");
+    close_menus(&mut h);
+    open_after_menu(&mut h, "播完後：不做任何事");
+    click_order_item(&mut h, "睡眠");
+    assert_eq!(h.state().after_playback(), AfterPlayback::Sleep);
+    assert_eq!(h.state().osd_text(), Some("播完後：睡眠"));
+    assert!(fake.runs().is_empty(), "選了只是等播完");
+}
+
+#[test]
+fn settings_playback_page_picks_the_action_without_writing_settings() {
+    let fake = Arc::new(FakePower::new(PowerCaps {
+        sleep: Avail::Unknown,
+        ..PowerCaps::all_yes()
+    }));
+    let dir = TempDir::new("after-settings-file");
+    let path = dir.0.join("settings.json");
+    let (_clip, mut h) = after_ui_case(
+        "after-settings",
+        Launch {
+            system: Some(fake),
+            ..Default::default()
+        },
+        Settings::load_from(path.clone()),
+    );
+    open_settings_page(&mut h, "播放");
+    h.get_by_label("只對這次有效：下次開啟影戲時是「不做任何事」");
+    assert_eq!(combo_value(&h, "播完後"), "不做任何事");
+    let saved = std::fs::read(&path).ok();
+    combo_in_view(&mut h, "播完後");
+    wait_menu_item(&mut h, "休眠");
+    let start = Instant::now();
+    while h.get_by_label("關機").accesskit_node().is_disabled() {
+        assert!(start.elapsed() < TIMEOUT, "一直沒問到系統支援哪些");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        h.get_by_label("睡眠").accesskit_node().is_disabled(),
+        "還在問系統：停用"
+    );
+    hover_menu_tooltip(&mut h, "睡眠", "檢查中…");
+    h.get_by_label("關閉影戲").click();
+    h.run_steps(3);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Close);
+    assert_eq!(combo_value(&h, "播完後"), "關閉影戲");
+    assert_eq!(h.state().osd_text(), Some("播完後：關閉影戲"));
+    assert_eq!(std::fs::read(&path).ok(), saved, "只對這次有效：設定視窗不寫設定檔");
+}
+
+#[test]
+fn after_playback_keys_and_the_control_bar_hourglass() {
+    let mut settings = Settings::default();
+    settings
+        .keys
+        .custom
+        .insert("after-playback-close".into(), vec!["F9".into()]);
+    settings
+        .keys
+        .custom
+        .insert("after-playback-none".into(), vec!["F10".into()]);
+    let (_dir, mut h) = after_ui_case("after-keys", Launch::default(), settings);
+    h.set_size(egui::vec2(960.0, 600.0));
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("⏳").is_none());
+    // 選單寫出指定的按鍵（跟其他指令一樣從 keymap 來）
+    open_after_menu(&mut h, "播完後：不做任何事");
+    h.get_by_label("F9");
+    h.get_by_label("F10");
+    close_menus(&mut h);
+    press_key(&mut h, egui::Key::F9);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Close);
+    assert_eq!(h.state().osd_text(), Some("播完後：關閉影戲"));
+    h.run_steps(2);
+    h.get_by_label("⏳ 播完後關閉影戲");
+    press_key(&mut h, egui::Key::F10);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("⏳").is_none());
+    // ⏳ 點一下取消
+    press_key(&mut h, egui::Key::F9);
+    h.run_steps(2);
+    hover_until_tooltip(&mut h, "⏳ 播完後關閉影戲", "點一下取消");
+    h.get_by_label("⏳ 播完後關閉影戲").click();
+    h.run_steps(2);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert_eq!(h.state().osd_text(), Some("播完後：不做任何事"));
+    assert!(h.query_by_label_contains("⏳").is_none());
+}
+
+/// 一個鍵按下、放開（同一幀內），處理完這一幀
+fn press_key(h: &mut Harness<'_, VitascopeApp>, key: egui::Key) {
+    h.key_press(key);
+    h.run_steps(2);
+}
+
+/// 控制列：選了播完後的動作（⏳）時，視窗窄時它最後才拿掉（🔀 先、速度其次）
+#[test]
+fn hourglass_outlasts_the_speed_and_the_order_icons_when_the_window_narrows() {
+    let mut settings = Settings::default();
+    settings.play_order.shuffle = true;
+    let (_dir, mut h) = after_ui_case("after-bar", Launch::default(), settings);
+    h.set_size(egui::vec2(960.0, 600.0));
+    h.run_steps(3);
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    h.state().player().set_speed(1.5).unwrap();
+    step_until(&mut h, "1.5×", |s| close_to(s.speed, 1.5));
+    h.run_steps(2);
+    let mut hourglass_only = false;
+    let mut width = 960.0;
+    while width > 200.0 {
+        h.set_size(egui::vec2(width, 480.0));
+        h.run_steps(3);
+        let hourglass = h.query_by_label("⏳ 播完後關閉影戲").is_some();
+        let speed = h.query_by_label("1.5×").is_some();
+        let icon = h.query_by_label("🔀").is_some();
+        if width == 960.0 {
+            assert!(hourglass && speed && icon, "寬的視窗都放");
+        }
+        assert!(!speed || hourglass, "⏳ 比速度晚拿掉（寬 {width}）");
+        assert!(!icon || speed, "🔀 比速度先拿掉（寬 {width}）");
+        hourglass_only |= hourglass && !speed;
+        width -= 2.0;
+    }
+    assert!(hourglass_only, "有一段寬度只放得下 ⏳");
+}
+
+/// 主播放器暫停，匯出 0.5–2 秒的片段，停在匯出的 mpv 準備好的地方（`gate.release()` 才繼續），關掉匯出視窗
+fn hold_an_export(h: &mut Harness<'_, VitascopeApp>) -> Gate {
+    let (gate, hook) = gate();
+    h.state_mut().set_export_test_hooks(vitascope::export::clip::TestHooks {
+        on_ready: Some(Arc::new(move |_: &vitascope::mpv::Mpv| hook(PathBuf::new()))),
+        ..Default::default()
+    });
+    h.key_press(egui::Key::Space);
+    step_until(h, "暫停", |s| s.paused);
+    open_export_window(h);
+    type_export_field(h, "起點", "0.5");
+    type_export_field(h, "終點", "2");
+    wait_ab(h, "範圍 0.5–2 秒", [Some(0.5), Some(2.0)]);
+    click_in_view(h, "開始匯出");
+    gate.wait(h);
+    assert!(h.state().export_busy());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().export_open());
+    gate
+}
+
+/// 播完時還在匯出：等匯出做完才開始倒數（提示「匯出完成後再關閉影戲」）
+#[test]
+fn the_countdown_waits_for_an_export_to_finish() {
+    let (_dir, _clips, _path, mut h) = export_harness("after-export", "common/mp4_h264_aac.mp4");
+    let mut gate = hold_an_export(&mut h);
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    // 主播放器播到結尾
+    play_to_the_end(&mut h);
+    step_until_app(&mut h, "播完：等匯出", |app| app.countdown_waiting_for_export());
+    assert_eq!(h.state().osd_text(), Some("匯出完成後再關閉影戲"));
+    assert_eq!(h.state().countdown_remaining(), None, "匯出還沒做完：不倒數");
+    assert!(h.query_by_label("播放完畢").is_none());
+    wait_real(&mut h, 0.3);
+    assert!(h.state().countdown_waiting_for_export(), "一直等到匯出做完");
+    // 等的時候又播起來了：不等了，選的動作留著；再播完又等匯出
+    h.state().player().seek_to(0.5, true).unwrap();
+    step_until_app(&mut h, "又播起來：不等了", |app| {
+        !app.countdown_waiting_for_export() && !app.player().state.eof
+    });
+    assert_eq!(h.state().after_playback(), AfterPlayback::Close, "選的動作還在");
+    play_to_the_end(&mut h);
+    step_until_app(&mut h, "又播完：等匯出", |app| {
+        app.countdown_waiting_for_export()
+    });
+    gate.release();
+    wait_export_done(&mut h);
+    step_until_app(&mut h, "匯出做完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    assert!(!h.state().countdown_waiting_for_export());
+    h.get_by_label_contains("秒後關閉影戲");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert_eq!(h.state().countdown_remaining(), None);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert!(!h.state().close_requested());
+}
+
+/// 等匯出時：停止就不等了（不提示）；等的時候開了檔案對話框，匯出做完時不倒數（一幀都沒有：
+/// 不能把視窗叫到對話框前面），取消
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn stop_or_a_file_dialog_during_the_export_wait_ends_it() {
+    let (_dir, _clips, _path, mut h) = export_harness("after-export-stop", "common/mp4_h264_aac.mp4");
+    let file = PathBuf::from(h.state().player().state.path.clone().unwrap());
+    let mut gate = hold_an_export(&mut h);
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    play_to_the_end(&mut h);
+    step_until_app(&mut h, "播完：等匯出", |app| app.countdown_waiting_for_export());
+    h.state_mut().run_command(vitascope::keymap::Command::Stop);
+    h.step();
+    assert!(!h.state().countdown_waiting_for_export(), "停止：不等了");
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert_ne!(h.state().osd_text(), Some("已取消：播完後關閉影戲"), "停止不提示");
+    // 再開一次、再播完（匯出還在做）
+    drop_file(&mut h, file);
+    settle(&mut h, "mp4_h264_aac.mp4");
+    pause_now(&mut h);
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    play_to_the_end(&mut h);
+    step_until_app(&mut h, "又播完：等匯出", |app| {
+        app.countdown_waiting_for_export()
+    });
+    // 等的時候開了檔案對話框
+    let requests = h.state_mut().stub_dialogs();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    let request = requests.recv_timeout(TIMEOUT).expect("沒有開對話框");
+    assert!(h.state().countdown_waiting_for_export(), "開對話框不取消等匯出");
+    gate.release();
+    let start = Instant::now();
+    while h.state().export_busy() || h.state().countdown_waiting_for_export() {
+        assert!(start.elapsed() < EXPORT_TIMEOUT, "等不到匯出結束");
+        h.step();
+        assert_eq!(h.state().countdown_remaining(), None, "對話框開著：不倒數");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for _ in 0..3 {
+        h.step();
+        assert_eq!(h.state().countdown_remaining(), None, "對話框開著：不倒數");
+    }
+    assert!(h.query_by_label("播放完畢").is_none());
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert_eq!(h.state().osd_text(), Some("已取消：播完後關閉影戲"));
+    let _ = request.reply.send(None);
+}
+
+#[test]
+fn after_playback_menu_countdown_and_hourglass_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let (_dir, mut h) = after_ui_case("after-english", Launch::default(), settings);
+    h.set_size(egui::vec2(960.0, 600.0));
+    h.run_steps(3);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "When playback ends: do nothing");
+    for label in ["Do nothing", "Close VitaScope", "For this session only"] {
+        wait_menu_item(&mut h, label);
+    }
+    click_order_item(&mut h, "Close VitaScope");
+    assert_eq!(h.state().osd_text(), Some("When playback ends: close VitaScope"));
+    h.run_steps(2);
+    h.get_by_label("⏳ Close VitaScope when done");
+    play_to_the_end(&mut h);
+    step_until_app(&mut h, "countdown", |app| app.countdown_remaining().is_some());
+    h.get_by_label("Playback finished");
+    h.get_by_label_contains("Closing VitaScope in");
+    h.get_by_label("Cancel (Esc)");
+    h.get_by_label("Press any key, move the mouse or click to cancel");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(3);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("Cancelled: close VitaScope when playback ends")
+    );
 }

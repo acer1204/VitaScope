@@ -83,9 +83,11 @@ x11-dl = "2.21"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-# 啟動時查有哪些螢幕（NSScreen）；視窗所在螢幕的編號（NSView → NSWindow → NSScreen.deviceDescription）
+# 啟動時查有哪些螢幕（NSScreen）；視窗所在螢幕的編號（NSView → NSWindow → NSScreen.deviceDescription）；
+# 播完後倒數時取消隱藏（NSApplication）
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSApplication",
     "NSGraphics",
     "NSResponder",
     "NSScreen",

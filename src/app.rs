@@ -1,5 +1,6 @@
 //! 播放器視窗：影片畫面、控制列、快捷鍵、全螢幕。
 
+mod after_playback;
 mod bookmarks_panel;
 mod capture;
 mod control_panel;
@@ -34,6 +35,7 @@ use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEv
 use crate::playlist::{Playlist, Repeat, Shuffler};
 use crate::settings::{OnTop, Settings, SideTab, SubStyle, WindowGeometry};
 use crate::sound::{EqPreset, Leveling};
+use crate::system_power::{AfterPlayback, PowerAction, PowerCaps, PowerError, SystemPower};
 use crate::theme::{self, Palette, ThemeChoice};
 use crate::update::{self, UpdateStatus};
 use crate::video::VideoView;
@@ -221,6 +223,8 @@ enum Action {
     /// 重複播放：依序切換（關閉 → 全部 → 單一檔案）/ 指定
     CycleRepeat,
     SetRepeat(Repeat),
+    /// 播完後的動作（只對這次有效）：右鍵選單、設定頁、快捷鍵、控制列的 ⏳（取消）
+    SetAfterPlayback(AfterPlayback),
 }
 
 /// 起始畫面上按的
@@ -402,6 +406,27 @@ pub struct VitascopeApp {
     auto_advance: Option<play_order::AutoAdvance>,
     /// 播放結束了幾次（清單播完等；「播完後」的動作從這裡開始）
     finished_count: u64,
+    /// 播完後的動作：只對這次有效（不存檔），執行或取消後回到「不做任何事」
+    after_playback: AfterPlayback,
+    /// 播完了、等匯出或倒數中
+    countdown: Option<after_playback::Pending>,
+    /// 這一幀的輸入取消了倒數：影片畫面不再處理這一幀的點擊、滾輪
+    countdown_ate_input: bool,
+    /// 取消倒數的那一下（滑鼠按鍵）還按著：放開之前（含放開的那一幀）影片畫面也不處理點擊
+    countdown_press_held: bool,
+    /// 倒數多久（測試用；None = 照動作）
+    countdown_override: Option<Duration>,
+    /// 倒數時把視窗叫到前面、暫時置頂
+    countdown_raise: bool,
+    /// 讓電腦睡眠、休眠、關機的方法（沒有時選單不列出）
+    system: Option<Arc<dyn SystemPower>>,
+    /// 系統能做哪些事（啟動時在背景問）
+    power_caps: PowerCaps,
+    caps_probe: Option<Receiver<PowerCaps>>,
+    /// 正在執行的睡眠 / 休眠 / 關機（背景執行緒）：結果
+    power_job: Option<(PowerAction, Receiver<Result<(), PowerError>>)>,
+    /// 播完後的「關閉影戲」送出了關閉視窗
+    close_requested: bool,
     /// 上次送給 mpv 的 loop-file（mpv 的預設是 no）
     loop_file_sent: &'static str,
     /// 目前的檔案不能跳轉（載入完成時問 mpv）：重複單一檔案不用 mpv 的 loop-file
@@ -626,6 +651,14 @@ pub struct Launch {
     /// 快取的根資料夾（匯出的磁碟快取；啟動時清掉 `<快取>/export` 與匯出資料夾裡上次留下的暫存檔）。
     /// 預設 None（自動測試、`--shot`：不清、不碰使用者的資料夾），播放器用 `paths::cache_root()`
     pub cache_root: Option<PathBuf>,
+    /// 讓電腦睡眠、休眠、關機的方法（「播完後 ▸」）；預設 None（自動測試、`--shot`：選單不列出睡眠、休眠、關機，
+    /// 絕不會讓電腦睡眠或關機）
+    pub system: Option<Arc<dyn SystemPower>>,
+    /// 測試用：播完後的倒數改成這麼久（None = 照動作：關閉影戲 10 秒，睡眠 / 休眠 30 秒，關機 60 秒）
+    #[doc(hidden)]
+    pub countdown_override: Option<Duration>,
+    /// 播完後倒數時把視窗還原、叫到前面、暫時置頂（main.rs 打開；預設不動：自動測試、`--shot` 不搶使用者的螢幕）
+    pub countdown_raise: bool,
 }
 
 impl VitascopeApp {
@@ -825,6 +858,17 @@ impl VitascopeApp {
             shuffler: Shuffler::from_time(),
             auto_advance: None,
             finished_count: 0,
+            after_playback: AfterPlayback::Nothing,
+            countdown: None,
+            countdown_ate_input: false,
+            countdown_press_held: false,
+            countdown_override: launch.countdown_override,
+            countdown_raise: launch.countdown_raise,
+            system: launch.system,
+            power_caps: PowerCaps::default(),
+            caps_probe: None,
+            power_job: None,
+            close_requested: false,
             loop_file_sent: "no",
             unseekable_file: false,
             popup_open_at_start: false,
@@ -1071,6 +1115,8 @@ impl VitascopeApp {
         self.net_startup();
         // 重複單一檔案（mpv 的 loop-file）
         self.play_order_startup();
+        // 播完後的睡眠、休眠、關機：系統支援哪些（背景）
+        self.probe_power_caps();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -1176,6 +1222,8 @@ impl VitascopeApp {
         self.reload_keep = None;
         // 這次開的是使用者要的（自動接下一個的，開完才由 `advance` 記下）：開不起來就停在錯誤畫面
         self.auto_advance = None;
+        // 開了別的檔案：播完後的倒數（或等匯出）取消，回到不做任何事
+        self.cancel_countdown(after_playback::Cancel::Quiet);
         // 播放清單檔：換成檔案裡的清單（只讀一次；HLS 串流的 .m3u8 交給 mpv）
         if formats::is_playlist(path) && !is_url(&path.to_string_lossy()) {
             match crate::m3u::read_text(path) {
@@ -1387,6 +1435,12 @@ impl VitascopeApp {
     }
 
     fn run(&mut self, ctx: &egui::Context, action: Action) {
+        // 倒數中的任何操作（之後的系統媒體鍵也走這裡）都取消倒數；停止不提示（跟開了別的檔案一樣），等匯出時也取消
+        if matches!(action, Action::Stop) {
+            self.cancel_countdown(after_playback::Cancel::Quiet);
+        } else if self.countdown_running() {
+            self.cancel_countdown(after_playback::Cancel::Input);
+        }
         let st = &self.player.state;
         let loaded = st.loaded;
         // 畫面調整：要有影像（純音訊、專輯封面不算，跟右鍵選單的「畫面」一樣），
@@ -1489,6 +1543,7 @@ impl VitascopeApp {
             Action::SetShuffle(on) => self.set_shuffle(on),
             Action::CycleRepeat => self.cycle_repeat(),
             Action::SetRepeat(repeat) => self.set_repeat(repeat),
+            Action::SetAfterPlayback(a) => self.set_after_playback(a),
             Action::Settings => self.settings_open = !self.settings_open,
             Action::ToggleSmooth => self.toggle_smooth(),
             Action::Adjust(kind, delta) => self.step_adjust(kind, delta),
@@ -1954,6 +2009,10 @@ impl VitascopeApp {
     /// 不然自動播下一個、換上一個／下一個檔案時視窗會先變一般再變回置頂。
     /// 迷你播放器、子母畫面回到一般視窗時也用這個
     fn on_top_now(&self) -> bool {
+        // 播完後的倒數：暫時置頂（人可能在用別的程式，倒數要看得到）
+        if self.countdown_on_top() {
+            return true;
+        }
         let st = &self.player.state;
         let playing =
             self.switching_file || ((st.loaded || st.loading) && !st.paused && !st.eof && !self.frame_stepping);
@@ -2401,7 +2460,7 @@ impl VitascopeApp {
     }
 
     /// 按鍵的處理順序：
-    /// 1. 播完後的倒數（之後的批次加在最前面）；2. 「設定 → 快捷鍵」正在錄按鍵（[`Self::capture_key`]）；
+    /// 1. 播完後的倒數（[`Self::countdown_input`]：任何按鍵、點擊、滑鼠都是取消，按鍵被吃掉）；2. 「設定 → 快捷鍵」正在錄按鍵（[`Self::capture_key`]）；
     /// 3. 「關於」、對話框（`egui::Modal`）開著、正在輸入文字時，按鍵都不當快捷鍵；
     /// 4. Esc 依序關掉開著的視窗（[`ESC_WINDOWS`]）；
     /// 5. 全螢幕時 Esc 離開全螢幕；一般視窗裡正在連線的網址，Esc 取消（全螢幕時不取消）；
@@ -2427,6 +2486,10 @@ impl VitascopeApp {
         }
         // 每一幀都要看（包括錄按鍵、對話框開著時），按著的鍵才不會記錯
         let (copy_repeat, paste_repeat) = self.mark_repeats(ctx);
+        // 播完後的倒數：任何按鍵、點擊、滑鼠都是取消（正在輸入文字、對話框開著、錄按鍵時也一樣），那些事件被吃掉
+        if self.countdown_input(ctx) {
+            return;
+        }
         // 設定頁正在錄按鍵：按鍵都給它（Esc 取消錄，不關設定視窗）
         if self.capture_key(ctx) {
             return;
@@ -2654,6 +2717,15 @@ impl VitascopeApp {
                 .is_none()
     }
 
+    /// 介面測試用：照快捷鍵的路徑（`Command` → `Action` → `run`）執行一個指令，不經過按鍵
+    /// （之後的系統媒體控制也走這條路，例如倒數中的媒體鍵）
+    #[doc(hidden)]
+    pub fn run_command(&mut self, cmd: Command) {
+        let ctx = self.egui_ctx.clone();
+        let action = self.command_action(cmd);
+        self.run(&ctx, action);
+    }
+
     /// 指令 → 操作（跳轉秒數之類的參數看設定）
     fn command_action(&self, cmd: Command) -> Action {
         let (short, long) = (self.settings.seek_short, self.settings.seek_long);
@@ -2740,6 +2812,8 @@ impl VitascopeApp {
             Command::ExportSheet => Action::ShowExport(export_panel::ExportTab::Sheet),
             Command::ToggleShuffle => Action::ToggleShuffle,
             Command::CycleRepeat => Action::CycleRepeat,
+            Command::AfterPlaybackNone => Action::SetAfterPlayback(AfterPlayback::Nothing),
+            Command::AfterPlaybackClose => Action::SetAfterPlayback(AfterPlayback::Close),
         }
     }
 
@@ -3335,7 +3409,11 @@ impl VitascopeApp {
             self.run(ui.ctx(), Action::CancelLoading);
         }
 
-        self.video_mouse(ui.ctx(), &response);
+        // 倒數畫面出現的第一幀底下還點得到：取消倒數的那一下不要再暫停、調音量
+        let blocked = self.countdown_blocks_video();
+        if !blocked {
+            self.video_mouse(ui.ctx(), &response);
+        }
 
         // 拖曳檔案到視窗上方時的提示
         if ui.ctx().input(|i| !i.raw.hovered_files.is_empty()) {
@@ -3357,11 +3435,11 @@ impl VitascopeApp {
 
         // Ctrl / Cmd + 滾輪、觸控板捏合：縮放畫面
         let zoom_delta = ui.ctx().input(|i| i.zoom_delta());
-        if response.hovered() && (zoom_delta - 1.0).abs() > 1e-3 {
+        if !blocked && response.hovered() && (zoom_delta - 1.0).abs() > 1e-3 {
             self.run(ui.ctx(), Action::Zoom(f64::from(zoom_delta.log2())));
         }
         // 滑鼠滾輪：預設調音量（比照 PotPlayer），可以改成跳轉（設定 → 快捷鍵 → 滑鼠）
-        let steps = f64::from(self.wheel_steps(ui.ctx(), response.hovered()));
+        let steps = f64::from(self.wheel_steps(ui.ctx(), response.hovered() && !blocked));
         let wheel = match self.settings.keys.mouse.wheel {
             _ if steps == 0.0 => None,
             WheelMode::Volume => Some(Action::Volume(5.0 * steps)),
@@ -3569,6 +3647,10 @@ impl VitascopeApp {
         }
         // 播放順序 ▸（「播完自動播放下一個」也在裡面）
         if let Some(a) = self.play_order_menu(ui) {
+            action = Some(a);
+        }
+        // 播完後：… ▸（標題寫著選好的動作）
+        if let Some(a) = self.after_playback_menu(ui) {
             action = Some(a);
         }
         let settings_changed = ui
@@ -3893,17 +3975,31 @@ impl VitascopeApp {
             } else {
                 ui.label(egui::RichText::new(time).monospace());
             }
+            // 播完後的動作（⏳，點一下取消）：視窗窄時最後才拿掉（比速度、🔀 / 🔂 都優先，選了關機時一定要看得到）。
+            // 先算它要的寬度，放得下的話速度、圖示都要留位置給它
+            let palette = Palette::of(ui.visuals());
+            let after = self.after_indicator().map(|(text, hover)| {
+                let font = egui::TextStyle::Button.resolve(ui.style());
+                let galley = ui.painter().layout_no_wrap(text.to_owned(), font, palette.accent);
+                let width = galley.size().x + 2.0 * ui.spacing().button_padding.x + ui.spacing().item_spacing.x;
+                (text, hover, width)
+            });
+            let after_room = after
+                .as_ref()
+                .map(|&(.., width)| width)
+                .filter(|&width| ui.available_width() >= self.right_controls_width + width)
+                .unwrap_or(0.0);
+            // ⏳ 放不下時，比它先拿掉的也都不放（跟速度放不下時不放 🔀 / 🔂 一樣）
+            let after_dropped = after.is_some() && after_room == 0.0;
             // 速度不是 1× 時顯示在時間旁邊；視窗太窄、會擠到右邊的按鈕時就不顯示（OSD 和右鍵選單還看得到）
-            let mut speed_dropped = false;
-            if (st.speed - 1.0).abs() > 1e-6 {
+            let mut speed_dropped = after_dropped;
+            if (st.speed - 1.0).abs() > 1e-6 && !after_dropped {
                 let font = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
-                let galley = ui.painter().layout_no_wrap(
-                    format!("{}×", fmt_speed(st.speed)),
-                    font,
-                    Palette::of(ui.visuals()).accent,
-                );
+                let galley = ui
+                    .painter()
+                    .layout_no_wrap(format!("{}×", fmt_speed(st.speed)), font, palette.accent);
                 let needed = galley.size().x + ui.spacing().item_spacing.x;
-                if ui.available_width() >= self.right_controls_width + needed {
+                if ui.available_width() >= self.right_controls_width + needed + after_room {
                     ui.label(galley).on_hover_text(crate::keymap::paren(
                         crate::tr!("播放速度", "Playback speed"),
                         &self.keymap.speed_keys(),
@@ -3916,11 +4012,12 @@ impl VitascopeApp {
             let indicators = self.order_indicators();
             if !indicators.is_empty() && !speed_dropped {
                 let font = egui::TextStyle::Body.resolve(ui.style());
-                let color = Palette::of(ui.visuals()).accent;
                 let galleys: Vec<_> = indicators
                     .into_iter()
                     .map(|(glyph, hover)| {
-                        let galley = ui.painter().layout_no_wrap(glyph.to_owned(), font.clone(), color);
+                        let galley = ui
+                            .painter()
+                            .layout_no_wrap(glyph.to_owned(), font.clone(), palette.accent);
                         (galley, hover)
                     })
                     .collect();
@@ -3928,11 +4025,20 @@ impl VitascopeApp {
                     .iter()
                     .map(|(g, _)| g.size().x + ui.spacing().item_spacing.x)
                     .sum();
-                if ui.available_width() >= self.right_controls_width + needed {
+                if ui.available_width() >= self.right_controls_width + needed + after_room {
                     for (galley, hover) in galleys {
                         ui.label(galley).on_hover_text(hover);
                     }
                 }
+            }
+            if let Some((text, hover, _)) = after
+                && after_room > 0.0
+                && ui
+                    .add(egui::Button::new(egui::RichText::new(text).color(palette.accent)).frame(false))
+                    .on_hover_text(hover)
+                    .clicked()
+            {
+                self.run(ui.ctx(), Action::SetAfterPlayback(AfterPlayback::Nothing));
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -4489,6 +4595,12 @@ impl VitascopeApp {
 
 impl eframe::App for VitascopeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 取消倒數的那一下還按著（倒數畫面出現的第一幀按下的：egui 已經記下按在影片畫面上）：
+        // 放開的那一幀 egui 才算點擊，到那時影片畫面都不處理（不然取消之後又切換暫停、從頭播放）
+        self.countdown_ate_input = std::mem::take(&mut self.countdown_press_held);
+        if self.countdown_ate_input {
+            self.countdown_press_held = ctx.input(|i| i.pointer.any_down());
+        }
         self.render_tick(ctx);
         for ev in self.player.poll() {
             self.on_player_event(ev);
@@ -4512,6 +4624,8 @@ impl eframe::App for VitascopeApp {
         self.poll_instance(ctx);
         // 下載、更新 yt-dlp、deno 做完了沒（結果提示、重新找、再開一次播不了的網址）
         self.install_tick(ctx);
+        // 系統能做哪些事（播完後的睡眠、關機）、睡眠 / 關機的結果
+        self.poll_power();
         // macOS：已經開著時從 Finder 開的檔案
         #[cfg(target_os = "macos")]
         {
@@ -4530,6 +4644,8 @@ impl eframe::App for VitascopeApp {
             self.last_activity = Instant::now();
         }
         self.handle_keys(ctx);
+        // 播完後的倒數：等匯出、系統其他地方的輸入、時間到了沒（在按鍵之後：同一幀按了鍵就是取消，不是執行）
+        self.countdown_tick(ctx);
         self.handle_drops(ctx);
         self.update_title(ctx);
         self.keep_window_level(ctx);
@@ -4647,6 +4763,8 @@ impl eframe::App for VitascopeApp {
         self.export_window(&ctx);
         // 同意下載、確認移除：在設定視窗之後畫（從設定頁按的，對話框要蓋在設定視窗上面）
         self.install_modals(&ctx);
+        // 播完後的倒數：最後畫，蓋在所有視窗、對話框上面
+        self.countdown_window(&ctx);
         self.typing_last_frame = ctx.text_edit_focused();
     }
 

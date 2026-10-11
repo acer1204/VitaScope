@@ -394,6 +394,10 @@ commands! {
     ToggleShuffle => "toggle-shuffle", Playback, once, ("隨機播放", "Shuffle");
     /// 播放順序（預設沒有按鍵）：重複播放依序切換 關閉 → 全部 → 單一檔案
     CycleRepeat => "cycle-repeat", Playback, once, ("重複播放", "Repeat");
+    /// 播完後的動作（預設沒有按鍵；只對這次有效）：不做任何事
+    AfterPlaybackNone => "after-playback-none", Playback, once, ("播完後：不做任何事", "When playback ends: do nothing");
+    /// 播完後的動作（預設沒有按鍵）：倒數 10 秒後關閉影戲
+    AfterPlaybackClose => "after-playback-close", Playback, once, ("播完後：關閉影戲", "When playback ends: close VitaScope");
     VolumeUp => "volume-up", Sound, repeat, ("音量 +", "Volume up");
     VolumeDown => "volume-down", Sound, repeat, ("音量 −", "Volume down");
     ToggleMute => "toggle-mute", Sound, once, ("靜音", "Mute");
@@ -1422,6 +1426,9 @@ mod tests {
         // E3
         "toggle-shuffle",
         "cycle-repeat",
+        // E4
+        "after-playback-none",
+        "after-playback-close",
     ];
 
     #[test]
@@ -1544,6 +1551,8 @@ mod tests {
                 | C::AbClear
                 | C::ToggleShuffle
                 | C::CycleRepeat
+                | C::AfterPlaybackNone
+                | C::AfterPlaybackClose
                 | C::AudioDelayReset
                 | C::NextAudioTrack
                 | C::ToggleEq
@@ -1573,7 +1582,13 @@ mod tests {
             for p in Platform::ALL {
                 for (cmd, chord) in preset.bindings(p) {
                     assert!(
-                        !matches!(cmd, Command::ToggleShuffle | Command::CycleRepeat),
+                        !matches!(
+                            cmd,
+                            Command::ToggleShuffle
+                                | Command::CycleRepeat
+                                | Command::AfterPlaybackNone
+                                | Command::AfterPlaybackClose
+                        ),
                         "{preset:?} {p:?}：{cmd:?} 預設不給按鍵（{chord:?}）"
                     );
                 }
@@ -1583,6 +1598,16 @@ mod tests {
         assert_eq!(Command::from_id("cycle-repeat"), Some(Command::CycleRepeat));
         assert_eq!(Command::ToggleShuffle.group(), Group::Playback);
         assert_eq!(Command::CycleRepeat.group(), Group::Playback);
+        // 播完後的動作：不給預設按鍵（會關掉影戲、之後還有關機，不放在一個鍵上）
+        assert_eq!(
+            Command::from_id("after-playback-none"),
+            Some(Command::AfterPlaybackNone)
+        );
+        assert_eq!(
+            Command::from_id("after-playback-close"),
+            Some(Command::AfterPlaybackClose)
+        );
+        assert_eq!(Command::AfterPlaybackClose.group(), Group::Playback);
     }
 
     #[test]

@@ -323,6 +323,10 @@ impl VitascopeApp {
         if let Some(r) = picked {
             *action = Some(Action::SetRepeat(r));
         }
+        // 播完後：只對這次有效，不算改了設定（不寫設定檔）
+        if let Some(a) = self.after_playback_row(ui) {
+            *action = Some(a);
+        }
         let s = &mut self.settings;
         changed |= ui
             .checkbox(

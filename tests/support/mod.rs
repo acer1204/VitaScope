@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+pub mod fake_power;
 pub mod fake_ytdl;
 pub mod http;
 pub mod release;

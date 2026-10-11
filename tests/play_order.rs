@@ -3,6 +3,7 @@
 //! - headless：mpv 的 `loop-file`（重複單一檔案）真的不會播完、改回 no 後馬上生效、換檔後照樣有效；
 //!   `VITASCOPE_MPV_OPTS` 之類自己指定的 loop-file / loop 算在使用者指定的選項裡。
 //! - 介面（kittest）：用 3 秒的樣本，每個檔案開始播就跳到快結束的地方（不整段播完，CI 才不會太慢）。
+//! - 播完後的動作：倒數、各種取消、執行（關閉影戲；睡眠、關機只用假的 `SystemPower`，絕不呼叫真的系統）。
 //!
 //! 樣本來自 `python scripts/gen_samples.py`。
 
@@ -14,12 +15,14 @@ use egui_kittest::kittest::{NodeT, Queryable};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use support::fake_power::FakePower;
 use support::fake_ytdl::{FakeResolver, site_playlist_json};
 use support::http::{Canned, Server};
 use vitascope::app::{Launch, VitascopeApp};
 use vitascope::player::{Options, Player, PlayerEvent};
 use vitascope::playlist::{Playlist, Repeat};
 use vitascope::settings::Settings;
+use vitascope::system_power::{AfterPlayback, PowerAction, PowerCaps, PowerError};
 use vitascope::ytdl::{Resolve, YtdlError};
 
 /// 慢的 CI 也要等得到（開檔、跳轉、換檔都是非同步的）
@@ -978,4 +981,720 @@ fn repeat_one_on_an_unseekable_stream_reopens_it() {
     step_until_app(&mut h, "能跳轉的檔案用回 loop-file", |app| {
         playing(app, "a.mp4") && app.player().get_string("loop-file").is_ok_and(|v| v == "inf")
     });
+}
+
+// ───────────── 播完後的動作：倒數、取消、執行 ─────────────
+
+/// 要等它被取消的倒數：很長（慢的 CI 也不會先時間到）
+const LONG_COUNTDOWN: Duration = Duration::from_secs(300);
+/// 要等它執行的倒數
+const SHORT_COUNTDOWN: Duration = Duration::from_secs(2);
+
+/// 一個 3 秒的片段（不自動接下一個）開始播放，設定檔在暫存資料夾；播完後的動作選 `a`。
+/// 回傳（暫存資料夾、設定檔、介面）
+fn after_case(name: &str, launch: Launch, a: AfterPlayback) -> (TempDir, PathBuf, Harness<'static, VitascopeApp>) {
+    let dir = TempDir::new(name);
+    let file = dir.clip("a.mp4");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    settings.resume = false;
+    let mut h = harness(
+        Launch {
+            files: vec![file],
+            ..launch
+        },
+        settings,
+    );
+    // 視窗配合影片調整完（之後才點得到控制列的按鈕）
+    step_until_app(&mut h, "a.mp4 開始播放、視窗調整完", |app| {
+        playing(app, "a.mp4") && app.player().state.video_size.is_some() && !app.window_fit_pending()
+    });
+    h.run_steps(5);
+    arm(&mut h, a);
+    (dir, path, h)
+}
+
+/// 選播完後的動作（睡眠、關機要等背景問好系統支援哪些）
+fn arm(h: &mut Harness<'_, VitascopeApp>, a: AfterPlayback) {
+    let start = Instant::now();
+    loop {
+        h.state_mut().set_after_playback(a);
+        if h.state().after_playback() == a {
+            return;
+        }
+        assert!(start.elapsed() < TIMEOUT, "選不了 {a:?}：{:?}", h.state().osd_text());
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 跳到快結束的地方，等播放結束、開始倒數；再跑一幀（倒數畫面畫出來之後，底下的東西才點不到）
+fn finish_and_count_down(h: &mut Harness<'_, VitascopeApp>) {
+    seek_near_end(h);
+    step_until_app(h, "播完：開始倒數", |app| app.countdown_remaining().is_some());
+    h.step();
+}
+
+/// 這一幀送給視窗的指令
+fn viewport_commands(h: &Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    h.output()
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map(|v| v.commands.clone())
+        .unwrap_or_default()
+}
+
+/// 一直更新介面直到條件成立，收集這段期間送給視窗的指令
+fn commands_until(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    cond: impl Fn(&VitascopeApp) -> bool,
+) -> Vec<egui::ViewportCommand> {
+    let start = Instant::now();
+    let mut cmds = Vec::new();
+    loop {
+        h.step();
+        cmds.extend(viewport_commands(h));
+        if cond(h.state()) {
+            return cmds;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 實際經過一段時間，收集這段期間送給視窗的指令
+fn commands_during(h: &mut Harness<'_, VitascopeApp>, seconds: f64) -> Vec<egui::ViewportCommand> {
+    let start = Instant::now();
+    let mut cmds = Vec::new();
+    while start.elapsed() < Duration::from_secs_f64(seconds) {
+        h.step();
+        cmds.extend(viewport_commands(h));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cmds
+}
+
+/// mpv 現在是不是暫停（直接問 mpv：按鍵送出的暫停切換是同步的，不用等屬性通知）
+fn mpv_paused(h: &Harness<'_, VitascopeApp>) -> bool {
+    h.state().player().get_string("pause").unwrap() == "yes"
+}
+
+fn left_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// 倒數被使用者的動作取消了：回到不做任何事、提示已取消、沒有關閉
+fn assert_cancelled(h: &Harness<'_, VitascopeApp>, how: &str) {
+    let app = h.state();
+    assert_eq!(app.countdown_remaining(), None, "{how}：倒數取消");
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing, "{how}：回到不做任何事");
+    assert_eq!(app.osd_text(), Some("已取消：播完後關閉影戲"), "{how}");
+    assert!(!app.close_requested(), "{how}");
+    assert!(h.query_by_label("播放完畢").is_none(), "{how}：倒數畫面關掉");
+}
+
+#[test]
+fn close_after_playback_counts_down_then_closes_once_after_saving() {
+    let (_dir, path, mut h) = after_case(
+        "after-close",
+        Launch {
+            countdown_override: Some(SHORT_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    assert_eq!(h.state().osd_text(), Some("播完後：關閉影戲"));
+    // 改了音量、還沒存檔：關閉之前要先存
+    h.state().player().set_volume(37.0).unwrap();
+    step_until_app(&mut h, "音量 37", |app| {
+        (app.player().state.volume - 37.0).abs() < 0.5
+    });
+    seek_near_end(&mut h);
+    let mut cmds = commands_until(&mut h, "播完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    assert_eq!(h.state().playback_finished_count(), 1);
+    h.get_by_label("播放完畢");
+    h.get_by_label_contains("秒後關閉影戲");
+    h.get_by_label("取消（Esc）");
+    h.get_by_label("按任何鍵、移動滑鼠或點一下就取消");
+    assert_eq!(h.state().after_playback(), AfterPlayback::Close, "倒數中還是關閉影戲");
+    assert!(!h.state().close_requested());
+    assert!(
+        (Settings::load_from(path.clone()).volume - 37.0).abs() > 0.5,
+        "倒數之前沒有存（下面確認是執行前存的）"
+    );
+    cmds.extend(commands_until(&mut h, "時間到：關閉影戲", |app| {
+        app.close_requested()
+    }));
+    let app = h.state();
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing, "只對這一次有效");
+    assert_eq!(app.countdown_remaining(), None);
+    assert!(
+        (Settings::load_from(path).volume - 37.0).abs() < 0.5,
+        "關閉之前先存設定（系統關機時可能來不及跑 on_exit）"
+    );
+    cmds.extend(commands_during(&mut h, 0.5));
+    let closes = cmds
+        .iter()
+        .filter(|c| matches!(c, egui::ViewportCommand::Close))
+        .count();
+    assert_eq!(closes, 1, "只關一次：{cmds:?}");
+    // 自動測試不動視窗（Launch.countdown_raise 預設關著）
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::WindowLevel(_) | egui::ViewportCommand::Focus)),
+        "{cmds:?}"
+    );
+    assert!(h.query_by_label("播放完畢").is_none());
+}
+
+#[test]
+fn shutdown_with_a_fake_system_counts_down_then_runs_once() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    let (_dir, _path, mut h) = after_case(
+        "after-shutdown",
+        Launch {
+            system: Some(fake.clone()),
+            countdown_override: Some(SHORT_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Shutdown,
+    );
+    assert_eq!(h.state().osd_text(), Some("播完後：關機"));
+    finish_and_count_down(&mut h);
+    h.get_by_label_contains("秒後關機");
+    assert!(fake.runs().is_empty(), "倒數中還沒執行");
+    step_until_app(&mut h, "時間到", |app| app.countdown_remaining().is_none());
+    let start = Instant::now();
+    while fake.runs().is_empty() {
+        assert!(start.elapsed() < TIMEOUT, "背景沒有執行");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_real(&mut h, 1.0);
+    let app = h.state();
+    assert_eq!(fake.runs(), [PowerAction::Shutdown], "只執行一次");
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing, "只對這一次有效");
+    assert!(!app.close_requested(), "關機不是關閉影戲");
+}
+
+#[test]
+fn a_failed_power_action_says_why() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    fake.fail_with(PowerError::NoPermission);
+    let (_dir, _path, mut h) = after_case(
+        "after-sleep-fails",
+        Launch {
+            system: Some(fake.clone()),
+            countdown_override: Some(SHORT_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Sleep,
+    );
+    finish_and_count_down(&mut h);
+    h.get_by_label_contains("秒後進入睡眠");
+    step_until_app(&mut h, "執行失敗的提示", |app| {
+        app.osd_text() == Some("無法進入睡眠：沒有權限")
+    });
+    assert_eq!(fake.runs(), [PowerAction::Sleep]);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+}
+
+#[test]
+fn any_key_cancels_the_countdown_and_is_not_also_a_shortcut() {
+    let (_dir, _path, mut h) = after_case(
+        "after-space",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    finish_and_count_down(&mut h);
+    let paused = mpv_paused(&h);
+    // 空白鍵被倒數吃掉：不會「從頭播放」（播完後按空白鍵是重新播放）
+    press(&mut h, egui::Key::Space);
+    assert_cancelled(&h, "空白鍵");
+    assert_eq!(mpv_paused(&h), paused, "空白鍵只取消倒數，不切換暫停");
+    wait_real(&mut h, 0.5);
+    let st = &h.state().player().state;
+    assert!(st.eof && st.time_pos > 2.0, "還停在結尾：{:?}", st.time_pos);
+    assert!(!h.state().close_requested());
+}
+
+#[test]
+fn typing_in_a_text_field_still_cancels_the_countdown_and_types_nothing() {
+    let (_dir, _path, mut h) = after_case(
+        "after-typing",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    // 字幕外觀視窗的字型欄位有焦點（打字時按鍵平常不當快捷鍵）
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label("字幕外觀…").click();
+    h.run_steps(2);
+    h.get_by_role(egui::accesskit::Role::TextInput).focus();
+    h.run_steps(2);
+    assert!(h.ctx.text_edit_focused());
+    let font = h.state().settings().subtitle.font.clone();
+    seek_near_end(&mut h);
+    step_until_app(&mut h, "播完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    // 倒數畫面出現的下一幀 egui 才把底下輸入框的焦點拿掉：這一幀按的鍵還是在輸入框有焦點時按的
+    assert!(h.ctx.text_edit_focused(), "倒數開始時輸入框還有焦點");
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::X,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.input_mut().events.push(egui::Event::Text("x".into()));
+    h.step();
+    h.step();
+    assert_cancelled(&h, "在輸入框打字");
+    assert_eq!(h.state().settings().subtitle.font, font, "取消的那一下沒有打進輸入框");
+}
+
+#[test]
+fn a_click_cancels_the_countdown_without_pausing() {
+    let (_dir, _path, mut h) = after_case(
+        "after-click",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    // 滑鼠先停在影片上（點的時候沒有移動）
+    let pos = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    finish_and_count_down(&mut h);
+    let paused = mpv_paused(&h);
+    h.event(left_button(pos, true));
+    h.event(left_button(pos, false));
+    h.run_steps(2);
+    assert_cancelled(&h, "點一下");
+    assert_eq!(mpv_paused(&h), paused, "點一下只取消倒數，不切換暫停");
+}
+
+#[test]
+fn moving_the_mouse_cancels_the_countdown_but_a_small_jitter_does_not() {
+    let (_dir, _path, mut h) = after_case(
+        "after-mouse",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    let pos = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    finish_and_count_down(&mut h);
+    // 剛開始的一下子不看滑鼠（視窗還原、移到最上層時，滑鼠在視窗裡的位置會變）
+    wait_real(&mut h, 0.6);
+    h.event(egui::Event::PointerMoved(pos + egui::vec2(3.0, 2.0)));
+    h.run_steps(2);
+    assert!(h.state().countdown_remaining().is_some(), "手碰到滑鼠的抖動不算");
+    h.event(egui::Event::PointerMoved(pos + egui::vec2(40.0, 0.0)));
+    h.run_steps(2);
+    assert_cancelled(&h, "移動滑鼠");
+}
+
+#[test]
+fn input_in_another_program_cancels_the_countdown() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    let (_dir, _path, mut h) = after_case(
+        "after-system-input",
+        Launch {
+            system: Some(fake.clone()),
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    finish_and_count_down(&mut h);
+    // 倒數之前的輸入（例如剛才在別的程式打字）不算
+    wait_real(&mut h, 0.5);
+    assert!(h.state().countdown_remaining().is_some());
+    // 使用者在別的程式裡打字
+    fake.input_now();
+    step_until_app(&mut h, "系統的輸入取消倒數", |app| {
+        app.countdown_remaining().is_none()
+    });
+    assert_cancelled(&h, "別的程式裡的輸入");
+    assert!(fake.runs().is_empty());
+}
+
+#[test]
+fn opening_a_file_cancels_the_countdown_quietly() {
+    let (dir, _path, mut h) = after_case(
+        "after-open",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    finish_and_count_down(&mut h);
+    let b = dir.clip("b.mp4");
+    h.input_mut().dropped_files.push(Arc::new(Dropped(b)));
+    h.step();
+    let app = h.state();
+    assert_eq!(app.countdown_remaining(), None);
+    assert_eq!(
+        app.after_playback(),
+        AfterPlayback::Nothing,
+        "開了別的檔案：回到不做任何事"
+    );
+    assert_ne!(
+        app.osd_text(),
+        Some("已取消：播完後關閉影戲"),
+        "不提示（新檔案的提示比較有用）"
+    );
+    step_until_app(&mut h, "播 b.mp4", |app| playing(app, "b.mp4"));
+    assert!(!h.state().close_requested());
+}
+
+/// 播完時開著檔案對話框（使用者在電腦前面；Windows 的主視窗這時點不到）：不倒數，取消
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_file_dialog_open_when_playback_ends_cancels_the_action() {
+    let (_dir, _path, mut h) = after_case(
+        "after-dialog",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    let requests = h.state_mut().stub_dialogs();
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::O);
+    h.run_steps(2);
+    let request = requests.recv_timeout(TIMEOUT).expect("沒有開對話框");
+    seek_near_end(&mut h);
+    step_until_app(&mut h, "播放結束", |app| app.playback_finished_count() == 1);
+    let app = h.state();
+    assert_eq!(app.countdown_remaining(), None, "對話框開著：不倒數");
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing);
+    assert_eq!(app.osd_text(), Some("已取消：播完後關閉影戲"));
+    let _ = request.reply.send(None);
+}
+
+#[test]
+fn the_countdown_raises_the_window_and_restores_its_level() {
+    let (_dir, _path, mut h) = after_case(
+        "after-raise",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            countdown_raise: true,
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    // 視窗縮到最小（使用者在用別的程式）
+    let minimized = |h: &mut Harness<'_, VitascopeApp>, on: bool| {
+        h.input_mut()
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .minimized = Some(on);
+    };
+    minimized(&mut h, true);
+    seek_near_end(&mut h);
+    let cmds = commands_until(&mut h, "播完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
+        "倒數時置頂：{cmds:?}"
+    );
+    assert!(
+        cmds.contains(&egui::ViewportCommand::Minimized(false)),
+        "還原：{cmds:?}"
+    );
+    assert!(cmds.contains(&egui::ViewportCommand::Focus), "叫到前面：{cmds:?}");
+    // 還沒還原好：不再叫；還原好了（macOS 的還原有動畫）：再叫一次到前面
+    let cmds = commands_during(&mut h, 0.1);
+    assert!(!cmds.contains(&egui::ViewportCommand::Focus), "{cmds:?}");
+    minimized(&mut h, false);
+    let mut cmds = commands_during(&mut h, 0.1);
+    assert_eq!(
+        cmds.iter().filter(|c| **c == egui::ViewportCommand::Focus).count(),
+        1,
+        "還原之後再叫一次：{cmds:?}"
+    );
+    // 系統不讓搶前景（視窗沒有焦點）時：之後閃工作列 / 跳 Dock
+    cmds.extend(commands_during(&mut h, 0.6));
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, egui::ViewportCommand::RequestUserAttention(_))),
+        "{cmds:?}"
+    );
+    assert!(h.state().countdown_remaining().is_some(), "叫視窗不會取消倒數");
+    // 按下、放開 Esc 在同一幀（kittest 的 key_press 會分成好幾幀送，`output()` 只看得到最後一幀）
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert_cancelled(&h, "Esc");
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
+        "取消後回到原本的層級（不置頂）：{cmds:?}"
+    );
+}
+
+#[test]
+fn after_playback_is_back_to_nothing_after_a_restart() {
+    let dir = TempDir::new("after-restart");
+    let path = dir.0.join("settings.json");
+    let mut h = harness(Launch::default(), Settings::load_from(path.clone()));
+    h.step();
+    arm(&mut h, AfterPlayback::Close);
+    // 存設定（改了隨機播放）：播完後的動作不會一起存
+    h.state_mut().set_shuffle(true);
+    let json = std::fs::read_to_string(&path).unwrap();
+    assert!(json.contains("shuffle") && !json.contains("after"), "{json}");
+    drop(h);
+    let mut h = harness(Launch::default(), Settings::load_from(path));
+    h.step();
+    assert!(h.state().settings().play_order.shuffle);
+    assert_eq!(
+        h.state().after_playback(),
+        AfterPlayback::Nothing,
+        "每次啟動都是不做任何事"
+    );
+}
+
+#[test]
+fn choosing_an_action_while_repeating_says_playback_never_ends() {
+    let mut h = harness(Launch::default(), order_settings(false, Repeat::All));
+    h.step();
+    arm(&mut h, AfterPlayback::Close);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播完後：關閉影戲（重複播放開著時，播放不會結束）")
+    );
+    arm(&mut h, AfterPlayback::Nothing);
+    assert_eq!(h.state().osd_text(), Some("播完後：不做任何事"));
+}
+
+/// 沒有 `Launch.system`（自動測試、`--shot`）：睡眠、休眠、關機選不了
+#[test]
+fn power_actions_need_a_system() {
+    let mut h = harness(Launch::default(), Settings::default());
+    h.step();
+    for a in [AfterPlayback::Sleep, AfterPlayback::Hibernate, AfterPlayback::Shutdown] {
+        h.state_mut().set_after_playback(a);
+        assert_eq!(h.state().after_playback(), AfterPlayback::Nothing, "{a:?}");
+    }
+    assert_eq!(h.state().osd_text(), Some("播完後無法關機：這台電腦不支援"));
+}
+
+/// 已經播完（沒選動作，不倒數）；選「關閉影戲」，然後當成現在才播完：下一幀就是倒數開始的那一幀
+/// （倒數畫面還沒畫過：底下的東西還點得到，`modal_open` 也還沒設，只剩倒數自己吃掉輸入）
+fn count_down_from_this_frame(h: &mut Harness<'_, VitascopeApp>) {
+    seek_near_end(h);
+    step_until_app(h, "播放結束（沒選動作）", |app| {
+        app.playback_finished_count() == 1
+    });
+    wait_real(h, 0.3);
+    assert_eq!(h.state().countdown_remaining(), None);
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    h.state_mut().finish_playback_now();
+    assert!(h.state().countdown_remaining().is_some(), "開始倒數");
+}
+
+#[test]
+fn a_key_on_the_frame_the_countdown_starts_is_eaten_too() {
+    let (_dir, _path, mut h) = after_case(
+        "after-first-frame-key",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Nothing,
+    );
+    count_down_from_this_frame(&mut h);
+    let paused = mpv_paused(&h);
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.step();
+    assert_cancelled(&h, "倒數開始那一幀的空白鍵");
+    assert_eq!(mpv_paused(&h), paused, "空白鍵只取消倒數，不切換暫停");
+    wait_real(&mut h, 0.5);
+    let st = &h.state().player().state;
+    assert!(st.eof && st.time_pos > 2.0, "還停在結尾：{:?}", st.time_pos);
+}
+
+#[test]
+fn a_click_on_the_frame_the_countdown_starts_does_not_reach_the_video() {
+    let (_dir, _path, mut h) = after_case(
+        "after-first-frame-click",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Nothing,
+    );
+    let pos = h.get_by_label("影片畫面").rect().center();
+    h.event(egui::Event::PointerMoved(pos));
+    h.step();
+    count_down_from_this_frame(&mut h);
+    let paused = mpv_paused(&h);
+    let zoom = h.state().player().get_string("video-zoom").unwrap();
+    // 按下（和縮放手勢）在倒數開始的那一幀，放開在之後的幀（egui 放開時才算點擊）。
+    // `h.event` 一個事件一幀，同一幀的要直接放進輸入
+    h.input_mut().events.push(left_button(pos, true));
+    h.input_mut().events.push(egui::Event::Zoom(1.5));
+    h.step();
+    assert_cancelled(&h, "倒數開始那一幀按下");
+    h.run_steps(2);
+    h.event(left_button(pos, false));
+    h.run_steps(3);
+    assert_cancelled(&h, "放開");
+    assert_eq!(mpv_paused(&h), paused, "取消倒數的那一下不切換暫停");
+    assert_eq!(h.state().player().get_string("video-zoom").unwrap(), zoom, "也不縮放");
+    wait_real(&mut h, 0.5);
+    let st = &h.state().player().state;
+    assert!(st.eof && st.time_pos > 2.0, "還停在結尾：{:?}", st.time_pos);
+    // 之後的點擊照常
+    h.event(left_button(pos, true));
+    h.event(left_button(pos, false));
+    h.step();
+    assert_ne!(mpv_paused(&h), paused, "下一次點擊照常切換暫停");
+}
+
+/// 倒數中從快捷鍵以外的路徑（之後的系統媒體鍵）來的指令：停止不提示，其他的提示已取消
+#[test]
+fn stop_and_other_commands_cancel_the_countdown() {
+    let (_dir, _path, mut h) = after_case(
+        "after-commands",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    finish_and_count_down(&mut h);
+    let muted = h.state().player().state.muted;
+    h.state_mut().run_command(vitascope::keymap::Command::ToggleMute);
+    let app = h.state();
+    assert_eq!(app.countdown_remaining(), None, "其他指令：取消倒數");
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing);
+    step_until_app(&mut h, "指令照樣執行（靜音）", |app| {
+        app.player().state.muted != muted
+    });
+    assert!(!h.state().close_requested());
+    // 再倒數一次，這次按停止：不提示已取消
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    h.state_mut().finish_playback_now();
+    h.step();
+    assert!(h.state().countdown_remaining().is_some());
+    h.state_mut().run_command(vitascope::keymap::Command::Stop);
+    h.step();
+    let app = h.state();
+    assert_eq!(app.countdown_remaining(), None, "停止：取消倒數");
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing);
+    assert_ne!(app.osd_text(), Some("已取消：播完後關閉影戲"), "停止不提示");
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().close_requested());
+}
+
+/// 倒數畫面在約 320 寬的小視窗（之後的迷你播放器）裡也放得下：每一行字、取消按鈕都在視窗裡（中英文）
+#[test]
+fn the_countdown_fits_a_window_about_320_wide() {
+    for (lang, labels) in [
+        (
+            vitascope::i18n::Lang::ZhTw,
+            ["播放完畢", "取消（Esc）", "按任何鍵、移動滑鼠或點一下就取消"],
+        ),
+        (
+            vitascope::i18n::Lang::En,
+            [
+                "Playback finished",
+                "Cancel (Esc)",
+                "Press any key, move the mouse or click to cancel",
+            ],
+        ),
+    ] {
+        let dir = TempDir::new("after-narrow");
+        let mut settings = Settings::load_from(dir.0.join("settings.json"));
+        settings.auto_next = false;
+        settings.resume = false;
+        settings.language = lang;
+        let mut h = harness(
+            Launch {
+                files: vec![dir.clip("a.mp4")],
+                countdown_override: Some(LONG_COUNTDOWN),
+                ..Default::default()
+            },
+            settings,
+        );
+        // 視窗配合影片調整完之後才改成 320 寬（不然會被調回影片的大小）
+        step_until_app(&mut h, "a.mp4 開始播放、視窗調整完", |app| {
+            playing(app, "a.mp4") && app.player().state.video_size.is_some() && !app.window_fit_pending()
+        });
+        h.run_steps(5);
+        h.set_size(egui::vec2(320.0, 240.0));
+        h.run_steps(3);
+        arm(&mut h, AfterPlayback::Close);
+        finish_and_count_down(&mut h);
+        h.run_steps(2);
+        let screen = h.ctx.content_rect();
+        assert!(screen.width() <= 321.0, "{screen:?}");
+        let line = if lang == vitascope::i18n::Lang::En {
+            "Closing VitaScope in"
+        } else {
+            "秒後關閉影戲"
+        };
+        // 倒數畫面整塊（egui::Modal 的區域）和裡面的每一行字、按鈕
+        let modal = h
+            .ctx
+            .memory(|m| m.area_rect(egui::Id::new("after_playback_countdown")))
+            .expect("倒數畫面");
+        let mut rects = vec![modal, h.get_by_label_contains(line).rect()];
+        rects.extend(labels.iter().map(|l| h.get_by_label(l).rect()));
+        for r in rects {
+            assert!(
+                screen.expand(0.5).contains_rect(r),
+                "{lang:?}：倒數畫面超出 320 寬的視窗：{r:?} / {screen:?}"
+            );
+        }
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+        assert_eq!(h.state().countdown_remaining(), None);
+    }
 }
