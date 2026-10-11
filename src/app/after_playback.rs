@@ -13,7 +13,7 @@
 //!
 //! [`SystemPower::prepare`]: crate::system_power::SystemPower::prepare
 
-use super::{Action, VitascopeApp};
+use super::{Action, INHIBIT_RELEASE_WAIT, VitascopeApp};
 use crate::keymap::Command;
 use crate::playlist::Repeat;
 use crate::system_power::{AfterPlayback, Avail, Countdown, PowerAction, PowerError, Tick, countdown_len};
@@ -497,13 +497,15 @@ impl VitascopeApp {
         }
     }
 
-    /// 時間到：先存檔（Windows、logind 關機時可能來不及跑 `on_exit`），再做
+    /// 時間到：先存檔（Windows、logind 關機時可能來不及跑 `on_exit`），放掉讓螢幕不關閉的要求，再做
     fn fire(&mut self, ctx: &egui::Context, a: AfterPlayback) {
         self.countdown = None;
         self.after_playback = AfterPlayback::Nothing;
         self.remember_position();
         self.save_settings();
         self.persist_playlist();
+        // 自己的要求不能擋住自己的睡眠、關機：先放掉（背景執行緒執行前等它做完）
+        let inhibitor = self.release_inhibit();
         match a {
             AfterPlayback::Nothing => {}
             AfterPlayback::Close => {
@@ -520,6 +522,11 @@ impl VitascopeApp {
                 let spawned = std::thread::Builder::new()
                     .name("vitascope-power-action".into())
                     .spawn(move || {
+                        if let Some(inhibitor) = inhibitor
+                            && !inhibitor.settle(INHIBIT_RELEASE_WAIT)
+                        {
+                            eprintln!("[vitascope] 讓螢幕不關閉的要求還沒放掉就執行{power:?}");
+                        }
                         let _ = tx.send(system.run(power));
                         wake.request_repaint();
                     });

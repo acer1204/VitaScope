@@ -2,6 +2,7 @@
 //! 介面（app）和自動測試（tests/）都透過這一層操作 mpv。
 
 use crate::approx_seek::{self, Check, Kind, Landing, Verdict};
+use crate::inhibit::StopScreensaver;
 use crate::mpv::{self, EndReason, Event, Format, Mpv, Node, Value};
 use crate::net;
 use crate::subs::{self, ExternalSub, SubLang};
@@ -871,6 +872,8 @@ pub struct Player {
     boost_pct: f64,
     /// ao 選項本來就有 null（headless、VITASCOPE_MPV_OPTS 指定）：用 null 輸出不是開不起來改用的
     ao_null_wanted: bool,
+    /// mpv 的 stop-screensaver（建立時讀；VITASCOPE_MPV_OPTS、include= 可以改）
+    stop_screensaver: StopScreensaver,
     /// 最近一次精準跳轉的目標和送出的時間（見 `position_now`）；其他跳轉、換檔時清掉
     exact_seek: std::sync::Mutex<Option<(f64, Instant)>>,
     /// 跳轉不準的格式（TS、M2TS、MPEG-PS）：分離器往前多跳的秒數、正在核對的跳轉（見 `approx_seek`）
@@ -972,14 +975,14 @@ impl Player {
         // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是這些選項）
         // af（等化器、音量平衡的濾鏡鏈）也一樣：預設是空的
         // 網路選項也一樣（user-agent、逾時、快取…、標頭清單、FFmpeg 的連線選項）
-        // 重複單一檔案的 loop-file 也一樣（別名 loop 改的也是它）
+        // 重複單一檔案的 loop-file 也一樣（別名 loop 改的也是它）；播放時螢幕不關閉的 stop-screensaver 也是
         for name in crate::picture::MANAGED
             .into_iter()
             .chain(crate::sound::MANAGED)
             .chain(["af"])
             .chain(net::MANAGED)
             .chain([net::HEADERS, net::LAVF])
-            .chain(["loop-file"])
+            .chain(["loop-file", "stop-screensaver"])
         {
             if let (Ok(now), Ok(default)) = (
                 mpv.get_string(name),
@@ -1005,6 +1008,8 @@ impl Player {
             user_overrides.insert("glsl-shaders".to_owned());
         }
         let ao_null_wanted = crate::sound::ao_list_has_null(&mpv.get_string("ao").unwrap_or_default());
+        // 播放時螢幕不關閉：照 mpv 的值（vo=libmpv 時 mpv 自己不做，影戲照它的值做，見 `inhibit`）
+        let stop_screensaver = StopScreensaver::from_mpv(&mpv.get_string("stop-screensaver").unwrap_or_default());
         let mpv_text = mpv.get_string("mpv-version").unwrap_or_default();
         if let Some(wakeup) = opts.wakeup {
             mpv.set_wakeup_callback(wakeup);
@@ -1046,6 +1051,7 @@ impl Player {
             shaders_inflight: HashSet::new(),
             boost_pct: 0.0,
             ao_null_wanted,
+            stop_screensaver,
             exact_seek: std::sync::Mutex::new(None),
             approx: std::sync::Mutex::new(Approx::default()),
             opening: None,
@@ -1077,6 +1083,11 @@ impl Player {
     /// 使用者用 VITASCOPE_MPV_OPTS 或 `Options.extra` 指定的 mpv 選項名稱（這些不自動調整）
     pub fn user_overrides(&self) -> &HashSet<String> {
         &self.user_overrides
+    }
+
+    /// mpv 的 stop-screensaver（建立時讀到的）：播放時要不要讓螢幕不關閉（見 `inhibit`）
+    pub fn stop_screensaver(&self) -> StopScreensaver {
+        self.stop_screensaver
     }
 
     /// 取出畫面輸出的錯誤記錄（libmpv_render、vo；收到的時間, 內容）

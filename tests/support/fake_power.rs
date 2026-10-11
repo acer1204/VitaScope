@@ -19,6 +19,8 @@ pub struct FakePower {
     prepare_released: Condvar,
     /// 系統最後一次有輸入的時間（None = 查不到，像 Wayland）
     last_input: Mutex<Option<Instant>>,
+    /// 執行時先呼叫（測試記下那一刻別的東西的狀態，例如讓螢幕不關閉的要求放掉了沒）
+    on_run: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl FakePower {
@@ -34,7 +36,13 @@ impl FakePower {
             prepare_held: Mutex::new(false),
             prepare_released: Condvar::new(),
             last_input: Mutex::new(Some(Instant::now())),
+            on_run: Mutex::new(None),
         }
+    }
+
+    /// 執行（`run`）時先呼叫 `f`（在背景執行緒上）
+    pub fn on_run(&self, f: impl Fn() + Send + 'static) {
+        *self.on_run.lock().unwrap() = Some(Box::new(f));
     }
 
     /// 執行時回傳這個結果（例如沒有權限）
@@ -109,6 +117,9 @@ impl SystemPower for FakePower {
     }
 
     fn run(&self, action: PowerAction) -> Result<(), PowerError> {
+        if let Some(f) = &*self.on_run.lock().unwrap() {
+            f();
+        }
         self.runs.lock().unwrap().push(action);
         self.result.lock().unwrap().clone()
     }

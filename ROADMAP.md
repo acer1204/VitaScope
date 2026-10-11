@@ -616,6 +616,21 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認（Linux）：GNOME、KDE 的媒體控制與鎖定畫面（X11、Wayland），桌面環境的媒體鍵，`playerctl` 的播放、暫停、跳轉、開網址
   - [ ] 手動確認（macOS）：F7–F9 在影戲在前面、在後面時都能用；控制中心的「正在播放」顯示片名、封面、進度，拖動進度、
     按鈕是上一個 / 下一個檔案（不是往前 / 往後跳幾秒）；AirPods 的按鍵（這裡沒有 Mac，目前只有 CI 的自動測試）
+  - 播放時螢幕不關閉（E10，`inhibit.rs`）：嵌入用的 `vo=libmpv` 不處理 mpv 的 `stop-screensaver`，影戲照 mpv 讀到的值自己做
+    （`Player::stop_screensaver`；`VITASCOPE_MPV_OPTS` 可以改成 no / always）。純函式 `inhibit::want`：播放中的影片 → 螢幕不關，
+    只有聲音（或關掉了影像軌）→ 電腦不睡眠，暫停、停止、播完、播完後的倒數與動作 → 都不要（睡眠、關機之前先放掉並等它做完）。
+    Windows `PowerCreateRequest` / `PowerSetRequest`、macOS `IOPMAssertionCreateWithName`、Linux 工作階段匯流排的
+    `org.freedesktop.ScreenSaver.Inhibit`（沒有時只記錄一次；只管螢幕，只有聲音時不做）；在自己的執行緒上做，真的只在 main.rs 接上（`Launch.inhibitor`）
+  （自動：`inhibit` 單元測試（`want` 的每一種組合、背景執行緒只做最後一個要求、等它做完、結束時放掉、失敗只記錄一次、被收回時再要、
+  只有 main.rs 在不是 `--shot` 時建立 `RealInhibitor`；真的系統只在 CI 上測（開發機跳過，手動 `CI=1 cargo test --lib inhibit::tests::`）：
+  Windows 設一次再清掉、用 `CallNtPowerInformation` 確認，macOS 拿一次再放掉、用 `pmset -g assertions` 確認）；
+  kittest `tests/inhibit.rs`（假的 `Inhibitor`：影片、只有聲音、關掉影像軌、暫停、播完、結束、`stop-screensaver=no` / `always`、
+  倒數開始的那一幀就放掉、關機之前已經放掉）；Linux 在私人的 D-Bus 匯流排（自己的設定，不會啟動電腦上的服務）上用假的 ScreenSaver
+  測 Inhibit / UnInhibit、放不掉時關掉連線、沒有服務、匯流排不見了、影戲結束時放掉（CI 一定要有 dbus-daemon））
+  - [ ] 手動確認（Windows）：播放影片時以系統管理員執行 `powercfg /requests`，DISPLAY 底下有影戲；暫停後消失；
+    把「關閉螢幕」設成 1 分鐘、播一部 15 分鐘以上的影片不碰電腦，螢幕不會關；只播音樂時 SYSTEM 底下有影戲、螢幕照常關
+  - [ ] 手動確認（macOS）：播放時 `pmset -g assertions` 有影戲的 PreventUserIdleDisplaySleep，暫停後消失
+  - [ ] 手動確認（Linux）：GNOME、KDE 播放影片時螢幕不會變暗、不會鎖定，暫停後照設定的時間關閉
 - [ ] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
 - [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試
 
@@ -978,3 +993,6 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   只有晚一兩格以內才當成影像本身缺格。加大的秒數只在它真的讓跳轉停對時才留給之後的跳轉。
   關鍵影格跳轉送出的是「目標 − 往前多跳的秒數」，mpv 在停住之前的 time-pos 也是這個數字：連按往回時要從目標算。
   自己產生的樣本只有開頭一個關鍵影格時，問題看起來是「沒有畫面」；真實的電視錄影、藍光則是「晚一點」，兩種都要測。
+- **嵌入用的 `vo=libmpv` 不處理 `stop-screensaver`**：mpv 預設播放時不讓螢幕關閉，但那是畫面輸出（`VOCTRL_KILL_SCREENSAVER`）做的，
+  `vo_libmpv.c` 的 `control()` 沒有這一項，所以嵌入 mpv 的程式播影片時螢幕照樣會關。要自己向系統要求
+  （Windows 的電源要求、macOS 的 IOPM assertion、Linux 的 `org.freedesktop.ScreenSaver`），也要記得在睡眠、關機之前放掉。

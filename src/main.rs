@@ -98,6 +98,8 @@ fn parse_args() -> (Launch, bool) {
         launch.system = Some(Arc::new(vitascope::system_power::RealPower::new()));
         // 系統的媒體控制（媒體鍵…）：真的系統只在這裡接上（自動截圖、自動測試都沒有）
         launch.media = vitascope::media_keys::MediaBackend::System;
+        // 播放影片時螢幕不關閉（mpv 的 stop-screensaver 對嵌入的畫面無效）：真的系統只在這裡接上
+        launch.inhibitor = Some(Arc::new(vitascope::inhibit::RealInhibitor::new()));
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
         if launch.files.is_empty()
             && let Some((entries, current)) = vitascope::m3u::load_session_entries()

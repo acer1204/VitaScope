@@ -26,6 +26,7 @@ use crate::bookmarks::Bookmarks;
 use crate::formats;
 use crate::geometry::{self, ASPECTS, CROPS, Geometry, PAN_STEP, ZOOM_STEP};
 use crate::history::History;
+use crate::inhibit::{self, Inhibitor, Want};
 use crate::keymap::{Chord, Command, Keymap, MouseInput, Platform, WheelMode};
 use crate::mpv::EndReason;
 use crate::picture::{
@@ -431,6 +432,9 @@ pub struct VitascopeApp {
     system: Option<Arc<dyn SystemPower>>,
     /// 系統的媒體控制（媒體鍵…）：工作階段、送出的內容、封面
     media: media::MediaUi,
+    /// 讓螢幕不關閉、電腦不睡眠的方法（None = 不要求），和上次要求的
+    inhibitor: Option<Arc<dyn Inhibitor>>,
+    inhibit_sent: Want,
     /// 系統能做哪些事（啟動時、打開「播完後」的選單時、選了動作時在背景問）
     power_caps: PowerCaps,
     caps_probe: Option<Receiver<PowerCaps>>,
@@ -678,6 +682,9 @@ pub struct Launch {
     /// 系統的媒體控制（媒體鍵、Windows 的媒體控制、macOS 的「正在播放」、Linux 的 MPRIS）；預設不用
     /// （自動測試、`--shot`：不碰使用者的系統媒體控制）。只有 main.rs 設成真的（`MediaBackend::System`），測試用假的
     pub media: crate::media_keys::MediaBackend,
+    /// 播放影片時讓螢幕不關閉、播放音訊時電腦不睡眠的方法；預設 None（自動測試、`--shot`：不向系統要求，
+    /// 測試用假的）。只有 main.rs 設成真的（`inhibit::RealInhibitor`）
+    pub inhibitor: Option<Arc<dyn Inhibitor>>,
 }
 
 impl VitascopeApp {
@@ -887,6 +894,8 @@ impl VitascopeApp {
             countdown_raise: launch.countdown_raise,
             system: launch.system,
             media,
+            inhibitor: launch.inhibitor,
+            inhibit_sent: Want::Nothing,
             power_caps: PowerCaps::default(),
             caps_probe: None,
             prepare_job: None,
@@ -4668,6 +4677,57 @@ impl VitascopeApp {
     }
 }
 
+/// 睡眠、關機、結束之前最多等多久放掉讓螢幕不關閉的要求（Linux 要經過 D-Bus；正常是幾毫秒）
+pub(crate) const INHIBIT_RELEASE_WAIT: Duration = Duration::from_secs(2);
+
+impl VitascopeApp {
+    /// 測試用：上次向系統要求的（螢幕不關、電腦不睡眠、都不要）
+    #[doc(hidden)]
+    pub fn keep_awake(&self) -> Want {
+        self.inhibit_sent
+    }
+
+    /// 現在要系統保持什麼（見 [`inhibit::want`]）
+    fn inhibit_want(&self) -> Want {
+        let st = &self.player.state;
+        let playing = inhibit::Playing {
+            // 選了哪些軌道還不知道（剛載入：mpv 先送軌道清單、之後才送選了哪些）：還不知道是影片還是只有聲音，先不要
+            loaded: st.loaded && st.tracks.iter().any(|t| t.selected),
+            paused: st.paused,
+            eof: st.eof,
+            // 選著的影像軌（不是專輯封面）：關掉影像只聽聲音時螢幕照常關（mpv 沒有影片輸出時也不管）
+            has_video: st.selected(TrackKind::Video).is_some_and(|t| !t.albumart),
+            // 播完後的動作：等匯出、倒數、睡眠 / 關機進行中、關閉影戲送出了
+            ending: self.countdown.is_some() || self.power_job.is_some() || self.close_requested,
+        };
+        inhibit::want(self.player.stop_screensaver(), &playing)
+    }
+
+    /// 每一幀：要的變了才告訴系統（背景執行緒去做，不卡住介面）
+    fn inhibit_tick(&mut self) {
+        if self.inhibitor.is_none() {
+            return;
+        }
+        let want = self.inhibit_want();
+        if want != self.inhibit_sent
+            && let Some(inhibitor) = &self.inhibitor
+        {
+            self.inhibit_sent = want;
+            inhibitor.set(want);
+        }
+    }
+
+    /// 馬上放掉（播完後的動作之前、結束時）；回傳要等它做完時用的 [`Inhibitor`]（沒有時 None）
+    pub(super) fn release_inhibit(&mut self) -> Option<Arc<dyn Inhibitor>> {
+        let inhibitor = self.inhibitor.clone()?;
+        if self.inhibit_sent != Want::Nothing {
+            self.inhibit_sent = Want::Nothing;
+            inhibitor.set(Want::Nothing);
+        }
+        Some(inhibitor)
+    }
+}
+
 impl eframe::App for VitascopeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // 取消倒數的那一下還按著（倒數畫面出現的第一幀按下的：egui 已經記下按在影片畫面上）：
@@ -4723,6 +4783,8 @@ impl eframe::App for VitascopeApp {
         self.handle_keys(ctx);
         // 播完後的倒數：等匯出、系統其他地方的輸入、時間到了沒（在按鍵之後：同一幀按了鍵就是取消，不是執行）
         self.countdown_tick(ctx);
+        // 播放中螢幕不關閉（在倒數之後：倒數、播完後的動作開始的這一幀就放掉）
+        self.inhibit_tick();
         self.handle_drops(ctx);
         self.update_title(ctx);
         self.keep_window_level(ctx);
@@ -4863,6 +4925,12 @@ impl eframe::App for VitascopeApp {
         self.persist_playlist();
         // 系統的媒體控制不再顯示影戲，這次存的封面刪掉
         self.media_end();
+        // 螢幕、電腦照系統的設定關閉、睡眠
+        if let Some(inhibitor) = self.release_inhibit()
+            && !inhibitor.settle(INHIBIT_RELEASE_WAIT)
+        {
+            eprintln!("[vitascope] 結束時來不及放掉讓螢幕不關閉的要求（程式結束時系統會收回）");
+        }
         // 下載到一半：停掉（暫存檔由背景執行緒刪掉；來不及的話下次下載時清掉）
         self.cancel_install();
         // 匯出到一半：取消、最多等一下、刪掉暫存檔（`Job` 被丟掉時做；寫檔中停不下來的，寫完由背景執行緒刪掉）
