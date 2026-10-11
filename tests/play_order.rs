@@ -1081,6 +1081,17 @@ fn mpv_paused(h: &Harness<'_, VitascopeApp>) -> bool {
     h.state().player().get_string("pause").unwrap() == "yes"
 }
 
+/// 等 mpv 在結尾停好：keep-open 要等聲音放完才暫停，比 eof-reached 晚（慢的機器上差很多），
+/// 在那之前讀到的暫停狀態之後會自己變
+fn wait_paused_at_end(h: &mut Harness<'_, VitascopeApp>) {
+    let start = Instant::now();
+    while !mpv_paused(h) {
+        assert!(start.elapsed() < TIMEOUT, "播完後 mpv 沒有停在最後一格");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn left_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
     egui::Event::PointerButton {
         pos,
@@ -1292,6 +1303,7 @@ fn any_key_cancels_the_countdown_and_is_not_also_a_shortcut() {
         AfterPlayback::Close,
     );
     finish_and_count_down(&mut h);
+    wait_paused_at_end(&mut h);
     let paused = mpv_paused(&h);
     // 空白鍵被倒數吃掉：不會「從頭播放」（播完後按空白鍵是重新播放）
     press(&mut h, egui::Key::Space);
@@ -1359,6 +1371,7 @@ fn a_click_cancels_the_countdown_without_pausing() {
     h.event(egui::Event::PointerMoved(pos));
     h.step();
     finish_and_count_down(&mut h);
+    wait_paused_at_end(&mut h);
     let paused = mpv_paused(&h);
     h.event(left_button(pos, true));
     h.event(left_button(pos, false));
@@ -1596,6 +1609,7 @@ fn count_down_from_this_frame(h: &mut Harness<'_, VitascopeApp>) {
         app.playback_finished_count() == 1
     });
     wait_real(h, 0.3);
+    wait_paused_at_end(h);
     assert_eq!(h.state().countdown_remaining(), None);
     h.state_mut().set_after_playback(AfterPlayback::Close);
     h.state_mut().finish_playback_now();
