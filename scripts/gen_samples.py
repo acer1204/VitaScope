@@ -271,6 +271,11 @@ def samples() -> list[Sample]:
         # 每 0.5 秒一個關鍵影格的 TS（像電視錄影）：用時間跳轉常落在下一個關鍵影格（GIF 要從 A 前面讀）
         S("ts_h264_gop05", "general", "ts", X264 + ["-g", "12", "-keyint_min", "12", "-sc_threshold", "0"], AAC,
           "h264", "aac", fmt=["-f", "mpegts"], dur=20, note="20 秒、每 0.5 秒一個關鍵影格的 TS（轉成 GIF）"),
+        # 一分半、每 2 秒一個關鍵影格的 TS（像電視錄影）：續播只記一分鐘以上的檔案，
+        # 介面測試用它測續播、書籤在跳轉不準的格式裡的跳轉（主播放器往前多跳 1 秒不夠時要再往前）
+        S("ts_h264_long", "general", "ts", X264 + ["-g", "48", "-keyint_min", "48", "-sc_threshold", "0"], AAC,
+          "h264", "aac", size="160x90", fmt=["-f", "mpegts"], dur=90,
+          note="90 秒、每 2 秒一個關鍵影格的 TS（續播、書籤的跳轉）"),
         # 影像比聲音晚 1.6 秒開始的 TS（電視錄影從 GOP 中間開始）：A 選在影像出來之前時，GIF 不算太短
         S("ts_h264_late_video", "general", "ts", X264, AAC, "h264", "aac", dur=6,
           note="影像比聲音晚 1.6 秒開始的 TS（轉成 GIF）", custom=[

@@ -478,6 +478,14 @@ impl Mpv {
         check(code, || crate::tf!("指令 {}", "command {}", args.join(" ")))
     }
 
+    /// 執行 mpv 指令字串（跟 input.conf 一樣的寫法）。用「;」分開的幾個指令是一個指令清單，
+    /// mpv 一次做完、中間不會插進別的事。參數要自己確定不需要引號
+    pub fn command_string(&self, command: &str) -> Result<()> {
+        let c = cstring(command);
+        let code = unsafe { sys::mpv_command_string(self.raw(), c.as_ptr()) };
+        check(code, || crate::tf!("指令 {}", "command {}", command))
+    }
+
     /// 非同步指令，結果以 `Event::CommandReply { id }` 回報。
     pub fn command_async(&self, id: u64, args: &[&str]) -> Result<()> {
         let owned: Vec<CString> = args.iter().map(|a| cstring(a)).collect();

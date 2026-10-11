@@ -1,6 +1,7 @@
 //! 播放器核心：把 mpv 的屬性與事件整理成 Rust 狀態。
 //! 介面（app）和自動測試（tests/）都透過這一層操作 mpv。
 
+use crate::approx_seek::{self, Check, Kind, Landing, Verdict};
 use crate::mpv::{self, EndReason, Event, Format, Mpv, Node, Value};
 use crate::net;
 use crate::subs::{self, ExternalSub, SubLang};
@@ -635,8 +636,9 @@ fn debug_log_level(value: Option<&str>) -> &'static str {
     }
 }
 
-/// 實際向 mpv 要的記錄等級：至少要警告。FFmpeg 的「HTTP error 404 Not Found」是警告，
-/// 網址開不了時靠它說明原因（只留下 `is_net_warning` 的那幾種，其他警告照舊不收）；VITASCOPE_DEBUG 要更多時照它的
+/// 收集錯誤和網路警告最少要的記錄等級：至少要警告。FFmpeg 的「HTTP error 404 Not Found」是警告，
+/// 網址開不了時靠它說明原因（只留下 `is_net_warning` 的那幾種，其他警告照舊不收）；VITASCOPE_DEBUG 要更多時照它的。
+/// 實際向 mpv 要的是 [`requested_log_level`]（再提高到 v）
 fn client_log_level(debug: Option<&str>) -> &'static str {
     let wanted = debug_log_level(debug);
     if log_rank(wanted) >= log_rank("warn") {
@@ -644,6 +646,14 @@ fn client_log_level(debug: Option<&str>) -> &'static str {
     } else {
         "warn"
     }
+}
+
+/// 主播放器向 mpv 要的記錄等級：至少 v。跳轉不準的格式（TS、MPEG-PS）要讀 mpv 的「跳轉完成」記錄
+/// 核對跳轉停在哪裡（見 `approx_seek`）。中途改等級的話 mpv 會丟掉還沒送出的記錄（開檔失敗的原因之類），
+/// 所以一開始就要。正常播放時 v 等級幾乎沒有記錄，只有開檔、跳轉、改設定時有幾筆
+fn requested_log_level(debug: Option<&str>) -> &'static str {
+    let wanted = client_log_level(debug);
+    if log_rank(wanted) >= log_rank("v") { wanted } else { "v" }
 }
 
 /// 記錄等級的順序（越大越詳細）；不認得的當成最詳細
@@ -859,6 +869,8 @@ pub struct Player {
     ao_null_wanted: bool,
     /// 最近一次精準跳轉的目標和送出的時間（見 `position_now`）；其他跳轉、換檔時清掉
     exact_seek: std::sync::Mutex<Option<(f64, Instant)>>,
+    /// 跳轉不準的格式（TS、M2TS、MPEG-PS）：分離器往前多跳的秒數、正在核對的跳轉（見 `approx_seek`）
+    approx: std::sync::Mutex<Approx>,
     /// 目前（或最近一次）開的檔案或網址（`open` 時記下，StartFile 時讀得到 mpv 的 path 就換成它）：
     /// 開檔失敗時判斷是不是網路的原因
     opening: Option<String>,
@@ -881,9 +893,33 @@ pub struct Player {
     memory_cookies: bool,
 }
 
+/// 跳轉不準的格式（`approx_seek::approximate_seeks`）在這個檔案的狀態；換檔時清掉
+#[derive(Debug, Default)]
+struct Approx {
+    /// 這個檔案要核對跳轉（開檔完成時決定：格式跳轉不準、有影像、使用者沒有自己指定 hr-seek-demuxer-offset）
+    on: bool,
+    /// 分離器往前多跳的秒數（file-local 的 `hr-seek-demuxer-offset`）。加大了才跳對的話（`Landing::lead`）
+    /// 這個檔案之後一直用；只是重試時加大、沒有用的不算
+    offset: f64,
+    /// 目前設給 mpv 的 hr-seek-demuxer-offset（重試時是那一次的秒數，核對完還原成 `offset`）
+    applied: f64,
+    /// 一格多久（秒，判斷有沒有跳過頭）
+    frame: f64,
+    /// 正在核對的跳轉（最新的那一次）
+    check: Option<Check>,
+    /// 最近一次開始核對播放器送出的跳轉的時間（`approx_watch`）
+    watched: Option<Instant>,
+    /// 標記的流水號
+    next_id: u64,
+    /// 最近一次核對完的結果（自動測試讀它）
+    landing: Option<Landing>,
+}
+
 /// 送出精準跳轉後這麼久（秒）以內，`position_now` 用跳轉的目標：上一次跳轉 0.3 秒內，
 /// mpv 會等上一次的畫面出來才做下一次（playloop.c `execute_queued_seek`），這段時間 time-pos 還是舊的位置
 const SEEK_PENDING: f64 = 0.35;
+/// 跳轉不準的格式：關鍵影格跳轉還沒停住時 `position_now` 用目標，最多這麼久（秒；正常不到半秒就停住了）
+const KEYFRAME_PENDING: f64 = 5.0;
 
 impl Player {
     pub fn new(opts: Options) -> mpv::Result<Self> {
@@ -964,7 +1000,7 @@ impl Player {
             mpv.set_wakeup_callback(wakeup);
         }
         let debug = std::env::var("VITASCOPE_DEBUG").ok();
-        mpv.request_log_messages(client_log_level(debug.as_deref()))?;
+        mpv.request_log_messages(requested_log_level(debug.as_deref()))?;
         for (i, (name, format)) in OBSERVED.iter().enumerate() {
             mpv.observe(i as u64 + 1, name, *format)?;
         }
@@ -1001,6 +1037,7 @@ impl Player {
             boost_pct: 0.0,
             ao_null_wanted,
             exact_seek: std::sync::Mutex::new(None),
+            approx: std::sync::Mutex::new(Approx::default()),
             opening: None,
             load_started: None,
             failed_after: None,
@@ -1559,9 +1596,10 @@ impl Player {
     }
 
     pub fn toggle_pause(&self) -> mpv::Result<()> {
-        // 播完停在最後一格時按播放 = 從頭開始
+        // 播完停在最後一格時按播放 = 從頭開始（跳轉不準的格式：mpv 開始做時從記錄核對，見 `approx_log`）
         if self.state.eof && self.state.paused {
             self.note_seek(None);
+            self.approx_forget();
             self.mpv.command(&["seek", "0", "absolute"])?;
         }
         self.mpv.command(&["cycle", "pause"])
@@ -1576,7 +1614,22 @@ impl Player {
             && self.state.time_pos + seconds >= duration
         {
             self.note_seek(None);
-            return self.mpv.command(&["seek", "100", "absolute-percent+exact"]);
+            // 跳轉不準的格式：分離器往前多跳的秒數不夠時一樣沒有新的畫面（最後一個關鍵影格離片尾太遠），要核對
+            let watch = self.approx_watch(Kind::Exact, duration, true);
+            return self.send_seek(watch.map(|(id, _)| id), 100.0, "absolute-percent+exact");
+        }
+        if self.approx_on() {
+            let target = (self.position_now() + seconds).max(0.0);
+            // 跳轉不準的格式往回跳：mpv 的相對跳轉常落在目標之後的關鍵影格，甚至原地不動。
+            // 跟拖曳進度條一樣往前多跳，落在目標之前的關鍵影格
+            if seconds < 0.0 {
+                return self.seek_to(target, false);
+            }
+            // 往後跳照 mpv 原本的做法，沒有新的畫面時才改成精確跳到這裡
+            //（mpv 從它自己的目前位置算，跟這裡的差不到一格）
+            let watch = self.approx_watch(Kind::Forward, target, false);
+            self.note_seek(None);
+            return self.send_seek(watch.map(|(id, _)| id), seconds, "relative");
         }
         self.note_seek(None);
         self.mpv.command(&["seek", &format!("{seconds}"), "relative"])
@@ -1584,10 +1637,186 @@ impl Player {
 
     /// 跳到絕對時間（秒）。`exact` = 精準到影格（較慢）；拖曳進度條時用關鍵影格比較順
     pub fn seek_to(&self, seconds: f64, exact: bool) -> mpv::Result<()> {
+        // 跳轉不準的格式：關鍵影格跳轉也往前多跳（見下面）。目標離開頭比往前多跳的秒數還近時改成精確跳轉：
+        // 關鍵影格跳轉的時間最多到 0（負的是從片尾算），跳到第一個時間戳常落到下一個關鍵影格
+        let exact = exact || self.approx_lead().is_some_and(|lead| seconds <= lead);
         let mode = if exact { "absolute+exact" } else { "absolute+keyframes" };
         // 關鍵影格跳轉落在哪裡要等 mpv 做了才知道：不記目標
         self.note_seek(exact.then_some(seconds));
-        self.mpv.command(&["seek", &format!("{seconds}"), mode])
+        let kind = if exact { Kind::Exact } else { Kind::Keyframe };
+        let watch = self.approx_watch(kind, seconds, true);
+        let at = match watch {
+            // 跳轉不準的格式：關鍵影格跳轉往前多跳，落在目標之前的關鍵影格（跟其他格式一樣），
+            // 不會跑到目標後面。精確跳轉往前多跳的秒數是 file-local 的 hr-seek-demuxer-offset，mpv 自己減
+            Some((_, lead)) if !exact => seconds - lead,
+            _ => seconds,
+        };
+        self.send_seek(watch.map(|(id, _)| id), at, mode)
+    }
+
+    /// 送出跳轉。要核對時（`watch` = 標記的編號）標記和跳轉放在同一個指令清單（見 `approx_seek::seek_command`）
+    fn send_seek(&self, watch: Option<u64>, amount: f64, mode: &str) -> mpv::Result<()> {
+        let Some(id) = watch else {
+            return self.mpv.command(&["seek", &format!("{amount}"), mode]);
+        };
+        let sent = self.mpv.command_string(&approx_seek::seek_command(id, amount, mode));
+        if sent.is_err() {
+            self.approx_forget();
+        }
+        sent
+    }
+
+    /// 這個檔案的格式跳轉不準，跳轉要核對（見 `approx_seek`）
+    fn approx_on(&self) -> bool {
+        self.approx.lock().is_ok_and(|a| a.on)
+    }
+
+    /// 跳轉要核對時，分離器目前往前多跳的秒數
+    fn approx_lead(&self) -> Option<f64> {
+        self.approx.lock().ok().filter(|a| a.on).map(|a| a.offset)
+    }
+
+    /// 跳轉不準的格式：開始核對這次跳轉（之前在核對的跳轉一律作廢）。`lead` = 分離器要不要往前多跳
+    /// （方向鍵的相對跳轉照 mpv 原本的做法，不多跳）。回傳標記的編號（跳轉要用 [`Self::send_seek`] 帶著它送出）
+    /// 和往前多跳的秒數；不用核對時 None
+    fn approx_watch(&self, kind: Kind, target: f64, lead: bool) -> Option<(u64, f64)> {
+        let mut a = self.approx.lock().ok()?;
+        a.check = None;
+        if !a.on {
+            return None;
+        }
+        a.next_id += 1;
+        let lead = if lead { a.offset } else { 0.0 };
+        a.check = Some(Check::new(a.next_id, target, kind, lead));
+        a.watched = Some(Instant::now());
+        Some((a.next_id, lead))
+    }
+
+    /// 不核對（其他種類的跳轉）：之前在核對的跳轉作廢
+    fn approx_forget(&self) {
+        if let Ok(mut a) = self.approx.lock() {
+            a.check = None;
+        }
+    }
+
+    /// 開檔完成：格式跳轉不準（TS、M2TS、MPEG-PS）、有影像時，精確跳轉的分離器先往前多跳
+    /// [`approx_seek::FIRST_OFFSET`] 秒（file-local，換檔時 mpv 自己還原），之後的跳轉都核對。
+    /// 使用者自己指定了 hr-seek-demuxer-offset（VITASCOPE_MPV_OPTS）時照使用者的，不核對
+    fn approx_setup(&mut self) {
+        let format = self.mpv.get_string("file-format").unwrap_or_default();
+        let mut on = approx_seek::approximate_seeks(&format)
+            && self.state.has_video()
+            && !self.user_overrides.contains("hr-seek-demuxer-offset");
+        if on
+            && let Err(e) = self
+                .mpv
+                .set_property("file-local-options/hr-seek-demuxer-offset", approx_seek::FIRST_OFFSET)
+        {
+            eprintln!("[vitascope] 無法設定 hr-seek-demuxer-offset：{e}");
+            on = false;
+        }
+        let frame = approx_seek::frame_duration(self.mpv.get_property::<f64>("container-fps").ok());
+        if let Ok(mut a) = self.approx.lock() {
+            *a = Approx {
+                on,
+                offset: approx_seek::FIRST_OFFSET,
+                applied: approx_seek::FIRST_OFFSET,
+                frame,
+                check: None,
+                watched: None,
+                next_id: a.next_id,
+                landing: None,
+            };
+        }
+    }
+
+    /// 換檔、檔案結束：不再核對
+    fn approx_reset(&mut self) {
+        if let Ok(mut a) = self.approx.lock() {
+            a.on = false;
+            a.check = None;
+        }
+    }
+
+    /// mpv 的記錄：核對中的跳轉（見 `approx_seek::Check::feed`）完成時，跳過頭或沒有新的畫面的話
+    /// 分離器往前多跳的秒數加大、再精確跳一次（見 `approx_seek::judge`）。
+    /// 沒有在核對的跳轉時，mpv 自己做的精確跳轉（A-B 重播繞回 A、逐格往回、章節、播完從頭播）從它的
+    /// 「hr-seek, skipping to」記錄開始核對
+    fn approx_log(&mut self, text: &str) {
+        let (id, target, offset) = {
+            let Ok(mut a) = self.approx.lock() else { return };
+            if !a.on {
+                return;
+            }
+            let Some(check) = a.check.as_mut() else {
+                if let Some((target, backstep)) = approx_seek::parse_hr_seek(text) {
+                    a.next_id += 1;
+                    let kind = if backstep { Kind::Backstep } else { Kind::Exact };
+                    a.check = Some(Check::started(a.next_id, target, kind, a.offset));
+                }
+                return;
+            };
+            let Some(restart) = check.feed(text) else { return };
+            let Some(check) = a.check.take() else { return };
+            match approx_seek::judge(&check, &restart, a.offset, a.frame) {
+                Verdict::Done(landing) => {
+                    // 加大了才跳對：關鍵影格隔得比較久，這個檔案之後都用這麼多
+                    if let Some(lead) = landing.lead
+                        && lead > a.offset
+                    {
+                        a.offset = lead;
+                    }
+                    a.landing = Some(landing);
+                    if a.applied == a.offset {
+                        return;
+                    }
+                    // 重試時暫時加大、沒有用的秒數還原（之後的跳轉、mpv 自己的跳轉用回這個檔案的秒數）
+                    a.applied = a.offset;
+                    (None, 0.0, a.offset)
+                }
+                Verdict::Retry { offset } => {
+                    a.next_id += 1;
+                    let next = check.retry(a.next_id, &restart, offset, a.frame);
+                    let target = next.target;
+                    a.check = Some(next);
+                    a.applied = offset;
+                    (Some(a.next_id), target, offset)
+                }
+            }
+        };
+        let set = self
+            .mpv
+            .set_property("file-local-options/hr-seek-demuxer-offset", offset);
+        let Some(id) = id else {
+            if let Err(e) = set {
+                eprintln!("[vitascope] 無法設定 hr-seek-demuxer-offset：{e}");
+            }
+            return;
+        };
+        // 這也是一次精確跳轉：剛送出時 `position_now` 用目標
+        self.note_seek(Some(target));
+        if let Err(e) = set.and_then(|()| self.send_seek(Some(id), target, "absolute+exact")) {
+            eprintln!("[vitascope] 無法重新跳轉：{e}");
+            self.approx_forget();
+        }
+    }
+
+    /// 測試用：最近一次核對完的跳轉（跳轉不準的格式才有）
+    #[doc(hidden)]
+    pub fn seek_landing(&self) -> Option<Landing> {
+        self.approx.lock().ok()?.landing
+    }
+
+    /// 測試用：還在核對跳轉（可能還會再跳一次）
+    #[doc(hidden)]
+    pub fn seek_checking(&self) -> bool {
+        self.approx.lock().is_ok_and(|a| a.check.is_some())
+    }
+
+    /// 測試用：這個檔案的跳轉要核對時，分離器目前往前多跳的秒數（不用核對時 None）
+    #[doc(hidden)]
+    pub fn seek_lead(&self) -> Option<f64> {
+        self.approx_lead()
     }
 
     /// 記下（或清掉）最近一次精準跳轉的目標
@@ -1601,6 +1830,7 @@ impl Player {
     /// - 直接問 mpv 的 time-pos：屬性通知可能還沒到，介面看到的狀態可能還是跳轉前的。
     /// - 剛送出精準跳轉（[`SEEK_PENDING`] 秒內）時用跳轉的目標：連續跳轉時 mpv 可能還沒開始做這一次，
     ///   time-pos 還是上一次的位置（連按「下一個書籤」會一直跳到同一個）
+    /// - 跳轉不準的格式的關鍵影格跳轉還沒停住時也用目標（見 `approx_keyframe_target`）
     pub fn position_now(&self) -> f64 {
         let pending = self.exact_seek.lock().ok().and_then(|slot| *slot);
         if let Some((t, at)) = pending
@@ -1608,7 +1838,22 @@ impl Player {
         {
             return t;
         }
+        if let Some(t) = self.approx_keyframe_target() {
+            return t;
+        }
         self.get_f64("time-pos").unwrap_or(self.state.time_pos)
+    }
+
+    /// 跳轉不準的格式的關鍵影格跳轉（拖曳進度條、方向鍵往回跳）還沒停住時，使用者要的位置是它的目標：
+    /// mpv 的 time-pos 這時是送出的時間（目標 − 往前多跳的秒數，playloop.c `last_seek_pts`），
+    /// 或 mpv 還沒開始做時的舊位置。按住方向鍵往回跳時每一下從目標算，跟 mpv 的相對跳轉一樣一次退 5 秒，
+    /// 不會每一下多退往前多跳的秒數。萬一一直沒停住（[`KEYFRAME_PENDING`] 秒）就照 mpv 的
+    fn approx_keyframe_target(&self) -> Option<f64> {
+        let a = self.approx.lock().ok()?;
+        let check = a.check.as_ref().filter(|c| c.kind == Kind::Keyframe)?;
+        a.watched
+            .is_some_and(|at| at.elapsed().as_secs_f64() < KEYFRAME_PENDING)
+            .then_some(check.target)
     }
 
     pub fn set_volume(&self, volume: f64) -> mpv::Result<()> {
@@ -1663,6 +1908,8 @@ impl Player {
     /// 逐格前進 / 後退（會暫停播放）
     pub fn frame_step(&self, forward: bool) -> mpv::Result<()> {
         self.note_seek(None);
+        // 跳轉不準的格式：往回一格是 mpv 自己的精確跳轉，從它的記錄開始核對（見 `approx_log`）
+        self.approx_forget();
         self.mpv
             .command(&[if forward { "frame-step" } else { "frame-back-step" }])
     }
@@ -1712,12 +1959,14 @@ impl Player {
     /// 跳到前 / 後幾個章節
     pub fn add_chapter(&self, delta: i64) -> mpv::Result<()> {
         self.note_seek(None);
+        self.approx_forget();
         self.mpv.command(&["add", "chapter", &delta.to_string()])
     }
 
     /// 跳到第 `index` 個章節（從 0 開始）
     pub fn seek_chapter(&self, index: usize) -> mpv::Result<()> {
         self.note_seek(None);
+        self.approx_forget();
         self.mpv.set_property("chapter", index as i64)
     }
 
@@ -2666,7 +2915,9 @@ impl Player {
                 None
             }
             Event::Log { prefix, level, text } => {
-                // 印出的跟以前一樣照 VITASCOPE_DEBUG 的等級（向 mpv 要的至少是警告，可能比要印的多）
+                // 跳轉不準的格式：核對跳轉停在哪裡（分離器、cplayer 的記錄）
+                self.approx_log(&text);
+                // 印出的跟以前一樣照 VITASCOPE_DEBUG 的等級（向 mpv 要的至少是 v，跳轉核對要用，比要印的多）
                 if self.debug_print.is_some_and(|max| log_rank(&level) <= max) {
                     eprint!("[mpv/{level}] [{prefix}] {text}");
                 }
@@ -2700,8 +2951,12 @@ impl Player {
                 None
             }
             Event::StartFile => {
-                // 上一個檔案的跳轉目標不算這個檔案的位置
+                // 上一個檔案的跳轉目標、核對結果不算這個檔案的
                 self.note_seek(None);
+                self.approx_reset();
+                if let Ok(mut a) = self.approx.lock() {
+                    a.landing = None;
+                }
                 // 這時看到的音訊輸出是上一個檔案的（新檔案的音訊在這之後才開；同一批裡之後才送到的，見
                 // `take_fell_back_at_start`）
                 self.fell_back_at_start |= self.audio_fell_back();
@@ -2748,11 +3003,13 @@ impl Player {
                 }
                 self.site_chapters();
                 self.refresh_tracks();
+                self.approx_setup();
                 Some(PlayerEvent::FileLoaded)
             }
             Event::EndFile { reason, error } => {
                 self.state.loading = false;
                 self.state.loaded = false;
+                self.approx_reset();
                 // 網路上的播放清單（IPTV 的 .m3u 網址）：mpv 讀完清單、把項目放進自己的播放清單，接著就會自己開第一個。
                 // 這時就讀出來（mpv 接著會開別的項目）；介面照一般的開檔重新開，mpv 的清單回到只有一個
                 if reason == EndReason::Redirect {
@@ -3039,7 +3296,8 @@ mod tests {
     use super::{
         ASYNC_BASE, AsyncKey, State, Track, TrackKind, async_id, async_key, client_log_level, debug_log_level,
         display_size, env_option_names, env_options, has_out_format, is_harmless_error, is_hdr_gamma, is_net_warning,
-        is_render_log, memory_cookies, mpv_version, picture_key, sound_key, spdif_format, spdif_live,
+        is_render_log, memory_cookies, mpv_version, picture_key, requested_log_level, sound_key, spdif_format,
+        spdif_live,
     };
 
     #[test]
@@ -3282,6 +3540,18 @@ mod tests {
         for odd in ["true", "yes", "0", "verbose", "V"] {
             assert_eq!(debug_log_level(Some(odd)), "warn", "{odd}");
         }
+    }
+
+    #[test]
+    fn main_player_asks_for_verbose_logs() {
+        // 跳轉不準的格式要讀 v 等級的「跳轉完成」記錄（見 approx_seek）；除錯要更多時照除錯的
+        assert_eq!(requested_log_level(None), "v");
+        assert_eq!(requested_log_level(Some("1")), "v");
+        assert_eq!(requested_log_level(Some("error")), "v");
+        assert_eq!(requested_log_level(Some("debug")), "debug");
+        assert_eq!(requested_log_level(Some("trace")), "trace");
+        // 印出的等級不變：沒設定時只印錯誤
+        assert_eq!(debug_log_level(None), "error");
     }
 
     #[test]

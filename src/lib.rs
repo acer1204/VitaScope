@@ -6,6 +6,7 @@
 //! - [`video`]：把 mpv 的畫面畫進 egui
 
 pub mod app;
+pub mod approx_seek;
 pub mod assoc;
 pub mod autoshot;
 pub mod bookmarks;

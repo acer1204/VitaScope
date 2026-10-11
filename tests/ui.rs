@@ -13391,6 +13391,65 @@ fn bookmark_jump_is_exact() {
     assert!((h.state().player().state.time_pos - 7.9).abs() < 0.05);
 }
 
+/// 跳轉不準的格式：等主播放器核對完跳到 `t` 的這一次跳轉（可能往前多跳、重試了幾次），
+/// 回傳停住的那一格的時間（mpv 記下的，播放中也不會變）
+fn ts_landed(h: &mut Harness<'_, VitascopeApp>, t: f64, what: &str) -> f64 {
+    step_until_app(h, what, |app| {
+        let p = app.player();
+        !p.seek_checking() && p.seek_landing().is_some_and(|l| (l.target - t).abs() < 1e-9)
+    });
+    let landing = h.state().player().seek_landing().unwrap();
+    let pts = landing.pts.unwrap();
+    // 停在目標那一格（mpv 精確跳轉停在第一個不早於目標 − 0.005 秒的畫面，樣本 24 fps），而且有新的畫面
+    assert!(
+        landing.shown && pts >= t - 0.006 && pts <= t + 1.0 / 24.0 + 0.006,
+        "{what}：{landing:?}"
+    );
+    pts
+}
+
+/// TS（電視錄影）沒有索引，mpv 原本的精確跳轉常落在目標之後的關鍵影格：
+/// 續播、跳到書籤都要停在那一格（主播放器往前多跳、核對，見 `vitascope::approx_seek`）
+#[test]
+fn ts_resume_and_bookmark_jumps_land_on_the_frame() {
+    let ts = sample("general/ts_h264_long.ts"); // 90 秒、每 2 秒一個關鍵影格
+    let mut history = vitascope::history::History::default();
+    // 41.3 秒：往前多跳 1 秒落在 42 秒的關鍵影格（目標之後），要再往前
+    history.remember(&ts.to_string_lossy(), 41.3, 90.0);
+    let mut h = harness_launch(
+        Launch {
+            files: vec![ts.clone()],
+            history,
+            ..Default::default()
+        },
+        no_auto_next(),
+    );
+    step_until(&mut h, "開始播放", |s| playing(s, "ts_h264_long.ts"));
+    ts_landed(&mut h, 41.3, "續播");
+    assert!(
+        h.state().player().seek_lead().is_some_and(|lead| lead >= 2.0),
+        "往前多跳 1 秒不夠，加大了：{:?}",
+        h.state().player().seek_lead()
+    );
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    paused_at(&mut h, 23.7);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    let marks = mark_times(&h);
+    assert!(marks.len() == 1 && (marks[0] - 23.7).abs() < 0.05, "{marks:?}");
+    paused_at(&mut h, 70.0);
+    h.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::PageUp);
+    let pts = ts_landed(&mut h, marks[0], "跳到書籤");
+    wait_seek_done(&mut h, "跳到書籤");
+    let s = &h.state().player().state;
+    assert!(
+        (s.time_pos - pts).abs() < 1e-6 && s.paused,
+        "停在書籤那一格：{} {pts}",
+        s.time_pos
+    );
+}
+
 /// 進度條上這個顏色的小三角形（書籤標記）的中心 x
 fn marker_xs(h: &Harness<'_, VitascopeApp>) -> Vec<f32> {
     fn walk(shape: &egui::Shape, color: egui::Color32, out: &mut Vec<f32>) {

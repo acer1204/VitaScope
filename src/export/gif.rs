@@ -258,11 +258,8 @@ pub fn edl_url(target: &str, start: f64, length: f64) -> String {
 
 // ───────────── 從哪裡開始讀 ─────────────
 
-/// 這種封裝格式（主播放器的 `file-format`）跳轉不準：沒有索引，FFmpeg 用時間戳搜尋位置，
-/// 常落在目標之後的關鍵影格、甚至檔尾（TS、M2TS、MTS 是 `mpegts`，MPEG-PS／VOB 是 `mpeg`）
-pub fn approximate_seeks(file_format: &str) -> bool {
-    matches!(file_format, "mpegts" | "mpeg")
-}
+/// 這種封裝格式（主播放器的 `file-format`）跳轉不準（主播放器的跳轉也用同一個判斷）
+pub use crate::approx_seek::approximate_seeks;
 
 /// mpv 精確跳轉（hr-seek）認定「到了」的誤差：比目標早這麼一點的畫面也算（跟 mpv 一樣）
 pub const HR_SEEK_TOLERANCE: f64 = 0.005;
