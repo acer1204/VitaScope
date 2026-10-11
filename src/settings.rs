@@ -8,6 +8,7 @@
 
 pub use crate::export::ExportSettings;
 pub use crate::keymap::KeySettings;
+pub use crate::media_keys::SystemMedia;
 pub use crate::net::NetSettings;
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
@@ -69,6 +70,8 @@ pub struct Settings {
     pub net: NetSettings,
     /// 匯出（片段、GIF、縮圖總覽圖）：存放的資料夾、片段的格式、上次的選擇
     pub export: ExportSettings,
+    /// 系統媒體控制（媒體鍵、Windows 的媒體控制、macOS 的「正在播放」、Linux 的 MPRIS）：開關、顯示片名與封面
+    pub system_media: SystemMedia,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -203,6 +206,7 @@ impl Default for Settings {
             keys: KeySettings::default(),
             net: NetSettings::default(),
             export: ExportSettings::default(),
+            system_media: SystemMedia::default(),
             path: None,
             baseline: None,
         }
@@ -713,6 +717,14 @@ mod tests {
             },
             "預設照順序、不重複"
         );
+        assert_eq!(
+            s.system_media,
+            SystemMedia {
+                enabled: true,
+                details: true
+            },
+            "系統媒體控制預設開、顯示片名與封面"
+        );
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
         assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
@@ -800,6 +812,7 @@ mod tests {
         assert_eq!(s.net, NetSettings::default(), "升級後網路設定是預設值（檢查憑證）");
         assert_eq!(s.export, ExportSettings::default(), "升級後匯出是預設值");
         assert_eq!(s.play_order, PlayOrder::default(), "升級後照順序播、不重複");
+        assert_eq!(s.system_media, SystemMedia::default(), "升級後系統媒體控制開著");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1245,6 +1258,47 @@ mod tests {
                 repeat: Repeat::One
             },
             "A 開的隨機播放不能被 B 蓋回去"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn system_media_is_saved_loads_leniently_and_merges() {
+        let dir = temp_dir("system-media");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.system_media.details = false;
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""details": false"#), "{text}");
+        assert_eq!(Settings::load_from(path.clone()).system_media, s.system_media);
+        // 看不懂的值：那一項是預設值，同一組的另一項、其他設定照讀
+        let s = lenient(r#"{"system_media": {"enabled": "yes", "details": false}, "volume": 31.0}"#);
+        assert_eq!(
+            s.system_media,
+            SystemMedia {
+                enabled: true,
+                details: false
+            }
+        );
+        assert_eq!(s.volume, 31.0);
+        // 兩個視窗：A 關掉系統媒體控制、B 關掉片名與封面，兩個都留下
+        let mut base = Settings::load_from(path.clone());
+        base.system_media = SystemMedia::default();
+        base.save().unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.system_media.enabled = false;
+        a.save().unwrap();
+        b.system_media.details = false;
+        b.save().unwrap();
+        assert_eq!(
+            Settings::load_from(path).system_media,
+            SystemMedia {
+                enabled: false,
+                details: false
+            },
+            "A 關掉的不能被 B 蓋回去"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -239,7 +239,7 @@ impl VitascopeApp {
         ui.add_space(10.0);
         // macOS 的 Backspace：預設組或自己指定的用到它時就不是「移除選取的項目」（例如 PotPlayer 風格的從頭播放）
         let backspace_free = self.keymap.owner(Chord::new(Mods::NONE, Key::Backspace)).is_none();
-        fixed_keys(ui, platform, backspace_free);
+        fixed_keys(ui, platform, backspace_free, self.media_keys_listed());
     }
 
     /// 一個指令一列：名稱、按鍵（按一下重錄、× 移除、+ 新增）、↺ 還原；底下是衝突、保留按鍵的說明
@@ -565,15 +565,20 @@ fn wheel_label() -> &'static str {
     tr!("在畫面上捲動滾輪", "Wheel over the video")
 }
 
-/// 固定的按鍵（不在對照表裡，不能改）；`backspace_free`：對照表沒有用到 Backspace（macOS 才用它移除側邊面板裡選取的項目）
-fn fixed_keys(ui: &mut egui::Ui, platform: keymap::Platform, backspace_free: bool) {
+/// 固定的按鍵（不在對照表裡，不能改）；`backspace_free`：對照表沒有用到 Backspace（macOS 才用它移除側邊面板裡選取的項目）；
+/// `media`：系統的媒體鍵能用（媒體鍵經過系統的媒體控制送來，egui 收不到，不能錄成快捷鍵）
+fn fixed_keys(ui: &mut egui::Ui, platform: keymap::Platform, backspace_free: bool, media: bool) {
     ui.strong(tr!("固定的按鍵（不能更改）", "Fixed keys (can't be changed)"));
     egui::Grid::new("shortcuts_fixed")
         .num_columns(2)
         .striped(true)
         .spacing([16.0, 4.0])
         .show(ui, |ui| {
-            for (key, what) in fixed_rows(platform, backspace_free) {
+            let mut rows = fixed_rows(platform, backspace_free);
+            if media {
+                rows.push(super::media::media_keys_row());
+            }
+            for (key, what) in rows {
                 ui.label(egui::RichText::new(key).monospace());
                 ui.label(what);
                 ui.end_row();

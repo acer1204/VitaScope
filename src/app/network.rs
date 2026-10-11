@@ -607,6 +607,8 @@ impl VitascopeApp {
             eprintln!("[vitascope] 無法取消：{e}");
             return;
         }
+        // mpv 還沒開始的檔案不會再有 StartFile：不再算換檔途中
+        self.switching_file = false;
         self.osd(tr!("已取消", "Cancelled"));
     }
 

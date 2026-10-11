@@ -96,6 +96,8 @@ fn parse_args() -> (Launch, bool) {
         launch.countdown_raise = true;
         // 播完後的睡眠、休眠、關機：真的系統只在這裡接上（自動截圖、自動測試都沒有，選單也就不列出）
         launch.system = Some(Arc::new(vitascope::system_power::RealPower::new()));
+        // 系統的媒體控制（媒體鍵…）：真的系統只在這裡接上（自動截圖、自動測試都沒有）
+        launch.media = vitascope::media_keys::MediaBackend::System;
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
         if launch.files.is_empty()
             && let Some((entries, current)) = vitascope::m3u::load_session_entries()

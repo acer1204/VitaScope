@@ -22,6 +22,7 @@ pub mod keymap;
 pub mod m3u;
 #[cfg(target_os = "macos")]
 pub mod macos_open;
+pub mod media_keys;
 pub mod mediainfo;
 pub mod mpv;
 pub mod net;

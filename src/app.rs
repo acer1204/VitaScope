@@ -8,6 +8,7 @@ mod dialogs;
 mod export_panel;
 mod info_panel;
 mod install;
+mod media;
 mod network;
 mod pacing;
 mod play_order;
@@ -225,6 +226,14 @@ enum Action {
     SetRepeat(Repeat),
     /// 播完後的動作（只對這次有效）：右鍵選單、設定頁、快捷鍵、控制列的 ⏳（取消）
     SetAfterPlayback(AfterPlayback),
+    /// 系統的媒體控制：播放（暫停中繼續；沒有在播時開停止前的那個檔案）、跳到某個時間（秒）、播放速度、
+    /// 總音量（%，上限是音量上限）、把視窗叫到前面、結束影戲
+    Play,
+    SeekTo(f64),
+    SetSpeed(f64),
+    SetVolumeTotal(f64),
+    Raise,
+    Quit,
 }
 
 /// 起始畫面上按的
@@ -420,6 +429,8 @@ pub struct VitascopeApp {
     countdown_raise: bool,
     /// 讓電腦睡眠、休眠、關機的方法（沒有時選單不列出）
     system: Option<Arc<dyn SystemPower>>,
+    /// 系統的媒體控制（媒體鍵…）：工作階段、送出的內容、封面
+    media: media::MediaUi,
     /// 系統能做哪些事（啟動時、打開「播完後」的選單時、選了動作時在背景問）
     power_caps: PowerCaps,
     caps_probe: Option<Receiver<PowerCaps>>,
@@ -664,6 +675,9 @@ pub struct Launch {
     pub countdown_override: Option<Duration>,
     /// 播完後倒數時把視窗還原、叫到前面、暫時置頂（main.rs 打開；預設不動：自動測試、`--shot` 不搶使用者的螢幕）
     pub countdown_raise: bool,
+    /// 系統的媒體控制（媒體鍵、Windows 的媒體控制、macOS 的「正在播放」、Linux 的 MPRIS）；預設不用
+    /// （自動測試、`--shot`：不碰使用者的系統媒體控制）。只有 main.rs 設成真的（`MediaBackend::System`），測試用假的
+    pub media: crate::media_keys::MediaBackend,
 }
 
 impl VitascopeApp {
@@ -788,6 +802,8 @@ impl VitascopeApp {
             ];
             std::thread::spawn(move || crate::export::sweep_leftovers(&root, &folders))
         });
+        // 系統的媒體控制：第一次有檔案載入時才建立（快取資料夾裡一天以上的舊封面在背景清掉）
+        let media = media::MediaUi::new(launch.media, launch.cache_root.as_deref());
         let mut app = Self {
             player,
             video,
@@ -870,6 +886,7 @@ impl VitascopeApp {
             countdown_override: launch.countdown_override,
             countdown_raise: launch.countdown_raise,
             system: launch.system,
+            media,
             power_caps: PowerCaps::default(),
             caps_probe: None,
             prepare_job: None,
@@ -992,6 +1009,12 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn window_fit_pending(&self) -> bool {
         self.fit_window_pending || self.refit_now
+    }
+
+    /// 測試用：上一次滑鼠、鍵盤的動作（控制列、游標什麼時候隱藏）
+    #[doc(hidden)]
+    pub fn last_activity(&self) -> Instant {
+        self.last_activity
     }
 
     /// 測試用：當成這一幀從 mpv 收到這個事件（模擬很慢的電腦上，事件晚到、跟別的事件分在不同批）
@@ -1166,6 +1189,11 @@ impl VitascopeApp {
             AsyncKey::Shaders => "glsl-shaders".to_owned(),
             _ => format!("{k:?}"),
         });
+        // 系統媒體控制的封面：自己處理，失敗不提示（沒有封面而已）
+        if k == AsyncKey::Cover {
+            self.cover_reply(id, error);
+            return;
+        }
         if k == AsyncKey::Af {
             self.af_reply(id, error.is_some());
         }
@@ -1472,6 +1500,8 @@ impl VitascopeApp {
             Action::Stop if loaded => {
                 self.remember_position();
                 let _ = self.player.stop();
+                // 換檔途中（loadfile 之後、新檔案還沒開始）停止：mpv 清掉清單，新檔案不會再有 StartFile
+                self.switching_file = false;
             }
             // 還在連線、載入：停止 = 取消
             Action::Stop | Action::CancelLoading if self.player.loading_now() => self.cancel_loading(),
@@ -1796,6 +1826,32 @@ impl VitascopeApp {
             Action::BookmarkAdd => self.add_bookmark(),
             Action::BookmarkStep(dir) if loaded => self.step_bookmark(dir),
             Action::BookmarkJump(id) if loaded => self.jump_bookmark(id),
+            // 系統的媒體控制：暫停中才切換（已經在播就不動）；沒有在播（停止了）時開停止前的那個檔案
+            Action::Play if loaded => {
+                if self.player.paused_now() {
+                    self.run(ctx, Action::TogglePause);
+                }
+            }
+            Action::Play if !self.player.loading_now() => self.play_stopped(),
+            Action::SeekTo(t) if loaded && st.seekable => {
+                let t = st.duration.map_or(t, |d| t.min(d)).max(0.0);
+                let _ = self.player.seek_to(t, true);
+            }
+            Action::SetSpeed(speed) if loaded => self.set_speed(speed),
+            // 音訊直通中：音量交給擴大機（跟快捷鍵一樣）
+            Action::SetVolumeTotal(_) if st.audio_spdif.is_some() => self.osd(sound::spdif_volume_hover()),
+            Action::SetVolumeTotal(v) => {
+                // 跟按鍵、音量滑桿一樣：改音量就取消靜音
+                let muted = st.muted;
+                let v = v.clamp(0.0, self.volume_cap());
+                self.set_volume_total(v, true);
+                if muted {
+                    let _ = self.player.set_mute(false);
+                }
+                self.osd(sound::volume_osd(v));
+            }
+            Action::Raise => self.bring_to_front(ctx),
+            Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
             Action::Restart if loaded && st.seekable => {
                 let _ = self.player.seek_to(0.0, true);
                 // 播完停在最後一格（暫停中）時也要開始播
@@ -2327,6 +2383,8 @@ impl VitascopeApp {
             PlayerEvent::PlaybackRestart => {
                 // 跳轉完成（開檔後開始播放也是）：流暢播放的量測重新開始
                 self.pacing.seeked();
+                // 系統媒體控制的封面存不了的話，這時再試一次
+                self.cover_retry_point();
                 if let Some(shot) = &mut self.autoshot {
                     shot.arm();
                 }
@@ -4616,6 +4674,8 @@ impl eframe::App for VitascopeApp {
         for ev in self.player.poll() {
             self.on_player_event(ev);
         }
+        // 系統的媒體控制：建立 / 結束、系統送來的指令、送出目前的檔案與播放狀態（縮到最小時也會跑）
+        self.media_tick(ctx);
         // 影片是不是 HDR 變了（換檔、拿到第一個影格的參數、換影片軌）：同一輪就重新送目標亮度
         self.hdr_tick();
         self.shader_tick();
@@ -4795,6 +4855,8 @@ impl eframe::App for VitascopeApp {
         self.remember_position();
         self.save_settings();
         self.persist_playlist();
+        // 系統的媒體控制不再顯示影戲，這次存的封面刪掉
+        self.media_end();
         // 下載到一半：停掉（暫存檔由背景執行緒刪掉；來不及的話下次下載時清掉）
         self.cancel_install();
         // 匯出到一半：取消、最多等一下、刪掉暫存檔（`Job` 被丟掉時做；寫檔中停不下來的，寫完由背景執行緒刪掉）

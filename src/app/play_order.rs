@@ -292,7 +292,7 @@ impl VitascopeApp {
     }
 
     /// 開清單上的第 `i` 項（回傳開的路徑）
-    fn open_list_item(&mut self, i: usize) -> Option<PathBuf> {
+    pub(super) fn open_list_item(&mut self, i: usize) -> Option<PathBuf> {
         let path = self.playlist.as_ref()?.items().get(i)?.clone();
         self.open_at(&path, Some(i));
         Some(path)

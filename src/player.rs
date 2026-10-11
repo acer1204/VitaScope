@@ -415,6 +415,7 @@ async_keys!(
     AfCommand,
     Net,
     LoopFile,
+    Cover,
 );
 
 impl AsyncKey {
@@ -3714,6 +3715,16 @@ mod tests {
         assert_eq!(
             super::async_key(super::async_id(AsyncKey::LoopFile, 7)),
             Some(AsyncKey::LoopFile)
+        );
+    }
+
+    /// 系統媒體控制的封面（E6）接在重複單一檔案後面；之後的再接在它後面
+    #[test]
+    fn cover_key_is_appended_after_loop_file() {
+        assert_eq!(AsyncKey::Cover as usize, AsyncKey::LoopFile as usize + 1);
+        assert_eq!(
+            super::async_key(super::async_id(AsyncKey::Cover, 3)),
+            Some(AsyncKey::Cover)
         );
     }
 

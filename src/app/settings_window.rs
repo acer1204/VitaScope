@@ -207,6 +207,8 @@ impl VitascopeApp {
                  (takes effect the next time it starts)"
             ))
             .changed();
+        // 系統媒體控制（這個系統還不支援時不顯示）
+        let changed = self.media_settings(ui) || changed;
         ui.add_space(10.0);
         ui.strong(tr!("檔案關聯", "File associations"));
         #[cfg(windows)]
