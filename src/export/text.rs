@@ -261,7 +261,9 @@ mod tests {
         // 排版用的字型族裡要有這些字
         assert!(t.fonts.has_glyphs(&FontId::proportional(24.0), "第集時間標記"));
         assert!(w > 50.0, "{w}");
-        let (inside, outside) = lit(&c, 3, 3, (5.0 + w).ceil() as usize + 1, 60);
+        // 中文字型的筆畫可以稍微超出排版的寬度與行高（macOS 的字型實測超出幾個像素）：留 8 像素的餘裕，
+        // 只要不跑到遠處就好
+        let (inside, outside) = lit(&c, 0, 0, (13.0 + w).ceil() as usize + 1, 60);
         assert!(inside > 80 && outside == 0, "{inside} {outside}");
     }
 
