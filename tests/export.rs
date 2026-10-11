@@ -3828,7 +3828,20 @@ fn sheet_cancel_and_read_timeout_leave_nothing() {
     let seen = seen_cells(&mut spec);
     let (_, done) = export_sheet(spec);
     assert_eq!(done.map(|d| d.path), Err(Failure::ReadTimeout));
-    assert_eq!(seen.lock().unwrap().len(), 2, "連續兩格取不到就停");
+    // 等待時間是 0 也可能剛好有一格已經解好（macOS CI 上看到）：不數總共幾格，看的是「連續兩格取不到就停」——
+    // 停下來的時候最後兩格都沒取到，在那之前沒有連續兩格取不到
+    let seen = seen.lock().unwrap();
+    let n = seen.len();
+    assert!(n >= 2, "{seen:?}");
+    assert!(
+        seen[n - 2].2.is_none() && seen[n - 1].2.is_none(),
+        "連續兩格取不到就停：{seen:?}"
+    );
+    assert!(
+        !seen[..n - 1].windows(2).any(|w| w[0].2.is_none() && w[1].2.is_none()),
+        "更早就連續兩格取不到時就該停了：{seen:?}"
+    );
+    drop(seen);
     assert!(names(&dirs.0).is_empty(), "{:?}", names(&dirs.0));
     for d in [&dirs.0, &dirs.1] {
         std::fs::remove_dir_all(d).unwrap();
