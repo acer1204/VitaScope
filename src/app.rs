@@ -1373,12 +1373,14 @@ impl VitascopeApp {
         let view = loaded && st.has_video() && !self.switching_file;
         match action {
             Action::TogglePause if loaded => {
-                let msg = if st.paused {
+                // 看 mpv 現在是不是暫停：介面記下的可能還沒更新（逐格到結尾後馬上按，見 `Player::paused_now`）
+                let paused = self.player.paused_now();
+                let msg = if paused {
                     crate::tr!("▶ 播放", "▶ Play")
                 } else {
                     crate::tr!("⏸ 暫停", "⏸ Pause")
                 };
-                if st.paused {
+                if paused {
                     self.frame_stepping = false;
                 }
                 let _ = self.player.toggle_pause();

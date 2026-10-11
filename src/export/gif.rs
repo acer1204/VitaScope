@@ -935,12 +935,13 @@ pub fn lead_in(
 }
 
 /// 編碼用的 mpv 讀到 EDL 的 `pts` 秒（`eof` = 讀完了）時轉換的進度：A 在 EDL 的 `a_at` 秒，之前多讀的部分算 0。
-/// 回傳（進度 0–1、還在讀）：讀到 B 前面一點或讀完就不算在讀了（之後是產生色盤、寫檔）
-pub fn read_progress(pts: Option<f64>, eof: bool, a_at: f64, length: f64) -> (f32, bool) {
+/// 回傳（進度 0–1、還在讀）：讀到 B 前面一點或讀完就不算在讀了（之後是產生色盤、寫檔）。
+/// `shown` = 上一次回報的進度：進度不倒退（mpv 回報讀到的位置偶爾會往回跳，例如開頭精確跳轉時又跳一次）
+pub fn read_progress(pts: Option<f64>, eof: bool, a_at: f64, length: f64, shown: f32) -> (f32, bool) {
     let pts = pts.map(|p| p - a_at);
     let reading = !(eof || pts.is_some_and(|p| p >= length - 0.1));
     let fraction = pts.map_or(0.0, |p| (p / length.max(0.001)).clamp(0.0, 1.0));
-    (fraction as f32, reading)
+    ((fraction as f32).max(shown), reading)
 }
 
 /// 另外開的 mpv（編碼用的、縮圖總覽圖的擷取）開檔、讀檔失敗的原因：看 mpv 的記錄（`log` 要先收完排著的事件），
@@ -1220,6 +1221,7 @@ impl Encoder {
         // 很寬的上限：CI 的機器很慢；大的 GIF 產生色盤、寫檔要一段時間；A 前面多讀的部分也要解碼
         let deadline = Instant::now() + Duration::from_secs(120) + Duration::from_secs_f64(4.0 * (length + a_at));
         let mut reading = true;
+        let mut shown = 0.0;
         let mut ended: Option<Failure> = None;
         // 收完排著的事件時可能已經收到 Shutdown（例如讀到一半出錯時）：這時不用再等
         while !self.shut_down {
@@ -1247,7 +1249,8 @@ impl Encoder {
             }
             if reading {
                 let (pts, eof) = self.reading().unwrap_or((None, false));
-                let (fraction, more) = read_progress(pts, eof, a_at, length);
+                let (fraction, more) = read_progress(pts, eof, a_at, length, shown);
+                shown = fraction;
                 reading = more;
                 ctl.progress(Progress {
                     phase: Phase::Converting,
@@ -1836,17 +1839,21 @@ mod tests {
     #[test]
     fn progress_skips_the_lead_in() {
         // 從頭讀、A 在 EDL 的 16.48 秒、1 秒的 GIF：前面多讀的部分算 0，還在讀
-        assert_eq!(read_progress(Some(5.0), false, 16.48, 1.0), (0.0, true));
-        let (f, reading) = read_progress(Some(16.98), false, 16.48, 1.0);
+        assert_eq!(read_progress(Some(5.0), false, 16.48, 1.0, 0.0), (0.0, true));
+        let (f, reading) = read_progress(Some(16.98), false, 16.48, 1.0, 0.0);
         assert!((f - 0.5).abs() < 1e-6 && reading, "{f}");
         // 讀到 B 前面一點、讀完：不算在讀了（之後是色盤）
-        assert!(!read_progress(Some(17.4), false, 16.48, 1.0).1);
-        assert_eq!(read_progress(Some(5.0), true, 16.48, 1.0), (0.0, false));
+        assert!(!read_progress(Some(17.4), false, 16.48, 1.0, 0.0).1);
+        assert_eq!(read_progress(Some(5.0), true, 16.48, 1.0, 0.0), (0.0, false));
         // 還不知道讀到哪裡
-        assert_eq!(read_progress(None, false, 16.48, 1.0), (0.0, true));
+        assert_eq!(read_progress(None, false, 16.48, 1.0, 0.0), (0.0, true));
         // EDL 從 A 開始
-        assert!(!read_progress(Some(3.0), false, 0.0, 2.0).1);
-        assert_eq!(read_progress(Some(1.0), false, 0.0, 2.0), (0.5, true));
+        assert!(!read_progress(Some(3.0), false, 0.0, 2.0, 0.0).1);
+        assert_eq!(read_progress(Some(1.0), false, 0.0, 2.0, 0.0), (0.5, true));
+        // mpv 回報讀到的位置往回跳：進度不倒退，還在讀；之後讀得更多再往前
+        assert_eq!(read_progress(Some(4.0), false, 5.0, 1.0, 0.25), (0.25, true));
+        assert_eq!(read_progress(None, false, 5.0, 1.0, 0.25), (0.25, true));
+        assert_eq!(read_progress(Some(5.5), false, 5.0, 1.0, 0.25), (0.5, true));
     }
 
     #[test]

@@ -24,6 +24,8 @@ use vitascope::theme::ThemeChoice;
 use vitascope::ytdl::{Failure, Hint, Resolve, YtdlError};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// 要等 mpv 真的播一段、處理完幾次畫面設定的條件（例如播到 A-B 重播的終點、旋轉後調整視窗）：CI 上播得比較慢
+const PLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn sample(rel: &str) -> PathBuf {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -939,11 +941,13 @@ fn ab_loop_key_cycles_and_new_file_clears_it() {
     h.key_press(egui::Key::L);
     step_until(&mut h, "L 設定終點", |s| s.ab_loop[1].is_some());
     let b = h.state().player().state.ab_loop[1].unwrap();
-    // 播到終點會回到起點：等一段比區段還長的時間，時間都不會超出區段
+    // 播到終點會回到起點：至少看一段比區段還長的時間，而且要看到跳回起點（CI 上播得慢，不能只等固定的時間），
+    // 時間都不會超出區段
     let start = Instant::now();
     let mut looped = false;
     let mut last = h.state().player().state.time_pos;
-    while start.elapsed() < Duration::from_secs_f64(b - a + 1.5) {
+    while start.elapsed() < Duration::from_secs_f64(b - a + 1.5) || !looped {
+        assert!(start.elapsed() < PLAY_TIMEOUT, "應該從終點 {b} 跳回起點 {a}");
         h.step();
         let t = h.state().player().state.time_pos;
         assert!(t <= b + 0.5, "時間 {t} 超過終點 {b}");
@@ -951,7 +955,6 @@ fn ab_loop_key_cycles_and_new_file_clears_it() {
         last = t;
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(looped, "應該從終點 {b} 跳回起點 {a}");
     h.key_press(egui::Key::L);
     step_until(&mut h, "L 第三次取消", |s| s.ab_loop == [None, None]);
 
@@ -1244,10 +1247,8 @@ fn subtitle_style_window_applies_changes_and_typing_is_not_a_shortcut() {
     assert_eq!(h.state().player().get_string("sub-bold").unwrap(), "no");
 }
 
-#[test]
-fn frame_stepping_to_the_end_does_not_switch_files() {
-    // 沒有音軌的影片：mpv 逐格時會短暫取消暫停，以前到結尾會被當成「播完」而換到下一個檔案
-    let dir = TempDir::new("frame-step-end");
+/// 兩個沒有音軌的影片（a.mp4、b.mp4）、播放 a、暫停中逐格到結尾：還是 a，mpv 停在結尾、暫停
+fn frame_stepped_to_the_end(dir: &TempDir) -> Harness<'static, VitascopeApp> {
     let src = sample("common/mp4_h264_noaudio.mp4");
     for name in ["a.mp4", "b.mp4"] {
         std::fs::copy(&src, dir.0.join(name)).unwrap();
@@ -1269,8 +1270,40 @@ fn frame_stepping_to_the_end_does_not_switch_files() {
     step_until(&mut h, "逐格到結尾", |s| s.eof);
     wait_real(&mut h, 0.5);
     assert!(playing(&h.state().player().state, "a.mp4"), "暫停中逐格到結尾，不換檔");
+    // 最後一下逐格會先取消暫停、到結尾再暫停：等 mpv 真的停在結尾、暫停（還在走的話按空白鍵本來就是「暫停」）
+    step_until_app(&mut h, "mpv 停在結尾、暫停", |app| {
+        let p = app.player();
+        p.get_string("pause").is_ok_and(|v| v == "yes") && p.get_string("eof-reached").is_ok_and(|v| v == "yes")
+    });
+    h
+}
+
+#[test]
+fn frame_stepping_to_the_end_does_not_switch_files() {
+    // 沒有音軌的影片：mpv 逐格時會短暫取消暫停，以前到結尾會被當成「播完」而換到下一個檔案
+    let dir = TempDir::new("frame-step-end");
+    let mut h = frame_stepped_to_the_end(&dir);
     // 按播放之後就是一般播放：從頭播到結尾會接下一個
     h.key_press(egui::Key::Space);
+    step_until(&mut h, "播完接下一個", |s| playing(s, "b.mp4"));
+}
+
+#[test]
+fn space_right_after_frame_stepping_to_the_end_restarts_even_if_the_pause_notice_is_late() {
+    // 很忙的電腦上，最後一下逐格之後介面可能還沒收到 mpv「到結尾了」「又暫停了」的通知（記下的還是播放中）。
+    // 這時按空白鍵也要看 mpv 現在的狀態：停在結尾、暫停 = 從頭播放（以前只會暫停，停在 a 的結尾不動）
+    let dir = TempDir::new("frame-step-end-late");
+    let mut h = frame_stepped_to_the_end(&dir);
+    // 先等介面也收到通知（之後 mpv 不會再送這兩個通知），再改回「播放中、還沒到結尾」：按下去的那一幀介面記下的就是舊的
+    step_until(&mut h, "介面記下停在結尾、暫停", |s| s.eof && s.paused);
+    let st = &mut h.state_mut().player_mut().state;
+    st.paused = false;
+    st.eof = false;
+    h.key_press(egui::Key::Space);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("▶ 播放"), "提示也看 mpv 現在的狀態");
+    // 介面記下的已經改成「播放中、沒到結尾」：要看到時間回到前面（影片約 3 秒；CI 上一幀可能很久，留 2 秒）
+    step_until(&mut h, "從頭播放", |s| !s.eof && !s.paused && s.time_pos < 2.0);
     step_until(&mut h, "播完接下一個", |s| playing(s, "b.mp4"));
 }
 
@@ -1478,12 +1511,32 @@ fn hover_menu_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     MenuItem::contains(label).hover(h);
 }
 
-/// 知道影片尺寸、視窗還沒配合影片調整的話，等它調整完（畫面設定好才調整，CI 上可能晚好幾幀）。
-/// 選單開著時視窗改大小，選單跟著移動，滑鼠就不在要點的項目上了。還不知道影片尺寸時不等（沒有影像的檔案不會調整）
+/// 視窗還要配合影片調整的話，等它調整完（畫面設定好才調整，CI 上可能晚好幾幀）。
+/// 選單開著時視窗改大小，選單跟著移動、項目可能跑到視窗外，滑鼠就不在要點的項目上了
 fn wait_window_fit(h: &mut Harness<'_, VitascopeApp>) {
-    step_until_app(h, "視窗配合影片調整完", |app| {
-        !app.window_fit_pending() || app.player().state.video_size.is_none()
-    });
+    if !window_fit_coming(h.state()) {
+        apply_pending_resize(h);
+        return;
+    }
+    step_until_app(h, "視窗配合影片調整完", |app| !window_fit_coming(app));
+    apply_pending_resize(h);
+}
+
+/// 調整視窗的那一幀送出新的大小，下一幀才照新的大小排版：還沒排的話跑一幀（之後點的位置、看得到的範圍才對）
+fn apply_pending_resize(h: &mut Harness<'_, VitascopeApp>) {
+    if h.input().screen_rect.is_some() {
+        h.step();
+    }
+}
+
+/// 開檔之後視窗還會配合影片調整：已經知道影片尺寸，或檔案載入好了、選的是影像軌（或還不知道選了哪幾軌）。
+/// 只看影片尺寸的話，載入好、還不知道尺寸時（CI 上可能晚好幾幀）會不等，選單打開後視窗才變小。
+/// 沒有影像（純音訊、只播聲音）不會調整；還在連線、載入時也不等（測試可能就是要在載入中操作）
+fn window_fit_coming(app: &VitascopeApp) -> bool {
+    let s = &app.player().state;
+    let selection_known = s.tracks.iter().any(|t| t.selected);
+    app.window_fit_pending()
+        && (s.video_size.is_some() || (s.loaded && (!selection_known || s.selected(TrackKind::Video).is_some())))
 }
 
 /// 等到選單裡有標籤含 `label` 的項目
@@ -1534,51 +1587,73 @@ impl<'a> MenuItem<'a> {
         }
     }
 
-    /// 等到這一項出現、捲到看得到（選單比視窗長時用滾輪捲）、等它停下來，把滑鼠移到它上面。
-    /// 有子選單的項目等到子選單打開：等的時候每隔幾幀再移過去一次（版面變了、項目換了位置的話，滑鼠已經不在它上面）
-    fn hover(self, h: &mut Harness<'_, VitascopeApp>) {
-        // 之後用完整的標籤找：子選單打開後可能有別的項目也含 `label`（例如「字幕 ⏵」裡的「第二字幕 ⏵」）
-        let (_, full, disabled) = self.wait(h);
-        let me = MenuItem::exact(&full);
-        let screen = h.ctx.content_rect();
+    /// 等到這一項出現、捲到看得到（選單比視窗長時用滾輪捲）、等它停下來，回傳它現在的範圍。
+    /// 每次都讀現在的視窗大小：視窗可能剛配合影片改小，原本看得到的項目跑到視窗外
+    fn bring_into_view(self, h: &mut Harness<'_, VitascopeApp>) -> egui::Rect {
         for _ in 0..10 {
-            let (item, ..) = me.wait(h);
-            if item.bottom() <= screen.bottom() {
+            apply_pending_resize(h);
+            let (item, ..) = self.wait(h);
+            let screen = h.ctx.content_rect();
+            // 往下捲（滾輪往下 = 負的）看下面的項目，往上捲看上面的
+            let delta = if item.bottom() > screen.bottom() {
+                -120.0
+            } else if item.top() < screen.top() {
+                120.0
+            } else {
                 break;
-            }
+            };
             let over_menu = egui::pos2(item.center().x, screen.center().y);
             h.event(egui::Event::PointerMoved(over_menu));
             h.event(egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, -120.0),
+                delta: egui::vec2(0.0, delta),
                 modifiers: egui::Modifiers::NONE,
                 phase: egui::TouchPhase::Move,
             });
             h.run_steps(2);
         }
         // 捲動有動畫：等項目停下來再移過去（不然滑鼠停在動畫途中的位置，項目捲走後就不在它上面了）
-        let (mut last, ..) = me.wait(h);
+        let (mut last, ..) = self.wait(h);
         for _ in 0..30 {
             h.step();
-            let (now, ..) = me.wait(h);
+            let (now, ..) = self.wait(h);
             if now == last {
                 break;
             }
             last = now;
         }
-        // 捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：先移到要點的項目上，等子選單關掉
-        h.event(egui::Event::PointerMoved(last.center()));
-        h.run_steps(3);
-        if !full.ends_with('⏵') || disabled {
-            return;
+        last
+    }
+
+    /// 等到這一項出現、捲到看得到、等它停下來，把滑鼠移到它上面。有子選單的項目等到子選單打開
+    fn hover(self, h: &mut Harness<'_, VitascopeApp>) {
+        // 之後用完整的標籤找：子選單打開後可能有別的項目也含 `label`（例如「字幕 ⏵」裡的「第二字幕 ⏵」）
+        let (_, full, disabled) = self.wait(h);
+        let me = MenuItem::exact(&full);
+        let item = me.bring_into_view(h);
+        me.point_at(h, item);
+        if full.ends_with('⏵') && !disabled {
+            me.wait_submenu(h);
         }
+    }
+
+    /// 把滑鼠移到 `item`（這一項剛才的範圍）上。捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：
+    /// 移過來之後多跑幾幀，等那個子選單關掉
+    fn point_at(self, h: &mut Harness<'_, VitascopeApp>, item: egui::Rect) {
+        h.event(egui::Event::PointerMoved(item.center()));
+        h.run_steps(3);
+    }
+
+    /// 滑鼠已經移到這一項（有子選單、標籤要完整）上：等到它的子選單打開。等的時候每隔幾幀再捲一次、移過去一次：
+    /// 版面變了（例如選單打開後視窗才配合影片變小，項目跑到視窗外），滑鼠已經不在它上面
+    fn wait_submenu(self, h: &mut Harness<'_, VitascopeApp>) {
         let start = Instant::now();
         let mut frames = 0;
-        while !submenu_open(h, &full) {
-            assert!(start.elapsed() < MENU_TIMEOUT, "「{full}」的子選單一直沒打開");
+        while !submenu_open(h, self.label) {
+            assert!(start.elapsed() < MENU_TIMEOUT, "「{}」的子選單一直沒打開", self.label);
             frames += 1;
             if frames % 10 == 0 {
-                let (header, ..) = me.wait(h);
+                let header = self.bring_into_view(h);
                 h.event(egui::Event::PointerMoved(header.center()));
             }
             h.step();
@@ -1600,6 +1675,80 @@ fn submenu_open(h: &Harness<'_, VitascopeApp>, header: &str) -> bool {
     h.root()
         .children()
         .any(|area| area.children().any(|ui| ui.accesskit_node().locate().0 == submenu))
+}
+
+/// 測試的選單工具：選單打開、滑鼠移到項目上之後視窗才配合影片變小（CI 上開檔後調整視窗可能晚好幾幀），
+/// 項目跑到視窗外。等子選單時要重新捲到看得到再移過去（以前只會一直移到視窗外的舊位置，等到逾時）
+#[test]
+fn menu_helper_scrolls_again_when_the_window_shrinks_under_the_menu() {
+    if !has_net_samples("menu_helper_scrolls_again_when_the_window_shrinks_under_the_menu") {
+        return;
+    }
+    let server = Server::start();
+    let (mut h, _fake, _page) = playing_two_qualities(&server, no_auto_next());
+    wait_window_fit(&mut h);
+    let small = h.ctx.content_rect().size();
+    assert_eq!(small, egui::vec2(640.0, 421.0), "前提：小影片的視窗");
+    // 還沒配合影片調整的大小打開選單、移到「網站影片」上
+    h.set_size(egui::vec2(960.0, 600.0));
+    h.run_steps(3);
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    let site = MenuItem::exact("網站影片 ⏵");
+    let before = site.bring_into_view(&mut h);
+    // 這時視窗才變小：項目跑到視窗下面
+    h.set_size(small);
+    h.run_steps(2);
+    let (moved, ..) = site.wait(&mut h);
+    assert!(moved.bottom() > small.y, "前提：項目跑到視窗外 {moved:?}");
+    site.point_at(&mut h, before);
+    site.wait_submenu(&mut h);
+    wait_menu_item(&mut h, "選擇畫質 ⏵");
+    assert_eq!(h.state().player().state.volume, 100.0, "滾輪捲的是選單，不是音量");
+}
+
+/// 測試的選單工具 `wait_window_fit`：開檔後載入好、還不知道影片尺寸時（CI 上可能晚好幾幀）也要等視窗配合影片調整。
+/// 以前只看影片尺寸，這時不等：選單打開後視窗才變小，要點的項目跑到視窗外（「更新 yt-dlp」點不到）
+#[test]
+fn wait_window_fit_also_waits_before_the_video_size_is_known() {
+    let mut h = playing_multitrack();
+    wait_window_fit(&mut h);
+    assert!(!window_fit_coming(h.state()), "前提：視窗已經配合影片調整完");
+    // 模擬很慢的電腦：新的檔案開始了（之後要調整視窗）、載入好、選了影像軌，還沒收到影片尺寸
+    let app = h.state_mut();
+    app.deliver_player_event(PlayerEvent::StartFile);
+    app.player_mut().state.video_size = None;
+    assert!(app.window_fit_pending(), "前提：開檔後要調整視窗");
+    let tracks = app.player().state.tracks.clone();
+    assert!(app.player().state.loaded && app.player().state.selected(TrackKind::Video).is_some());
+    assert!(
+        tracks.iter().any(|t| t.kind == TrackKind::Audio && t.selected),
+        "前提：也選了聲音"
+    );
+    assert!(
+        window_fit_coming(app),
+        "載入好、選了影像軌、還不知道尺寸：視窗還會調整，要等"
+    );
+    // mpv 先報軌道清單、後報選了哪幾軌：還不知道選擇時也等
+    for t in &mut app.player_mut().state.tracks {
+        t.selected = false;
+    }
+    assert!(window_fit_coming(app), "還不知道選了哪幾軌：要等");
+    // 只選了聲音（沒有影像）：不會調整，不等
+    app.player_mut().state.tracks = tracks.clone();
+    for t in &mut app.player_mut().state.tracks {
+        if t.kind == TrackKind::Video {
+            t.selected = false;
+        }
+    }
+    assert!(!window_fit_coming(app), "沒有影像不會調整視窗：不等");
+    // 還在連線、載入：不等（測試可能就是要在載入中操作）
+    app.player_mut().state.tracks = tracks;
+    app.player_mut().state.loaded = false;
+    assert!(!window_fit_coming(app), "還在載入：不等");
+    // 已經知道影片尺寸：一定會調整，要等
+    app.player_mut().state.video_size = Some([640, 360]);
+    assert!(window_fit_coming(app), "知道影片尺寸：要等");
 }
 
 #[test]
@@ -2245,9 +2394,17 @@ fn window_height_follows_rotation() {
     let mut h = playing_multitrack(); // 640x360
     let width = h.ctx.content_rect().width();
     h.key_press_modifiers(egui::Modifiers::ALT, egui::Key::K);
-    let mut sizes = Vec::new();
+    let mut sizes: Vec<egui::Vec2> = Vec::new();
+    // 等到畫面轉成直的、視窗跟著調整成直的（CI 上可能要好幾秒，不能只等固定的時間），而且至少看 3 秒：
+    // 之後的 VideoReconfig 也可能再調整，看的是最後一次
+    let adjusted = |app: &VitascopeApp, sizes: &[egui::Vec2]| {
+        app.player().state.video_size == Some([360, 640])
+            && !app.window_fit_pending()
+            && sizes.last().is_some_and(|s| s.y > width * 640.0 / 360.0)
+    };
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(3) {
+    while start.elapsed() < Duration::from_secs(3) || !adjusted(h.state(), &sizes) {
+        assert!(start.elapsed() < PLAY_TIMEOUT, "視窗沒有配合直的畫面調整：{sizes:?}");
         h.step();
         sizes.extend(viewport_commands(&h).into_iter().filter_map(|c| match c {
             egui::ViewportCommand::InnerSize(s) => Some(s),
@@ -4650,8 +4807,11 @@ fn stale_video_reconfig_during_a_quality_switch_does_not_refit() {
         !h.state().window_fit_pending(),
         "換畫質途中舊檔案的 VideoReconfig 不調整視窗"
     );
+    // 點的那一幀送出的視窗大小不算（同 site_quality_switch_keeps_pause_delay_ab_subtitle_and_view）：那一幀先處理 mpv 的事件、
+    // 調整視窗，最後才處理點擊。上面改長寬比之後 mpv 的 VideoReconfig 在很慢的電腦上可能這時才到，照規則調整視窗高度，
+    // 跟換畫質無關。下一幀起（上面送進去的舊檔案的 VideoReconfig 在下一幀才會調整）都要記
     let mut seen = Seen::default();
-    seen.record(&h);
+    run_steps_seen(&mut h, &mut seen, 1);
     step_until_seen(&mut h, &mut seen, "換成 360p", |app| playing_format(app, &page, "lo"));
     h.run_steps(3);
     seen.record(&h);

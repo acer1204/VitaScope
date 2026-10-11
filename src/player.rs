@@ -1595,9 +1595,21 @@ impl Player {
         self.mpv.set_property("pause", paused)
     }
 
+    /// 現在是不是暫停：直接問 mpv，問不到時用介面記下的。屬性通知可能還沒到：
+    /// 逐格到結尾時 mpv 先取消暫停、到結尾再暫停，介面記下的可能還是「播放中」
+    pub fn paused_now(&self) -> bool {
+        self.mpv.get_property::<bool>("pause").unwrap_or(self.state.paused)
+    }
+
+    /// 現在是不是停在結尾：直接問 mpv（同 [`Self::paused_now`]），問不到時用介面記下的
+    pub fn eof_now(&self) -> bool {
+        self.mpv.get_property::<bool>("eof-reached").unwrap_or(self.state.eof)
+    }
+
     pub fn toggle_pause(&self) -> mpv::Result<()> {
-        // 播完停在最後一格時按播放 = 從頭開始（跳轉不準的格式：mpv 開始做時從記錄核對，見 `approx_log`）
-        if self.state.eof && self.state.paused {
+        // 播完停在最後一格時按播放 = 從頭開始（跳轉不準的格式：mpv 開始做時從記錄核對，見 `approx_log`）。
+        // 看 mpv 現在的狀態：介面記下的可能還沒更新（見 `paused_now`），以為在播放就只會暫停，不會從頭開始
+        if self.eof_now() && self.paused_now() {
             self.note_seek(None);
             self.approx_forget();
             self.mpv.command(&["seek", "0", "absolute"])?;
