@@ -15,6 +15,7 @@ use support::fake_ytdl::{FakeResolver, site_playlist_json};
 use support::http::Server;
 use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
 use vitascope::keymap::Platform;
+use vitascope::mpv::{Event, Value};
 use vitascope::pacing::{Plan, Reason, SmoothMode};
 use vitascope::player::{AsyncKey, Options, Player, PlayerEvent, State, TrackKind};
 use vitascope::playlist::{Playlist, Repeat};
@@ -12950,34 +12951,7 @@ fn audio_fallback_reported_after_the_next_start_is_retried() {
     assert!(!h.state().player().audio_fell_back());
     // 先不跑介面：上一個檔案的輸出改用 null，接著開下一個檔案、等 mpv 開始它（path 在送出 StartFile 之後才換），
     // 下一幀一起處理：StartFile 先到，改用 null 的通知在後面
-    let missing = dir.0.join("missing").join("out.wav");
-    let player = h.state().player();
-    player
-        .set_option_if_changed("ao-pcm-file", &missing.to_string_lossy())
-        .unwrap();
-    player
-        .command_async_keyed(AsyncKey::AudioDevice, &["ao-reload"])
-        .unwrap();
-    let start = Instant::now();
-    let mut reloaded = Instant::now();
-    while player.get_string("current-ao").ok().as_deref() != Some("null") {
-        // 重開的那一刻剛好沒有音訊輸出（例如正在重開）時 mpv 不做：等一下再要一次
-        if reloaded.elapsed() > Duration::from_secs(2) {
-            player
-                .command_async_keyed(AsyncKey::AudioDevice, &["ao-reload"])
-                .unwrap();
-            reloaded = Instant::now();
-        }
-        assert!(
-            start.elapsed() < TIMEOUT,
-            "mpv 沒有改用 null：{:?} {:?} {:?} {:?}",
-            player.get_string("current-ao"),
-            player.get_string("pause"),
-            player.get_string("core-idle"),
-            player.recent_errors()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    fall_back_to_null(h.state().player(), &dir);
     let next = sample("general/audio_wav.wav");
     h.state_mut().player_mut().open(&next.to_string_lossy()).unwrap();
     let player = h.state().player();
@@ -13023,6 +12997,293 @@ fn audio_fallback_reported_after_the_next_start_is_retried() {
         retries,
         "上一個檔案用的是真正的輸出：換檔時不重開"
     );
+}
+
+/// pcm 輸出寫到的空裝置（每個平台都開得起來）
+const PCM_NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// 改用 null 的通知（`current-ao`）在新檔案的 StartFile 之後多久才收到。mpv 先送完排著的事件才送變了的屬性，
+/// 屬性的值每輪播放迴圈才取一次，慢的電腦上可能晚好幾批（macOS CI 上晚了一批）
+#[derive(Clone, Copy, Debug)]
+enum NullArrives {
+    /// 跟 StartFile 同一批：介面處理 StartFile 時，播放器已經看到 null
+    SameBatch,
+    /// 介面處理完 StartFile 之後，又過了這麼多幀才收到
+    FramesLater(usize),
+}
+
+const NULL_ORDERS: [NullArrives; 3] = [
+    NullArrives::SameBatch,
+    NullArrives::FramesLater(1),
+    NullArrives::FramesLater(3),
+];
+
+/// 不經過介面要 mpv 改用 null：寫不進去的路徑再重開輸出，等 mpv 真的開著 null。
+/// 重開用同步指令：回來時 mpv 已經做完（拿掉了輸出），之後才開檔不會有還沒執行的重開。
+/// 非同步的重開可能還排著，在測試開下一個檔案前後才把 null 拿掉（開檔時問 mpv 得到沒有輸出，或新檔案自己重開）
+fn fall_back_to_null(player: &Player, dir: &TempDir) {
+    let missing = dir.0.join("missing").join("out.wav");
+    player
+        .set_option_if_changed("ao-pcm-file", &missing.to_string_lossy())
+        .unwrap();
+    let current = || player.get_string("current-ao").ok();
+    let start = Instant::now();
+    let mut reloaded: Option<Instant> = None;
+    while current().as_deref() != Some("null") {
+        // 重開的那一刻剛好沒有音訊輸出時 mpv 不做（之後開的輸出用新的路徑，也會改用 null）；
+        // 一直還是真正的輸出才再要一次
+        if reloaded.is_none()
+            || (current().as_deref() == Some("pcm") && reloaded.is_some_and(|t| t.elapsed() > Duration::from_secs(2)))
+        {
+            player.mpv().command(&["ao-reload"]).unwrap();
+            reloaded = Some(Instant::now());
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "mpv 沒有改用 null：{:?} {:?} {:?} {:?}",
+            current(),
+            player.get_string("pause"),
+            player.get_string("core-idle"),
+            player.recent_errors()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 播放器收到 current-ao 變成 `ao`（測試自己送，不靠 mpv 什麼時候送）
+fn current_ao_changed(h: &mut Harness<'_, VitascopeApp>, ao: &str) {
+    h.state_mut().player_mut().inject_event(Event::PropertyChange {
+        id: 0,
+        name: "current-ao".into(),
+        value: Value::String(ao.into()),
+    });
+}
+
+/// 播放器自己處理 mpv 的事件（不交給介面），直到條件成立
+fn player_until(h: &mut Harness<'_, VitascopeApp>, what: &str, cond: impl Fn(&Player) -> bool) {
+    let start = Instant::now();
+    while !cond(h.state().player()) {
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+        let _ = h.state_mut().player_mut().poll();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 用 pcm 輸出播 audio_flac.flac，一開始就暫停（pcm 不照時間播；暫停中 mpv 照樣開音訊輸出），等到開著真正的輸出
+fn pcm_harness(name: &str) -> (TempDir, Harness<'static, VitascopeApp>) {
+    let (dir, _path, mut h) = sound_harness_with(
+        name,
+        None,
+        Some(&[SPEAKERS]),
+        &[("ao", "pcm"), ("ao-pcm-file", PCM_NULL_DEVICE), LOOP_FILE],
+        |_| {},
+    );
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    h.state().player().set_pause(true).unwrap();
+    step_until(&mut h, "開著真正的輸出", |s| {
+        s.loaded && s.paused && s.current_ao.as_deref() == Some("pcm")
+    });
+    (dir, h)
+}
+
+/// 同一個格式、另一個名字的檔案（換檔時 mpv 沿用同一個音訊輸出；檔名不同才分得出 mpv 開始它了沒）
+fn same_format_copy(dir: &TempDir) -> PathBuf {
+    let next = dir.0.join("next.flac");
+    std::fs::copy(sample("general/audio_flac.flac"), &next).unwrap();
+    next
+}
+
+/// 不經過介面直接開 `next`，等 mpv 開始它（path 在送出 StartFile 之後才換）。播放器先處理 mpv 排著的事件（含 StartFile），
+/// 再照 `order` 交給介面：測試送的 current-ao=`ao` 跟 StartFile 同一批，或晚幾幀才收到
+fn start_next_with_ao(h: &mut Harness<'_, VitascopeApp>, next: &std::path::Path, ao: &str, order: NullArrives) {
+    h.state_mut().player_mut().open(&next.to_string_lossy()).unwrap();
+    deliver_start_with_ao(h, next, ao, order);
+}
+
+/// 同 `start_next_with_ao`，`next` 已經要 mpv 開始了（例如 mpv 自己的播放清單的下一個項目）
+fn deliver_start_with_ao(h: &mut Harness<'_, VitascopeApp>, next: &std::path::Path, ao: &str, order: NullArrives) {
+    let start = Instant::now();
+    while h.state().player().get_string("path").ok().map(PathBuf::from).as_deref() != Some(next) {
+        assert!(start.elapsed() < TIMEOUT, "mpv 沒有開始下一個檔案");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let events = h.state_mut().player_mut().poll();
+    assert!(events.contains(&PlayerEvent::StartFile), "{order:?}：{events:?}");
+    if let NullArrives::SameBatch = order {
+        current_ao_changed(h, ao);
+    }
+    for ev in events {
+        h.state_mut().deliver_player_event(ev);
+    }
+    if let NullArrives::FramesLater(frames) = order {
+        h.run_steps(frames);
+        current_ao_changed(h, ao);
+    }
+    h.step();
+}
+
+/// 上一個檔案改用了 null、新檔案沿用它（格式一樣 mpv 不重開）：改用 null 的通知跟新檔案的 StartFile 同一批、晚一幀、
+/// 晚好幾幀，都剛好重開一次（開檔時直接問 mpv，不看通知）。以前看通知分在哪一批，macOS CI 上晚了一批就沒有重開
+#[test]
+fn audio_fallback_before_the_next_file_is_retried_once_whenever_it_is_reported() {
+    for (i, order) in NULL_ORDERS.into_iter().enumerate() {
+        let (dir, mut h) = pcm_harness(&format!("sound-ao-inherited-{i}"));
+        fall_back_to_null(h.state().player(), &dir);
+        // 播放器先收下 mpv 的 null 和開不起來的記錄（介面不知道），再當成還是 pcm：mpv 已經送過 null 不會再送，
+        // 介面什麼時候知道由測試決定
+        player_until(&mut h, "收到改用 null 和開不起來的記錄", |p| {
+            p.state.current_ao.as_deref() == Some("null") && p.recent_errors().iter().any(|e| e.starts_with("[ao"))
+        });
+        current_ao_changed(&mut h, "pcm");
+        assert_eq!(h.state().audio_output_retries(), 0);
+        let next = same_format_copy(&dir);
+        start_next_with_ao(&mut h, &next, "null", order);
+        assert_eq!(
+            h.state().audio_output_retries(),
+            1,
+            "{order:?}：上一個檔案改用了 null，換檔時重開"
+        );
+        // 真的重開了：新檔案又試了一次寫不進去的路徑（沒重開的話沿用 null，這個檔案沒有音訊輸出的錯誤）
+        step_until_app(&mut h, "重開了、還是開不起來", |app| {
+            app.player().recent_errors().iter().any(|e| e.starts_with("[ao"))
+        });
+        step_until_app(&mut h, "還是開不起來：提示", |app| {
+            app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+        });
+        // 同一個檔案不再重開
+        wait_real(&mut h, 1.5);
+        assert_eq!(h.state().audio_output_retries(), 1, "{order:?}");
+    }
+}
+
+/// 交給 mpv 讀的本機清單（.pls）：下一個項目是 mpv 自己開始的，沒有經過開檔（`open`）。上一個項目改用了 null、
+/// 下一個項目沿用它時，也是改用 null 的通知什麼時候收到都剛好重開一次（只在開檔時問的話，mpv 自己換項目就一直沒有聲音）
+#[test]
+fn audio_fallback_before_an_entry_mpv_starts_itself_is_retried_once() {
+    for (i, order) in NULL_ORDERS.into_iter().enumerate() {
+        let (dir, mut h) = pcm_harness(&format!("sound-ao-pls-{i}"));
+        let entries = ["a.flac", "b.flac"].map(|name| {
+            let path = dir.0.join(name);
+            std::fs::copy(sample("general/audio_flac.flac"), &path).unwrap();
+            path
+        });
+        let list = dir.0.join("list.pls");
+        std::fs::write(
+            &list,
+            format!(
+                "[playlist]
+File1={}
+File2={}
+NumberOfEntries=2
+Version=2
+",
+                entries[0].display(),
+                entries[1].display()
+            ),
+        )
+        .unwrap();
+        h.state_mut().player_mut().open(&list.to_string_lossy()).unwrap();
+        step_until(&mut h, "清單的第一個項目開好、用真正的輸出", |s| {
+            playing(s, "a.flac") && s.paused && s.current_ao.as_deref() == Some("pcm")
+        });
+        assert_eq!(
+            h.state().audio_output_retries(),
+            0,
+            "{order:?}：上一個檔案用的是真正的輸出"
+        );
+        fall_back_to_null(h.state().player(), &dir);
+        player_until(&mut h, "收到改用 null 和開不起來的記錄", |p| {
+            p.state.current_ao.as_deref() == Some("null") && p.recent_errors().iter().any(|e| e.starts_with("[ao"))
+        });
+        current_ao_changed(&mut h, "pcm");
+        // mpv 自己換到清單的下一個項目（像播完了一樣），介面沒有開檔
+        h.state().player().mpv().command(&["playlist-next"]).unwrap();
+        deliver_start_with_ao(&mut h, &entries[1], "null", order);
+        assert_eq!(
+            h.state().audio_output_retries(),
+            1,
+            "{order:?}：上一個項目改用了 null，mpv 自己換項目時也重開"
+        );
+        step_until_app(&mut h, "重開了、還是開不起來", |app| {
+            app.player().recent_errors().iter().any(|e| e.starts_with("[ao"))
+        });
+        step_until_app(&mut h, "還是開不起來：提示", |app| {
+            app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+        });
+        wait_real(&mut h, 1.5);
+        assert_eq!(h.state().audio_output_retries(), 1, "{order:?}");
+    }
+}
+
+/// 反過來：上一個檔案用的是真正的輸出，新檔案自己改用了 null（這裡由測試送，mpv 那邊其實還是 pcm）。
+/// mpv 剛剛才為它試過裝置，不重開；通知跟 StartFile 同一批、晚一幀、晚好幾幀都一樣，照樣提示
+#[test]
+fn audio_fallback_of_the_next_file_itself_is_not_retried_whenever_it_is_reported() {
+    for (i, order) in NULL_ORDERS.into_iter().enumerate() {
+        let (dir, mut h) = pcm_harness(&format!("sound-ao-own-{i}"));
+        let next = same_format_copy(&dir);
+        start_next_with_ao(&mut h, &next, "null", order);
+        assert_eq!(h.state().audio_output_retries(), 0, "{order:?}：新檔案自己的不重開");
+        // 照樣提示（重開了的話要等重開的結果，mpv 那邊是 pcm，就不會提示）
+        step_until_app(&mut h, "提示沒有聲音", |app| {
+            app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+        });
+        step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+        assert_eq!(h.state().audio_output_retries(), 0, "{order:?}");
+    }
+}
+
+/// 另一種格式的 WAV（22.05 kHz 單聲道、5 秒靜音）：取樣率、聲道不同，換檔時 mpv 要為它重開音訊輸出
+///（只有取樣格式不同的話 mpv 轉換一下、沿用同一個輸出）
+fn other_format_wav(dir: &TempDir) -> PathBuf {
+    let rate: u32 = 22_050;
+    let data = vec![0u8; rate as usize * 2 * 5];
+    let mut b = Vec::with_capacity(data.len() + 44);
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    // PCM、單聲道、16 位元
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&(rate * 2).to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    b.extend_from_slice(&data);
+    let path = dir.0.join("mono.wav");
+    std::fs::write(&path, b).unwrap();
+    path
+}
+
+/// 同上，真的開不起來：上一個檔案用 pcm，新檔案格式不同（mpv 為它重開輸出），寫不進去、改用 null。
+/// 通知什麼時候到由 mpv 決定，結果都一樣：不重開、提示一次
+#[test]
+fn audio_fallback_of_a_next_file_in_another_format_is_not_retried() {
+    let (dir, mut h) = pcm_harness("sound-ao-own-real");
+    // 改這個選項 mpv 不會重開輸出（還是 pcm），開下一個檔案時才用到
+    let missing = dir.0.join("missing").join("out.wav");
+    h.state()
+        .player()
+        .set_option_if_changed("ao-pcm-file", &missing.to_string_lossy())
+        .unwrap();
+    assert_eq!(h.state().player().get_string("current-ao").unwrap(), "pcm");
+    let next = other_format_wav(&dir);
+    drop_file(&mut h, next);
+    step_until_app(&mut h, "提示沒有聲音", |app| {
+        app.osd_text() == Some("無法開啟音訊裝置，暫時沒有聲音")
+    });
+    step_until(&mut h, "照樣播放", |s| playing(s, "mono.wav"));
+    assert!(h.state().player().audio_fell_back());
+    // mpv 自己為這個檔案試過裝置（開不起來的記錄是這個檔案的：StartFile 時清掉了之前的；記錄比屬性晚送到）
+    step_until_app(&mut h, "這個檔案開不起來的記錄", |app| {
+        app.player().recent_errors().iter().any(|e| e.starts_with("[ao"))
+    });
+    assert_eq!(h.state().audio_output_retries(), 0, "新檔案自己的不重開");
+    step_until_app(&mut h, "提示消失", |app| app.osd_text().is_none());
+    assert_eq!(h.state().audio_output_retries(), 0);
 }
 
 #[test]

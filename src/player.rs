@@ -851,11 +851,10 @@ pub struct Player {
     watching_devices: bool,
     /// 測試用的假裝置清單：有的話不讀 mpv 的（見 `set_fake_audio_devices`）
     fake_devices: bool,
-    /// 開始下一個檔案（StartFile）時，上一個檔案的音訊輸出改用了 null（見 `take_fell_back_at_start`）
-    fell_back_at_start: bool,
-    /// StartFile 時開著真正的音訊輸出（不是 null），介面還沒處理那個 StartFile：
-    /// 之後才收到的「改用 null」分不出是誰的（見 `take_fell_back_at_start`）
-    real_ao_at_start: bool,
+    /// 最近一次開檔（`open`）換掉的檔案，音訊輸出是改用的 null（見 `take_fell_back_before_open`）
+    fell_back_before_open: bool,
+    /// 送出了開檔（`open`），還沒處理到 StartFile：沒有的話 StartFile 是 mpv 自己開始的下一個項目
+    open_pending: bool,
     /// 測試用：影片軌一律當成這個杜比視界 profile（見 `set_fake_dolby_vision`）
     fake_dolby_vision: Option<i64>,
     /// 像素著色器：使用者的組合（app 給的；VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時是使用者原本的清單，不改）
@@ -1036,8 +1035,8 @@ impl Player {
             options_applied: HashMap::new(),
             watching_devices: false,
             fake_devices: false,
-            fell_back_at_start: false,
-            real_ao_at_start: false,
+            fell_back_before_open: false,
+            open_pending: false,
             fake_dolby_vision: None,
             shaders_applied: Some(shader_base.clone()),
             shader_user: shader_base,
@@ -1275,17 +1274,20 @@ impl Player {
         !self.ao_null_wanted && self.state.current_ao.as_deref() == Some("null")
     }
 
-    /// 開始下一個檔案（StartFile）的那一刻，上一個檔案的音訊輸出是不是改用了 null；讀過就清掉。
-    /// 事件是一次全部處理完才交給介面的：電腦慢的時候，新檔案也開不起來、改用 null 的通知可能在同一批裡，
-    /// 介面處理 StartFile 時再看 `audio_fell_back` 會把新檔案的當成上一個的（多重開一次音訊輸出）。
+    /// 最近一次開檔（`open`）換掉的檔案，音訊輸出是不是改用了 null；讀過就清掉（介面在新檔案的 StartFile 讀，
+    /// 是的話重開一次音訊輸出：同樣格式時 mpv 換檔沿用同一個輸出，不重開的話新檔案一直沒有聲音）。
     ///
-    /// 屬性的變化不跟事件排順序：mpv 先送完排著的事件（StartFile…），沒有事件了才送變了的屬性（client.c
-    /// `mpv_wait_event`），所以上一個檔案快結束時才改用 null 的話，那個通知也可能排在 StartFile 後面。
-    /// StartFile 時開著真正的輸出、同一批裡才變成 null 的分不出是誰的，當成上一個的（重開一次）：
-    /// 多重開一次只是再試一次裝置，沒重開的話新檔案沿用 null（同樣格式時 mpv 不重開），之後一直沒有聲音
-    pub(crate) fn take_fell_back_at_start(&mut self) -> bool {
-        self.real_ao_at_start = false;
-        std::mem::take(&mut self.fell_back_at_start)
+    /// 不看觀察到的 current-ao：屬性的變化不跟事件排順序（mpv 先送完排著的事件才送變了的屬性，屬性的值
+    /// 每輪播放迴圈才取一次），慢的電腦上上一個檔案的 null 可能在 StartFile 之後好幾批才收到，新檔案自己的
+    /// null 也可能跟 StartFile 同一批，分不出是誰的。所以在送出 loadfile 之前直接問 mpv（見 `open_inner`）：
+    /// 那時新檔案還沒開始，看到的一定是要換掉的檔案的輸出。新檔案自己開不起來（第一個檔案、格式不同而重開）
+    /// 不算：mpv 剛剛才為它試過裝置。
+    ///
+    /// mpv 自己開始的下一個項目（交給 mpv 讀的本機清單 .pls 之類，沒有經過 `open`）在處理它的 StartFile 時才問：
+    /// 介面放行 on_load hook 之前 mpv 還沒為它開音訊輸出，看到的是上一個項目的。沒有 hook 時（headless）
+    /// 可能已經是這個項目自己的，盡量而已
+    pub(crate) fn take_fell_back_before_open(&mut self) -> bool {
+        std::mem::take(&mut self.fell_back_before_open)
     }
 
     /// 同 `audio_fell_back`，直接問 mpv（重開音訊輸出之後，觀察到的值可能還是重開前的）
@@ -1540,8 +1542,13 @@ impl Player {
         self.state.net_failure = None;
         let flips = self.shader_flip.clone();
         self.reset_shaders_for_next_file();
+        // 要換掉的檔案的音訊輸出是不是改用的 null（見 `take_fell_back_before_open`）：送出 loadfile 之前問，
+        // 之後新檔案可能已經開了自己的輸出（沒有 on_load hook 時 mpv 不等介面）
+        let fell_back = self.audio_fell_back_now();
         let result = self.mpv.command(&["loadfile", path, "replace"]);
         if result.is_ok() {
+            self.fell_back_before_open = fell_back;
+            self.open_pending = true;
             // 開檔失敗時判斷是不是網路的原因（StartFile 時讀 mpv 的 path 可能已經太晚）
             self.opening = Some(path.to_owned());
             self.load_started = Some(Instant::now());
@@ -2980,10 +2987,11 @@ impl Player {
                 if let Ok(mut a) = self.approx.lock() {
                     a.landing = None;
                 }
-                // 這時看到的音訊輸出是上一個檔案的（新檔案的音訊在這之後才開；同一批裡之後才送到的，見
-                // `take_fell_back_at_start`）
-                self.fell_back_at_start |= self.audio_fell_back();
-                self.real_ao_at_start = self.state.current_ao.as_deref().is_some_and(|ao| ao != "null");
+                // mpv 自己開始的下一個項目（沒有 `open`）：上一個項目的音訊輸出是不是改用的 null，現在才問
+                //（見 `take_fell_back_before_open`）。兩次 `open` 只開始一個檔案時，之後的 StartFile 也當成 mpv 自己開始的
+                if !std::mem::take(&mut self.open_pending) {
+                    self.fell_back_before_open = self.audio_fell_back_now();
+                }
                 self.state.loading = true;
                 self.state.loaded = false;
                 self.state.last_error = None;
@@ -3148,14 +3156,7 @@ impl Player {
                 s.audio_out_pcm = s.audio_spdif.is_none() && value.as_str().is_some_and(has_out_format);
             }
             "video-params/gamma" => s.video_hdr = value.as_str().is_some_and(is_hdr_gamma),
-            "current-ao" => {
-                s.current_ao = value.as_str().filter(|v| !v.is_empty()).map(str::to_owned);
-                // StartFile 時開著真正的輸出、介面還沒處理那個 StartFile 就變成 null：分不出是上一個檔案的
-                // 還是新檔案的，當成上一個的（見 `take_fell_back_at_start`）。之後再變的是新檔案自己的
-                if std::mem::take(&mut self.real_ao_at_start) && self.audio_fell_back() {
-                    self.fell_back_at_start = true;
-                }
-            }
+            "current-ao" => s.current_ao = value.as_str().filter(|v| !v.is_empty()).map(str::to_owned),
             // 關檔時 mpv 送「不可用」：跟著變回 false / None
             "paused-for-cache" => s.paused_for_cache = value.as_bool().unwrap_or(false),
             "cache-buffering-state" => s.cache_buffering = value.as_i64(),
@@ -3714,6 +3715,70 @@ mod tests {
             super::async_key(super::async_id(AsyncKey::LoopFile, 7)),
             Some(AsyncKey::LoopFile)
         );
+    }
+
+    /// 換掉的檔案的音訊輸出是不是改用的 null，開檔（送出 loadfile）之前直接問 mpv：
+    /// 跟事件、屬性通知怎麼分批無關（這裡一個事件都不處理）
+    #[test]
+    fn fallback_before_open_is_asked_when_opening() {
+        use std::time::{Duration, Instant};
+        // 引擎沒有 FFmpeg 的 sine 來源濾鏡：用產生的樣本
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/generated/general/audio_flac.flac");
+        let player = |ao: &str, file: &str| {
+            let extra = [("ao", ao), ("ao-pcm-file", file), ("pause", "yes")];
+            super::Player::new(super::Options {
+                extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                ..super::Options::headless()
+            })
+            .unwrap()
+        };
+        // 暫停中 mpv 照樣開音訊輸出
+        let wait_ao = |p: &super::Player, want: &str| {
+            let start = Instant::now();
+            while p.mpv.get_string("current-ao").ok().as_deref() != Some(want) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(30),
+                    "current-ao 沒有變成 {want}：{:?} {:?} {:?} {:?}",
+                    p.mpv.get_string("current-ao"),
+                    p.mpv.get_string("path"),
+                    p.mpv.get_string("audio-params"),
+                    p.mpv.get_string("core-idle"),
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let missing = std::env::temp_dir()
+            .join(format!("vitascope-no-such-dir-{}", std::process::id()))
+            .join("out.wav");
+
+        // 開不起來：第一個檔案沒有換掉的輸出，不算；第二個檔案換掉的是改用的 null
+        let mut p = player("pcm", &missing.to_string_lossy());
+        p.open(src).unwrap();
+        assert!(!p.take_fell_back_before_open(), "第一個檔案沒有上一個");
+        wait_ao(&p, "null");
+        assert_eq!(p.state.current_ao, None, "沒有處理事件：觀察到的還不知道");
+        p.open(src).unwrap();
+        assert!(p.take_fell_back_before_open());
+        assert!(!p.take_fell_back_before_open(), "讀過就清掉");
+        // 下一次開檔照當時的：新檔案還是沿用 null
+        wait_ao(&p, "null");
+        p.open(src).unwrap();
+        assert!(p.take_fell_back_before_open());
+
+        // 真正的輸出開得起來：不算
+        let mut q = player("pcm", null_device);
+        q.open(src).unwrap();
+        wait_ao(&q, "pcm");
+        q.open(src).unwrap();
+        assert!(!q.take_fell_back_before_open());
+
+        // ao 本來就指定 null：不是開不起來改用的
+        let mut r = player("null", null_device);
+        r.open(src).unwrap();
+        wait_ao(&r, "null");
+        r.open(src).unwrap();
+        assert!(!r.take_fell_back_before_open());
     }
 
     #[test]

@@ -2176,8 +2176,10 @@ impl VitascopeApp {
                 self.net_live = false;
                 self.live_end_shown = false;
                 // 上一個檔案的音訊輸出開不起來、改用 null：mpv 換檔時沿用同一個輸出，不重開的話之後的檔案都沒有聲音。
-                // 看 StartFile 那一刻的（現在的狀態可能已經是這個檔案的了：同一批事件裡它也改用了 null）
-                if self.player.take_fell_back_at_start() {
+                // 看開檔那一刻直接問 mpv 的（mpv 自己開始的清單項目是 StartFile 時問的；觀察到的 current-ao 跟事件
+                // 分批的方式有關，可能已經是這個檔案的、或還沒收到上一個的，見 `Player::take_fell_back_before_open`）。
+                // 每個檔案最多重開一次
+                if self.player.take_fell_back_before_open() {
                     self.retry_audio_output();
                 }
             }
