@@ -8,6 +8,7 @@
 //!   要測的用假的（[`MediaBackend::Custom`]），絕不碰使用者的系統媒體控制。
 //! - 音訊檔的專輯封面：mpv 把封面當成影像，`screenshot-to-file … video` 存成 PNG 放在快取資料夾的 `covers/`
 //!   （`cover-<pid>-<第幾個檔案>.png`；MPRIS 要檔案，其他系統用內容）。換檔、關掉時刪掉自己的，啟動時清掉一天以上的。
+//! - 各系統：Windows 的 SMTC 在 `windows.rs`（也有視窗在最前面時的媒體鍵 `windows::msg_hook`）。
 
 use crate::keymap::Command;
 use crate::playlist::Repeat;
@@ -19,6 +20,9 @@ use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 pub use crate::instance::Wake;
+
+#[cfg(windows)]
+pub mod windows;
 
 /// 位置跟預期的差超過這麼多秒就當成跳轉（跳轉、換章節、重複單一檔案繞回開頭）
 pub const SEEK_JUMP: f64 = 1.0;
@@ -130,6 +134,8 @@ pub struct PlaybackInfo {
     pub repeat: Repeat,
     /// 音量（1.0 = 100%，超過 100% 的放大也算）
     pub volume: f64,
+    /// 網路串流在等快取（paused-for-cache）：狀態還是播放中，但位置不會前進
+    pub buffering: bool,
 }
 
 impl PlaybackInfo {
@@ -181,6 +187,10 @@ pub trait MediaSession {
     fn apply(&mut self, update: &Update);
     /// 結束：系統不再顯示影戲，也不再送指令（關掉設定、結束影戲時）
     fn shutdown(&mut self);
+    /// 還能用：系統那一端斷線了（例如 Windows 的檔案總管重開）時 false，介面在下一個檔案時重新建立
+    fn alive(&self) -> bool {
+        true
+    }
 }
 
 /// 建立好的工作階段，和它送來的指令
@@ -221,15 +231,23 @@ impl MediaBackend {
     }
 }
 
-/// 這個作業系統的媒體控制做好了沒（各系統的實作加進來時打開）
+/// 這個作業系統的媒體控制做好了沒（各系統的實作加進來時打開）：Windows 的 SMTC
 pub const fn system_supported() -> bool {
-    false
+    cfg!(windows)
 }
 
-/// 建立這個作業系統的工作階段
+/// 建立這個作業系統的工作階段（`identity`：程式名稱，MPRIS 用；Windows 顯示的是程式本身的名稱與圖示）
 pub fn create_system(owner: Option<RawWindowHandle>, identity: &str, wake: Wake) -> Result<Opened, String> {
-    let _ = (owner, identity, wake);
-    Err(crate::tr!("這個系統還不支援", "Not supported on this system yet").to_owned())
+    #[cfg(windows)]
+    {
+        let _ = identity;
+        self::windows::create(owner, wake)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (owner, identity, wake);
+        Err(crate::tr!("這個系統還不支援", "Not supported on this system yet").to_owned())
+    }
 }
 
 // ───────────── 什麼時候送什麼 ─────────────
@@ -284,14 +302,16 @@ impl SessionSync {
             return out;
         };
         let elapsed = now.saturating_duration_since(*at);
-        let expected = if last.status == Status::Playing {
+        // 在等快取時位置不會前進：不然每過 1 秒就被當成跳轉，一直送
+        let advancing = last.status == Status::Playing && !last.buffering;
+        let expected = if advancing {
             last.position + elapsed.as_secs_f64() * last.rate
         } else {
             last.position
         };
         let seeked = (playback.position - expected).abs() > SEEK_JUMP;
         let changed = !last.same_state(playback);
-        let refresh = playback.status == Status::Playing && elapsed >= REFRESH_EVERY;
+        let refresh = playback.status == Status::Playing && !playback.buffering && elapsed >= REFRESH_EVERY;
         if seeked || changed || refresh {
             out.push(self.send(playback, seeked, now));
         }
@@ -519,6 +539,7 @@ mod tests {
             shuffle: false,
             repeat: Repeat::Off,
             volume: 1.0,
+            buffering: false,
         }
     }
 
@@ -649,6 +670,7 @@ mod tests {
             |p| p.rate = 1.5,
             |p| p.seekable = false,
             |p| p.status = Status::Paused,
+            |p| p.buffering = true,
         ] {
             let mut p = playing(0.0);
             change(&mut p);
@@ -656,6 +678,45 @@ mod tests {
             assert_eq!(out, [Update::Playback { info: p, seeked: false }]);
             s.tick(Some(&track(1)), &playing(0.0), t0);
         }
+    }
+
+    #[test]
+    fn sync_buffering_is_not_a_seek() {
+        let mut s = SessionSync::new();
+        let t0 = Instant::now();
+        s.tick(Some(&track(1)), &playing(10.0), t0);
+        // 開始等快取：狀態變了，送一次
+        let mut stalled = playing(10.2);
+        stalled.buffering = true;
+        assert_eq!(
+            s.tick(Some(&track(1)), &stalled, t0 + secs(0.2)),
+            [Update::Playback {
+                info: stalled.clone(),
+                seeked: false
+            }]
+        );
+        // 等了 30 秒：位置沒動，不是跳轉，也不定期送
+        for i in 1..=300 {
+            let t = 0.2 + f64::from(i) * 0.1;
+            assert!(s.tick(Some(&track(1)), &stalled, t0 + secs(t)).is_empty(), "{t}");
+        }
+        // 等到了，接著播：送一次（不是跳轉），之後照常
+        assert!(matches!(
+            &s.tick(Some(&track(1)), &playing(10.2), t0 + secs(30.3))[..],
+            [Update::Playback { seeked: false, .. }]
+        ));
+        assert!(s.tick(Some(&track(1)), &playing(11.2), t0 + secs(31.3)).is_empty());
+        // 等快取的時候被跳轉：照樣看得出來
+        stalled.position = 11.3;
+        assert!(matches!(
+            &s.tick(Some(&track(1)), &stalled, t0 + secs(31.4))[..],
+            [Update::Playback { seeked: false, .. }]
+        ));
+        stalled.position = 50.0;
+        assert!(matches!(
+            &s.tick(Some(&track(1)), &stalled, t0 + secs(31.5))[..],
+            [Update::Playback { seeked: true, .. }]
+        ));
     }
 
     #[test]
@@ -841,6 +902,12 @@ mod tests {
         );
         let s: SystemMedia = serde_json::from_str(r#"{"details": false}"#).unwrap();
         assert!(s.enabled && !s.details);
+    }
+
+    #[test]
+    fn windows_has_a_system_session() {
+        // Windows 的 SMTC 做好了；其他系統的在之後的子批次打開
+        assert_eq!(system_supported(), cfg!(windows));
     }
 
     #[test]

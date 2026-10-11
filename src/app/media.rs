@@ -3,6 +3,7 @@
 //!
 //! - 第一次有檔案載入時才建立工作階段（沒有在播時系統的媒體控制不會多出影戲）；關掉設定、結束時結束。
 //!   建立失敗：記下原因（「設定 → 系統」顯示），關掉再打開設定之前不再試。
+//!   系統那一端斷線了（`MediaSession::alive`；例如 Windows 的檔案總管重開）：結束它，下一個檔案載入時重新建立。
 //! - 系統的指令：播放、暫停、停止、上一個 / 下一個跟按鍵走同一條路（`Command` → `Action` → `run`），
 //!   所以也會取消播完後的倒數；沒有在播時的「播放」開停止前的那個檔案（還原的清單開接下來要播的）。
 //!   指令不會叫出控制列（不算滑鼠、鍵盤的動作），提示照常顯示。
@@ -39,6 +40,8 @@ pub(super) struct MediaUi {
     commands: Option<Receiver<MediaCommand>>,
     /// 建立工作階段失敗的原因（「設定 → 系統」顯示；關掉再打開設定之前不再試）
     error: Option<String>,
+    /// 工作階段斷線時系統顯示的檔案（這個檔案播放期間不重新建立，換檔再試：不會每一幀一直重建）
+    lost_at: Option<u64>,
     sync: SessionSync,
     /// 目前檔案的資訊、算它用的來源（來源變了才重新整理）
     track: Option<(TrackKey, TrackInfo)>,
@@ -118,6 +121,12 @@ impl VitascopeApp {
         self.media.error.as_deref()
     }
 
+    /// 測試用：系統那一端斷線、等下一個檔案重新建立
+    #[doc(hidden)]
+    pub fn media_session_lost(&self) -> bool {
+        self.media.lost_at.is_some()
+    }
+
     /// 測試用：送給系統的更新數
     #[doc(hidden)]
     pub fn media_updates_applied(&self) -> u64 {
@@ -149,7 +158,17 @@ impl VitascopeApp {
             self.media_end();
             // 關掉再打開時重新試
             self.media.error = None;
+            self.media.lost_at = None;
             return;
+        }
+        if self.media.session.as_ref().is_some_and(|s| !s.alive()) {
+            if std::env::var_os("VITASCOPE_DEBUG_MEDIA").is_some() {
+                eprintln!("[media] 系統媒體控制斷線了，下一個檔案時重新建立");
+            }
+            // 記下斷線時系統顯示的檔案（不是 `file_gen`：換檔途中 StartFile 已經加過了，那是正在載入的檔案，
+            // 它載入時要重新建立）。沒有顯示任何檔案時 None：下一個載入的檔案就重新建立
+            self.media.lost_at = self.media.sync.sent_track().map(|t| t.file_gen);
+            self.media_end();
         }
         if self.media.session.is_none() && !self.media_start(ctx) {
             return;
@@ -169,7 +188,11 @@ impl VitascopeApp {
 
     /// 第一次有檔案載入時建立工作階段；回傳有沒有工作階段
     fn media_start(&mut self, ctx: &egui::Context) -> bool {
-        if !self.media.backend.available() || self.media.error.is_some() || !self.player.state.loaded {
+        if !self.media.backend.available()
+            || self.media.error.is_some()
+            || !self.player.state.loaded
+            || self.media.lost_at == Some(self.file_gen)
+        {
             return false;
         }
         let ctx = ctx.clone();
@@ -181,6 +204,7 @@ impl VitascopeApp {
                 self.media.commands = Some(commands);
                 self.media.sync = SessionSync::new();
                 self.media.cover = None;
+                self.media.lost_at = None;
                 true
             }
             Err(e) => {
@@ -426,6 +450,7 @@ impl VitascopeApp {
                 self.effective_repeat()
             },
             volume: self.player.volume_total() / 100.0,
+            buffering: st.loaded && st.paused_for_cache,
         }
     }
 

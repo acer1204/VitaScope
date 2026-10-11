@@ -75,6 +75,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# 系統媒體控制：Windows 的 SMTC（音量浮動視窗、鎖定畫面、媒體鍵）與封面的記憶體資料流。
+# 本來就在相依樹裡（accesskit_windows 用的），只多開幾個功能，沒有新套件
+windows = { version = "0.62", default-features = false, features = [
+    "Media",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }
+# 視窗在最前面時的媒體鍵：winit 的訊息掛鉤（eframe 只轉出 EventLoopBuilder）；本來就在相依樹裡（同一個版本）
+winit = { version = "0.30", default-features = false }
 
 # macOS：Finder 開檔送來的 Apple Event（winit 沒有提供）
 [target.'cfg(unix)'.dependencies]
@@ -125,3 +135,7 @@ opt-level = 2
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe"] }
+
+# Windows：SMTC 的實機測試（#[ignore]）從系統那一端找到影戲的工作階段、按它的按鈕
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", default-features = false, features = ["Media_Control"] }

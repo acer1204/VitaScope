@@ -3,6 +3,7 @@
 //! - `/f/<路徑>`：`samples/generated` 底下的檔案；支援 `Range`（206）、HEAD，Content-Type 依副檔名
 //! - `/status/<代碼>`：回應這個狀態碼
 //! - `/slow`：收下請求、永遠不回應（測連線逾時）
+//! - `/hold/<路徑>`：收下請求、等測試呼叫 `release()` 才跟 `/f/` 一樣送出（檔案一直「載入中」，直到測試放行）
 //! - `/html`：一個網頁（不是影片）
 //! - `/m3u`：網路上的播放清單：兩個 `/f/` 的網址，中間夾一個 `file:///` 的項目（匯入時要拿掉）
 //! - `/hlslive/<路徑>`：像直播一樣的 HLS：`.m3u8` 拿掉結尾的 `#EXT-X-ENDLIST`（和 VOD 的標記），片段照常送。
@@ -108,6 +109,8 @@ struct Shared {
     root: PathBuf,
     log: Mutex<Vec<Request>>,
     stop: AtomicBool,
+    /// `/hold/` 放行了
+    released: AtomicBool,
     canned: Mutex<HashMap<String, Canned>>,
 }
 
@@ -129,6 +132,7 @@ impl Server {
             root,
             log: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             canned: Mutex::new(HashMap::new()),
         });
         let s = shared.clone();
@@ -166,6 +170,11 @@ impl Server {
     /// 路徑 `path`（不含查詢字串）固定回應 `c`（取代同一個路徑之前指定的）
     pub fn put(&self, path: &str, c: Canned) {
         self.shared.canned.lock().unwrap().insert(path.to_owned(), c);
+    }
+
+    /// 放行 `/hold/` 的請求（在等的、之後來的都照 `/f/` 送）
+    pub fn release(&self) {
+        self.shared.released.store(true, Ordering::SeqCst);
     }
 
     /// 拿掉 `put` 指定的回應（之後回應 404）
@@ -244,6 +253,16 @@ fn serve(conn: TcpStream, s: &Shared) -> std::io::Result<()> {
         return send_canned(&mut out, &c, head, s);
     }
     if let Some(rel) = route.strip_prefix("/f/") {
+        return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
+    }
+    if let Some(rel) = route.strip_prefix("/hold/") {
+        let start = Instant::now();
+        while !s.released.load(Ordering::SeqCst) {
+            if s.stop.load(Ordering::SeqCst) || start.elapsed() > SLOW_LIMIT {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
         return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
     }
     if let Some(rel) = route.strip_prefix("/norange/") {

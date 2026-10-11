@@ -602,9 +602,10 @@ fn has_out_format(json: &str) -> bool {
 /// Windows：整個程式一直保有多執行緒 COM（MTA）。mpv 偵測音訊裝置插拔（觀察 `audio-device-list`）時，
 /// 在自己的核心執行緒上 `CoInitializeEx(MTA)`，關閉時 `CoUninitialize`；那是程式裡唯一的 MTA 時，
 /// COM 整個被拆掉，系統的裝置通知卻還在用，關閉播放器時存取違規（GitHub 的 Windows 虛擬機上每次都會）。
-/// 先登記一份程式層級的 MTA 使用（不再減回去），mpv 收掉的就只是它自己那一份
+/// 先登記一份程式層級的 MTA 使用（不再減回去），mpv 收掉的就只是它自己那一份。
+/// 系統媒體控制的背景執行緒也靠這一份當隱含的 MTA（`media_keys::windows`；沒有播放器的測試也會先呼叫）
 #[cfg(windows)]
-fn keep_com_mta_alive() {
+pub(crate) fn keep_com_mta_alive() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut cookie = std::ptr::null_mut();

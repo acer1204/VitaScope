@@ -17,6 +17,8 @@ struct Shared {
     shutdowns: Mutex<usize>,
     /// 建立時回傳這個錯誤
     fail: Mutex<Option<String>>,
+    /// 目前的工作階段斷線了（`MediaSession::alive` 回傳 false；新建立的又是好的）
+    lost: Mutex<bool>,
 }
 
 #[derive(Clone, Default)]
@@ -39,6 +41,7 @@ impl FakeMedia {
             *shared.sender.lock().unwrap() = Some(tx);
             *shared.wake.lock().unwrap() = Some(wake);
             *shared.created.lock().unwrap() += 1;
+            *shared.lost.lock().unwrap() = false;
             let session: Box<dyn MediaSession> = Box::new(FakeSession {
                 shared: shared.clone(),
                 ended: false,
@@ -50,6 +53,14 @@ impl FakeMedia {
     /// 之後建立時失敗（None = 成功）
     pub fn fail_with(&self, e: Option<&str>) {
         *self.0.fail.lock().unwrap() = e.map(str::to_owned);
+    }
+
+    /// 像系統那一端斷線了（Windows 的檔案總管重開之類的）：目前的工作階段不能用了，叫醒介面
+    pub fn lose(&self) {
+        *self.0.lost.lock().unwrap() = true;
+        if let Some(wake) = self.0.wake.lock().unwrap().as_ref() {
+            wake();
+        }
     }
 
     /// 像使用者按了媒體鍵：送給目前的工作階段，叫醒介面。沒有工作階段時回傳 false
@@ -124,6 +135,10 @@ impl MediaSession for FakeSession {
     fn apply(&mut self, update: &Update) {
         assert!(!self.ended, "工作階段結束之後不能再送更新：{update:?}");
         self.shared.updates.lock().unwrap().push(update.clone());
+    }
+
+    fn alive(&self) -> bool {
+        !*self.shared.lost.lock().unwrap()
     }
 
     fn shutdown(&mut self) {

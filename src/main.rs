@@ -236,6 +236,8 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // 自動截圖不裝（跟其他真的系統功能一樣）
+        event_loop_builder: media_key_hook(launch.autoshot.is_none()),
         // mpv 的 render API 只支援 OpenGL
         renderer: eframe::Renderer::Glow,
         // 顯示器同步靠 swap 等垂直同步；不能關
@@ -277,6 +279,20 @@ fn main() -> eframe::Result {
         ));
     }
     result
+}
+
+/// Windows：視窗在最前面時按的媒體鍵交給系統（winit 會把它吃掉；見 `media_keys::windows::msg_hook`）。
+/// `install` = false（自動截圖）時不裝；其他系統沒有
+fn media_key_hook(install: bool) -> Option<eframe::EventLoopBuilderHook> {
+    #[cfg(windows)]
+    if install {
+        return Some(Box::new(|builder| {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_msg_hook(vitascope::media_keys::windows::msg_hook);
+        }));
+    }
+    let _ = install;
+    None
 }
 
 /// 檔案關聯的設定跟登錄檔對齊（見 `assoc::on_startup`）：安裝程式勾了檔案關聯時設定跟著打開；

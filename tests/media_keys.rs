@@ -1,7 +1,8 @@
 //! 系統的媒體控制（媒體鍵、Windows 的媒體控制、macOS 的「正在播放」、Linux 的 MPRIS）。
 //!
 //! 這裡用假的系統（`support::fake_media`）：影戲送出的更新記下來，測試自己送指令（像使用者按了媒體鍵）。
-//! 絕不碰真的系統媒體控制（`Launch` 的預設沒有）。各系統真的實作的測試在之後的子批次加進來。
+//! 絕不碰真的系統媒體控制（`Launch` 的預設沒有）。各系統真的實作的測試是 `#[ignore]` 的（會短暫出現在
+//! 系統的媒體控制裡），在開發機上手動跑：Windows `smtc_session_round_trip`。
 //!
 //! 樣本來自 `python scripts/gen_samples.py`。
 
@@ -1045,6 +1046,360 @@ fn raise_quit_and_open_uri() {
     fake.send(MediaCommand::Quit);
     h.step();
     assert!(viewport_commands(&h).contains(&egui::ViewportCommand::Close));
+}
+
+/// 網路串流在等快取：系統收到「在等」（位置不會前進，不會被當成一直在跳轉），等到了再收到一次
+#[test]
+fn a_stall_for_cache_reaches_the_session() {
+    let dir = TempDir::new("buffering");
+    let long = dir.copy("common/mp4_long.mp4", "long.mp4");
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![long], dir.settings());
+    step_until_app(&mut h, "開始播放", |app| playing(app, "long.mp4"));
+    step_until(&mut h, "系統收到「播放中」", || {
+        last_status(&fake) == Some(Status::Playing)
+    });
+    assert!(!fake.last_playback().unwrap().buffering);
+    // 本機檔案不會真的等快取：直接改介面記下的狀態（mpv 那邊沒變，不會再通知）
+    h.state_mut().player_mut().state.paused_for_cache = true;
+    step_until(&mut h, "系統收到「在等快取」", || {
+        fake.last_playback().is_some_and(|p| p.buffering)
+    });
+    assert_eq!(last_status(&fake), Some(Status::Playing), "狀態還是播放中");
+    h.state_mut().player_mut().state.paused_for_cache = false;
+    step_until(&mut h, "系統收到「等到了」", || {
+        fake.last_playback().is_some_and(|p| !p.buffering)
+    });
+}
+
+/// 系統那一端斷線了（Windows 的檔案總管重開之類的）：結束工作階段；同一個檔案播放期間不一直重建，
+/// 下一個檔案載入時重新建立、重新送檔案資訊
+#[test]
+fn a_lost_session_is_rebuilt_with_the_next_file() {
+    let dir = TempDir::new("lost");
+    let (a, b) = (dir.clip("a.mp4"), dir.clip("b.mp4"));
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![a, b], dir.settings());
+    step_until_app(&mut h, "a.mp4 開始播放", |app| playing(app, "a.mp4"));
+    step_until(&mut h, "系統收到「播放中」", || {
+        last_status(&fake) == Some(Status::Playing)
+    });
+    assert_eq!(fake.created(), 1);
+    fake.lose();
+    step_until(&mut h, "斷線的工作階段結束了", || fake.shutdowns() == 1);
+    assert!(!h.state().media_session_active());
+    assert!(h.state().media_session_lost());
+    wait_real(&mut h, 0.5);
+    assert_eq!(fake.attempts(), 1, "同一個檔案播放期間不重建");
+    fake.take_updates();
+    h.key_press(egui::Key::PageDown);
+    step_until_app(&mut h, "b.mp4 開始播放", |app| playing(app, "b.mp4"));
+    step_until(&mut h, "重新建立", || fake.created() == 2);
+    step_until(&mut h, "新的工作階段收到 b.mp4", || {
+        fake.last_track()
+            .is_some_and(|t| t.url.is_some_and(|u| u.ends_with("b.mp4")))
+    });
+    assert!(h.state().media_session_active());
+    assert!(!h.state().media_session_lost());
+}
+
+/// 換檔途中（StartFile 之後、FileLoaded 之前）才發現斷線：正在載入的檔案載入時就重新建立，
+/// 不是要等到再下一個檔案（那可能是一整部電影）。檔案用 `/hold/` 停在載入中，斷線處理完才放行
+#[test]
+fn a_session_lost_while_the_next_file_loads_is_rebuilt_for_it() {
+    let server = Server::start();
+    let dir = TempDir::new("lost-switch");
+    let a = dir.clip("a.mp4");
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![a], dir.settings());
+    step_until_app(&mut h, "a.mp4 開始播放", |app| playing(app, "a.mp4"));
+    step_until(&mut h, "系統收到「播放中」", || {
+        last_status(&fake) == Some(Status::Playing)
+    });
+    assert_eq!(fake.created(), 1);
+    h.event(egui::Event::Paste(server.url("/hold/common/mp4_h264_aac.mp4")));
+    step_until(&mut h, "連到伺服器", || !server.requests_to("/hold/").is_empty());
+    step_until_app(&mut h, "換檔途中（舊的卸載了、新的載入中）", |app| {
+        let s = &app.player().state;
+        s.loading && !s.loaded
+    });
+    fake.lose();
+    step_until(&mut h, "斷線的工作階段結束了", || fake.shutdowns() == 1);
+    assert!(!h.state().media_session_active());
+    wait_real(&mut h, 0.3);
+    assert_eq!(fake.attempts(), 1, "還在載入：先不重建");
+    fake.take_updates();
+    server.release();
+    step_until_app(&mut h, "網址的檔案開始播放", |app| {
+        playing(app, "mp4_h264_aac.mp4")
+    });
+    step_until(&mut h, "正在載入的檔案載入時重新建立", || {
+        fake.created() == 2
+    });
+    step_until(&mut h, "新的工作階段收到這個檔案", || {
+        fake.last_track().is_some_and(|t| t.title == "mp4_h264_aac.mp4")
+    });
+    assert!(h.state().media_session_active());
+    assert!(!h.state().media_session_lost());
+}
+
+// ───────────── Windows：真的 SMTC ─────────────
+
+/// 真的 SMTC 來回一趟：從系統那一端（`GlobalSystemMediaTransportControlsSessionManager`，跟音量浮動視窗看到的一樣）
+/// 找到影戲的工作階段，看標題、封面、時間軸、重複，再按它的按鈕，影戲收到對應的指令；結束後系統不再列出。
+/// 只操作這個測試自己的工作階段（不送全域的媒體鍵）；會短暫出現在使用者的媒體控制裡，所以 `#[ignore]`
+#[cfg(windows)]
+#[test]
+#[ignore = "會短暫出現在 Windows 的媒體控制（音量浮動視窗）裡：在開發機上手動跑"]
+fn smtc_session_round_trip() {
+    use std::num::NonZeroIsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use vitascope::media_keys::{Cover, PlaybackInfo, TrackInfo};
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSession as Session,
+        GlobalSystemMediaTransportControlsSessionManager as Manager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as SessionStatus,
+    };
+    use windows::Media::{MediaPlaybackAutoRepeatMode, MediaPlaybackType};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, UnregisterClassW, WNDCLASSW,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    const TICKS: f64 = 10_000_000.0;
+    let pid = std::process::id();
+    // 測試自己的隱藏視窗（SMTC 跟著視窗）
+    let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let class = wide(&format!("VitaScopeSmtcTest{pid}"));
+    // SAFETY: 這個測試執行緒自己的視窗類別與隱藏視窗（不顯示），測試結束前銷毀
+    let hwnd = unsafe {
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            lpszClassName: class.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        assert_ne!(RegisterClassW(&wc), 0);
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            class.as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            100,
+            100,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        )
+    };
+    assert!(!hwnd.is_null());
+    let owner = raw_window_handle::RawWindowHandle::Win32(raw_window_handle::Win32WindowHandle::new(
+        NonZeroIsize::new(hwnd as isize).unwrap(),
+    ));
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let w = wakes.clone();
+    let (mut session, commands) = media_keys::create_system(
+        Some(owner),
+        "VitaScope",
+        Arc::new(move || {
+            w.fetch_add(1, Ordering::Relaxed);
+        }),
+    )
+    .expect("建立 SMTC");
+
+    let title = format!("VitaScope 測試 {pid}");
+    let mut track = TrackInfo {
+        file_gen: 1,
+        kind: MediaKind::Audio,
+        title: format!("{title}（舊標題）"),
+        artist: Some("影戲".into()),
+        album: Some("測試專輯".into()),
+        album_artist: None,
+        track_no: Some(3),
+        duration: Some(120.0),
+        url: None,
+        details: true,
+    };
+    // 4×4 的紅色 PNG
+    let mut png = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png, 4, 4);
+        enc.set_color(png::ColorType::Rgb);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[255, 0, 0].repeat(16))
+            .unwrap();
+    }
+    let info = PlaybackInfo {
+        status: Status::Playing,
+        position: 30.0,
+        rate: 1.0,
+        seekable: true,
+        can_next: true,
+        can_prev: true,
+        shuffle: false,
+        repeat: Repeat::All,
+        volume: 1.0,
+        buffering: false,
+    };
+    session.apply(&Update::Track(track.clone()));
+    session.apply(&Update::Cover(Cover {
+        file_gen: 1,
+        png: Arc::new(png),
+        path: PathBuf::from("cover.png"),
+    }));
+    session.apply(&Update::Playback {
+        info: info.clone(),
+        seeked: true,
+    });
+    // 同一個檔案換標題（ClearAll）：封面要放回去（S-B12）
+    track.title = title.clone();
+    session.apply(&Update::Track(track.clone()));
+    session.apply(&Update::Playback { info, seeked: true });
+
+    let manager = Manager::RequestAsync().unwrap().join().unwrap();
+    let find = |want: &str| -> Option<Session> {
+        manager.GetSessions().ok()?.into_iter().find(|s| {
+            s.TryGetMediaPropertiesAsync()
+                .and_then(|op| op.join())
+                .and_then(|p| p.Title())
+                .is_ok_and(|t| t == want)
+        })
+    };
+    let start = Instant::now();
+    let found = loop {
+        if let Some(s) = find(&title) {
+            break s;
+        }
+        assert!(start.elapsed() < TIMEOUT, "系統的媒體控制找不到「{title}」");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let props = found.TryGetMediaPropertiesAsync().unwrap().join().unwrap();
+    assert_eq!(props.Artist().unwrap(), "影戲");
+    assert_eq!(props.AlbumTitle().unwrap(), "測試專輯");
+    assert_eq!(props.TrackNumber().unwrap(), 3);
+    assert_eq!(props.PlaybackType().unwrap().Value().unwrap(), MediaPlaybackType::Music);
+    assert!(props.Thumbnail().is_ok(), "換標題之後封面還在");
+    let tl = found.GetTimelineProperties().unwrap();
+    assert_eq!(tl.EndTime().unwrap().Duration as f64 / TICKS, 120.0);
+    assert_eq!(tl.MaxSeekTime().unwrap().Duration as f64 / TICKS, 120.0);
+    assert_eq!(tl.Position().unwrap().Duration as f64 / TICKS, 30.0);
+    let pb = found.GetPlaybackInfo().unwrap();
+    assert_eq!(pb.PlaybackStatus().unwrap(), SessionStatus::Playing);
+    assert_eq!(
+        pb.AutoRepeatMode().unwrap().Value().unwrap(),
+        MediaPlaybackAutoRepeatMode::List
+    );
+    assert!(pb.Controls().unwrap().IsNextEnabled().unwrap());
+
+    // 系統那一端按按鈕：影戲收到對應的指令（播放中按播放／暫停 = 暫停）
+    let expect = |what: &str, want: MediaCommand| {
+        let got = commands
+            .recv_timeout(TIMEOUT)
+            .unwrap_or_else(|_| panic!("沒收到 {what}"));
+        assert_eq!(got, want, "{what}");
+    };
+    assert!(found.TryTogglePlayPauseAsync().unwrap().join().unwrap());
+    expect("播放／暫停", MediaCommand::Pause);
+    assert!(found.TrySkipNextAsync().unwrap().join().unwrap());
+    expect("下一個", MediaCommand::Next);
+    assert!(found.TrySkipPreviousAsync().unwrap().join().unwrap());
+    expect("上一個", MediaCommand::Previous);
+    assert!(found.TryStopAsync().unwrap().join().unwrap());
+    expect("停止", MediaCommand::Stop);
+    assert!(
+        found
+            .TryChangePlaybackPositionAsync(45 * TICKS as i64)
+            .unwrap()
+            .join()
+            .unwrap()
+    );
+    expect(
+        "時間軸",
+        MediaCommand::SeekTo {
+            secs: 45.0,
+            track: Some(1),
+        },
+    );
+    assert!(
+        found
+            .TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode::Track)
+            .unwrap()
+            .join()
+            .unwrap()
+    );
+    expect("重複", MediaCommand::SetRepeat(Repeat::One));
+    assert!(found.TryChangeShuffleActiveAsync(true).unwrap().join().unwrap());
+    expect("隨機", MediaCommand::SetShuffle(true));
+    assert!(found.TryChangePlaybackRateAsync(1.5).unwrap().join().unwrap());
+    expect("速度", MediaCommand::SetRate(1.5));
+    // 先送進通道、才叫醒介面（系統的執行緒上）：收到最後一個指令時那一下可能還沒叫，等一下
+    let start = Instant::now();
+    while wakes.load(Ordering::Relaxed) < 8 {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "每個指令都叫醒介面：{}",
+            wakes.load(Ordering::Relaxed)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // 結束：系統不再列出
+    session.shutdown();
+    let start = Instant::now();
+    while find(&title).is_some() {
+        assert!(start.elapsed() < TIMEOUT, "結束之後系統還列著「{title}」");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(session);
+
+    // 關掉再打開設定（同一個視窗再建立一次）：又出現；按鈕只送到新的工作階段一次（舊的事件拿掉了）
+    let (mut again, commands2) =
+        media_keys::create_system(Some(owner), "VitaScope", Arc::new(|| {})).expect("再建立 SMTC");
+    let title2 = format!("{title}（再一次）");
+    track.file_gen = 2;
+    track.title = title2.clone();
+    again.apply(&Update::Track(track));
+    again.apply(&Update::Playback {
+        info: PlaybackInfo {
+            status: Status::Paused,
+            position: 0.0,
+            rate: 1.0,
+            seekable: true,
+            can_next: true,
+            can_prev: false,
+            shuffle: false,
+            repeat: Repeat::Off,
+            volume: 1.0,
+            buffering: false,
+        },
+        seeked: true,
+    });
+    let start = Instant::now();
+    let found = loop {
+        if let Some(s) = find(&title2) {
+            break s;
+        }
+        assert!(start.elapsed() < TIMEOUT, "再建立之後找不到「{title2}」");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(found.TryTogglePlayPauseAsync().unwrap().join().unwrap());
+    assert_eq!(
+        commands2.recv_timeout(TIMEOUT),
+        Ok(MediaCommand::Play),
+        "暫停中按播放／暫停 = 播放"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(commands2.try_recv().is_err(), "只送一次");
+    assert!(commands.try_recv().is_err(), "舊的工作階段收不到");
+    again.shutdown();
+    // SAFETY: 上面建立的視窗與類別
+    unsafe {
+        DestroyWindow(hwnd);
+        UnregisterClassW(class.as_ptr(), std::ptr::null_mut());
+    }
 }
 
 // ───────────── mpv：專輯封面存成 PNG ─────────────
