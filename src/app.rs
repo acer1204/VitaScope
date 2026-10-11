@@ -9,6 +9,7 @@ mod info_panel;
 mod install;
 mod network;
 mod pacing;
+mod play_order;
 mod playlist_panel;
 mod preview;
 mod quality;
@@ -30,7 +31,7 @@ use crate::picture::{
     Upscaler,
 };
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
-use crate::playlist::Playlist;
+use crate::playlist::{Playlist, Shuffler};
 use crate::settings::{OnTop, Settings, SideTab, SubStyle, WindowGeometry};
 use crate::sound::{EqPreset, Leveling};
 use crate::theme::{self, Palette, ThemeChoice};
@@ -389,6 +390,16 @@ pub struct VitascopeApp {
     pending_subs: Option<(PathBuf, Vec<PathBuf>)>,
     /// 播完時資料夾還沒掃描完（不知道有沒有下一個）：掃描完再接下一個
     pending_auto_next: bool,
+    /// 隨機播放洗牌用的亂數（清單本身不帶亂數，才能維持 `Clone`）
+    shuffler: Shuffler,
+    /// 目前的檔案是自動接下一個開的：開不起來時跳過（[`play_order::AutoAdvance`]）
+    auto_advance: Option<play_order::AutoAdvance>,
+    /// 播放結束了幾次（清單播完等；「播完後」的動作從這裡開始）
+    finished_count: u64,
+    /// 上次送給 mpv 的 loop-file（mpv 的預設是 no）
+    loop_file_sent: &'static str,
+    /// 目前的檔案不能跳轉（載入完成時問 mpv）：重複單一檔案不用 mpv 的 loop-file
+    unseekable_file: bool,
     /// 這一幀開始時是否有選單開著（點畫面關選單時，不要順便暫停）
     popup_open_at_start: bool,
     /// 畫面調整（長寬比、裁切、縮放、旋轉、翻轉）；換檔時還原
@@ -766,7 +777,8 @@ impl VitascopeApp {
             bookmark_selected: None,
             bookmark_edit: None,
             bookmarks_clear: None,
-            playlist: launch.playlist.clone(),
+            // 上次的清單在下面經過 replace_playlist（開著隨機播放時重新洗牌、從上次的檔案開始）
+            playlist: None,
             titles,
             url_dialog: None,
             url_prefill_wait: network::PREFILL_WAIT,
@@ -804,6 +816,11 @@ impl VitascopeApp {
             resume_target: None,
             pending_subs: None,
             pending_auto_next: false,
+            shuffler: Shuffler::from_time(),
+            auto_advance: None,
+            finished_count: 0,
+            loop_file_sent: "no",
+            unseekable_file: false,
             popup_open_at_start: false,
             geometry: Geometry::default(),
             natural: None,
@@ -884,6 +901,9 @@ impl VitascopeApp {
             .player
             .get_string("mpv-configuration")
             .is_ok_and(|c| c.contains("gpl=false"));
+        if let Some(list) = launch.playlist {
+            app.replace_playlist(list);
+        }
         // 軟體繪圖的判斷（gpu-dumb-mode）已經做完、還沒開任何檔案：這時才能同步設定 mpv
         app.apply_startup();
         if launch.files.is_empty() {
@@ -1033,6 +1053,8 @@ impl VitascopeApp {
         self.sound_startup();
         // 網路：憑證檢查、逾時、快取、重新連線、標頭（命令列給的網址也要生效）
         self.net_startup();
+        // 重複單一檔案（mpv 的 loop-file）
+        self.play_order_startup();
     }
 
     // ───────────── 非同步設定 mpv 選項 ─────────────
@@ -1136,6 +1158,8 @@ impl VitascopeApp {
     ) {
         // 換畫質時要保留的狀態只給那一次（`reload_site` 開完才設定）
         self.reload_keep = None;
+        // 這次開的是使用者要的（自動接下一個的，開完才由 `advance` 記下）：開不起來就停在錯誤畫面
+        self.auto_advance = None;
         // 播放清單檔：換成檔案裡的清單（只讀一次；HLS 串流的 .m3u8 交給 mpv）
         if formats::is_playlist(path) && !is_url(&path.to_string_lossy()) {
             match crate::m3u::read_text(path) {
@@ -1173,9 +1197,9 @@ impl VitascopeApp {
             let text = path.to_string_lossy();
             if crate::net::is_network(&text) {
                 // 網路串流自己成一份清單（沒有資料夾可以掃）：播放清單面板看得到它，貼上、拖放的接在它後面
-                self.playlist = Some(Playlist::from_files(vec![path.clone()]));
+                self.replace_playlist(Playlist::from_files(vec![path.clone()]));
             } else if !is_url(&text) {
-                self.playlist = Some(Playlist::from_files(vec![path.clone()]));
+                self.replace_playlist(Playlist::from_files(vec![path.clone()]));
                 let (tx, rx) = mpsc::channel();
                 let (scan_path, ctx) = (path.clone(), self.egui_ctx.clone());
                 std::thread::spawn(move || {
@@ -1232,19 +1256,29 @@ impl VitascopeApp {
                 if let Some(current) = current
                     && list.select(&current)
                 {
-                    self.playlist = Some(list);
-                    let st = &self.player.state;
-                    let still_allowed = self.settings.auto_next
-                        && self.seek_drag.is_none()
-                        && self.drag_gen.is_none()
-                        && self.autoshot.is_none();
-                    if std::mem::take(&mut self.pending_auto_next) && still_allowed && st.loaded && st.eof {
-                        self.play_next_in_list();
-                    }
+                    // 開著隨機播放時重新套用（目前的檔案排第一個）：清單換掉了，原本只有一項的順序不能用
+                    self.replace_playlist(list);
+                    self.scan_follow_up();
                 }
             }
             Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => self.playlist_scan = None,
+            Err(TryRecvError::Disconnected) => {
+                self.playlist_scan = None;
+                self.scan_follow_up();
+            }
+        }
+    }
+
+    /// 播完時清單還在掃描（`EndStep::WaitScan`）：掃完了，照新的清單再決定一次
+    /// （有下一個就播，沒有就是播放結束）。這段期間拖了進度條、換了檔案就不管
+    fn scan_follow_up(&mut self) {
+        if !std::mem::take(&mut self.pending_auto_next) {
+            return;
+        }
+        let st = &self.player.state;
+        let still_ended = st.loaded && st.eof;
+        if still_ended && self.seek_drag.is_none() && self.drag_gen.is_none() && self.autoshot.is_none() {
+            self.file_ended(false);
         }
     }
 
@@ -1305,35 +1339,6 @@ impl VitascopeApp {
         let playing = st.loaded && !st.paused;
         if just_paused || (playing && self.last_autosave.elapsed() >= AUTOSAVE_EVERY) {
             self.remember_position();
-        }
-    }
-
-    /// 播放清單的上一個 / 下一個檔案
-    fn step_file(&mut self, forward: bool) {
-        let target = self.playlist.as_ref().and_then(|l| {
-            let i = if forward { l.next_index() } else { l.prev_index() }?;
-            Some((i, l.items()[i].clone()))
-        });
-        match target {
-            Some((i, path)) => {
-                self.open_at(&path, Some(i));
-                let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
-                let dir = if forward {
-                    crate::tr!("下一個", "Next")
-                } else {
-                    crate::tr!("上一個", "Previous")
-                };
-                self.osd(crate::tf!(
-                    "{dir}（{pos}/{len}）：{}",
-                    "{dir} ({pos}/{len}): {}",
-                    display_label(&self.titles, &path)
-                ));
-            }
-            None => self.osd(if forward {
-                crate::tr!("已經是最後一個檔案", "This is the last file")
-            } else {
-                crate::tr!("已經是第一個檔案", "This is the first file")
-            }),
         }
     }
 
@@ -2017,7 +2022,7 @@ impl VitascopeApp {
         match current {
             Some(c) if list.len() > 1 && list.select(&c) => {
                 self.playlist_scan = None;
-                self.playlist = Some(list);
+                self.replace_playlist(list);
                 self.owns_session = true;
                 self.persist_playlist();
             }
@@ -2141,6 +2146,7 @@ impl VitascopeApp {
                 self.refit_now = false;
                 self.switching_file = false;
                 self.pending_auto_next = false;
+                self.auto_advance_started();
                 // 自動存檔從開檔起重新計時（不然停在起始畫面很久再開檔，第一幀就會存到 0）
                 self.last_autosave = Instant::now();
                 self.file_gen += 1;
@@ -2155,12 +2161,19 @@ impl VitascopeApp {
                     self.retry_audio_output();
                 }
             }
-            PlayerEvent::FileLoaded => self.on_file_loaded(),
+            PlayerEvent::FileLoaded => {
+                // 自動接下一個開的檔案開成功了：開不起來的記錄清掉
+                self.auto_advance = None;
+                // 不能跳轉的檔案不用 mpv 的 loop-file（跳不回開頭）
+                self.play_order_file_loaded();
+                self.on_file_loaded();
+            }
             // 網站的播放清單（yt-dlp 解析出來的）：跟網路上的 .m3u 一樣展開成播放清單，照一般的開檔開要播的那一個
             PlayerEvent::NetPlaylist {
                 source,
                 entries,
                 start,
+                chosen,
                 dropped,
                 capped,
             } => {
@@ -2169,6 +2182,7 @@ impl VitascopeApp {
                         source,
                         entries,
                         start,
+                        chosen,
                         dropped,
                     },
                     capped,
@@ -2249,6 +2263,8 @@ impl VitascopeApp {
                 }
                 if let Some(e) = error {
                     eprintln!("[vitascope] {e}");
+                    // 自動接下一個開的檔案開不起來：下一幀跳過它（不在處理事件的中途開別的檔案）
+                    self.auto_advance_failed();
                     // 開檔失敗：不會直通，濾鏡鏈設回來
                     self.sound_open_failed();
                     // 開檔失敗也要截圖（截的是錯誤畫面）
@@ -2327,6 +2343,10 @@ impl VitascopeApp {
     /// 播完時自動播放清單的下一個檔案。只算「播放中播到結尾」：
     /// 暫停中逐格或跳轉到結尾不算；拖曳進度條期間也先不動，放開後再說
     fn auto_next(&mut self) {
+        // 自動接下一個開的檔案開不起來：跳過（自動截圖不換檔）
+        if self.autoshot.is_none() && self.skip_failed() {
+            return;
+        }
         if self.seek_drag.is_some() || self.drag_gen.is_some() {
             let st = &self.player.state;
             if st.loaded && st.eof && self.was_playing {
@@ -2351,32 +2371,11 @@ impl VitascopeApp {
         // mpv 播到結尾時會同時設定暫停，所以看的是上一幀還在播放
         self.was_playing = st.loaded && !st.paused && !st.eof && !self.frame_stepping;
         // 自動截圖（開發、CI 用）要固定的畫面，不換檔
-        if !just_ended || !self.settings.auto_next || self.autoshot.is_some() {
+        if !just_ended || self.autoshot.is_some() {
             return;
         }
-        let has_next = self.playlist.as_ref().is_some_and(|l| l.next().is_some());
-        if has_next {
-            self.play_next_in_list();
-        } else if self.playlist_scan.is_some() {
-            // 資料夾還在掃描：掃完再看有沒有下一個
-            self.pending_auto_next = true;
-        }
-    }
-
-    fn play_next_in_list(&mut self) {
-        let target = self
-            .playlist
-            .as_ref()
-            .and_then(|l| l.next_index().map(|i| (i, l.items()[i].clone())));
-        if let Some((i, next)) = target {
-            self.open_at(&next, Some(i));
-            let (pos, len) = self.playlist.as_ref().map_or((1, 1), |l| (l.position(), l.len()));
-            self.osd(crate::tf!(
-                "下一個（{pos}/{len}）：{}",
-                "Next ({pos}/{len}): {}",
-                display_label(&self.titles, &next)
-            ));
-        }
+        // 照播放順序：下一個、從頭、重播、等資料夾掃描完，或播放結束（見 `playlist::end_step`）
+        self.file_ended(self.playlist_scan.is_some());
     }
 
     /// 按鍵的處理順序：
@@ -2822,15 +2821,18 @@ impl VitascopeApp {
             }
             return;
         }
-        let video = media[0].clone();
+        let mut video = media[0].clone();
+        let mut index = None;
         if media.len() > 1 {
             self.remember_position();
             self.playlist_scan = None;
-            self.playlist = Some(Playlist::from_files(media).manual());
+            // 整份一起開：開著隨機播放時第一個也是隨機的
+            index = self.replace_playlist_whole(Playlist::from_files(media.clone()).manual());
+            video = index.and_then(|i| media.get(i).cloned()).unwrap_or(video);
             self.owns_session = true;
             self.persist_playlist();
         }
-        self.open(&video);
+        self.open_at(&video, index);
         // 影片載入完再加上去（open 會把路徑轉成完整路徑，這裡也一樣）
         if !extra_subs.is_empty() {
             let video = std::path::absolute(&video).unwrap_or(video);
@@ -3515,10 +3517,8 @@ impl VitascopeApp {
 
         let st = &self.player.state;
         let loaded = st.loaded;
-        let (has_prev, has_next) = self
-            .playlist
-            .as_ref()
-            .map_or((false, false), |l| (l.prev().is_some(), l.next().is_some()));
+        // 重複全部時最後一個也有「下一個」（從頭）
+        let (has_prev, has_next) = (self.can_step(false), self.can_step(true));
         let pause_label = if loaded && !st.paused {
             crate::tr!("暫停", "Pause")
         } else {
@@ -3810,10 +3810,7 @@ impl VitascopeApp {
             let st = &self.player.state;
             let loaded = st.loaded;
             let play_icon = if !st.paused && loaded { "⏸" } else { "▶" };
-            let (has_prev, has_next) = self
-                .playlist
-                .as_ref()
-                .map_or((false, false), |l| (l.prev().is_some(), l.next().is_some()));
+            let (has_prev, has_next) = (self.can_step(false), self.can_step(true));
             if ui
                 .add_enabled(has_prev, icon_button("⏮"))
                 .on_hover_text(

@@ -98,6 +98,9 @@ pub enum Plan {
     Playlist {
         entries: Vec<(String, Option<String>)>,
         start: usize,
+        /// `start` 是網址指定的那一部（「載入整個播放清單」時網址 `v=` 的影片）：隨機播放時也從它開始。
+        /// 沒指定的（純播放清單的網址）是整份一起開，隨機播放時第一個也是隨機的
+        chosen: bool,
         /// yt-dlp 給的項目裡略過了幾個（不能開的、指回清單本身的）
         dropped: usize,
         /// yt-dlp 給的項目到了上限（[`super::PLAYLIST_MAX`]）：清單可能被截掉了
@@ -374,10 +377,10 @@ fn playlist(info: &Info, page_url: &str, mode: &Mode) -> Result<Plan, YtdlError>
     if entries.is_empty() {
         return Err(YtdlError::EmptyPlaylist);
     }
-    let start = if mode.yes_playlist {
-        start_index(page_url, &ids).unwrap_or(0)
+    let chosen = if mode.yes_playlist {
+        start_index(page_url, &ids)
     } else {
-        0
+        None
     };
     // 截掉了沒有看 yt-dlp 給了幾個（略過的也算），不是留下幾個
     let total = info.entries.len();
@@ -385,7 +388,8 @@ fn playlist(info: &Info, page_url: &str, mode: &Mode) -> Result<Plan, YtdlError>
         dropped: total - entries.len(),
         capped: total >= super::PLAYLIST_MAX,
         entries,
-        start,
+        start: chosen.unwrap_or(0),
+        chosen: chosen.is_some(),
     })
 }
 
@@ -1399,6 +1403,7 @@ mod tests {
         let Plan::Playlist {
             entries,
             start,
+            chosen,
             dropped,
             capped,
         } = plan(&i, page, &Mode::default(), &PlanConfig::default()).unwrap()
@@ -1421,15 +1426,33 @@ mod tests {
             ],
             "只有代號的補成網址、標題的換行變成空白、file:// 與不認得的代號略過"
         );
-        assert_eq!(start, 0, "只播這部影片的模式不管 v=");
+        assert_eq!((start, chosen), (0, false), "只播這部影片的模式不管 v=");
         let yes = Mode {
             yes_playlist: true,
             ..Default::default()
         };
-        let Plan::Playlist { start, .. } = plan(&i, page, &yes, &PlanConfig::default()).unwrap() else {
+        let Plan::Playlist { start, chosen, .. } = plan(&i, page, &yes, &PlanConfig::default()).unwrap() else {
             panic!()
         };
         assert_eq!(start, 1, "從網址 v= 的那一部開始");
+        assert!(chosen, "網址指定了從哪一部開始（隨機播放時也從它開始）");
+        // v= 指的是第一部：一樣是指定的，不是「沒指定、從第一個開始」
+        let first = "https://www.youtube.com/watch?v=aaaaaaaaaaa&list=PL1";
+        let Plan::Playlist { start, chosen, .. } = plan(&i, first, &yes, &PlanConfig::default()).unwrap() else {
+            panic!()
+        };
+        assert_eq!((start, chosen), (0, true));
+        // 純播放清單的網址（沒有 v=）：整份一起開
+        let Plan::Playlist { start, chosen, .. } = plan(
+            &i,
+            "https://www.youtube.com/playlist?list=PL1",
+            &yes,
+            &PlanConfig::default(),
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert_eq!((start, chosen), (0, false));
         // yt-dlp 給了上限那麼多個（-I 1:200）：清單可能被截掉了，就算略過了幾個、留下的不到上限也是
         let many: Vec<String> = (0..crate::ytdl::PLAYLIST_MAX)
             .map(|n| {

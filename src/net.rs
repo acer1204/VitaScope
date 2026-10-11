@@ -580,6 +580,9 @@ pub struct RemotePlaylist {
     pub entries: Vec<(String, Option<String>)>,
     /// 從第幾個開始播（mpv 選的那一個；它被拿掉了就是它後面第一個留下的）
     pub start: usize,
+    /// `start` 是使用者指定的（網站播放清單網址的 `v=`）：隨機播放時也從它開始。
+    /// mpv 讀的 `.m3u` 沒有指定，整份一起開（隨機播放時第一個也是隨機的）
+    pub chosen: bool,
     /// 拿掉了幾個（本機檔案、`edl://` 之類不能從網路上的清單開的）
     pub dropped: usize,
 }

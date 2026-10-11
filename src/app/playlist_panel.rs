@@ -413,7 +413,8 @@ impl VitascopeApp {
                 self.playlist_selected = None;
             }
             ListOp::Clear => {
-                self.playlist = Some(Playlist::cleared());
+                // 開著隨機播放時，之後加進來的打散到這一輪
+                self.replace_playlist(Playlist::cleared());
                 self.playlist_selected = None;
                 self.pending_auto_next = false;
             }
@@ -443,24 +444,40 @@ impl VitascopeApp {
         self.persist_playlist();
     }
 
-    /// 加到清單最後；還沒有在播的話，播第一個加進來的
+    /// 加到清單最後（隨機播放時打散到這一輪還沒播的部分）；還沒有在播的話，播第一個加進來的
+    /// （隨機播放時是加進來的其中一個）
     pub(super) fn add_to_playlist(&mut self, files: Vec<PathBuf>) {
         let files: Vec<PathBuf> = files.iter().map(|p| crate::playlist::absolute(p)).collect();
-        let Some(first) = files.first().cloned() else { return };
+        let Some(mut first) = files.first().cloned() else {
+            return;
+        };
         self.playlist_scan = None;
         self.owns_session = true;
+        let mut first_index = None;
         let added = match &mut self.playlist {
-            Some(list) => list.extend(files),
+            Some(list) => {
+                let before = list.len();
+                let added = list.extend_with(files, &mut self.shuffler);
+                // 隨機播放：開加進來的隨機一個
+                if list.is_shuffled() && added > 0 {
+                    let i = before + self.shuffler.below(added);
+                    first_index = Some(i);
+                    first = list.items()[i].clone();
+                }
+                added
+            }
             None => {
                 let n = files.len();
-                self.playlist = Some(Playlist::from_files(files).manual());
+                // 加到空的播放器 = 整份一起開：隨機播放時第一個也是隨機的
+                first_index = self.replace_playlist_whole(Playlist::from_files(files.clone()).manual());
+                first = first_index.and_then(|i| files.get(i).cloned()).unwrap_or(first);
                 n
             }
         };
         self.persist_playlist();
         let st = &self.player.state;
         if !st.loaded && !st.loading {
-            self.open(&first);
+            self.open_at(&first, first_index);
         } else {
             self.osd(crate::tf!(
                 "加入播放清單：{added} 個檔案",
@@ -563,10 +580,14 @@ impl VitascopeApp {
         self.remember_position();
         self.playlist_scan = None;
         self.playlist_selected = None;
-        self.playlist = Some(Playlist::from_files(files).manual());
+        // 整份一起開：開著隨機播放時第一個也是隨機的
+        let at = self
+            .replace_playlist_whole(Playlist::from_files(files.clone()).manual())
+            .unwrap_or(0);
+        let first = files.get(at).cloned().unwrap_or(first);
         self.owns_session = true;
         self.persist_playlist();
-        self.open_at(&first, Some(0));
+        self.open_at(&first, Some(at));
     }
 
     fn save_playlist_dialog(&mut self) {

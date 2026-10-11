@@ -1250,6 +1250,7 @@ fn site_playlist_redirect_import() {
             source: page.clone(),
             entries: want.clone(),
             start: 0,
+            chosen: false,
             dropped: 0,
             capped: false,
         }
@@ -1283,6 +1284,7 @@ fn site_playlist_redirect_import() {
             source: both,
             entries: want,
             start: 1,
+            chosen: true,
             dropped: 0,
             capped: false,
         }

@@ -318,6 +318,8 @@ pub enum PlayerEvent {
         source: String,
         entries: Vec<(String, Option<String>)>,
         start: usize,
+        /// `start` 是網址指定的那一部（`v=`）：隨機播放時也從它開始（見 `ytdl::plan::Plan::Playlist`）
+        chosen: bool,
         /// 略過了幾個項目（不能開的）
         dropped: usize,
         /// yt-dlp 只讀了前 [`ytdl::PLAYLIST_MAX`] 個（清單可能更長）
@@ -412,6 +414,7 @@ async_keys!(
     Af,
     AfCommand,
     Net,
+    LoopFile,
 );
 
 impl AsyncKey {
@@ -968,12 +971,14 @@ impl Player {
         // 建立後跟引擎的預設值不一樣的就是（上面我們自己的選項都不是這些選項）
         // af（等化器、音量平衡的濾鏡鏈）也一樣：預設是空的
         // 網路選項也一樣（user-agent、逾時、快取…、標頭清單、FFmpeg 的連線選項）
+        // 重複單一檔案的 loop-file 也一樣（別名 loop 改的也是它）
         for name in crate::picture::MANAGED
             .into_iter()
             .chain(crate::sound::MANAGED)
             .chain(["af"])
             .chain(net::MANAGED)
             .chain([net::HEADERS, net::LAVF])
+            .chain(["loop-file"])
         {
             if let (Ok(now), Ok(default)) = (
                 mpv.get_string(name),
@@ -987,6 +992,10 @@ impl Player {
         // 或 VITASCOPE_MPV_OPTS 寫了 glsl-shaders（即使是空的；glsl-shaders-append 之類、別名 glsl-shader 也算），
         // 就是使用者自己指定的。影戲不改它，翻轉的著色器接在它後面。glsl-shader-opts 是著色器的參數、不是清單，不算
         // 指定成空的（glsl-shaders=）時 mpv 的清單是一個空字串：不當成檔案（翻轉接在後面時不能多一個空的路徑）
+        // loop 是 loop-file 的別名：VITASCOPE_MPV_OPTS 寫 loop=no（跟預設一樣，上面看不出來）也算指定了 loop-file
+        if user_overrides.contains("loop") {
+            user_overrides.insert("loop-file".to_owned());
+        }
         let mut shader_base = mpv.get_string_list("glsl-shaders").unwrap_or_default();
         shader_base.retain(|s| !s.is_empty());
         let names_shader_list =
@@ -2707,6 +2716,7 @@ impl Player {
             Ok(Plan::Playlist {
                 entries,
                 start,
+                chosen,
                 dropped,
                 capped,
             }) => {
@@ -2719,6 +2729,7 @@ impl Player {
                     source: url,
                     entries,
                     start,
+                    chosen,
                     dropped,
                     capped,
                 })
@@ -3697,6 +3708,12 @@ mod tests {
         assert_eq!(super::DEVICE_LIST_ID, super::OBSERVED.len() as u64 + 1);
         // Net 接在 C2 之前最後一個的後面（之後的會再接在它後面，見設計 §1.9）
         assert_eq!(AsyncKey::Net as usize, AsyncKey::AfCommand as usize + 1);
+        // 重複單一檔案（E2）接在 Net 後面
+        assert_eq!(AsyncKey::LoopFile as usize, AsyncKey::Net as usize + 1);
+        assert_eq!(
+            super::async_key(super::async_id(AsyncKey::LoopFile, 7)),
+            Some(AsyncKey::LoopFile)
+        );
     }
 
     #[test]

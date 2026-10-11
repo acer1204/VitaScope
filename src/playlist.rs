@@ -567,6 +567,26 @@ impl Playlist {
         Some(at)
     }
 
+    /// 隨機播放時，從 `range`（目前的檔案和這一輪還沒播的幾項，例如 [`Self::replace_current_with`] 剛換進來的）
+    /// 隨機選一項當成目前的檔案：它換到目前那一格，原本目前的那一項換到它原本的位置（變成還沒播）。
+    /// 網路上的播放清單整份一起開時，第一個也是隨機的。回傳選到的項目；沒開隨機、目前的檔案不在範圍裡時 None
+    pub fn pick_current_in(&mut self, range: std::ops::Range<usize>, rng: &mut Shuffler) -> Option<usize> {
+        if self.current_removed || !range.contains(&self.index) || range.end > self.items.len() {
+            return None;
+        }
+        let s = self.shuffle.as_mut()?;
+        let k = range.start + rng.below(range.len());
+        let slot = s.slot_of(k);
+        // 這一輪已經播過的不選（換進來的項目一定排在還沒播的部分）
+        if slot < s.pos {
+            return None;
+        }
+        s.order.swap(s.pos, slot);
+        self.sync_index();
+        self.debug_check();
+        Some(k)
+    }
+
     /// 依檔名自然排序，目前的檔案維持是目前的
     pub fn sort(&mut self) {
         self.manual = true;
@@ -655,6 +675,24 @@ pub fn end_step(
         Repeat::All if list.is_some_and(Playlist::can_wrap) => EndStep::Wrap,
         Repeat::All => EndStep::RestartSame,
         Repeat::Off | Repeat::One => EndStep::Finished,
+    }
+}
+
+/// 自動接下一個（或重複全部繞回去）開的檔案開不起來（檔案不見了、網路磁碟斷線、不是影音檔…）：
+/// 跳過它，接下來做什麼。清單上目前的項目就是開不起來的那一個。
+/// - `failed` 是上次開成功之後開不起來的檔案（包括這一個）：清單上的每一項都在裡面（整輪都開不起來）就停，
+///   不會一直繞。看的是哪些檔案、不是連續幾次：隨機播放重複全部時，新的一輪可能先試到已經失敗過的，
+///   次數到了清單的長度也不代表每一項都試過（能播的那一個還沒輪到）。
+/// - 開不起來的檔案不重播：重複單一檔案當成不重複；只剩它自己（[`EndStep::RestartSame`]）時也停。
+/// - 不等資料夾掃描（自動接下一個開的一定是清單上的項目，清單已經完整了）。
+pub fn skip_step(list: Option<&Playlist>, failed: &HashSet<PathBuf>, auto_next: bool, repeat: Repeat) -> EndStep {
+    if list.is_none_or(|l| l.items().iter().all(|p| failed.contains(p))) {
+        return EndStep::Finished;
+    }
+    let repeat = if repeat == Repeat::One { Repeat::Off } else { repeat };
+    match end_step(list, false, auto_next, repeat, true) {
+        EndStep::RestartSame | EndStep::WaitScan => EndStep::Finished,
+        step => step,
     }
 }
 
@@ -1842,6 +1880,179 @@ mod tests {
         assert_eq!(end_step(Some(&numbered(1)), false, true, All, true), RestartSame);
         assert_eq!(end_step(None, false, true, All, true), RestartSame);
         assert_eq!(end_step(None, false, true, Off, true), Finished);
+    }
+
+    #[test]
+    fn pick_current_in_chooses_a_random_unplayed_spliced_item() {
+        let urls = |n: usize| {
+            (0..n)
+                .map(|k| PathBuf::from(format!("http://h/{k}")))
+                .collect::<Vec<_>>()
+        };
+        let mut seen = HashSet::new();
+        for seed in 0..64 {
+            let mut rng = Shuffler::seeded(seed);
+            // 清單 0..4，播過 0、1，目前是 1；把 1 換成網路清單的 4 項（位置 1..5）
+            let mut l = numbered(4);
+            l.set_shuffle(true, &mut rng);
+            let first = l.shuffle_order().unwrap().0[1];
+            l.select_index(first);
+            let played_before = l.shuffle_order().unwrap().0[0];
+            let at = l.replace_current_with(urls(4), &mut rng).unwrap();
+            assert_eq!(at, first);
+            let k = l.pick_current_in(at..at + 4, &mut rng).unwrap();
+            assert!((at..at + 4).contains(&k));
+            seen.insert(k - at);
+            let (order, pos) = l.shuffle_order().unwrap();
+            assert_eq!((pos, order[pos]), (1, k), "選到的是目前的檔案，播過的還是只有一個");
+            assert_eq!(order[0], played_before);
+            assert_eq!(l.current_index(), Some(k));
+            // 其他換進來的都在還沒播的部分
+            for j in at..at + 4 {
+                let slot = order.iter().position(|&e| e == j).unwrap();
+                assert!(slot >= pos, "seed {seed}：{j} 在 {slot}");
+            }
+        }
+        assert_eq!(seen.len(), 4, "每一項都可能是第一個：{seen:?}");
+        // 沒開隨機、目前的已經移出清單、範圍不含目前的：不動
+        let mut rng = Shuffler::seeded(1);
+        let mut plain = numbered(3);
+        assert_eq!(plain.pick_current_in(0..3, &mut rng), None);
+        let mut s = numbered(3);
+        s.set_shuffle(true, &mut rng);
+        assert_eq!(s.pick_current_in(1..3, &mut rng), None);
+        assert_eq!(s.pick_current_in(0..4, &mut rng), None, "超出清單");
+        s.remove(0);
+        assert_eq!(s.pick_current_in(0..2, &mut rng), None);
+    }
+
+    /// 上次開成功之後開不起來的檔案（清單上第 `idx` 項的路徑）
+    fn failed_set(l: &Playlist, idx: &[usize]) -> HashSet<PathBuf> {
+        idx.iter().map(|&i| l.items()[i].clone()).collect()
+    }
+
+    #[test]
+    fn skip_step_moves_on_and_stops_after_a_whole_cycle_of_failures() {
+        use EndStep::*;
+        use Repeat::*;
+        // 第 2 項（目前的）開不起來：跳到第 3 項；重複單一檔案不重播開不起來的
+        let mut l = numbered(4);
+        l.select_index(1);
+        for repeat in [Off, One, All] {
+            assert_eq!(
+                skip_step(Some(&l), &failed_set(&l, &[1]), true, repeat),
+                Open(2),
+                "{repeat:?}"
+            );
+        }
+        // 最後一項開不起來：不重複就結束，重複全部繞回去
+        l.select_index(3);
+        let f = failed_set(&l, &[3]);
+        assert_eq!(skip_step(Some(&l), &f, true, Off), Finished);
+        assert_eq!(skip_step(Some(&l), &f, true, One), Finished, "單一檔案不重播開不起來的");
+        assert_eq!(skip_step(Some(&l), &f, true, All), Wrap);
+        // 還有沒失敗過的：繼續繞；清單上的每一項都開不起來：停，不再繞
+        assert_eq!(skip_step(Some(&l), &failed_set(&l, &[1, 2, 3]), true, All), Wrap);
+        assert_eq!(skip_step(Some(&l), &failed_set(&l, &[0, 1, 2, 3]), true, All), Finished);
+        l.select_index(1);
+        assert_eq!(
+            skip_step(Some(&l), &failed_set(&l, &[0, 1, 2, 3]), true, Off),
+            Finished,
+            "還有下一個也停"
+        );
+        // 失敗過好幾次的同一個檔案只算一個（次數不算數）
+        let mut dup = Playlist::from_files(["a", "b", "b", "c"].map(PathBuf::from).to_vec());
+        dup.select_index(2);
+        assert_eq!(skip_step(Some(&dup), &failed_set(&dup, &[1, 2]), true, All), Open(3));
+        // 每個檔案都開不起來了（重複的那一個失敗一次就算）：停，不是等到失敗次數到清單的長度
+        assert_eq!(
+            skip_step(Some(&dup), &failed_set(&dup, &[0, 1, 3]), true, All),
+            Finished
+        );
+        // 失敗過、之後從清單拿掉的檔案不算：清單上還有沒試過的（第 1 項）就繼續
+        let mut gone = failed_set(&l, &[1, 2, 3]);
+        gone.insert(PathBuf::from("removed.mp4"));
+        assert_eq!(skip_step(Some(&l), &gone, true, All), Open(2));
+        // 中途關掉了自動播放下一個
+        assert_eq!(skip_step(Some(&l), &failed_set(&l, &[1]), false, All), Finished);
+        // 只有它自己：不重播
+        let one = numbered(1);
+        assert_eq!(skip_step(Some(&one), &failed_set(&one, &[0]), true, All), Finished);
+        assert_eq!(skip_step(None, &HashSet::new(), true, All), Finished);
+        // 隨機播放：照洗好的順序跳到下一個
+        let mut rng = Shuffler::seeded(9);
+        let mut s = numbered(5);
+        s.set_shuffle(true, &mut rng);
+        let next = s.next_index().unwrap();
+        s.select_index(next);
+        assert_eq!(
+            skip_step(Some(&s), &failed_set(&s, &[next]), true, Off),
+            Open(s.next_index().unwrap())
+        );
+    }
+
+    /// 照播放器的做法模擬：目前的檔案播完（[`end_step`]），之後一直試開，開不起來就 [`skip_step`]。
+    /// 回傳試開了哪些項目，和開成功的那一個（播放結束時 None）
+    fn after_end(
+        l: &mut Playlist,
+        rng: &mut Shuffler,
+        repeat: Repeat,
+        playable: impl Fn(usize) -> bool,
+    ) -> (Vec<usize>, Option<usize>) {
+        let mut tried = Vec::new();
+        let mut failed = HashSet::new();
+        let mut step = end_step(Some(l), false, true, repeat, true);
+        loop {
+            let i = match step {
+                EndStep::Open(i) => {
+                    l.select_index(i);
+                    i
+                }
+                EndStep::Wrap => {
+                    let i = l.wrap_index(rng).unwrap();
+                    l.select_index(i);
+                    i
+                }
+                _ => return (tried, None),
+            };
+            tried.push(i);
+            assert!(tried.len() <= 3 * l.len(), "一直繞：{tried:?}");
+            if playable(i) {
+                return (tried, Some(i));
+            }
+            failed.insert(l.items()[i].clone());
+            step = skip_step(Some(l), &failed, true, repeat);
+        }
+    }
+
+    #[test]
+    fn shuffled_repeat_all_keeps_skipping_until_the_playable_file_comes_round() {
+        // 三個裡只有 0 能開：隨機播放、重複全部時，新的一輪可能先試到已經失敗過的，照樣要繞到 0，不能停
+        for seed in 0..200 {
+            let mut rng = Shuffler::seeded(seed);
+            let mut l = numbered(3);
+            l.set_shuffle(true, &mut rng);
+            assert_eq!(l.current_index(), Some(0));
+            for round in 0..4 {
+                let (tried, ok) = after_end(&mut l, &mut rng, Repeat::All, |i| i == 0);
+                assert_eq!(ok, Some(0), "seed {seed} 第 {round} 輪：試了 {tried:?}");
+            }
+        }
+        // 照清單順序也一樣
+        let mut rng = Shuffler::seeded(1);
+        let mut l = numbered(3);
+        let (tried, ok) = after_end(&mut l, &mut rng, Repeat::All, |i| i == 0);
+        assert_eq!((tried, ok), (vec![1, 2, 0], Some(0)));
+        // 全部都開不起來（能播的那一個也斷線了）：每一項都試過就停，不會一直繞
+        for seed in 0..50 {
+            let mut rng = Shuffler::seeded(seed);
+            let mut l = numbered(4);
+            l.set_shuffle(true, &mut rng);
+            let (tried, ok) = after_end(&mut l, &mut rng, Repeat::All, |_| false);
+            assert_eq!(ok, None);
+            let distinct: HashSet<usize> = tried.iter().copied().collect();
+            assert_eq!(distinct.len(), 4, "seed {seed}：每一項都試過才停：{tried:?}");
+        }
     }
 
     #[test]

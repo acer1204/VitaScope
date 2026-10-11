@@ -11,6 +11,7 @@ pub use crate::keymap::KeySettings;
 pub use crate::net::NetSettings;
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
+pub use crate::playlist::{PlayOrder, Repeat};
 pub use crate::sound::AudioSettings;
 pub use crate::theme::ThemeChoice;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ pub struct Settings {
     pub window: Option<WindowGeometry>,
     /// 播完自動播放同資料夾的下一個檔案
     pub auto_next: bool,
+    /// 播放清單的播放順序：隨機、重複（隨機的順序本身不存，下次重新洗牌）
+    pub play_order: PlayOrder,
     /// 再次開啟時從上次看到的地方繼續播放
     pub resume: bool,
     /// 字幕外觀
@@ -179,6 +182,7 @@ impl Default for Settings {
             muted: false,
             window: None,
             auto_next: true,
+            play_order: PlayOrder::default(),
             resume: true,
             subtitle: SubStyle::default(),
             on_top: OnTop::Never,
@@ -701,6 +705,14 @@ mod tests {
         assert_eq!(s.theme, ThemeChoice::Dark, "外觀預設深色");
         assert_eq!(s.on_top, OnTop::Never, "預設不置頂");
         assert_eq!(s.side_tab, SideTab::Playlist, "側邊面板預設是播放清單");
+        assert_eq!(
+            s.play_order,
+            PlayOrder {
+                shuffle: false,
+                repeat: Repeat::Off
+            },
+            "預設照順序、不重複"
+        );
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
         assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
@@ -787,6 +799,7 @@ mod tests {
         assert_eq!(s.side_tab, SideTab::Playlist, "升級後側邊面板還是播放清單");
         assert_eq!(s.net, NetSettings::default(), "升級後網路設定是預設值（檢查憑證）");
         assert_eq!(s.export, ExportSettings::default(), "升級後匯出是預設值");
+        assert_eq!(s.play_order, PlayOrder::default(), "升級後照順序播、不重複");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1188,6 +1201,51 @@ mod tests {
         let back = Settings::load_from(path.clone());
         assert_eq!(back.side_tab, SideTab::Playlist, "A 換的分頁不能被 B 蓋回去");
         assert_eq!(back.volume, 20.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn play_order_is_saved_loads_leniently_and_merges() {
+        let dir = temp_dir("play-order");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.play_order = PlayOrder {
+            shuffle: true,
+            repeat: Repeat::All,
+        };
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""repeat": "all""#), "{text}");
+        assert_eq!(Settings::load_from(path.clone()).play_order, s.play_order);
+        // 新版加的重複方式（或手動改錯）：不重複，同一組的隨機播放、其他設定照讀
+        let s = lenient(r#"{"play_order": {"shuffle": true, "repeat": "shuffle-all"}, "volume": 31.0}"#);
+        assert_eq!(
+            s.play_order,
+            PlayOrder {
+                shuffle: true,
+                repeat: Repeat::Off
+            }
+        );
+        assert_eq!(s.volume, 31.0);
+        // 兩個視窗：A 開隨機播放、B 改重複，兩個都留下（同一組裡的不同項目也不會互相蓋掉）
+        let mut base = Settings::load_from(path.clone());
+        base.play_order = PlayOrder::default();
+        base.save().unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.play_order.shuffle = true;
+        a.save().unwrap();
+        b.play_order.repeat = Repeat::One;
+        b.save().unwrap();
+        let back = Settings::load_from(path);
+        assert_eq!(
+            back.play_order,
+            PlayOrder {
+                shuffle: true,
+                repeat: Repeat::One
+            },
+            "A 開的隨機播放不能被 B 蓋回去"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

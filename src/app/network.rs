@@ -703,6 +703,8 @@ impl VitascopeApp {
                 )
                 .to_owned(),
             );
+            // 自動接下一個時：跳過它，接著播下一個（或播放結束），不停在這裡
+            self.auto_advance_nothing_to_play();
             return;
         }
         for (url, title) in &list.entries {
@@ -713,21 +715,43 @@ impl VitascopeApp {
         let n = list.entries.len();
         let paths: Vec<PathBuf> = list.entries.into_iter().map(|(u, _)| PathBuf::from(u)).collect();
         let source = Path::new(&list.source);
+        let start = list.start.min(n - 1);
+        // 沒指定從哪一個開始（IPTV 的 .m3u、網站的播放清單）= 整份一起開：開著隨機播放時第一個也是隨機的。
+        // 指定了（網址 v= 指的那部影片，就算是第一部）就從它開始
+        let whole = !list.chosen;
+        let shuffler = &mut self.shuffler;
+        // 清單本身在目前的播放清單上：換成裡面的項目（隨機播放時其餘的打散到這一輪還沒播的部分）
         let spliced = self
             .playlist
             .as_mut()
             .filter(|l| l.current().is_some_and(|c| crate::playlist::same_file(c, source)))
-            .and_then(|l| l.replace_current(paths.clone()));
-        let first = match spliced {
-            Some(at) => at,
+            .and_then(|l| {
+                let at = l.replace_current_with(paths.clone(), shuffler)?;
+                let random = whole.then(|| l.pick_current_in(at..at + n, shuffler)).flatten();
+                Some(random.unwrap_or(at + start))
+            });
+        let target = match spliced {
+            Some(i) => i,
             None => {
                 self.playlist_scan = None;
-                self.playlist = Some(Playlist::from_files(paths.clone()).manual());
-                0
+                let mut fresh = Playlist::from_files(paths.clone()).manual();
+                if whole && self.settings.play_order.shuffle {
+                    self.replace_playlist_whole(fresh).unwrap_or(0)
+                } else {
+                    // 隨機播放時它排第一個
+                    fresh.select_index(start);
+                    self.replace_playlist(fresh);
+                    start
+                }
             }
         };
-        let start = list.start.min(n - 1);
-        self.open_at(&paths[start], Some(first + start));
+        let path = self
+            .playlist
+            .as_ref()
+            .and_then(|l| l.items().get(target))
+            .cloned()
+            .unwrap_or_else(|| paths[start].clone());
+        self.open_at(&path, Some(target));
         let mut msg = tf!("播放清單：{n} 個項目", "Playlist: {n} items");
         // 網站的播放清單只讀前 200 個（頻道可能有上萬部影片）
         if capped {
