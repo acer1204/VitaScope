@@ -56,6 +56,18 @@ fn sample(rel: &str) -> String {
     p.to_string_lossy().into_owned()
 }
 
+/// 不是每個平台的 FFmpeg 都產生得了的樣本：有就測，沒有就說明略過
+fn optional_sample(rel: &str) -> bool {
+    let found = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/generated")
+        .join(rel)
+        .exists();
+    if !found {
+        eprintln!("略過 {rel}：這個 FFmpeg 產生不了");
+    }
+    found
+}
+
 /// 暫停、播完停在最後一格的 headless 播放器，開好 `rel`、第一格解好
 fn open_with(rel: &str, extra: &[(&str, &str)]) -> Player {
     let mut opts = Options {
@@ -197,6 +209,10 @@ fn exact_seeks_land_on_the_target_frame() {
         "general/ts_mpeg2_interlaced.ts",
         "general/vob_mpeg2_ac3_anamorphic.vob",
     ] {
+        // Windows、macOS 的 CI 用的 FFmpeg 產生不了交錯式的 TS（其他用到它的測試也是略過）
+        if rel == "general/ts_mpeg2_interlaced.ts" && !optional_sample(rel) {
+            continue;
+        }
         let mut p = open(rel);
         let mut r = reference(rel);
         assert_eq!(p.seek_lead(), Some(vitascope::approx_seek::FIRST_OFFSET), "{rel}");
