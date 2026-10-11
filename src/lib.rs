@@ -46,4 +46,5 @@ pub mod thumbs;
 pub mod update;
 pub mod video;
 pub mod web;
+pub mod window_mode;
 pub mod ytdl;

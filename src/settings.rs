@@ -15,6 +15,7 @@ pub use crate::picture::VideoSettings;
 pub use crate::playlist::{PlayOrder, Repeat};
 pub use crate::sound::AudioSettings;
 pub use crate::theme::ThemeChoice;
+pub use crate::window_mode::CompactWindows;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -72,6 +73,8 @@ pub struct Settings {
     pub export: ExportSettings,
     /// 系統媒體控制（媒體鍵、Windows 的媒體控制、macOS 的「正在播放」、Linux 的 MPRIS）：開關、顯示片名與封面
     pub system_media: SystemMedia,
+    /// 迷你播放器：置頂、上次的位置大小（視窗模式本身不存，下次啟動是一般視窗）
+    pub compact: CompactWindows,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -207,6 +210,7 @@ impl Default for Settings {
             net: NetSettings::default(),
             export: ExportSettings::default(),
             system_media: SystemMedia::default(),
+            compact: CompactWindows::default(),
             path: None,
             baseline: None,
         }
@@ -381,6 +385,7 @@ impl Settings {
         self.keys = self.keys.sanitized();
         self.net = self.net.sanitized();
         self.export = self.export.sanitized();
+        self.compact = self.compact.sanitized();
         self
     }
 
@@ -725,6 +730,9 @@ mod tests {
             },
             "系統媒體控制預設開、顯示片名與封面"
         );
+        assert!(s.compact.mini_on_top, "迷你播放器預設置頂");
+        assert_eq!(s.compact.mini, None, "迷你播放器預設放在螢幕右下角");
+        assert_eq!(s.compact, CompactWindows::default());
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
         assert_eq!(s.keys.mouse.click, "toggle-pause", "單擊畫面預設播放／暫停");
@@ -813,6 +821,59 @@ mod tests {
         assert_eq!(s.export, ExportSettings::default(), "升級後匯出是預設值");
         assert_eq!(s.play_order, PlayOrder::default(), "升級後照順序播、不重複");
         assert_eq!(s.system_media, SystemMedia::default(), "升級後系統媒體控制開著");
+        assert_eq!(s.compact, CompactWindows::default(), "升級後迷你播放器置頂、位置照預設");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 迷你播放器的設定（F1）：存檔讀回、讀不懂的只有那一項用預設值、兩個視窗各改一項都留下、
+    /// 壞掉的位置大小整理掉
+    #[test]
+    fn compact_windows_round_trip_lenient_and_merge() {
+        let dir = temp_dir("compact");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.compact.mini_on_top = false;
+        s.compact.mini = Some(WindowGeometry {
+            pos: [1400.0, 700.0],
+            size: [520.0, 330.0],
+            maximized: false,
+        });
+        s.save().unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""mini_on_top": false"#), "{text}");
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.compact, s.compact);
+        // 讀不懂的（手動改錯）：只有那一項用預設值，同一組的其他項目、其他設定照讀
+        let s = lenient(
+            r#"{"compact": {"mini_on_top": "yes", "mini": {"pos": [1.0, 2.0], "size": [400.0, 300.0], "maximized": false}}, "volume": 33.0}"#,
+        );
+        assert!(s.compact.mini_on_top);
+        assert_eq!(s.compact.mini.unwrap().size, [400.0, 300.0]);
+        assert_eq!(s.volume, 33.0);
+        // 太小的大小拉到最小值（讀檔都經過 sanitized）
+        std::fs::write(
+            &path,
+            r#"{"compact": {"mini": {"pos": [1.0, 2.0], "size": [10.0, 10.0], "maximized": false}}}"#,
+        )
+        .unwrap();
+        let s = Settings::load_from(path.clone());
+        let min = crate::window_mode::MINI_MIN;
+        assert_eq!(s.compact.mini.unwrap().size, [min.x, min.y]);
+        // 兩個視窗：A 關掉迷你播放器置頂、B 記下迷你播放器的位置，兩個都留下
+        std::fs::remove_file(&path).unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.compact.mini_on_top = false;
+        a.save().unwrap();
+        b.compact.mini = Some(WindowGeometry {
+            pos: [5.0, 6.0],
+            size: [480.0, 308.0],
+            maximized: false,
+        });
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert!(!back.compact.mini_on_top, "A 改的不能被 B 蓋回去");
+        assert_eq!(back.compact.mini.unwrap().pos, [5.0, 6.0]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

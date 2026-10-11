@@ -59,7 +59,12 @@ enum ListOp {
 impl VitascopeApp {
     /// 看得到播放清單（側邊面板開著、在播放清單分頁）
     pub(super) fn playlist_shown(&self) -> bool {
-        self.settings.show_playlist && self.settings.side_tab == SideTab::Playlist
+        self.side_visible() && self.settings.side_tab == SideTab::Playlist
+    }
+
+    /// 看得到側邊面板：開著，而且不是迷你播放器（迷你播放器裡藏起來，設定照舊）
+    pub(super) fn side_visible(&self) -> bool {
+        self.settings.show_playlist && !self.compact()
     }
 
     /// F6（播放清單）、H（書籤）：面板關著就打開到那一頁；開著但在另一頁就換過去（視窗大小不變）；
@@ -102,14 +107,10 @@ impl VitascopeApp {
         self.playlist_follow = None;
         self.playlist_view = (0.0, 0.0);
         let grew = self.playlist_grew.take();
-        let (fullscreen, maximized, outer, monitor) = ctx.input(|i| {
+        let maximized = self.maximized_now(ctx).unwrap_or(false);
+        let (fullscreen, outer, monitor) = ctx.input(|i| {
             let v = i.viewport();
-            (
-                v.fullscreen.unwrap_or(false),
-                v.maximized.unwrap_or(false),
-                v.outer_rect,
-                v.monitor_size,
-            )
+            (v.fullscreen.unwrap_or(false), v.outer_rect, v.monitor_size)
         });
         if fullscreen || maximized || self.frames < 2 {
             return;

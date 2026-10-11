@@ -20,6 +20,7 @@ mod shaders;
 mod shortcuts_page;
 mod sound;
 mod tuning_menu;
+mod window_modes;
 
 use crate::autoshot::AutoShot;
 use crate::bookmarks::Bookmarks;
@@ -67,8 +68,8 @@ pub fn app_name() -> &'static str {
 /// 全螢幕時，滑鼠多久沒動就隱藏控制列
 const HIDE_AFTER: Duration = Duration::from_secs(2);
 const OSD_DURATION: Duration = Duration::from_millis(1500);
-/// 控制列完整顯示需要的寬度（也是視窗的最小寬度）
-pub const MIN_WINDOW_WIDTH: f32 = 640.0;
+/// 控制列完整顯示需要的寬度（也是一般視窗的最小寬度；迷你播放器另外是 `window_mode::MINI_MIN`）
+pub const MIN_WINDOW_WIDTH: f32 = crate::window_mode::NORMAL_MIN.x;
 /// 螢幕下方留給工作列（Windows）/ Dock（macOS）的高度，視窗不要被蓋住
 const TASKBAR_ALLOWANCE: f32 = 48.0;
 /// 播放中每隔多久把續播位置存起來（當機、關機時才不會整段遺失）
@@ -235,6 +236,12 @@ enum Action {
     SetVolumeTotal(f64),
     Raise,
     Quit,
+    /// 迷你播放器開 / 關（Ctrl（⌘）+ Shift + M、控制列的 🗗、右鍵選單）
+    ToggleMini,
+    /// 回到一般視窗（迷你播放器的 🗖、Esc、右鍵選單；雙擊「全螢幕」在迷你播放器裡也是這個）
+    NormalWindow,
+    /// 「迷你播放器置頂」開 / 關（設定頁；迷你播放器裡的 Ctrl+T、右鍵選單也走 `set_mini_on_top`）
+    SetMiniOnTop(bool),
 }
 
 /// 起始畫面上按的
@@ -432,6 +439,8 @@ pub struct VitascopeApp {
     system: Option<Arc<dyn SystemPower>>,
     /// 系統的媒體控制（媒體鍵…）：工作階段、送出的內容、封面
     media: media::MediaUi,
+    /// 視窗模式（一般視窗、迷你播放器）：切換中要等的事、一般視窗要還原的位置大小
+    modes: window_modes::ModeUi,
     /// 讓螢幕不關閉、電腦不睡眠的方法（None = 不要求），和上次要求的
     inhibitor: Option<Arc<dyn Inhibitor>>,
     inhibit_sent: Want,
@@ -685,6 +694,9 @@ pub struct Launch {
     /// 播放影片時讓螢幕不關閉、播放音訊時電腦不睡眠的方法；預設 None（自動測試、`--shot`：不向系統要求，
     /// 測試用假的）。只有 main.rs 設成真的（`inhibit::RealInhibitor`）
     pub inhibitor: Option<Arc<dyn Inhibitor>>,
+    /// 測試用：當成接著這些螢幕（迷你播放器的位置；空的 = 沒有螢幕資訊，像 Wayland）；None = 問作業系統
+    #[doc(hidden)]
+    pub screen_areas: Option<Vec<crate::screens::Area>>,
 }
 
 impl VitascopeApp {
@@ -894,6 +906,7 @@ impl VitascopeApp {
             countdown_raise: launch.countdown_raise,
             system: launch.system,
             media,
+            modes: window_modes::ModeUi::new(launch.screen_areas),
             inhibitor: launch.inhibitor,
             inhibit_sent: Want::Nothing,
             power_caps: PowerCaps::default(),
@@ -1017,7 +1030,8 @@ impl VitascopeApp {
     /// 介面測試等它調整完再操作選單、按鈕：視窗改大小時選單跟著移動，會點到別的項目
     #[doc(hidden)]
     pub fn window_fit_pending(&self) -> bool {
-        self.fit_window_pending || self.refit_now
+        // 視窗模式切換中（迷你播放器）也算：大小還會變
+        self.fit_window_pending || self.refit_now || self.modes.switching()
     }
 
     /// 測試用：上一次滑鼠、鍵盤的動作（控制列、游標什麼時候隱藏）
@@ -1562,11 +1576,32 @@ impl VitascopeApp {
                 let _ = self.player.set_mute(muted);
                 self.osd(mute_osd(muted));
             }
+            // 全螢幕一律經過 request_fullscreen（迷你播放器裡先回到一般視窗）
             Action::ToggleFullscreen => {
-                let fullscreen = is_fullscreen(ctx);
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
+                let on = !self.fullscreen_wanted(ctx);
+                self.request_fullscreen(ctx, on);
             }
-            Action::ExitFullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false)),
+            Action::ExitFullscreen => self.request_fullscreen(ctx, false),
+            Action::ToggleMini => self.toggle_mini(ctx),
+            Action::NormalWindow => self.leave_compact(ctx, window_modes::Then::Nothing),
+            Action::SetMiniOnTop(on) => self.set_mini_on_top(ctx, on, false),
+            // 要大視窗的功能：迷你播放器裡先回到一般視窗（開關類的一律是打開，藏起來的設定視窗不會被這一下關掉）
+            // 正在回到一般視窗時也是（面板加寬視窗要用還原後的大小）
+            Action::TogglePlaylist if self.compact() || self.modes.restoring() => {
+                self.side_after_leaving(ctx, SideTab::Playlist)
+            }
+            Action::ToggleBookmarks if self.compact() || self.modes.restoring() => {
+                self.side_after_leaving(ctx, SideTab::Bookmarks)
+            }
+            Action::Settings | Action::ToggleControlPanel | Action::About | Action::SubtitleStyle if self.compact() => {
+                match action {
+                    Action::Settings => self.settings_open = true,
+                    Action::ToggleControlPanel => self.panel_open = true,
+                    Action::About => self.about_open = true,
+                    _ => self.sub_style_open = true,
+                }
+                self.leave_compact(ctx, window_modes::Then::Nothing);
+            }
             Action::Open => self.open_dialog(),
             Action::OpenUrl => self.open_url_dialog(ctx),
             Action::CancelLoading => {}
@@ -1817,6 +1852,11 @@ impl VitascopeApp {
                     self.sync_shape(true);
                 }
                 self.osd(crate::tr!("畫面已重設", "Picture reset"));
+            }
+            // 迷你播放器裡：切換「迷你播放器置頂」（一般視窗的模式在迷你播放器置頂時看不出差別）
+            Action::CycleOnTop if self.compact() => {
+                let on = !self.settings.compact.mini_on_top;
+                self.set_mini_on_top(ctx, on, true);
             }
             Action::CycleOnTop => {
                 // Wayland 只能關掉（存下來的設定是在別的桌面環境開的）：開著時直接回到不置頂
@@ -2092,6 +2132,10 @@ impl VitascopeApp {
         if self.countdown_on_top() {
             return true;
         }
+        // 迷你播放器：「迷你播放器置頂」開著時一律置頂；關掉時照一般視窗的模式
+        if self.compact() && self.settings.compact.mini_on_top {
+            return true;
+        }
         let st = &self.player.state;
         let playing =
             self.switching_file || ((st.loaded || st.loading) && !st.paused && !st.eof && !self.frame_stepping);
@@ -2112,10 +2156,9 @@ impl VitascopeApp {
     fn keep_window_level(&mut self, ctx: &egui::Context) {
         self.sync_window_level(ctx);
         let fullscreen = is_fullscreen(ctx);
-        if std::mem::replace(&mut self.was_fullscreen, fullscreen)
-            && !fullscreen
-            && self.settings.on_top != OnTop::Never
-        {
+        // 不管「視窗置頂」是哪個模式都要等：迷你播放器（預設置頂）可能正在從全螢幕進入，
+        // 它的層級也是 `on_top_now` 決定的（只有一個來源）。不用置頂時不送，重看一次沒有影響
+        if std::mem::replace(&mut self.was_fullscreen, fullscreen) && !fullscreen {
             if self.on_top_now() {
                 self.apply_window_level(ctx);
             }
@@ -2123,9 +2166,15 @@ impl VitascopeApp {
             ctx.request_repaint_after(Duration::from_millis(1100));
         }
         if self.reapply_level_at.is_some_and(|t| Instant::now() >= t) {
-            self.reapply_level_at = None;
-            if self.on_top_now() && !fullscreen {
-                self.apply_window_level(ctx);
+            if self.modes.switching() {
+                // 還在換視窗模式（從全螢幕進入迷你播放器，macOS 等動畫結束）：換好了再看
+                self.reapply_level_at = Some(Instant::now() + Duration::from_millis(300));
+                ctx.request_repaint_after(Duration::from_millis(300));
+            } else {
+                self.reapply_level_at = None;
+                if self.on_top_now() && !fullscreen {
+                    self.apply_window_level(ctx);
+                }
             }
         }
     }
@@ -2147,8 +2196,9 @@ impl VitascopeApp {
             crate::instance::BatchPoll::Idle => {}
             crate::instance::BatchPoll::Wait(d) => ctx.request_repaint_after(d),
             crate::instance::BatchPoll::Ready { request, continues } => {
+                // 迷你播放器裡收到 --fullscreen：先回到一般視窗（跟其他全螢幕一樣）
                 if request.fullscreen {
-                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                    self.request_fullscreen(ctx, true);
                 }
                 if continues && self.player.state.path.is_some() {
                     self.continue_burst(request.paths);
@@ -2592,6 +2642,10 @@ impl VitascopeApp {
             return;
         }
         let mut actions = Vec::new();
+        // 迷你播放器裡 Esc 回到一般視窗（看得到的視窗都關掉之後）
+        if !menu_open && self.compact() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            actions.push(Action::NormalWindow);
+        }
         let fullscreen = is_fullscreen(ctx);
         if !menu_open && fullscreen && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
             actions.push(Action::ExitFullscreen);
@@ -2605,7 +2659,8 @@ impl VitascopeApp {
         {
             actions.push(Action::CancelLoading);
         }
-        let side_open = self.settings.show_playlist;
+        // 迷你播放器裡面板藏起來了：Delete 不能移除看不到的項目
+        let side_open = self.side_visible();
         // 移除的是目前分頁上選取的項目
         let remove = match self.settings.side_tab {
             SideTab::Playlist => Action::PlaylistRemove,
@@ -2790,7 +2845,7 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn side_backspace_removes(&self, platform: Platform) -> bool {
         platform == Platform::Mac
-            && self.settings.show_playlist
+            && self.side_visible()
             && (self.pointer_over_playlist || self.side_clicked_last)
             && self
                 .keymap
@@ -2866,6 +2921,7 @@ impl VitascopeApp {
             Command::Settings => Action::Settings,
             Command::About => Action::About,
             Command::CycleTheme => Action::CycleTheme,
+            Command::MiniPlayer => Action::ToggleMini,
             Command::OpenFile => Action::Open,
             Command::OpenUrl => Action::OpenUrl,
             Command::Screenshot => Action::Screenshot,
@@ -2902,6 +2958,10 @@ impl VitascopeApp {
     }
 
     fn esc_window_open(&self, w: EscWindow) -> bool {
+        // 迷你播放器裡藏起來的視窗看不到，Esc 不關它們（媒體資訊是蓋在影片上的，看得到）
+        if self.compact() && !matches!(w, EscWindow::MediaInfo) {
+            return false;
+        }
         match w {
             EscWindow::SubtitleStyle => self.sub_style_open,
             EscWindow::ControlPanel => self.panel_open,
@@ -3036,6 +3096,10 @@ impl VitascopeApp {
 
     /// 新檔案的影片尺寸確定後，把視窗調整成影片比例（不超過螢幕的 80%）
     fn fit_window(&mut self, ctx: &egui::Context) {
+        // 視窗模式切換中：等切換完再調整（兩邊送的大小會打架）
+        if self.modes.switching() {
+            return;
+        }
         if self.refit_now && !self.fit_window_pending {
             self.refit_now = false;
             self.refit_height(ctx);
@@ -3048,13 +3112,13 @@ impl VitascopeApp {
             return;
         };
         self.fit_window_pending = false;
-        let (fullscreen, maximized, monitor) = ctx.input(|i| {
-            (
-                i.viewport().fullscreen,
-                i.viewport().maximized,
-                i.viewport().monitor_size,
-            )
-        });
+        // 迷你播放器：寬度不變、高度照新影片的比例
+        if self.compact() {
+            self.compact_refit(ctx);
+            return;
+        }
+        let maximized = self.maximized_now(ctx);
+        let (fullscreen, monitor) = ctx.input(|i| (i.viewport().fullscreen, i.viewport().monitor_size));
         if fullscreen.unwrap_or(false) || maximized.unwrap_or(false) {
             return;
         }
@@ -3111,16 +3175,16 @@ impl VitascopeApp {
 
     /// 長寬比、裁切、旋轉改了：視窗寬度不變，高度配合新的比例（不超過螢幕）
     fn refit_height(&mut self, ctx: &egui::Context) {
+        if self.compact() {
+            self.compact_refit(ctx);
+            return;
+        }
         let Some([w, h]) = self.player.state.video_size else {
             return;
         };
-        let (fullscreen, maximized, monitor) = ctx.input(|i| {
-            (
-                i.viewport().fullscreen.unwrap_or(false),
-                i.viewport().maximized.unwrap_or(false),
-                i.viewport().monitor_size,
-            )
-        });
+        let maximized = self.maximized_now(ctx).unwrap_or(false);
+        let (fullscreen, monitor) =
+            ctx.input(|i| (i.viewport().fullscreen.unwrap_or(false), i.viewport().monitor_size));
         let content = ctx.content_rect();
         if fullscreen || maximized || w <= 0 || h <= 0 {
             return;
@@ -3402,16 +3466,20 @@ impl VitascopeApp {
         }
     }
 
-    /// 記下一般模式的視窗位置大小；全螢幕不記，最大化只記旗標（還原時回到原本大小）
+    /// 記下一般模式的視窗位置大小；全螢幕不記，最大化只記旗標（還原時回到原本大小）。
+    /// 迷你播放器記在 `compact.mini`；模式切換中（視窗還在變）都不記（P-B1）
     fn remember_window(&mut self, ctx: &egui::Context) {
-        let (fullscreen, maximized, outer, inner) = ctx.input(|i| {
+        if self.modes.switching() {
+            return;
+        }
+        if self.compact() {
+            self.remember_compact(ctx);
+            return;
+        }
+        let maximized = self.maximized_now(ctx).unwrap_or(false);
+        let (fullscreen, outer, inner) = ctx.input(|i| {
             let v = i.viewport();
-            (
-                v.fullscreen.unwrap_or(false),
-                v.maximized.unwrap_or(false),
-                v.outer_rect,
-                v.inner_rect,
-            )
+            (v.fullscreen.unwrap_or(false), v.outer_rect, v.inner_rect)
         });
         if fullscreen {
             return;
@@ -3522,10 +3590,13 @@ impl VitascopeApp {
         if !blocked && response.hovered() && (zoom_delta - 1.0).abs() > 1e-3 {
             self.run(ui.ctx(), Action::Zoom(f64::from(zoom_delta.log2())));
         }
-        // 滑鼠滾輪：預設調音量（比照 PotPlayer），可以改成跳轉（設定 → 快捷鍵 → 滑鼠）
-        let steps = f64::from(self.wheel_steps(ui.ctx(), response.hovered() && !blocked));
+        // 滑鼠滾輪：預設調音量（比照 PotPlayer），可以改成跳轉（設定 → 快捷鍵 → 滑鼠）。
+        // 迷你播放器的 🔊 上一律是音量
+        let on_volume = std::mem::take(&mut self.modes.wheel_on_volume);
+        let steps = f64::from(self.wheel_steps(ui.ctx(), (response.hovered() || on_volume) && !blocked));
         let wheel = match self.settings.keys.mouse.wheel {
             _ if steps == 0.0 => None,
+            _ if on_volume => Some(Action::Volume(5.0 * steps)),
             WheelMode::Volume => Some(Action::Volume(5.0 * steps)),
             // 往上捲 = 前進（舊版 mpv 的預設方向；現在的 mpv 預設滾輪是音量）
             WheelMode::Seek => Some(Action::Seek(self.settings.seek_short * steps)),
@@ -3553,15 +3624,20 @@ impl VitascopeApp {
         if response.double_clicked() {
             // 第一下點在別的地方（例如起始畫面的「最近開啟」）：這一下不算
             if let Some(first) = self.video_click.take().filter(|c| now - c.time <= max_delay) {
-                // F1 / F2（迷你播放器、子母畫面）要接手：雙擊的選項加上迷你播放器、子母畫面，
-                // 而且在迷你播放器、子母畫面裡雙擊「全螢幕」是回到一般視窗（NormalWindow），不是全螢幕
+                // 雙擊的選項：全螢幕、迷你播放器（F2 加子母畫面）。
+                // 在迷你播放器裡雙擊「全螢幕」是回到一般視窗（NormalWindow），不是全螢幕（F2：子母畫面也是）
                 match self.settings.keys.mouse.command(MouseInput::DoubleClick) {
                     Some(cmd) => {
                         // 第一下單擊已經切換過暫停（或靜音），這裡切回來，結果只有全螢幕改變（跟 PotPlayer 一樣）
                         if self.undo_click(ctx, first) {
                             self.osd = None;
                         }
-                        self.run(ctx, self.command_action(cmd));
+                        let action = if cmd == Command::Fullscreen && self.compact() {
+                            Action::NormalWindow
+                        } else {
+                            self.command_action(cmd)
+                        };
+                        self.run(ctx, action);
                     }
                     // 雙擊不動作：第二下就是另一次單擊（點兩下 = 切換兩次）
                     None => self.click_video_again(ctx, now, click, first),
@@ -3829,6 +3905,15 @@ impl VitascopeApp {
         if self.cmd_item(ui, true, crate::tr!("全螢幕", "Fullscreen"), Command::Fullscreen) {
             action = Some(Action::ToggleFullscreen);
         }
+        let compact = self.compact();
+        let mini = egui::Button::selectable(compact, Command::MiniPlayer.label())
+            .shortcut_text(self.keymap.hint(Command::MiniPlayer));
+        if ui.add(mini).clicked() {
+            action = Some(Action::ToggleMini);
+        }
+        if compact && menu_item(ui, true, crate::tr!("回到一般視窗", "Back to the normal window"), "Esc") {
+            action = Some(Action::NormalWindow);
+        }
         let playlist = egui::Button::selectable(self.playlist_shown(), crate::tr!("播放清單", "Playlist"))
             .shortcut_text(self.keymap.hint(Command::Playlist));
         if ui.add(playlist).clicked() {
@@ -3842,14 +3927,20 @@ impl VitascopeApp {
         if menu_item(ui, loaded, crate::tr!("複製媒體資訊", "Copy media info"), "") {
             action = Some(Action::CopyInfo);
         }
-        if let Some(mode) = self.on_top_menu(ui) {
-            action = Some(Action::SetOnTop(mode));
+        match self.on_top_menu(ui) {
+            Some(OnTopPick::Mode(mode)) => action = Some(Action::SetOnTop(mode)),
+            Some(OnTopPick::Mini(on)) => self.set_mini_on_top(&ctx, on, true),
+            None => {}
         }
         if self.cmd_item(ui, true, crate::tr!("設定…", "Settings…"), Command::Settings) {
             action = Some(Action::Settings);
         }
         if self.cmd_item(ui, true, crate::tr!("關於影戲", "About VitaScope"), Command::About) {
             action = Some(Action::About);
+        }
+        // 迷你播放器的標題列小，關閉按鈕不好按：選單也可以結束
+        if compact && menu_item(ui, true, crate::tr!("結束影戲", "Quit VitaScope"), "") {
+            action = Some(Action::Quit);
         }
 
         if settings_changed {
@@ -3984,7 +4075,13 @@ impl VitascopeApp {
         }
         ui.ctx().request_repaint_after(OSD_DURATION - age);
         let painter = ui.painter();
-        let galley = painter.layout_no_wrap(text.clone(), FontId::proportional(20.0), Color32::WHITE);
+        // 迷你播放器的畫面小：字跟著變小（最小 12 點）
+        let size = if self.modes.mode.is_compact() {
+            (rect.width() / 24.0).clamp(12.0, 20.0)
+        } else {
+            20.0
+        };
+        let galley = painter.layout_no_wrap(text.clone(), FontId::proportional(size), Color32::WHITE);
         let pos = rect.left_top() + vec2(20.0, 20.0);
         let bg = Rect::from_min_size(pos, galley.size()).expand2(vec2(12.0, 6.0));
         painter.rect_filled(bg, CornerRadius::same(6), Color32::from_black_alpha(150));
@@ -4124,6 +4221,10 @@ impl VitascopeApp {
             {
                 self.run(ui.ctx(), Action::SetAfterPlayback(AfterPlayback::Nothing));
             }
+            // 🗗（迷你播放器）最先拿掉：時間、速度、⏳ 都放得下才放（快捷鍵、右鍵選單一樣能進入）。
+            // `right_controls_width` 不含它，上面的判斷照舊
+            let mini_width = 32.0 + ui.spacing().item_spacing.x;
+            let mini_room = ui.available_width() >= self.right_controls_width + mini_width;
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui
@@ -4135,6 +4236,17 @@ impl VitascopeApp {
                     .clicked()
                 {
                     self.run(ui.ctx(), Action::ToggleFullscreen);
+                }
+                if mini_room
+                    && ui
+                        .add(icon_button("🗗"))
+                        .on_hover_text(
+                            self.keymap
+                                .labeled(crate::tr!("迷你播放器", "Mini player"), Command::MiniPlayer),
+                        )
+                        .clicked()
+                {
+                    self.run(ui.ctx(), Action::ToggleMini);
                 }
                 // 按右鍵：開啟檔案 / 開啟網址
                 let open = ui.add(icon_button("🗁")).on_hover_text(crate::tf!(
@@ -4182,7 +4294,7 @@ impl VitascopeApp {
                 self.track_menu(ui, TrackKind::Sub, crate::tr!("字幕", "Subtitles"));
                 self.track_menu(ui, TrackKind::Audio, crate::tr!("音軌", "Audio"));
                 self.volume_controls(ui);
-                self.right_controls_width = ui.min_rect().width();
+                self.right_controls_width = ui.min_rect().width() - if mini_room { mini_width } else { 0.0 };
             });
         });
     }
@@ -4787,10 +4899,12 @@ impl eframe::App for VitascopeApp {
         self.inhibit_tick();
         self.handle_drops(ctx);
         self.update_title(ctx);
+        // 視窗模式：切換進行到哪裡、系統把迷你播放器變成全螢幕 / 最大化了沒（在層級之前：換了模式，層級同一幀跟著換）
+        self.mode_tick(ctx);
         self.keep_window_level(ctx);
         if self.frames >= 2 {
             if std::mem::take(&mut self.start_fullscreen) {
-                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                self.request_fullscreen(ctx, true);
                 self.fit_window_pending = false;
             }
             self.fit_window(ctx);
@@ -4822,7 +4936,16 @@ impl eframe::App for VitascopeApp {
 
         let palette = Palette::of(ui.visuals());
         let panel_frame = Frame::NONE.fill(palette.panel).inner_margin(Margin::symmetric(10, 6));
-        if !fullscreen {
+        if self.compact() {
+            // 迷你播放器：影片下面一列精簡的控制列（固定高度：進入時照這個高度算視窗大小）
+            let r = egui::Panel::bottom("mini_controls")
+                .frame(panel_frame)
+                .resizable(false)
+                .exact_size(crate::window_mode::MINI_BAR)
+                .show(ui, |ui| self.mini_bar(ui));
+            self.controls_height = r.response.rect.height();
+            self.pointer_over_controls = false;
+        } else if !fullscreen {
             let r = egui::Panel::bottom("controls")
                 .frame(panel_frame)
                 .resizable(false)
@@ -4834,7 +4957,8 @@ impl eframe::App for VitascopeApp {
         self.playlist_width = 0.0;
         self.pointer_over_playlist = false;
         let mut side_rect = None;
-        if self.settings.show_playlist {
+        // 迷你播放器裡不顯示（設定照舊，回到一般視窗時面板跟著回來）
+        if self.side_visible() {
             let r = egui::Panel::right("playlist")
                 .frame(Self::playlist_frame(&palette))
                 .resizable(true)
@@ -4893,13 +5017,18 @@ impl eframe::App for VitascopeApp {
         self.lift_subtitles(overlay_height);
         // 這一幀畫的對話框自己記下來（下一幀的 handle_keys 看）
         self.modal_open = false;
+        // 迷你播放器裡打開了大視窗（設定、控制面板…，從哪裡打開的都一樣）：回到一般視窗
+        self.compact_window_check(&ctx);
         self.about_window(&ctx);
         self.url_dialog_window(&ctx);
         self.bookmarks_clear_modal(&ctx);
-        self.subtitle_style_window(&ctx);
-        self.settings_window(&ctx);
-        self.control_panel(&ctx);
-        self.export_window(&ctx);
+        // 迷你播放器裡藏起來（狀態保留，回到一般視窗時照原樣出現）
+        if !self.compact() {
+            self.subtitle_style_window(&ctx);
+            self.settings_window(&ctx);
+            self.control_panel(&ctx);
+            self.export_window(&ctx);
+        }
         // 同意下載、確認移除：在設定視窗之後畫（從設定頁按的，對話框要蓋在設定視窗上面）
         self.install_modals(&ctx);
         // 播完後的倒數：最後畫，蓋在所有視窗、對話框上面
@@ -5044,8 +5173,9 @@ fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
 }
 
 impl VitascopeApp {
-    /// 右鍵選單「視窗置頂 ▸」：三種模式（快捷鍵寫在子選單的標題上，它是依序切換）；回傳選了哪一個
-    fn on_top_menu(&self, ui: &mut egui::Ui) -> Option<OnTop> {
+    /// 右鍵選單「視窗置頂 ▸」：三種模式（快捷鍵寫在子選單的標題上，它是依序切換）；迷你播放器裡另外有
+    /// 「迷你播放器置頂」（這時快捷鍵切換的是它）。回傳選了哪一個
+    fn on_top_menu(&self, ui: &mut egui::Ui) -> Option<OnTopPick> {
         use egui::containers::menu::SubMenuButton;
         let label = crate::tr!("視窗置頂", "Always on top");
         let hint = self.keymap.hint(Command::OnTop);
@@ -5061,10 +5191,20 @@ impl VitascopeApp {
         };
         let current = self.settings.on_top;
         let mut picked = None;
+        let mini = self.compact().then_some(self.settings.compact.mini_on_top);
         button.ui(ui, |ui| {
+            if let Some(mut on) = mini {
+                if ui
+                    .checkbox(&mut on, crate::tr!("迷你播放器置頂", "Keep the mini player on top"))
+                    .clicked()
+                {
+                    picked = Some(OnTopPick::Mini(on));
+                }
+                ui.separator();
+            }
             for mode in OnTop::ALL {
                 if ui.radio(current == mode, mode.label()).clicked() && mode != current {
-                    picked = Some(mode);
+                    picked = Some(OnTopPick::Mode(mode));
                 }
             }
         });
@@ -5075,6 +5215,14 @@ impl VitascopeApp {
     fn cmd_item(&self, ui: &mut egui::Ui, enabled: bool, text: &str, cmd: Command) -> bool {
         menu_item(ui, enabled, text, &self.keymap.hint(cmd))
     }
+}
+
+/// 右鍵選單「視窗置頂 ▸」選的
+enum OnTopPick {
+    /// 一般視窗的置頂模式
+    Mode(OnTop),
+    /// 迷你播放器置頂開 / 關（只在迷你播放器裡出現）
+    Mini(bool),
 }
 
 /// 選單裡的勾選項目：後面寫按鍵（沒有按鍵時跟原本的勾選框一模一樣）

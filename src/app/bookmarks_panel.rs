@@ -454,7 +454,7 @@ impl VitascopeApp {
     /// 改名到一半、書籤分頁就不見了（例如按了控制列的 ☰ 換到播放清單）：跟點了別的地方一樣，改好。
     /// 不然輸入框下次出現時沒有焦點，也不會再「失去焦點」，一直停在改名的樣子
     pub(super) fn finish_hidden_rename(&mut self) {
-        let shown = self.settings.show_playlist && self.settings.side_tab == SideTab::Bookmarks;
+        let shown = self.side_visible() && self.settings.side_tab == SideTab::Bookmarks;
         if !shown && let Some(e) = self.bookmark_edit.take() {
             self.bookmarks.rename(&e.key, e.id, &e.text);
         }
@@ -540,7 +540,7 @@ impl VitascopeApp {
             }
             ui.separator();
             // 側邊面板的書籤分頁（開著時標成選取，按了關掉）
-            let shown = self.settings.show_playlist && self.settings.side_tab == SideTab::Bookmarks;
+            let shown = self.side_visible() && self.settings.side_tab == SideTab::Bookmarks;
             let mut list = egui::Button::selectable(shown, crate::tr!("書籤清單", "Bookmark list"));
             let hint = self.keymap.hint(Command::BookmarkList);
             if !hint.is_empty() {

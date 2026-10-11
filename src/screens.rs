@@ -322,6 +322,19 @@ pub fn monitor_key(w: RawWindowHandle) -> Option<u64> {
     }
 }
 
+/// macOS：視窗是不是放到最大（zoom，綠色按鈕按 Option、雙擊標題列）。egui-winit 在 macOS 執行中不更新
+/// `maximized`（egui#3494），迷你播放器要知道系統把它放大了沒、回到一般視窗時要不要再放大。
+/// 其他系統（egui 的值是對的）、查不到時是 None
+pub fn window_zoomed(w: RawWindowHandle) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if let RawWindowHandle::AppKit(h) = w {
+        return rate::zoomed(h.ns_view);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = w;
+    None
+}
+
 /// 遠端桌面連線中：RDP 回報的更新率是假的，swap 也不等垂直同步，不能依螢幕同步
 pub fn remote_session() -> bool {
     #[cfg(windows)]
@@ -704,6 +717,27 @@ mod rate {
 
     pub fn monitor_key(view: NonNull<c_void>) -> Option<u64> {
         screen_of(view).map(|(id, _)| u64::from(id))
+    }
+
+    /// 視窗是不是放到最大。沒有標題列、不能改大小的視窗 `isZoomed` 一定是 false（winit 會暫時改 styleMask 再問；
+    /// 這裡不改視窗，回答不知道）。全螢幕不算放到最大（全螢幕另外看；不要退回 egui 留著的舊值）
+    pub fn zoomed(view: NonNull<c_void>) -> Option<bool> {
+        // AppKit 只能在主執行緒用；logic() 在主執行緒
+        MainThreadMarker::new()?;
+        // SAFETY: winit 給的 ns_view 是 NSView，主視窗在整個程式執行期間都存在
+        let view: &NSView = unsafe { view.cast::<NSView>().as_ref() };
+        let window = view.window()?;
+        // NSWindowStyleMaskTitled | NSWindowStyleMaskResizable；NSWindowStyleMaskFullScreen
+        const TITLED_RESIZABLE: usize = (1 << 0) | (1 << 3);
+        const FULL_SCREEN: usize = 1 << 14;
+        let mask = window.styleMask().0;
+        if mask & FULL_SCREEN != 0 {
+            return Some(false);
+        }
+        if mask & TITLED_RESIZABLE != TITLED_RESIZABLE {
+            return None;
+        }
+        Some(window.isZoomed())
     }
 
     pub fn refresh_rate(view: NonNull<c_void>) -> Option<Refresh> {

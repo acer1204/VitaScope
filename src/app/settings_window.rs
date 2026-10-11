@@ -191,6 +191,23 @@ impl VitascopeApp {
                         }
                     });
                 ui.end_row();
+                // 迷你播放器置頂（預設開）：關掉時迷你播放器照上面的「視窗置頂」
+                ui.label("");
+                let mut mini_on_top = self.settings.compact.mini_on_top;
+                let mini = self
+                    .keymap
+                    .labeled(tr!("迷你播放器", "The mini player"), crate::keymap::Command::MiniPlayer);
+                if ui
+                    .checkbox(&mut mini_on_top, tr!("迷你播放器置頂", "Keep the mini player on top"))
+                    .on_hover_text(tf!(
+                        "{mini}一律蓋在其他視窗上面；關掉時照「視窗置頂」的設定",
+                        "{mini} always stays above other windows; when off, it follows “Always on top”"
+                    ))
+                    .changed()
+                {
+                    *action = Some(Action::SetMiniOnTop(mini_on_top));
+                }
+                ui.end_row();
             });
         changed
     }

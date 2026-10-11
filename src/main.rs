@@ -212,7 +212,7 @@ fn main() -> eframe::Result {
         // Linux：Wayland 用它找 .desktop 檔與圖示，X11 是 WM_CLASS
         .with_app_id("io.github.acer1204.vitascope")
         .with_inner_size([960.0, 600.0])
-        .with_min_inner_size([vitascope::app::MIN_WINDOW_WIDTH, 300.0])
+        .with_min_inner_size(vitascope::window_mode::NORMAL_MIN)
         .with_drag_and_drop(true);
     if let Some(icon) = vitascope::icon::window_icon() {
         viewport = viewport.with_icon(icon);

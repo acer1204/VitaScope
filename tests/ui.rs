@@ -25,6 +25,7 @@ use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::{OnTop, Settings, SideTab};
 use vitascope::system_power::{AfterPlayback, Avail, PowerAction, PowerCaps, PowerError};
 use vitascope::theme::ThemeChoice;
+use vitascope::window_mode::WindowMode;
 use vitascope::ytdl::{Failure, Hint, Resolve, YtdlError};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -17962,5 +17963,1330 @@ fn after_playback_menu_countdown_and_hourglass_in_english() {
     assert_eq!(
         h.state().osd_text(),
         Some("Cancelled: close VitaScope when playback ends")
+    );
+}
+
+// ───────────── 迷你播放器（F1） ─────────────
+
+/// 迷你播放器測試用的螢幕：一個 1920×1080 的螢幕，工作區（扣掉工作列）1920×1040
+fn mini_areas() -> Vec<vitascope::screens::Area> {
+    vec![vitascope::screens::Area {
+        x: 0.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1040.0,
+        scale: 1.0,
+    }]
+}
+
+/// 模擬的標題列與邊框：外框比內容大這麼多，內容在外框裡的位置
+const MINI_FRAME: egui::Vec2 = egui::vec2(16.0, 39.0);
+const MINI_INSET: egui::Vec2 = egui::vec2(8.0, 31.0);
+
+/// 模擬視窗管理員回報的位置大小：外框左上角 `pos`、內容大小 `size`
+fn report_window(h: &mut Harness<'_, VitascopeApp>, pos: egui::Pos2, size: egui::Vec2) {
+    let v = h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default();
+    v.outer_rect = Some(egui::Rect::from_min_size(pos, size + MINI_FRAME));
+    v.inner_rect = Some(egui::Rect::from_min_size(pos + MINI_INSET, size));
+    v.monitor_size = Some(egui::vec2(1920.0, 1080.0));
+}
+
+/// 跑一幀，像視窗管理員一樣照這一幀送出的大小、位置改視窗（kittest 自己只會改內容大小），回傳這一幀的指令
+fn window_step(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    h.step();
+    let cmds = viewport_commands(h);
+    // 這一幀改了大小的話，下一幀的輸入已經是新的大小（kittest 照 InnerSize 改）；沒改就是現在的
+    let size = h
+        .input()
+        .screen_rect
+        .map_or_else(|| h.ctx.content_rect().size(), |r| r.size());
+    let v = h.input().viewports.get(&egui::ViewportId::ROOT);
+    let mut pos = v.and_then(|v| v.outer_rect).map_or(egui::pos2(200.0, 150.0), |r| r.min);
+    for c in &cmds {
+        if let egui::ViewportCommand::OuterPosition(p) = c {
+            pos = *p;
+        }
+    }
+    report_window(h, pos, size);
+    cmds
+}
+
+/// 一直跑（像視窗管理員一樣跟著指令改視窗）直到條件成立，回傳期間送出的所有指令
+fn window_steps_until(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    cond: impl Fn(&VitascopeApp) -> bool,
+) -> Vec<egui::ViewportCommand> {
+    let start = Instant::now();
+    let mut all = Vec::new();
+    loop {
+        all.extend(window_step(h));
+        if cond(h.state()) {
+            return all;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}（指令：{all:?}）");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 切換做完（視窗變好、之後要做的也做了）
+fn window_settled(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    let mut cmds = window_steps_until(h, "視窗模式切換完", |app| !app.window_mode_pending());
+    cmds.extend(window_step(h));
+    cmds
+}
+
+/// 同一幀按下、放開（有修飾鍵），跑一幀（像視窗管理員），回傳這一幀的指令
+fn press_window_key(
+    h: &mut Harness<'_, VitascopeApp>,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> Vec<egui::ViewportCommand> {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        });
+    }
+    window_step(h)
+}
+
+/// Ctrl（macOS：⌘）+ Shift + M
+fn toggle_mini_key(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    let mods = egui::Modifiers {
+        shift: true,
+        ..egui::Modifiers::COMMAND
+    };
+    press_window_key(h, mods, egui::Key::M)
+}
+
+/// 迷你播放器測試：播 `file`（自動接下一個關掉），螢幕是 `mini_areas`，視窗外框在 (200, 150)
+fn mini_case_with(file: PathBuf, mut settings: Settings, mut launch: Launch) -> Harness<'static, VitascopeApp> {
+    settings.auto_next = false;
+    let name = file.file_name().unwrap().to_string_lossy().into_owned();
+    let areas = launch.screen_areas.take().unwrap_or_else(mini_areas);
+    let mut h = harness_launch(
+        Launch {
+            files: vec![file],
+            screen_areas: Some(areas),
+            ..launch
+        },
+        settings,
+    );
+    settle(&mut h, &name);
+    let size = h.ctx.content_rect().size();
+    report_window(&mut h, egui::pos2(200.0, 150.0), size);
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    h
+}
+
+fn mini_case(file: PathBuf) -> Harness<'static, VitascopeApp> {
+    mini_case_with(file, Settings::default(), Launch::default())
+}
+
+fn cmd_index(cmds: &[egui::ViewportCommand], want: &egui::ViewportCommand) -> usize {
+    cmds.iter()
+        .position(|c| c == want)
+        .unwrap_or_else(|| panic!("沒有送 {want:?}：{cmds:?}"))
+}
+
+fn inner_sizes(cmds: &[egui::ViewportCommand]) -> Vec<egui::Vec2> {
+    cmds.iter()
+        .filter_map(|c| match c {
+            egui::ViewportCommand::InnerSize(s) => Some(*s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 16:9 的影片在迷你播放器裡的大小：480 寬，影片 270 高 + 精簡的控制列
+fn mini_16_9() -> egui::Vec2 {
+    egui::vec2(480.0, 270.0 + vitascope::window_mode::MINI_BAR)
+}
+
+/// 迷你播放器的預設位置：工作區右下角（離邊緣 24 點；macOS、X11 的範圍是整個螢幕，多留工作列）
+fn mini_default_pos(size: egui::Vec2) -> egui::Pos2 {
+    let allowance = if cfg!(windows) {
+        0.0
+    } else {
+        vitascope::window_mode::TASKBAR_ALLOWANCE
+    };
+    egui::pos2(
+        1920.0 - size.x - MINI_FRAME.x - 24.0,
+        1040.0 - size.y - MINI_FRAME.y - 24.0 - allowance,
+    )
+}
+
+#[test]
+fn mini_player_enters_and_comes_back_to_the_same_place() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv")); // 640×360
+    let normal = h.ctx.content_rect().size();
+    let before = h.state().settings().window;
+    assert_eq!(
+        before.map(|g| g.pos),
+        Some([200.0, 150.0]),
+        "前提：記下了一般視窗的位置"
+    );
+    let cmds = toggle_mini_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    let size = mini_16_9();
+    let min = cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::MINI_MIN),
+    );
+    let inner = cmd_index(&cmds, &egui::ViewportCommand::InnerSize(size));
+    assert!(min < inner, "最小大小先放寬，不然縮不下去：{cmds:?}");
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(mini_default_pos(size)));
+    // 迷你播放器預設置頂（一般視窗是不置頂）
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+    );
+    window_settled(&mut h);
+    assert_eq!(h.ctx.content_rect().size(), size);
+    // 精簡的控制列：⏸、進度、🔊、🗖；沒有一般控制列的 ⛶、☰
+    h.get_by_label("🗖");
+    h.get_by_label("🔊");
+    h.get_by_label("進度");
+    assert!(h.query_by_label("⛶").is_none() && h.query_by_label("☰").is_none());
+    // 控制列的高度跟算視窗大小時用的一樣：影片畫面剛好是 16:9
+    let video = h.get_by_label("影片畫面").rect();
+    assert!(
+        (video.width() / video.height() - 16.0 / 9.0).abs() < 0.01,
+        "影片畫面 {video:?}"
+    );
+    assert_eq!(h.state().settings().window, before, "一般視窗記的位置大小不動");
+    // 再按一次：回到原本的位置大小，最小大小、層級改回來
+    let cmds = toggle_mini_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    let min = cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::NORMAL_MIN),
+    );
+    let inner = cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    assert!(min < inner, "{cmds:?}");
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(egui::pos2(200.0, 150.0)));
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Maximized(true)),
+        "原本沒有最大化"
+    );
+    window_settled(&mut h);
+    assert_eq!(h.ctx.content_rect().size(), normal);
+    assert_eq!(h.state().settings().window, before);
+    h.get_by_label("⛶");
+    assert!(h.query_by_label("🗖").is_none());
+}
+
+/// 控制列的 🗗、右鍵選單的「迷你播放器」也能進入；迷你播放器的 🗖、Esc、右鍵選單「回到一般視窗」回來。
+/// 控制列放不下時 🗗 最先拿掉（最小寬度的視窗：時間照樣寫總長度）
+#[test]
+fn mini_player_button_menu_and_ways_back() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    assert_eq!(h.ctx.content_rect().width(), 640.0, "前提：最小寬度的視窗");
+    assert!(h.query_by_label("🗗").is_none(), "放不下：🗗 先拿掉");
+    h.get_by_label_contains("/ 00:20");
+    click_context_item(&mut h, "迷你播放器");
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal, "Esc 回到一般視窗");
+    window_settled(&mut h);
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    click_context_item(&mut h, "回到一般視窗");
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    window_settled(&mut h);
+    // 一般視窗的選單沒有「回到一般視窗」「結束影戲」
+    hover_context_item(&mut h, "迷你播放器");
+    assert!(h.query_by_label("回到一般視窗").is_none() && h.query_by_label("結束影戲").is_none());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 放大：🗗 出現；按了進入，迷你播放器的 🗖 回來
+    h.set_size(egui::vec2(960.0, 600.0));
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    h.get_by_label("🗗").click();
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    h.get_by_label("🗖").click();
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert_eq!(h.ctx.content_rect().size(), egui::vec2(960.0, 600.0));
+}
+
+/// 迷你播放器的右鍵選單：完整的選單，另外有「回到一般視窗」「結束影戲」（標題列小，關閉按鈕不好按）
+#[test]
+fn mini_player_menu_can_quit() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    hover_context_item(&mut h, "結束影戲");
+    h.get_by_label("結束影戲").click();
+    h.step();
+    assert!(
+        viewport_commands(&h).contains(&egui::ViewportCommand::Close),
+        "{:?}",
+        viewport_commands(&h)
+    );
+}
+
+/// 最大化的視窗進入迷你播放器：先取消最大化、等還原好的大小出來才送迷你播放器的大小；
+/// 回來時還原原本的大小再最大化（P-B1：一般視窗要在要求的那一刻記下，包括最大化）
+#[test]
+fn maximized_window_comes_back_maximized_from_the_mini_player() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window.unwrap();
+    // 使用者把視窗最大化
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(true);
+    h.set_size(egui::vec2(1920.0, 1000.0));
+    report_window(&mut h, egui::pos2(-8.0, -8.0), egui::vec2(1920.0, 1000.0));
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    assert_eq!(
+        h.state().settings().window,
+        Some(vitascope::settings::WindowGeometry {
+            maximized: true,
+            ..before
+        }),
+        "前提：最大化時只記旗標"
+    );
+    let toggled = Instant::now();
+    let cmds = toggle_mini_key(&mut h);
+    assert!(cmds.contains(&egui::ViewportCommand::Maximized(false)), "{cmds:?}");
+    assert!(inner_sizes(&cmds).is_empty(), "還是最大化時不送大小：{cmds:?}");
+    assert_eq!(h.state().window_mode(), WindowMode::Normal, "還沒換");
+    // 等取消最大化最多一秒（之後照樣送）：很慢的機器上這幾幀已經超過一秒時，不檢查「還在等」
+    let in_time = || toggled.elapsed() < Duration::from_millis(900);
+    // 系統還沒取消最大化：繼續等
+    let cmds = window_step(&mut h);
+    if in_time() {
+        assert!(inner_sizes(&cmds).is_empty(), "{cmds:?}");
+    }
+    // 取消最大化了，大小晚一幀才給（Windows）：還是等
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(false);
+    h.step();
+    if in_time() {
+        assert!(inner_sizes(&viewport_commands(&h)).is_empty());
+        assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    }
+    // 還原後的大小出來了：送迷你播放器的
+    h.set_size(egui::vec2(before.size[0], before.size[1]));
+    let cmds = window_steps_until(&mut h, "進入迷你播放器", |app| {
+        app.window_mode() == WindowMode::Mini
+    });
+    assert!(inner_sizes(&cmds).contains(&mini_16_9()), "{cmds:?}");
+    window_settled(&mut h);
+    assert_eq!(
+        h.state().settings().window.map(|g| g.maximized),
+        Some(true),
+        "切換中、迷你播放器裡都不改一般視窗記的"
+    );
+    // 回來：原本的大小、位置，再最大化
+    let cmds = toggle_mini_key(&mut h);
+    let inner = cmd_index(
+        &cmds,
+        &egui::ViewportCommand::InnerSize(egui::vec2(before.size[0], before.size[1])),
+    );
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(egui::pos2(before.pos[0], before.pos[1])),
+    );
+    let max = cmd_index(&cmds, &egui::ViewportCommand::Maximized(true));
+    assert!(inner < max, "先還原大小再最大化：{cmds:?}");
+}
+
+/// 全螢幕時進入迷你播放器：先離開全螢幕，系統說結束了才送迷你播放器的大小（不然會被全螢幕的還原蓋掉）；
+/// 回來時是全螢幕之前的一般視窗
+#[test]
+fn entering_the_mini_player_from_fullscreen_waits_for_the_exit() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window.unwrap();
+    {
+        let v = h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default();
+        v.fullscreen = Some(true);
+    }
+    h.set_size(egui::vec2(1920.0, 1080.0));
+    report_window(&mut h, egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    let cmds = toggle_mini_key(&mut h);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::MinInnerSize(_) | egui::ViewportCommand::InnerSize(_)
+        )),
+        "全螢幕結束之前不送大小：{cmds:?}"
+    );
+    let cmds = window_step(&mut h);
+    assert!(inner_sizes(&cmds).is_empty(), "{cmds:?}");
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    // 系統說離開全螢幕了（還原成全螢幕之前的大小）
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.set_size(egui::vec2(before.size[0], before.size[1]));
+    let cmds = window_steps_until(&mut h, "進入迷你播放器", |app| {
+        app.window_mode() == WindowMode::Mini
+    });
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::MINI_MIN),
+    );
+    assert!(inner_sizes(&cmds).contains(&mini_16_9()), "{cmds:?}");
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+    );
+    // macOS 離開全螢幕的動畫結束時把層級改回一般：之後再設一次迷你播放器的置頂。
+    // 「視窗置頂」是不置頂也一樣（層級只有一個來源：迷你播放器置頂也算）
+    assert_eq!(h.state().settings().on_top, OnTop::Never, "前提");
+    let start = Instant::now();
+    while !window_step(&mut h).contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)) {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "離開全螢幕的動畫之後再設一次迷你播放器的置頂"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    window_settled(&mut h);
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::InnerSize(egui::vec2(before.size[0], before.size[1])),
+    );
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+        "回到一般視窗，不是全螢幕"
+    );
+}
+
+/// 迷你播放器裡要全螢幕（F、⛶ 的快捷鍵）：先回到一般視窗，還原好了才全螢幕（之後離開全螢幕是一般視窗）
+#[test]
+fn fullscreen_from_the_mini_player_restores_the_normal_window_first() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let cmds = press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+        "還原好之前不全螢幕：{cmds:?}"
+    );
+    let later = window_settled(&mut h);
+    assert!(later.contains(&egui::ViewportCommand::Fullscreen(true)), "{later:?}");
+}
+
+/// 單一執行個體：迷你播放器開著時另一個程式送來 `--fullscreen`：一樣先回到一般視窗再全螢幕
+#[test]
+fn single_instance_fullscreen_while_mini_goes_through_the_helper() {
+    let dir = TempDir::new("mini-instance");
+    let a = dir.clip("第1集.mp4");
+    let b = dir.clip("第2集.mp4");
+    let suffix = format!("-mini{}", std::process::id());
+    let run = TempDir(std::env::temp_dir().join(format!("vts-mini-{}", std::process::id())));
+    let ep = vitascope::instance::Endpoint::in_dir(run.0.clone(), &suffix).unwrap();
+    let primary = match vitascope::instance::start(
+        &ep,
+        &vitascope::instance::Request::default(),
+        true,
+        std::sync::Arc::new(|| {}),
+    ) {
+        vitascope::instance::Startup::Primary(p) => p,
+        _ => panic!("應該是主視窗"),
+    };
+    let mut h = mini_case_with(
+        a,
+        Settings::default(),
+        Launch {
+            instance: Some(primary),
+            ..Default::default()
+        },
+    );
+    let normal = h.ctx.content_rect().size();
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let req = vitascope::instance::Request {
+        paths: vec![b],
+        fullscreen: true,
+    };
+    let sent = vitascope::instance::start(&ep, &req, true, std::sync::Arc::new(|| {}));
+    assert!(matches!(sent, vitascope::instance::Startup::Forwarded));
+    let cmds = window_steps_until(&mut h, "收到 --fullscreen", |app| {
+        app.window_mode() == WindowMode::Normal
+    });
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+        "迷你播放器裡不直接全螢幕：{cmds:?}"
+    );
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    let later = window_settled(&mut h);
+    assert!(later.contains(&egui::ViewportCommand::Fullscreen(true)), "{later:?}");
+}
+
+/// 系統把迷你播放器最大化（雙擊標題列、Win+↑）：回到一般模式（最小大小、層級改回來）；
+/// 使用者取消最大化時還原一般視窗的位置大小（系統會還原成迷你播放器的大小）（P-B2）
+#[test]
+fn maximizing_the_mini_player_from_outside_goes_back_to_normal() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let mini = h.ctx.content_rect().size();
+    let mini_pos = mini_default_pos(mini);
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(true);
+    h.set_size(egui::vec2(1920.0, 1000.0));
+    let cmds = window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::NORMAL_MIN),
+    );
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+    assert!(inner_sizes(&cmds).is_empty(), "最大化中不改大小：{cmds:?}");
+    h.get_by_label("⛶");
+    // 最大化中照一般視窗：不記成一般視窗的大小
+    for _ in 0..3 {
+        assert!(inner_sizes(&window_step(&mut h)).is_empty());
+    }
+    // 使用者取消最大化：系統還原成迷你播放器的大小 → 改回一般視窗原本的
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(false);
+    h.set_size(mini);
+    report_window(&mut h, mini_pos, mini);
+    let cmds = window_settled(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(egui::pos2(200.0, 150.0)));
+    assert!(!cmds.contains(&egui::ViewportCommand::Maximized(true)), "{cmds:?}");
+    assert_eq!(h.ctx.content_rect().size(), normal);
+    assert_eq!(
+        h.state().settings().window.map(|g| (g.pos, g.size)),
+        Some(([200.0, 150.0], [normal.x, normal.y]))
+    );
+}
+
+/// 一般視窗原本是最大化的，迷你播放器又被系統最大化、使用者自己取消最大化：
+/// 還原成一般視窗原本的大小，但不再最大化（使用者剛取消了最大化，P-B2）
+#[test]
+fn unmaximizing_the_mini_player_from_outside_does_not_maximize_again() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window.unwrap();
+    let normal = egui::vec2(before.size[0], before.size[1]);
+    let set_maximized = |h: &mut Harness<'_, VitascopeApp>, on: bool| {
+        h.input_mut()
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .maximized = Some(on);
+    };
+    // 一般視窗最大化，進入迷你播放器（先取消最大化）
+    set_maximized(&mut h, true);
+    h.set_size(egui::vec2(1920.0, 1000.0));
+    report_window(&mut h, egui::pos2(-8.0, -8.0), egui::vec2(1920.0, 1000.0));
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    let cmds = toggle_mini_key(&mut h);
+    assert!(cmds.contains(&egui::ViewportCommand::Maximized(false)), "{cmds:?}");
+    set_maximized(&mut h, false);
+    h.set_size(normal);
+    report_window(&mut h, egui::pos2(before.pos[0], before.pos[1]), normal);
+    window_steps_until(&mut h, "進入迷你播放器", |app| {
+        app.window_mode() == WindowMode::Mini
+    });
+    window_settled(&mut h);
+    let mini = h.ctx.content_rect().size();
+    assert_eq!(mini, mini_16_9(), "前提：進入了迷你播放器");
+    // 系統把迷你播放器最大化：回到一般模式
+    set_maximized(&mut h, true);
+    h.set_size(egui::vec2(1920.0, 1000.0));
+    window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    // 使用者自己取消最大化：還原一般視窗原本的大小，不再最大化
+    set_maximized(&mut h, false);
+    h.set_size(mini);
+    report_window(&mut h, mini_default_pos(mini), mini);
+    let cmds = window_settled(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Maximized(true)),
+        "使用者剛取消最大化，不再最大化：{cmds:?}"
+    );
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+}
+
+/// 系統把迷你播放器最大化之後，還沒取消最大化就又按 Ctrl+Shift+M：進入迷你播放器，
+/// 之前等著的「取消最大化時還原一般視窗」不要了（不然一進入又被改回一般視窗的大小）
+#[test]
+fn entering_again_while_maximized_from_outside_drops_the_old_restore() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let mini = h.ctx.content_rect().size();
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(true);
+    h.set_size(egui::vec2(1920.0, 1000.0));
+    window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal, "前提：系統最大化了");
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    let cmds = toggle_mini_key(&mut h);
+    assert!(cmds.contains(&egui::ViewportCommand::Maximized(false)), "{cmds:?}");
+    // 系統取消最大化（還原成之前的迷你播放器大小）
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(false);
+    h.set_size(mini);
+    let mut cmds = window_steps_until(&mut h, "進入迷你播放器", |app| {
+        app.window_mode() == WindowMode::Mini
+    });
+    cmds.extend(window_settled(&mut h));
+    for _ in 0..5 {
+        cmds.extend(window_step(&mut h));
+    }
+    assert!(
+        !inner_sizes(&cmds).contains(&normal),
+        "沒有被改回一般視窗的大小：{cmds:?}"
+    );
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    assert_eq!(h.ctx.content_rect().size(), mini_16_9());
+    // 回來：一般視窗原本的大小；進入前是最大化的，再最大化
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    cmd_index(&cmds, &egui::ViewportCommand::Maximized(true));
+}
+
+/// 系統把迷你播放器變成全螢幕（macOS 的綠色按鈕）：一樣回到一般模式，全螢幕結束後還原一般視窗
+#[test]
+fn fullscreen_from_outside_leaves_the_mini_player() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let mini = h.ctx.content_rect().size();
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(true);
+    h.set_size(egui::vec2(1920.0, 1080.0));
+    let cmds = window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::NORMAL_MIN),
+    );
+    // Esc 離開全螢幕（一般的路），之後還原一般視窗
+    let cmds = press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.set_size(mini);
+    let cmds = window_settled(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+}
+
+/// 迷你播放器裡按 F6：回到一般視窗，還原好了才打開播放清單（視窗照一般視窗的大小加寬）
+#[test]
+fn f6_in_mini_returns_to_normal_and_opens_the_playlist() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let cmds = press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F6);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    let later = window_settled(&mut h);
+    assert!(h.state().settings().show_playlist);
+    assert_eq!(h.state().settings().side_tab, SideTab::Playlist);
+    let widened = inner_sizes(&later);
+    assert!(
+        widened
+            .iter()
+            .any(|s| s.x > normal.x + 100.0 && (s.y - normal.y).abs() < 0.5),
+        "照一般視窗的大小加寬：{widened:?}"
+    );
+    h.run_steps(2);
+    h.get_by_label_contains("播放清單（");
+    // 面板開著時進入迷你播放器：藏起來（設定不變），按 H 回來時換到書籤分頁
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert!(
+        h.query_by_label_contains("播放清單（").is_none(),
+        "迷你播放器裡沒有側邊面板"
+    );
+    assert!(h.state().settings().show_playlist);
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::H);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert!(h.state().settings().show_playlist, "沒有被這一下關掉");
+    assert_eq!(h.state().settings().side_tab, SideTab::Bookmarks);
+}
+
+/// F5、Alt+G 在迷你播放器裡：回到一般視窗再打開；進入時已經開著的設定視窗先藏起來，Esc 不關它（回到一般視窗後照樣在）
+#[test]
+fn settings_and_control_panel_return_from_the_mini_player() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F5);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    window_settled(&mut h);
+    h.get_by_label("外觀");
+    // 設定開著時進入：藏起來
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert!(h.query_by_label("外觀").is_none(), "迷你播放器裡看不到設定視窗");
+    // Esc：回到一般視窗（不是關掉看不到的設定視窗）
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label("外觀");
+    // F5 在一般視窗照舊是開關
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F5);
+    h.run_steps(2);
+    assert!(h.query_by_label("外觀").is_none());
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    press_window_key(&mut h, egui::Modifiers::ALT, egui::Key::G);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal, "Alt+G 回到一般視窗");
+    window_settled(&mut h);
+    h.get_by_label("控制面板");
+}
+
+/// 匯出視窗：迷你播放器裡藏起來、狀態保留；迷你播放器裡要打開匯出（快捷鍵、選單）時回到一般視窗
+#[test]
+fn export_window_is_hidden_in_the_mini_player_and_keeps_its_state() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    h.state_mut().run_command(vitascope::keymap::Command::ExportGif);
+    h.run_steps(2);
+    h.get_by_label("匯出");
+    type_export_field(&mut h, "檔名", "迷你播放器之前打的");
+    assert_eq!(field_value(&h, "檔名"), "迷你播放器之前打的");
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert!(h.query_by_label("匯出").is_none(), "藏起來");
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.get_by_label("匯出");
+    assert_eq!(field_value(&h, "檔名"), "迷你播放器之前打的", "回來時照原樣");
+    // 迷你播放器裡打開（一般視窗沒開著時）：回到一般視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("匯出").is_none());
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().run_command(vitascope::keymap::Command::ExportClip);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label("匯出");
+}
+
+/// 雙擊畫面：雙擊是「全螢幕」時，迷你播放器裡雙擊回到一般視窗（不是全螢幕）；
+/// 雙擊也可以設成「迷你播放器」（設定 → 快捷鍵 → 滑鼠）
+#[test]
+fn double_click_in_the_mini_player_goes_back_to_the_normal_window() {
+    let mut h = mini_case(sample("common/mp4_long.mp4"));
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let video = h.get_by_label("影片畫面").rect().center();
+    let paused = paused_now(&h);
+    double_click(&mut h, video);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert!(
+        !viewport_commands(&h).contains(&egui::ViewportCommand::Fullscreen(true)),
+        "不是全螢幕"
+    );
+    assert_eq!(paused_now(&h), paused, "第一下的暫停切回來了");
+    let later = window_settled(&mut h);
+    assert!(
+        !later.contains(&egui::ViewportCommand::Fullscreen(true)),
+        "回到一般視窗之後也不全螢幕：{later:?}"
+    );
+    // 雙擊設成迷你播放器：一般視窗裡雙擊進入、迷你播放器裡雙擊回來
+    h.state_mut().settings_mut().keys.mouse.set(
+        vitascope::keymap::MouseInput::DoubleClick,
+        Some(vitascope::keymap::Command::MiniPlayer),
+    );
+    let video = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, video);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    window_settled(&mut h);
+    let video = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, video);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+}
+
+/// 「迷你播放器置頂」跟「視窗置頂」的模式一起決定層級（只有一個來源）：開著時迷你播放器一律置頂；
+/// 關掉時照模式（這裡是播放時置頂）。迷你播放器裡 Ctrl+T 切換的是它；層級沒變時不重送
+#[test]
+fn mini_player_on_top_composes_with_the_on_top_mode() {
+    let dir = TempDir::new("mini-on-top");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.on_top = OnTop::WhilePlaying;
+    let mut h = mini_case_with(sample("common/mp4_long.mp4"), settings, Launch::default());
+    h.key_press(egui::Key::Space);
+    let levels = levels_until(&mut h, "暫停", |s| s.paused);
+    assert_eq!(levels, [egui::WindowLevel::Normal], "前提：播放時置頂、暫停了");
+    // 迷你播放器（預設置頂）：暫停中也置頂
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+    );
+    window_settled(&mut h);
+    assert_eq!(levels_during(&mut h, 0.3), [], "沒變就不重送");
+    // Ctrl+T：關掉迷你播放器置頂 → 照播放時置頂（暫停中：一般）
+    assert_eq!(press_ctrl_t(&mut h), [egui::WindowLevel::Normal]);
+    assert!(!h.state().settings().compact.mini_on_top);
+    assert_eq!(h.state().settings().on_top, OnTop::WhilePlaying, "一般視窗的模式不動");
+    assert_eq!(h.state().osd_text(), Some("迷你播放器置頂：關閉"));
+    assert!(!Settings::load_from(path.clone()).compact.mini_on_top, "馬上存檔");
+    // 播放 → 置頂；暫停 → 一般
+    h.key_press(egui::Key::Space);
+    assert_eq!(
+        levels_until(&mut h, "播放", |s| !s.paused),
+        [egui::WindowLevel::AlwaysOnTop]
+    );
+    h.key_press(egui::Key::Space);
+    assert_eq!(levels_until(&mut h, "暫停", |s| s.paused), [egui::WindowLevel::Normal]);
+    // 右鍵選單「視窗置頂 ▸」裡的「迷你播放器置頂」打開 → 置頂
+    hover_context_item(&mut h, "視窗置頂");
+    h.get_by_label("迷你播放器置頂").click();
+    h.step();
+    assert_eq!(window_levels(&h), [egui::WindowLevel::AlwaysOnTop]);
+    assert!(h.state().settings().compact.mini_on_top);
+    assert_eq!(h.state().osd_text(), Some("迷你播放器置頂：開啟"));
+    h.run_steps(2);
+    // 回到一般視窗（暫停中、播放時置頂）：一般
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+    window_settled(&mut h);
+    // 一般視窗裡 Ctrl+T 照舊切換模式（播放時置頂 → 不置頂）
+    press_ctrl_t(&mut h);
+    assert_eq!(h.state().settings().on_top, OnTop::Never);
+    assert!(h.state().settings().compact.mini_on_top);
+}
+
+/// 「設定 → 一般」的「迷你播放器置頂」：馬上存檔，迷你播放器的層級跟著改
+#[test]
+fn general_page_mini_on_top_checkbox() {
+    let dir = TempDir::new("mini-on-top-page");
+    let path = dir.0.join("settings.json");
+    let mut h = mini_case_with(
+        sample("common/mkv_multitrack.mkv"),
+        Settings::load_from(path.clone()),
+        Launch::default(),
+    );
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("迷你播放器置頂").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().compact.mini_on_top);
+    assert!(!Settings::load_from(path.clone()).compact.mini_on_top);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    // 關掉時迷你播放器照「視窗置頂」（不置頂）：進入時是一般層級
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+}
+
+/// 迷你播放器記住自己的位置大小（換好 0.6 秒之後、跟換之前不一樣了才記；一般視窗記的不動）。
+/// 下次用記住的寬度與位置；位置已經不在任何螢幕上（螢幕拔掉了）就放回右下角（P-C6）
+#[test]
+fn mini_player_remembers_its_place_and_checks_it_is_still_on_a_screen() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window;
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    // 使用者把迷你播放器移到左上、拉寬
+    let moved = egui::pos2(300.0, 200.0);
+    let size = egui::vec2(640.0, 398.0);
+    h.set_size(size);
+    report_window(&mut h, moved, size);
+    let start = Instant::now();
+    while h
+        .state()
+        .settings()
+        .compact
+        .mini
+        .is_none_or(|g| g.pos != [300.0, 200.0])
+    {
+        assert!(start.elapsed() < TIMEOUT, "記住迷你播放器的位置");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let g = h.state().settings().compact.mini.unwrap();
+    assert_eq!(g.size, [640.0, 398.0]);
+    assert_eq!(h.state().settings().window, before, "一般視窗記的不動");
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().settings().window, before);
+    // 下次：記住的位置、寬度（高度照影片比例）
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(moved));
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::InnerSize(egui::vec2(640.0, 360.0 + vitascope::window_mode::MINI_BAR)),
+    );
+    window_settled(&mut h);
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    // 那個螢幕拔掉了：放回目前螢幕的右下角
+    h.state_mut().settings_mut().compact.mini = Some(vitascope::settings::WindowGeometry {
+        pos: [2500.0, 300.0],
+        size: [480.0, 308.0],
+        maximized: false,
+    });
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(mini_default_pos(mini_16_9())),
+    );
+}
+
+/// 迷你播放器裡換了檔案：寬度不變、高度照新影片的比例；視窗模式切換中不配合影片調整
+#[test]
+fn new_file_in_the_mini_player_keeps_the_width() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4")); // 4:3
+    let cmds = window_steps_until(&mut h, "配合 4:3 的影片", |app| {
+        let s = &app.player().state;
+        s.video_size == Some([320, 240]) && !app.window_fit_pending()
+    });
+    let taller = egui::vec2(480.0, 360.0 + vitascope::window_mode::MINI_BAR);
+    assert!(inner_sizes(&cmds).contains(&taller), "{cmds:?}");
+    // 右下角不動（P§2.4）：變高的部分往上長
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(mini_default_pos(taller)));
+    window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+}
+
+/// 迷你播放器在第二個螢幕上：放在那個螢幕的右下角；換了比較高的影片時右下角不動，整個視窗留在那個螢幕裡
+/// （只知道主螢幕大小的「移回螢幕裡」管不到第二個螢幕）
+#[test]
+fn mini_player_on_a_second_monitor_stays_on_it() {
+    let mut areas = mini_areas();
+    areas.push(vitascope::screens::Area {
+        x: 1920.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1040.0,
+        scale: 1.0,
+    });
+    let mut h = mini_case_with(
+        sample("common/mkv_multitrack.mkv"),
+        Settings::default(),
+        Launch {
+            screen_areas: Some(areas),
+            ..Default::default()
+        },
+    );
+    // 使用者把一般視窗移到第二個螢幕
+    let size = h.ctx.content_rect().size();
+    report_window(&mut h, egui::pos2(2100.0, 150.0), size);
+    window_step(&mut h);
+    let corner = |s: egui::Vec2| mini_default_pos(s) + egui::vec2(1920.0, 0.0);
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(corner(mini_16_9())));
+    window_settled(&mut h);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4")); // 4:3
+    let cmds = window_steps_until(&mut h, "配合 4:3 的影片", |app| {
+        let s = &app.player().state;
+        s.video_size == Some([320, 240]) && !app.window_fit_pending()
+    });
+    let taller = egui::vec2(480.0, 360.0 + vitascope::window_mode::MINI_BAR);
+    assert!(inner_sizes(&cmds).contains(&taller), "{cmds:?}");
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(corner(taller)));
+    window_step(&mut h);
+    let outer = h.input().viewports[&egui::ViewportId::ROOT].outer_rect.unwrap();
+    assert!(
+        outer.min.x >= 1920.0 && outer.max.x <= 3840.0 && outer.max.y <= 1040.0,
+        "整個視窗在第二個螢幕的工作區裡：{outer:?}"
+    );
+}
+
+/// 記住的位置是上次 16:9 的迷你播放器放在右下角時記的：這次的影片比較高（高度照影片重算），
+/// 右下角對齊上次的，整個視窗留在螢幕裡（控制列不會跑到螢幕、工作列下面）
+#[test]
+fn remembered_mini_position_keeps_a_taller_window_on_the_screen() {
+    let mut settings = Settings::default();
+    settings.compact.mini = Some(vitascope::settings::WindowGeometry {
+        pos: mini_default_pos(mini_16_9()).into(),
+        size: mini_16_9().into(),
+        maximized: false,
+    });
+    let mut h = mini_case_with(sample("common/mp4_h264_aac.mp4"), settings, Launch::default()); // 4:3
+    step_until(&mut h, "影片大小", |s| s.video_size == Some([320, 240]));
+    let taller = egui::vec2(480.0, 360.0 + vitascope::window_mode::MINI_BAR);
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(taller));
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(mini_default_pos(taller)));
+    // 記住的位置在螢幕中間：右下角對齊上次的（不用移回螢幕裡）
+    window_settled(&mut h);
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().settings_mut().compact.mini = Some(vitascope::settings::WindowGeometry {
+        pos: [600.0, 300.0],
+        size: mini_16_9().into(),
+        maximized: false,
+    });
+    let cmds = toggle_mini_key(&mut h);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(egui::pos2(600.0, 300.0 - (taller.y - mini_16_9().y))),
+    );
+}
+
+/// 視窗管理員還沒照迷你播放器的大小、位置改視窗時，不能把那時的視窗記成迷你播放器的：
+/// 一直不理（有些 X11 視窗管理員）：一直是一般視窗的位置大小，不記；
+/// 大小先變了、位置晚幾幀才跟上：換好 0.6 秒內不記（不然記成一般視窗的位置配迷你播放器的大小）
+#[test]
+fn mini_player_does_not_remember_a_window_that_has_not_changed_yet() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    let pos = egui::pos2(200.0, 150.0);
+    let press = |h: &mut Harness<'_, VitascopeApp>| {
+        let mods = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::COMMAND
+        };
+        for pressed in [true, false] {
+            h.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::M,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: mods,
+            });
+        }
+        h.step();
+    };
+    // 一直不理：每一幀都還是一般視窗的位置大小
+    let ignore = |h: &mut Harness<'_, VitascopeApp>| {
+        h.set_size(normal);
+        report_window(h, pos, normal);
+    };
+    press(&mut h);
+    ignore(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    let start = Instant::now();
+    let mut done: Option<Instant> = None;
+    // 切換放棄等待之後再過 0.8 秒（超過 0.6 秒的「剛換好」）
+    while done.is_none_or(|t| t.elapsed() < Duration::from_millis(800)) {
+        assert!(start.elapsed() < TIMEOUT, "切換一直沒有結束");
+        h.step();
+        ignore(&mut h);
+        if done.is_none() && !h.state().window_mode_pending() {
+            done = Some(Instant::now());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.ctx.content_rect().size(), normal, "前提：視窗沒變");
+    assert_eq!(
+        h.state().settings().compact.mini,
+        None,
+        "沒變過的視窗不記成迷你播放器的"
+    );
+    // 回到一般視窗（這次視窗管理員照做）
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    // 再進入：大小馬上變了，位置晚幾幀才跟上
+    let toggled = Instant::now();
+    press(&mut h);
+    let target = viewport_commands(&h)
+        .iter()
+        .find_map(|c| match c {
+            egui::ViewportCommand::OuterPosition(p) => Some(*p),
+            _ => None,
+        })
+        .expect("送了迷你播放器的位置");
+    let size = h.input().screen_rect.map_or(normal, |r| r.size());
+    assert_eq!(size, mini_16_9(), "前提：大小已經變了");
+    report_window(&mut h, pos, size);
+    while toggled.elapsed() < Duration::from_millis(400) {
+        h.step();
+        report_window(&mut h, pos, size);
+        // 很慢的機器上這幾幀已經超過 0.6 秒時不檢查
+        if toggled.elapsed() < Duration::from_millis(500) {
+            assert_eq!(h.state().settings().compact.mini, None, "剛換好、位置還沒跟上：不記");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 位置跟上之後才記
+    report_window(&mut h, target, size);
+    let start = Instant::now();
+    while h.state().settings().compact.mini.map(|g| g.pos) != Some(target.into()) {
+        assert!(start.elapsed() < TIMEOUT, "記住迷你播放器的位置");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 迷你播放器的控制列：播完後的動作（⏳，點一下取消）一定看得到（S-B9）；🔊 點一下靜音、滾輪調音量
+#[test]
+fn mini_bar_shows_the_after_playback_action_and_mutes() {
+    let mut h = mini_case(sample("common/mp4_long.mp4"));
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    h.run_steps(2);
+    h.get_by_label_contains("⏳").click();
+    h.run_steps(2);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert!(h.query_by_label_contains("⏳").is_none());
+    let muted = muted_now(&h);
+    assert!(!muted, "前提");
+    h.get_by_label("🔊").click();
+    // 圖示照 mpv 回報的靜音狀態畫：等回報到了再找 🔇
+    step_until(&mut h, "靜音", |s| s.muted);
+    h.run_steps(1);
+    assert!(muted_now(&h));
+    h.get_by_label("🔇").click();
+    step_until(&mut h, "取消靜音", |s| !s.muted);
+    h.run_steps(1);
+    assert!(!muted_now(&h));
+    // 滾輪（設定是跳轉也一樣）：🔊 上一律是音量
+    h.state_mut().settings_mut().keys.mouse.wheel = vitascope::keymap::WheelMode::Seek;
+    let volume = h.state().player().state.volume;
+    let icon = h.get_by_label("🔊").rect().center();
+    h.event(egui::Event::PointerMoved(icon));
+    h.step();
+    h.event(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, -1.0),
+        modifiers: egui::Modifiers::NONE,
+        phase: egui::TouchPhase::Move,
+    });
+    step_until(&mut h, "音量 -5", |s| (s.volume - (volume - 5.0)).abs() < 0.01);
+}
+
+/// Wayland：不能指定位置（不送 OuterPosition）、不能置頂（這次執行只提示一次）
+#[test]
+fn mini_player_on_wayland() {
+    let mut h = mini_case_with(
+        sample("common/mkv_multitrack.mkv"),
+        Settings::default(),
+        Launch {
+            wayland: Some(true),
+            screen_areas: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    let cmds = toggle_mini_key(&mut h);
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::OuterPosition(_))),
+        "{cmds:?}"
+    );
+    assert!(inner_sizes(&cmds).contains(&mini_16_9()));
+    assert_eq!(
+        h.state().osd_text(),
+        Some("這個桌面環境（Wayland）不讓程式自己置頂，視窗可能被其他視窗蓋住")
+    );
+    window_settled(&mut h);
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().run_command(vitascope::keymap::Command::ToggleMute);
+    toggle_mini_key(&mut h);
+    assert_eq!(h.state().osd_text(), Some("靜音"), "只提示一次");
+}
+
+/// Wayland：程式拿不到視窗的位置（egui 沒有外框、內容的範圍），迷你播放器的寬度照樣記得
+/// （位置記成不在任何螢幕上，下次交給系統）
+#[test]
+fn mini_player_on_wayland_remembers_the_width() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            wayland: Some(true),
+            screen_areas: Some(Vec::new()),
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, "mkv_multitrack.mkv");
+    let press = |h: &mut Harness<'_, VitascopeApp>| {
+        let mods = egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::COMMAND
+        };
+        for pressed in [true, false] {
+            h.input_mut().events.push(egui::Event::Key {
+                key: egui::Key::M,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: mods,
+            });
+        }
+        h.step();
+        viewport_commands(h)
+    };
+    let toggle = |h: &mut Harness<'_, VitascopeApp>| {
+        press(h);
+        step_until_app(h, "視窗模式切換完", |app| !app.window_mode_pending());
+    };
+    assert!(
+        h.input().viewports[&egui::ViewportId::ROOT].outer_rect.is_none(),
+        "前提：沒有視窗的位置"
+    );
+    toggle(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    // 使用者把迷你播放器拉寬
+    let wide = egui::vec2(640.0, 398.0);
+    h.set_size(wide);
+    step_until_app(&mut h, "記住迷你播放器的寬度", |app| {
+        app.settings().compact.mini.is_some_and(|g| g.size == [640.0, 398.0])
+    });
+    let g = h.state().settings().compact.mini.unwrap();
+    assert!(
+        !vitascope::window_mode::position_usable(&g, Some(&mini_areas())),
+        "位置不知道：不在任何螢幕上 {g:?}"
+    );
+    toggle(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    let cmds = press(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(wide));
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::OuterPosition(_))),
+        "{cmds:?}"
+    );
+}
+
+/// Wayland、英文介面：提示的英文；迷你播放器置頂關掉之後不能再打開（Wayland 不能置頂，設定不變）
+#[test]
+fn mini_player_on_wayland_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = mini_case_with(
+        sample("common/mkv_multitrack.mkv"),
+        settings,
+        Launch {
+            wayland: Some(true),
+            screen_areas: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    toggle_mini_key(&mut h);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("This desktop (Wayland) doesn't let programs keep themselves on top; the window may be covered")
+    );
+    window_settled(&mut h);
+    press_ctrl_t(&mut h);
+    assert!(!h.state().settings().compact.mini_on_top);
+    assert_eq!(h.state().osd_text(), Some("Keep the mini player on top: off"));
+    press_ctrl_t(&mut h);
+    assert!(!h.state().settings().compact.mini_on_top, "Wayland 不能置頂：不打開");
+    assert_eq!(
+        h.state().osd_text(),
+        Some("This desktop (Wayland) does not let programs keep themselves on top")
+    );
+}
+
+/// 滑鼠停在 `label` 上，等包含 `tooltip` 的說明出現
+fn hover_until_tooltip_contains(h: &mut Harness<'_, VitascopeApp>, label: &str, tooltip: &str) {
+    h.get_by_label(label).hover();
+    let start = Instant::now();
+    while h.query_by_label_contains(tooltip).is_none() {
+        assert!(start.elapsed() < TIMEOUT, "「{label}」上沒有出現說明「{tooltip}」");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn mini_player_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = mini_case_with(sample("common/mkv_multitrack.mkv"), settings, Launch::default());
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    MenuItem::contains("Mini player").hover(&mut h);
+    h.get_by_label_contains("Mini player").click();
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    MenuItem::contains("Back to the normal window").wait(&mut h);
+    MenuItem::exact("Quit VitaScope").wait(&mut h);
+    MenuItem::contains("Always on top").hover(&mut h);
+    MenuItem::exact("Keep the mini player on top").wait(&mut h);
+    h.get_by_label("Keep the mini player on top").click();
+    h.run_steps(2);
+    assert_eq!(h.state().osd_text(), Some("Keep the mini player on top: off"));
+    press_ctrl_t(&mut h);
+    assert_eq!(h.state().osd_text(), Some("Keep the mini player on top: on"));
+    // 迷你控制列的說明
+    hover_until_tooltip_contains(&mut h, "🔊", "(scroll to change, click to mute)");
+    h.get_by_label_contains("Volume ");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.run_steps(2);
+    // 時間（停住了，名稱不會再變）：總長度
+    let is_time =
+        |l: &str| l.len() == 5 && l.as_bytes()[2] == b':' && l.chars().all(|c| c.is_ascii_digit() || c == ':');
+    let time = h
+        .get_by(move |n| n.role() == egui::accesskit::Role::Label && n.value().is_some_and(|l| is_time(&l)))
+        .accesskit_node()
+        .value()
+        .unwrap();
+    hover_until_tooltip_contains(&mut h, &time, "Length 00:20");
+    // 設定 → 一般的「迷你播放器置頂」說明
+    h.get_by_label("🗖").click();
+    window_settled(&mut h);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    hover_until_tooltip_contains(
+        &mut h,
+        "Keep the mini player on top",
+        "always stays above other windows; when off, it follows “Always on top”",
     );
 }

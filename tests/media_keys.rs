@@ -1142,6 +1142,56 @@ fn raise_quit_and_open_uri() {
     assert!(viewport_commands(&h).contains(&egui::ViewportCommand::Close));
 }
 
+/// 迷你播放器開著時，系統的媒體控制要叫視窗到前面（MPRIS 的 Raise 之類）：只叫到前面，不離開迷你播放器（S-B9）
+#[test]
+fn raise_keeps_the_mini_player() {
+    let dir = TempDir::new("raise-mini");
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![dir.clip("a.mp4")], dir.settings());
+    step_until_app(&mut h, "a.mp4 開始播放", |app| playing(app, "a.mp4"));
+    step_until(&mut h, "工作階段建立了", || fake.created() == 1);
+    step_until_app(&mut h, "視窗配合影片調整完", |app| !app.window_fit_pending());
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        });
+    }
+    h.step();
+    assert_eq!(h.state().window_mode(), vitascope::window_mode::WindowMode::Mini);
+    step_until_app(&mut h, "迷你播放器換好", |app| !app.window_mode_pending());
+    // 縮到最小時也叫得回來（先還原，再叫到前面）
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .minimized = Some(true);
+    fake.send(MediaCommand::Raise);
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert!(cmds.contains(&egui::ViewportCommand::Focus), "{cmds:?}");
+    assert!(cmds.contains(&egui::ViewportCommand::Minimized(false)), "{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::InnerSize(_)
+                | egui::ViewportCommand::MinInnerSize(_)
+                | egui::ViewportCommand::Fullscreen(_)
+                | egui::ViewportCommand::WindowLevel(_)
+        )),
+        "大小、層級都不動：{cmds:?}"
+    );
+    assert_eq!(h.state().window_mode(), vitascope::window_mode::WindowMode::Mini);
+    h.run_steps(3);
+    assert_eq!(h.state().window_mode(), vitascope::window_mode::WindowMode::Mini);
+}
+
 /// 網路串流在等快取：系統收到「在等」（位置不會前進，不會被當成一直在跳轉），等到了再收到一次
 #[test]
 fn a_stall_for_cache_reaches_the_session() {

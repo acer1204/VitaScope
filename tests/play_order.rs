@@ -23,6 +23,7 @@ use vitascope::player::{Options, Player, PlayerEvent};
 use vitascope::playlist::{Playlist, Repeat};
 use vitascope::settings::Settings;
 use vitascope::system_power::{AfterPlayback, PowerAction, PowerCaps, PowerError};
+use vitascope::window_mode::WindowMode;
 use vitascope::ytdl::{Resolve, YtdlError};
 
 /// 慢的 CI 也要等得到（開檔、跳轉、換檔都是非同步的）
@@ -1552,6 +1553,83 @@ fn the_countdown_raises_the_window_and_restores_its_level() {
         cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
         "取消後回到原本的層級（不置頂）：{cmds:?}"
     );
+}
+
+/// 迷你播放器裡的倒數：叫到前面、暫時置頂，但不離開迷你播放器（不改大小）；倒數畫面放得下；
+/// 取消的 Esc 只取消倒數（不會順便回到一般視窗），層級回到迷你播放器自己的（S-B9）
+#[test]
+fn the_countdown_in_the_mini_player_keeps_the_mini_player() {
+    let (_dir, _path, mut h) = after_case(
+        "after-mini",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            countdown_raise: true,
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    // 迷你播放器不置頂（照「不置頂」）：才看得出倒數的置頂
+    h.state_mut().settings_mut().compact.mini_on_top = false;
+    step_until_app(&mut h, "視窗配合影片調整完", |app| !app.window_fit_pending());
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::M,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        });
+    }
+    h.step();
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    assert!(
+        viewport_commands(&h).contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
+        "{:?}",
+        viewport_commands(&h)
+    );
+    step_until_app(&mut h, "迷你播放器換好", |app| !app.window_mode_pending());
+    let mini = h.ctx.content_rect().size();
+    seek_near_end(&mut h);
+    let cmds = commands_until(&mut h, "播完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop)),
+        "倒數時置頂：{cmds:?}"
+    );
+    assert!(cmds.contains(&egui::ViewportCommand::Focus), "叫到前面：{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::InnerSize(_) | egui::ViewportCommand::MinInnerSize(_)
+        )),
+        "不改大小：{cmds:?}"
+    );
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    h.run_steps(2);
+    let panel = h.get_by_label("播放完畢").rect();
+    assert!(panel.width() <= mini.x, "倒數畫面放得下：{panel:?} 視窗 {mini:?}");
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert_cancelled(&h, "Esc");
+    assert!(
+        cmds.contains(&egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal)),
+        "取消後回到迷你播放器的層級：{cmds:?}"
+    );
+    h.run_steps(3);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini, "Esc 只取消倒數");
 }
 
 #[test]
