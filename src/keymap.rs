@@ -390,6 +390,10 @@ commands! {
     AbSetStart => "ab-set-start", Playback, once, ("A-B 重播：設定起點", "A-B loop: set start");
     AbSetEnd => "ab-set-end", Playback, once, ("A-B 重播：設定終點", "A-B loop: set end");
     AbClear => "ab-clear", Playback, once, ("取消 A-B 重播", "Cancel A-B loop");
+    /// 播放順序（預設沒有按鍵）：隨機播放開／關
+    ToggleShuffle => "toggle-shuffle", Playback, once, ("隨機播放", "Shuffle");
+    /// 播放順序（預設沒有按鍵）：重複播放依序切換 關閉 → 全部 → 單一檔案
+    CycleRepeat => "cycle-repeat", Playback, once, ("重複播放", "Repeat");
     VolumeUp => "volume-up", Sound, repeat, ("音量 +", "Volume up");
     VolumeDown => "volume-down", Sound, repeat, ("音量 −", "Volume down");
     ToggleMute => "toggle-mute", Sound, once, ("靜音", "Mute");
@@ -1415,6 +1419,9 @@ mod tests {
         "export-gif",
         // D5
         "export-sheet",
+        // E3
+        "toggle-shuffle",
+        "cycle-repeat",
     ];
 
     #[test]
@@ -1535,6 +1542,8 @@ mod tests {
                 | C::AbSetStart
                 | C::AbSetEnd
                 | C::AbClear
+                | C::ToggleShuffle
+                | C::CycleRepeat
                 | C::AudioDelayReset
                 | C::NextAudioTrack
                 | C::ToggleEq
@@ -1555,6 +1564,25 @@ mod tests {
             };
             assert_eq!(c.repeatable(), expected, "{c:?}");
         }
+    }
+
+    /// 播放順序的指令預設沒有按鍵（兩組預設、每個平台都是）：使用者在「設定 → 快捷鍵」自己指定
+    #[test]
+    fn play_order_commands_have_no_default_keys() {
+        for preset in KeyPreset::ALL {
+            for p in Platform::ALL {
+                for (cmd, chord) in preset.bindings(p) {
+                    assert!(
+                        !matches!(cmd, Command::ToggleShuffle | Command::CycleRepeat),
+                        "{preset:?} {p:?}：{cmd:?} 預設不給按鍵（{chord:?}）"
+                    );
+                }
+            }
+        }
+        assert_eq!(Command::from_id("toggle-shuffle"), Some(Command::ToggleShuffle));
+        assert_eq!(Command::from_id("cycle-repeat"), Some(Command::CycleRepeat));
+        assert_eq!(Command::ToggleShuffle.group(), Group::Playback);
+        assert_eq!(Command::CycleRepeat.group(), Group::Playback);
     }
 
     #[test]

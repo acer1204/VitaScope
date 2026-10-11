@@ -17,6 +17,7 @@ use vitascope::app::{DialogKind, Launch, Pick, PlatformProbe, VitascopeApp};
 use vitascope::keymap::Platform;
 use vitascope::pacing::{Plan, Reason, SmoothMode};
 use vitascope::player::{AsyncKey, Options, Player, PlayerEvent, State, TrackKind};
+use vitascope::playlist::{Playlist, Repeat};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::{OnTop, Settings, SideTab};
@@ -16509,4 +16510,543 @@ fn export_sheet_command_menu_shortcut_and_english() {
          Each timestamp is the picture's actual time.",
     );
     assert_eq!(field_value(&h, "File name"), "mp4_h264_aac thumbnails");
+}
+
+// ───────────── 播放順序：右鍵選單、播放清單的按鈕、設定頁、控制列、快捷鍵 ─────────────
+
+/// 在影片上按右鍵、打開「播放順序：… ▸」（標題寫著現在的順序，例如「播放順序：依序 ⏵」）
+fn open_order_menu(h: &mut Harness<'_, VitascopeApp>, title: &str) {
+    hover_context_item(h, "播放順序");
+    let (_, full, _) = MenuItem::contains("播放順序").wait(h);
+    assert_eq!(full, format!("{title} ⏵"), "選單的標題寫著現在的播放順序");
+    wait_menu_item(h, "播完自動播放下一個");
+}
+
+/// 點選單裡的項目，再按 Esc 關掉還開著的選單（勾選框、圓鈕點了不一定會關）
+fn click_order_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    h.get_by_label(label).click();
+    h.run_steps(2);
+    close_menus(h);
+}
+
+/// 有選單開著就按 Esc 關掉
+fn close_menus(h: &mut Harness<'_, VitascopeApp>) {
+    let start = Instant::now();
+    while egui::Popup::is_any_open(&h.ctx) {
+        assert!(start.elapsed() < MENU_TIMEOUT, "選單關不掉");
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+}
+
+/// 圓鈕、勾選框、按鈕現在是選取（勾起來）的
+fn toggled(h: &Harness<'_, VitascopeApp>, label: &str) -> bool {
+    let node = h
+        .query_all_by_label(label)
+        .next()
+        .unwrap_or_else(|| panic!("找不到 {label}"));
+    node.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True)
+}
+
+/// 暫停：測試裡打開了「播完自動播放下一個」時，3 秒的片段播完會換檔、蓋掉要檢查的提示（慢的電腦更容易碰到）。
+/// 等 mpv 真的暫停了再繼續
+fn pause_now(h: &mut Harness<'_, VitascopeApp>) {
+    h.state().player().set_pause(true).unwrap();
+    step_until(h, "暫停", |s| s.paused);
+}
+
+/// 等 mpv 的 loop-file 變成 `value`（選項是非同步送出的）
+fn wait_loop_file(h: &mut Harness<'_, VitascopeApp>, value: &str) {
+    step_until_app(h, &format!("loop-file = {value}"), |app| {
+        app.player().get_string("loop-file").is_ok_and(|v| v == value)
+    });
+}
+
+#[test]
+fn play_order_submenu_holds_auto_next_shuffle_and_repeat() {
+    let dir = three_episodes("order-menu");
+    let path = dir.0.join("settings.json");
+    let mut settings = Settings::load_from(path.clone());
+    settings.auto_next = false;
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    settle(&mut h, "第1集.mp4");
+    pause_now(&mut h);
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+
+    // 「播完自動播放下一個」從最上層移到「播放順序 ▸」裡
+    hover_context_item(&mut h, "從上次的位置繼續播放");
+    assert!(
+        h.query_by_label("播完自動播放下一個").is_none(),
+        "最上層沒有「播完自動播放下一個」"
+    );
+    close_menus(&mut h);
+    open_order_menu(&mut h, "播放順序：依序");
+    assert!(!toggled(&h, "播完自動播放下一個"));
+    assert!(!toggled(&h, "隨機播放"));
+    assert!(toggled(&h, "不重複"));
+    // 沒有指定按鍵：不寫按鍵
+    assert!(h.query_by_label_contains("依序切換重複播放").is_none());
+    click_order_item(&mut h, "播完自動播放下一個");
+    assert!(h.state().settings().auto_next);
+    assert!(Settings::load_from(path.clone()).auto_next, "馬上存檔");
+
+    // 隨機播放
+    open_order_menu(&mut h, "播放順序：依序");
+    assert!(toggled(&h, "播完自動播放下一個"));
+    click_order_item(&mut h, "隨機播放");
+    assert!(h.state().settings().play_order.shuffle);
+    assert!(h.state().playlist().unwrap().is_shuffled());
+    assert_eq!(h.state().osd_text(), Some("隨機播放：開啟"));
+
+    // 重複單一檔案：mpv 的 loop-file
+    open_order_menu(&mut h, "播放順序：隨機");
+    assert!(toggled(&h, "隨機播放"));
+    click_order_item(&mut h, "重複單一檔案");
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::One);
+    assert_eq!(h.state().osd_text(), Some("重複播放：單一檔案"));
+    wait_loop_file(&mut h, "inf");
+
+    // 重複全部
+    open_order_menu(&mut h, "播放順序：隨機・重複單一");
+    assert!(toggled(&h, "重複單一檔案"));
+    click_order_item(&mut h, "重複全部");
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    wait_loop_file(&mut h, "no");
+
+    // 關掉「播完自動播放下一個」：重複全部沒有作用了，選單照實際的顯示（不重複）
+    open_order_menu(&mut h, "播放順序：隨機・重複全部");
+    assert!(toggled(&h, "重複全部"));
+    click_order_item(&mut h, "播完自動播放下一個");
+    assert!(!h.state().settings().auto_next);
+    assert!(!Settings::load_from(path.clone()).auto_next, "馬上存檔");
+    open_order_menu(&mut h, "播放順序：隨機");
+    assert!(toggled(&h, "不重複"));
+    assert!(!toggled(&h, "重複全部"));
+    // 點「不重複」就真的改成不重複（之後打開「播完自動播放下一個」也不會又重複全部）
+    click_order_item(&mut h, "不重複");
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::Off);
+    // 選「重複全部」時一併打開「播完自動播放下一個」
+    open_order_menu(&mut h, "播放順序：隨機");
+    click_order_item(&mut h, "重複全部");
+    assert!(h.state().settings().auto_next);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(osd.contains("播完自動播放下一個"), "{osd}");
+}
+
+#[test]
+fn play_order_menu_panel_and_settings_in_english() {
+    let dir = three_episodes("order-english");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = harness_with(Some(dir.0.join("第1集.mp4")), settings);
+    settle(&mut h, "第1集.mp4");
+    pause_now(&mut h);
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Play order: in order");
+    for label in [
+        "Play the next file automatically",
+        "Shuffle",
+        "No repeat",
+        "Repeat this file",
+        "Repeat all",
+    ] {
+        wait_menu_item(&mut h, label);
+    }
+    click_order_item(&mut h, "Repeat all");
+    assert_eq!(
+        h.state().osd_text(),
+        Some("Repeat: all, and “Play the next file automatically” is on")
+    );
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    hover_menu_item(&mut h, "Play order: repeat all");
+    wait_menu_item(&mut h, "Shuffle");
+    click_order_item(&mut h, "Shuffle");
+    assert_eq!(h.state().osd_text(), Some("Shuffle: on"));
+
+    // 播放清單的按鈕
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    assert!(toggled(&h, "Shuffle"));
+    h.get_by_label("Repeat: all");
+    h.get_by_label("shuffle · repeat all");
+    h.get_by_label("Next");
+
+    // 設定 → 播放
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    open_settings_page(&mut h, "Playback");
+    h.get_by_label("The shuffled order isn't kept: next time VitaScope starts, it reshuffles from the last file");
+    assert_eq!(combo_value(&h, "Repeat"), "All");
+    combo_in_view(&mut h, "Repeat");
+    h.get_by_label("This file").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::One);
+    assert_eq!(h.state().osd_text(), Some("Repeat: this file"));
+}
+
+#[test]
+fn playlist_panel_order_buttons_cycle_and_mark_the_next_item() {
+    let dir = three_episodes("order-panel");
+    let mut h = playlist_panel_open(&dir);
+    pause_now(&mut h);
+    assert!(!toggled(&h, "隨機播放"));
+    assert!(!toggled(&h, "重複播放：關閉"));
+    h.get_by_label("依序");
+    assert!(h.query_by_label("下一個").is_none(), "照清單順序時不標「下一個」");
+
+    // 🔀：隨機播放，接下來會播的那一列標「下一個」
+    h.get_by_label("隨機播放").click();
+    h.run_steps(3);
+    assert!(h.state().settings().play_order.shuffle);
+    assert!(toggled(&h, "隨機播放"));
+    h.get_by_label("隨機");
+    let list = h.state().playlist().unwrap();
+    assert!(list.is_shuffled());
+    let next = list.next_index().expect("隨機的下一個");
+    let row = format!("{}. {}", next + 1, playlist_names(h.state())[next]);
+    assert_eq!(h.query_all_by_label("下一個").count(), 1, "只標一列");
+    let marker = h.get_by_label("下一個").rect();
+    assert!(
+        h.get_by_label(&row).rect().contains(marker.center()),
+        "「下一個」標在 {row}"
+    );
+    // 點在「下一個」上面照樣是那一列（「下一個」不接收點擊）：單擊選取、雙擊播放
+    let pos = marker.center();
+    h.event(egui::Event::PointerMoved(pos));
+    h.event(left_button(pos, true));
+    h.event(left_button(pos, false));
+    h.run_steps(2);
+    assert!(toggled(&h, &row), "點「下一個」選取那一列");
+    let name = playlist_names(h.state())[next].clone();
+    double_click(&mut h, pos);
+    step_until(&mut h, "雙擊「下一個」：播放那一列", |s| playing(s, &name));
+    pause_now(&mut h);
+
+    // 🔁：關閉 → 全部（一併打開播完自動播放下一個）→ 單一檔案 🔂 → 關閉
+    h.get_by_label("重複播放：關閉").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    assert!(h.state().settings().auto_next, "選「全部」時一併打開播完自動播放下一個");
+    assert!(toggled(&h, "重複播放：全部"));
+    h.get_by_label("隨機・重複全部");
+    h.get_by_label("重複播放：全部").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::One);
+    assert!(toggled(&h, "重複播放：單一檔案"));
+    wait_loop_file(&mut h, "inf");
+    h.get_by_label("重複播放：單一檔案").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::Off);
+    assert!(!toggled(&h, "重複播放：關閉"));
+    wait_loop_file(&mut h, "no");
+
+    // 關掉隨機播放：不標「下一個」
+    h.get_by_label("隨機播放").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().play_order.shuffle);
+    assert!(!h.state().playlist().unwrap().is_shuffled());
+    assert!(h.query_by_label("下一個").is_none());
+    assert!(!h.state().owns_session(), "播放順序不算整理過清單");
+}
+
+/// 同資料夾還在背景掃描時按清單上的 🔀 / 🔁：掃描的結果照樣用上（按鈕不是在改清單），而且套用隨機播放
+#[test]
+fn panel_order_buttons_keep_the_folder_scan() {
+    let dir = three_episodes("order-scan");
+    let first = dir.0.join("第1集.mp4");
+    let mut h = harness(None);
+    h.step();
+    drop_file(&mut h, first.clone());
+    let scan = h
+        .state_mut()
+        .hold_playlist_scan()
+        .expect("拖放進來的檔案：背景掃描同資料夾");
+    settle(&mut h, "第1集.mp4");
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    assert_eq!(playlist_len(h.state()), 1, "還在掃描");
+    h.get_by_label("隨機播放").click();
+    h.run_steps(2);
+    h.get_by_label("重複播放：關閉").click();
+    h.run_steps(2);
+    assert!(h.state().settings().play_order.shuffle);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    scan.send(Playlist::for_file(&first)).unwrap();
+    step_until_app(&mut h, "掃描的結果照樣用上", |app| playlist_len(app) == 3);
+    let list = h.state().playlist().unwrap();
+    assert!(list.is_shuffled(), "掃描完的清單也是隨機的");
+    assert!(list.current().is_some_and(|p| p.ends_with("第1集.mp4")));
+    assert!(!h.state().owns_session());
+}
+
+/// 播完時同資料夾還在掃描（不知道有沒有下一個）：先等；掃完有下一個就播，掃描失敗就是播放結束
+#[test]
+fn a_file_that_ends_while_the_folder_is_being_scanned_waits_for_the_scan() {
+    for scan_ok in [true, false] {
+        let dir = three_episodes(if scan_ok { "wait-scan" } else { "wait-scan-fail" });
+        let first = dir.0.join("第1集.mp4");
+        let mut settings = Settings::default();
+        settings.auto_next = true;
+        settings.resume = false;
+        let mut h = harness_with(None, settings);
+        h.step();
+        drop_file(&mut h, first.clone());
+        let scan = h
+            .state_mut()
+            .hold_playlist_scan()
+            .expect("拖放進來的檔案：背景掃描同資料夾");
+        settle(&mut h, "第1集.mp4");
+        let d = h.state().player().state.duration.unwrap();
+        h.state().player().seek_to(d - 0.3, true).unwrap();
+        step_until(&mut h, "播到結尾", |s| s.eof);
+        h.run_steps(10);
+        assert!(playing(&h.state().player().state, "第1集.mp4"));
+        assert_eq!(playlist_len(h.state()), 1);
+        assert_eq!(
+            h.state().playback_finished_count(),
+            0,
+            "還在掃描：不知道有沒有下一個，先等"
+        );
+        if scan_ok {
+            scan.send(Playlist::for_file(&first)).unwrap();
+            step_until(&mut h, "掃完：接著播第2集", |s| playing(s, "第2集.mp4"));
+            assert_eq!(h.state().playback_finished_count(), 0);
+        } else {
+            drop(scan);
+            step_until_app(&mut h, "掃描失敗：播放結束", |app| {
+                app.playback_finished_count() == 1
+            });
+            assert!(playing(&h.state().player().state, "第1集.mp4"));
+        }
+    }
+}
+
+#[test]
+fn settings_playback_page_sets_shuffle_and_repeat() {
+    // 自己的資料夾：選「全部」會打開「播完自動播放下一個」，樣本資料夾裡會換到別的樣本
+    let dir = TempDir::new("order-settings");
+    let mut h = opened(dir.clip("a.mp4"));
+    pause_now(&mut h);
+    open_settings_page(&mut h, "播放");
+    h.get_by_label("隨機的順序不會記住：下次開啟影戲時重新洗牌，從上次的檔案開始");
+    assert_eq!(combo_value(&h, "重複播放"), "關閉");
+    h.get_by_label("隨機播放").click();
+    h.run_steps(2);
+    assert!(h.state().settings().play_order.shuffle);
+    assert_eq!(h.state().osd_text(), Some("隨機播放：開啟"));
+    combo_in_view(&mut h, "重複播放");
+    h.get_by_label("單一檔案").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::One);
+    assert_eq!(combo_value(&h, "重複播放"), "單一檔案");
+    wait_loop_file(&mut h, "inf");
+    // 全部：一併打開「播完自動播放下一個」（同一頁的勾選框跟著勾起來）
+    assert!(!h.state().settings().auto_next);
+    combo_in_view(&mut h, "重複播放");
+    h.get_by_label("全部").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    assert!(h.state().settings().auto_next);
+    assert!(toggled(&h, "播完自動播放下一個"));
+    // 關掉「播完自動播放下一個」：重複播放顯示實際的「關閉」
+    h.get_by_label("播完自動播放下一個").click();
+    h.run_steps(2);
+    assert!(!h.state().settings().auto_next);
+    assert_eq!(combo_value(&h, "重複播放"), "關閉");
+}
+
+/// 「隨機播放」「重複播放」（快捷鍵設定頁的名稱）預設沒有按鍵：自己指定後照樣能用，選單寫出按鍵
+#[test]
+fn shuffle_and_repeat_commands_work_when_bound() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("toggle-shuffle".into(), vec!["F8".into()]);
+    settings.keys.custom.insert("cycle-repeat".into(), vec!["F9".into()]);
+    let dir = TempDir::new("order-keys");
+    let mut h = harness_with(Some(dir.clip("a.mp4")), settings);
+    settle(&mut h, "a.mp4");
+    h.key_press(egui::Key::F8);
+    h.step();
+    assert!(h.state().settings().play_order.shuffle);
+    assert_eq!(h.state().osd_text(), Some("隨機播放：開啟"));
+    h.key_press(egui::Key::F8);
+    h.step();
+    assert!(!h.state().settings().play_order.shuffle);
+    assert_eq!(h.state().osd_text(), Some("隨機播放：關閉"));
+    // 關閉 → 全部（一併打開播完自動播放下一個）→ 單一檔案 → 關閉
+    for expected in [Repeat::All, Repeat::One, Repeat::Off] {
+        h.key_press(egui::Key::F9);
+        h.step();
+        assert_eq!(h.state().settings().play_order.repeat, expected);
+    }
+    assert!(h.state().settings().auto_next);
+    // 存的是全部、但「播完自動播放下一個」關著（實際是不重複）：下一個是全部（再一併打開）
+    h.key_press(egui::Key::F9);
+    h.step();
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    open_order_menu(&mut h, "播放順序：重複全部");
+    // 選單寫出指定的按鍵
+    h.get_by_label("F8");
+    h.get_by_label("依序切換重複播放：F9");
+    click_order_item(&mut h, "播完自動播放下一個");
+    assert!(!h.state().settings().auto_next);
+    h.key_press(egui::Key::F9);
+    h.step();
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::All);
+    assert!(h.state().settings().auto_next);
+}
+
+/// 控制列：隨機播放 🔀、重複單一檔案 🔂（重複全部不放）；視窗窄時比速度先拿掉
+#[test]
+fn control_bar_shows_shuffle_and_repeat_one_and_drops_them_before_the_speed() {
+    let dir = TempDir::new("order-bar");
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.play_order.shuffle = true;
+    settings.play_order.repeat = Repeat::One;
+    let mut h = harness_with(Some(dir.clip("a.mp4")), settings);
+    settle(&mut h, "a.mp4");
+    // 320×240 的影片視窗是最小的 640 寬，放不下圖示：先放大
+    h.set_size(egui::vec2(960.0, 600.0));
+    h.run_steps(3);
+    h.get_by_label("🔀");
+    h.get_by_label("🔂");
+    // 重複全部：不放圖示；隨機關掉：🔀 也拿掉
+    h.state_mut().set_repeat(Repeat::All);
+    h.state_mut().set_shuffle(false);
+    h.run_steps(2);
+    assert!(h.query_by_label("🔂").is_none() && h.query_by_label("🔁").is_none());
+    assert!(h.query_by_label("🔀").is_none());
+    h.state_mut().set_shuffle(true);
+    h.state_mut().set_repeat(Repeat::One);
+    h.state().player().set_speed(1.5).unwrap();
+    step_until(&mut h, "1.5×", |s| close_to(s.speed, 1.5));
+    h.run_steps(2);
+    h.get_by_label("1.5×");
+    h.get_by_label("🔀");
+    h.get_by_label("🔂");
+    // 一點一點縮小視窗：圖示一定比速度先拿掉，而且有一段寬度是只剩速度。
+    // 只有一個圖示（比速度窄）時也一樣：速度放不下時，圖示放得下也不放
+    shrink_and_check_the_drop_order(&mut h, true);
+    h.state_mut().set_repeat(Repeat::Off);
+    shrink_and_check_the_drop_order(&mut h, false);
+}
+
+/// 從 960 寬一點一點縮小視窗，檢查控制列的 🔀（`two`：還有 🔂）比速度「1.5×」先拿掉
+fn shrink_and_check_the_drop_order(h: &mut Harness<'_, VitascopeApp>, two: bool) {
+    let mut speed_only = false;
+    let mut width = 960.0;
+    while width > 200.0 {
+        h.set_size(egui::vec2(width, 480.0));
+        h.run_steps(3);
+        let speed = h.query_by_label("1.5×").is_some();
+        let icons = h.query_by_label("🔀").is_some();
+        if width == 960.0 {
+            assert!(speed && icons, "寬的視窗兩個都放");
+        }
+        assert_eq!(
+            icons && two,
+            h.query_by_label("🔂").is_some(),
+            "兩個圖示一起放或一起拿掉（寬 {width}）"
+        );
+        assert!(!icons || speed, "圖示比速度先拿掉（寬 {width}）");
+        speed_only |= speed && !icons;
+        width -= 2.0;
+    }
+    assert!(speed_only, "有一段寬度只放得下速度");
+}
+
+/// VITASCOPE_MPV_OPTS（這裡用 `Options.extra`）指定 loop-file=inf：mpv 一直重播目前的檔案，影戲的重複播放沒有作用。
+/// 右鍵選單、播放清單的按鈕、設定頁都顯示「單一檔案」並停用（滑鼠移上去說明原因），控制列有 🔂，快捷鍵只提示。
+/// 指定 loop-file=no 時照常能選（重複單一檔案改由播完時重播）
+#[test]
+fn repeat_is_locked_while_mpv_opts_loop_the_file() {
+    let dir = three_episodes("order-locked");
+    let launch = || Launch {
+        files: vec![dir.0.join("第1集.mp4")],
+        ..Default::default()
+    };
+    let opts = |value: &str| Options {
+        extra: vec![("loop-file".into(), value.into())],
+        keep_open: true,
+        ..Options::headless()
+    };
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.keys.custom.insert("cycle-repeat".into(), vec!["F9".into()]);
+    let mut h = harness_launch_with(opts("inf"), launch(), settings.clone());
+    settle(&mut h, "第1集.mp4");
+    pause_now(&mut h);
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    assert_eq!(h.state().player().get_string("loop-file").unwrap(), "inf");
+    // 控制列：🔂（檔案會一直重播）
+    h.set_size(egui::vec2(960.0, 600.0));
+    h.run_steps(3);
+    h.get_by_label("🔂");
+    // 快捷鍵：只提示原因
+    h.key_press(egui::Key::F9);
+    h.step();
+    assert_eq!(h.state().osd_text(), Some("重複播放：已由 VITASCOPE_MPV_OPTS 指定"));
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::Off);
+
+    // 右鍵選單：三個重複的選項都停用，顯示的是單一檔案；隨機播放照常
+    open_order_menu(&mut h, "播放順序：重複單一");
+    for label in ["不重複", "重複單一檔案", "重複全部"] {
+        assert!(h.get_by_label(label).accesskit_node().is_disabled(), "{label}");
+    }
+    assert!(toggled(&h, "重複單一檔案"));
+    assert!(!h.get_by_label("隨機播放").accesskit_node().is_disabled());
+    // 選單裡不捲動（捲動時子選單會關掉）：直接移過去
+    h.get_by_label("不重複").hover();
+    let start = Instant::now();
+    while h.query_by_label("已由 VITASCOPE_MPV_OPTS 指定").is_none() {
+        assert!(start.elapsed() < MENU_TIMEOUT, "「不重複」上沒有出現說明");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    click_order_item(&mut h, "重複全部");
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::Off);
+    assert!(!h.state().settings().auto_next);
+
+    // 播放清單的 🔂：停用
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    assert!(h.get_by_label("重複播放：單一檔案").accesskit_node().is_disabled());
+    assert!(toggled(&h, "重複播放：單一檔案"));
+    h.get_by_label("重複單一");
+    hover_until_tooltip(&mut h, "重複播放：單一檔案", "已由 VITASCOPE_MPV_OPTS 指定");
+    h.get_by_label("重複播放：單一檔案").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::Off);
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+
+    // 設定 → 播放：下拉選單停用
+    open_settings_page(&mut h, "播放");
+    assert_eq!(combo_value(&h, "重複播放"), "單一檔案");
+    assert!(combo_box(&h, "重複播放").accesskit_node().is_disabled());
+    assert_eq!(h.state().player().get_string("loop-file").unwrap(), "inf", "影戲不動它");
+    drop(h);
+
+    // loop-file=no：照常能選
+    let mut h = harness_launch_with(opts("no"), launch(), settings);
+    settle(&mut h, "第1集.mp4");
+    pause_now(&mut h);
+    step_until_app(&mut h, "掃描到三個影片", |app| playlist_len(app) == 3);
+    h.key_press(egui::Key::F6);
+    h.run_steps(3);
+    assert!(!h.get_by_label("重複播放：關閉").accesskit_node().is_disabled());
+    h.key_press(egui::Key::F9);
+    h.step();
+    h.key_press(egui::Key::F9);
+    h.step();
+    assert_eq!(h.state().settings().play_order.repeat, Repeat::One);
+    h.run_steps(2);
+    assert!(!h.get_by_label("重複播放：單一檔案").accesskit_node().is_disabled());
+    assert_eq!(h.state().player().get_string("loop-file").unwrap(), "no", "影戲不動它");
 }

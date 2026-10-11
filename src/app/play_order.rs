@@ -3,11 +3,18 @@
 //!
 //! mpv 自己的清單永遠只有一項：接下來播哪一個都由 [`Playlist`] 決定。重複單一檔案用 mpv 的 `loop-file`
 //! （幾乎無縫，而且根本不會「播完」）；VITASCOPE_MPV_OPTS 自己指定了 loop-file 時不動它，播完時由這裡重播。
-//! 選單、清單面板的按鈕、設定頁在之後的步驟。
+//!
+//! 介面：右鍵選單「播放順序：… ▸」（「播完自動播放下一個」也在裡面）、播放清單分頁標題列下面的 🔀 / 🔁 按鈕、
+//! 控制列的 🔀 / 🔂、「設定 → 播放」；快捷鍵 `toggle-shuffle`、`cycle-repeat`（預設沒有按鍵）。
+//! 顯示的都是實際的重複方式（[`VitascopeApp::shown_repeat`]）：存的是「全部」、但「播完自動播放下一個」關著時顯示不重複；
+//! VITASCOPE_MPV_OPTS 指定的 loop-file 讓 mpv 一直重播時顯示單一檔案，重複播放停用（[`VitascopeApp::repeat_locked`]）
 
-use super::{VitascopeApp, display_label, mpv_opts_override};
+use super::control_panel::adjust_locked_hover;
+use super::{Action, VitascopeApp, display_label, mpv_opts_override, with_hint};
+use crate::keymap::Command;
 use crate::player::AsyncKey;
 use crate::playlist::{EndStep, Playlist, Repeat, end_step, skip_step};
+use eframe::egui::{self, WidgetInfo, WidgetType, vec2};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +60,54 @@ pub(super) fn repeat_label(repeat: Repeat) -> &'static str {
     }
 }
 
+/// 「設定 → 播放」重複播放的選項（英文開頭大寫）
+pub(super) fn repeat_option(repeat: Repeat) -> &'static str {
+    match repeat {
+        Repeat::Off => crate::tr!("關閉", "Off"),
+        Repeat::One => crate::tr!("單一檔案", "This file"),
+        Repeat::All => crate::tr!("全部", "All"),
+    }
+}
+
+/// 重複播放依序切換：關閉 → 全部 → 單一檔案 → 關閉（播放清單的按鈕、快捷鍵 `cycle-repeat`）
+pub(super) fn next_repeat(repeat: Repeat) -> Repeat {
+    match repeat {
+        Repeat::Off => Repeat::All,
+        Repeat::All => Repeat::One,
+        Repeat::One => Repeat::Off,
+    }
+}
+
+/// 右鍵選單「播放順序 ▸」裡重複播放的三個選項
+fn repeat_choice_label(repeat: Repeat) -> &'static str {
+    match repeat {
+        Repeat::Off => crate::tr!("不重複", "No repeat"),
+        Repeat::One => crate::tr!("重複單一檔案", "Repeat this file"),
+        Repeat::All => crate::tr!("重複全部", "Repeat all"),
+    }
+}
+
+/// 播放順序的簡短說明（右鍵選單「播放順序：… ▸」的標題，每次打開選單都看得到現在的狀態）
+fn order_summary(shuffle: bool, repeat: Repeat) -> &'static str {
+    match (shuffle, repeat) {
+        (false, Repeat::Off) => crate::tr!("依序", "in order"),
+        (true, Repeat::Off) => crate::tr!("隨機", "shuffle"),
+        (false, Repeat::One) => crate::tr!("重複單一", "repeat one"),
+        (false, Repeat::All) => crate::tr!("重複全部", "repeat all"),
+        (true, Repeat::One) => crate::tr!("隨機・重複單一", "shuffle · repeat one"),
+        (true, Repeat::All) => crate::tr!("隨機・重複全部", "shuffle · repeat all"),
+    }
+}
+
+/// 隨機播放開著 / 關著的說明（OSD、按鈕的提示）
+fn shuffle_state(on: bool) -> &'static str {
+    if on {
+        crate::tr!("隨機播放：開啟", "Shuffle: on")
+    } else {
+        crate::tr!("隨機播放：關閉", "Shuffle: off")
+    }
+}
+
 impl VitascopeApp {
     // ───────────── 換清單 ─────────────
 
@@ -91,11 +146,7 @@ impl VitascopeApp {
             list.set_shuffle(on, &mut self.shuffler);
         }
         self.save_settings();
-        self.osd(if on {
-            crate::tr!("隨機播放：開啟", "Shuffle: on")
-        } else {
-            crate::tr!("隨機播放：關閉", "Shuffle: off")
-        });
+        self.osd(shuffle_state(on));
     }
 
     /// 重複播放：關閉 / 單一檔案 / 全部（存檔）。
@@ -161,11 +212,38 @@ impl VitascopeApp {
             .is_ok_and(|v| !v.is_empty() && v != "no")
     }
 
-    /// 實際的重複方式：「全部」要開著「播完自動播放下一個」才算數（手動的上一個 / 下一個繞不繞回去）
-    fn effective_repeat(&self) -> Repeat {
+    /// 實際的重複方式：「全部」要開著「播完自動播放下一個」才算數（手動的上一個 / 下一個繞不繞回去）。
+    /// 選單、按鈕、設定頁顯示的也是這個（存的「全部」等「播完自動播放下一個」打開後才又有效）
+    pub(super) fn effective_repeat(&self) -> Repeat {
         match self.settings.play_order.repeat {
             Repeat::All if !self.settings.auto_next => Repeat::Off,
             r => r,
+        }
+    }
+
+    /// VITASCOPE_MPV_OPTS 指定的 loop-file（inf、次數…）讓 mpv 自己重播目前的檔案：影戲的重複播放沒有作用，
+    /// 選單、播放清單的按鈕、設定頁的重複播放停用（滑鼠移上去說明原因），快捷鍵只提示。
+    /// 指定 loop-file=no 時照常能選：重複單一檔案改由播完時重播（[`end_step`] 的 RestartSame）
+    pub(super) fn repeat_locked(&self) -> bool {
+        self.loop_file_overridden() && self.loop_file_active()
+    }
+
+    /// 介面上顯示的重複方式（選單、按鈕、設定頁、控制列的 🔂）：mpv 被指定一直重播時是單一檔案，
+    /// 其他時候是 [`Self::effective_repeat`]
+    pub(super) fn shown_repeat(&self) -> Repeat {
+        if self.repeat_locked() {
+            Repeat::One
+        } else {
+            self.effective_repeat()
+        }
+    }
+
+    /// 快捷鍵 `cycle-repeat`：從顯示的重複方式換到下一個；被 VITASCOPE_MPV_OPTS 鎖住時只提示原因
+    pub(super) fn cycle_repeat(&mut self) {
+        if self.repeat_locked() {
+            self.osd(crate::tf!("重複播放：{}", "Repeat: {}", adjust_locked_hover()));
+        } else {
+            self.set_repeat(next_repeat(self.effective_repeat()));
         }
     }
 
@@ -395,11 +473,148 @@ impl VitascopeApp {
         }
         true
     }
+
+    // ───────────── 介面 ─────────────
+
+    /// 右鍵選單「播放順序：… ▸」：播完自動播放下一個、隨機播放、重複（不重複 / 單一檔案 / 全部）。
+    /// 「播完自動播放下一個」在這裡直接改、存檔；其他的回傳要做的動作
+    pub(super) fn play_order_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
+        let order = self.settings.play_order;
+        let repeat = self.shown_repeat();
+        let locked = self.repeat_locked();
+        let auto_next = self.settings.auto_next;
+        let shuffle_hint = self.keymap.hint(Command::ToggleShuffle);
+        let cycle_hint = self.keymap.hint(Command::CycleRepeat);
+        let mut auto = auto_next;
+        let mut action = None;
+        let title = crate::tf!("播放順序：{}", "Play order: {}", order_summary(order.shuffle, repeat));
+        ui.menu_button(title, |ui| {
+            ui.checkbox(
+                &mut auto,
+                crate::tr!("播完自動播放下一個", "Play the next file automatically"),
+            );
+            let mut shuffle = order.shuffle;
+            let r = with_hint(ui, &shuffle_hint, |ui| {
+                ui.checkbox(&mut shuffle, crate::tr!("隨機播放", "Shuffle"))
+            });
+            if r.changed() {
+                action = Some(Action::SetShuffle(shuffle));
+            }
+            ui.separator();
+            for choice in [Repeat::Off, Repeat::One, Repeat::All] {
+                let mut r = ui.add_enabled(
+                    !locked,
+                    egui::RadioButton::new(repeat == choice, repeat_choice_label(choice)),
+                );
+                r = r.on_disabled_hover_text(adjust_locked_hover());
+                if choice == Repeat::All && !auto_next {
+                    r = r.on_hover_text(crate::tr!(
+                        "會一併打開「播完自動播放下一個」",
+                        "This also turns on “Play the next file automatically”"
+                    ));
+                }
+                // 顯示的是實際的重複方式：存的「全部」沒有作用時，點「不重複」也要真的改掉
+                if r.clicked() && (choice != repeat || choice != order.repeat) {
+                    action = Some(Action::SetRepeat(choice));
+                }
+            }
+            if !cycle_hint.is_empty() {
+                ui.separator();
+                ui.weak(crate::tf!(
+                    "依序切換重複播放：{cycle_hint}",
+                    "Cycle repeat mode: {cycle_hint}"
+                ));
+            }
+        });
+        if auto != auto_next {
+            self.settings.auto_next = auto;
+            self.save_settings();
+        }
+        action
+    }
+
+    /// 播放清單分頁標題列下面的 🔀（隨機播放）、🔁 / 🔂（重複播放：關閉 → 全部 → 單一檔案），
+    /// 後面寫現在的播放順序；回傳按了哪一個
+    pub(super) fn play_order_buttons(&self, ui: &mut egui::Ui) -> Option<Action> {
+        let shuffle = self.settings.play_order.shuffle;
+        let repeat = self.shown_repeat();
+        let locked = self.repeat_locked();
+        let mut action = None;
+        // 開著 / 關著用選取的樣子表示（不是只靠顏色深淺，淺色主題也看得出來）
+        let button = |ui: &mut egui::Ui, enabled: bool, on: bool, glyph: &str, name: &str| {
+            let r = ui.add_enabled(enabled, egui::Button::selectable(on, glyph).min_size(vec2(26.0, 20.0)));
+            // 螢幕閱讀器、介面測試讀到的是名稱，不是圖示
+            r.widget_info(|| WidgetInfo::selected(WidgetType::Button, true, on, name));
+            r
+        };
+        let name = crate::tr!("隨機播放", "Shuffle");
+        let hover = self.keymap.labeled(shuffle_state(shuffle), Command::ToggleShuffle);
+        if button(ui, true, shuffle, "🔀", name).on_hover_text(hover).clicked() {
+            action = Some(Action::SetShuffle(!shuffle));
+        }
+        let next = next_repeat(repeat);
+        let name = crate::tf!("重複播放：{}", "Repeat: {}", repeat_label(repeat));
+        let glyph = if repeat == Repeat::One { "🔂" } else { "🔁" };
+        let hover = crate::tf!(
+            "{}\n點一下改成：{}",
+            "{}\nClick for: {}",
+            self.keymap.labeled(&name, Command::CycleRepeat),
+            repeat_label(next)
+        );
+        if button(ui, !locked, repeat != Repeat::Off, glyph, &name)
+            .on_hover_text(hover)
+            .on_disabled_hover_text(adjust_locked_hover())
+            .clicked()
+        {
+            action = Some(Action::SetRepeat(next));
+        }
+        ui.weak(order_summary(shuffle, repeat));
+        action
+    }
+
+    /// 控制列上的狀態圖示（圖示, 說明）：🔀 隨機播放開著、🔂 重複單一檔案（檔案會一直重播，看得出來比較好）。
+    /// 重複全部不放（清單面板、選單看得到）
+    pub(super) fn order_indicators(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if self.settings.play_order.shuffle {
+            out.push(("🔀", self.keymap.labeled(shuffle_state(true), Command::ToggleShuffle)));
+        }
+        if self.shown_repeat() == Repeat::One {
+            let name = crate::tf!("重複播放：{}", "Repeat: {}", repeat_label(Repeat::One));
+            out.push(("🔂", self.keymap.labeled(&name, Command::CycleRepeat)));
+        }
+        out
+    }
+
+    /// 播放清單上「下一個」的那一項（只在隨機播放時標出來：照清單順序時就是下一列）
+    pub(super) fn shuffled_next(&self) -> Option<usize> {
+        let list = self.playlist.as_ref().filter(|l| l.is_shuffled())?;
+        list.next_index().filter(|&i| Some(i) != list.current_index())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeat_cycles_off_all_one() {
+        assert_eq!(next_repeat(Repeat::Off), Repeat::All);
+        assert_eq!(next_repeat(Repeat::All), Repeat::One);
+        assert_eq!(next_repeat(Repeat::One), Repeat::Off);
+    }
+
+    #[test]
+    fn order_summary_names_every_combination() {
+        let mut seen = HashSet::new();
+        for shuffle in [false, true] {
+            for repeat in [Repeat::Off, Repeat::One, Repeat::All] {
+                assert!(seen.insert(order_summary(shuffle, repeat)), "{shuffle} {repeat:?}");
+            }
+        }
+        assert_eq!(order_summary(false, Repeat::Off), "依序");
+        assert_eq!(order_summary(true, Repeat::All), "隨機・重複全部");
+    }
 
     #[test]
     fn loop_file_follows_repeat_one_only() {

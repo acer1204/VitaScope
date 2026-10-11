@@ -1,6 +1,7 @@
 //! 設定視窗（F5、右鍵選單「設定…」）：改了馬上生效、馬上存檔。
 
 use super::control_panel::adjust_locked_hover;
+use super::play_order::repeat_option;
 use super::quality::{combo, dumb_hover, scaler_choice};
 use super::sound::auto_device_label;
 use super::{Action, VitascopeApp};
@@ -9,6 +10,7 @@ use crate::pacing::{Plan, SmoothMode};
 use crate::picture::{
     ChromaScaler, Downscaler, Gamut, Quality, Strength, ToneCurve, ToneSettings, Upscaler, peak_hover,
 };
+use crate::playlist::Repeat;
 use crate::settings::OnTop;
 use crate::sound::{AUTO_DEVICE, AudioDevice, SPDIF_CODECS, spdif_label};
 use crate::theme::ThemeChoice;
@@ -100,7 +102,7 @@ impl VitascopeApp {
                         egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
                             match self.settings_page {
                                 Page::General => changed |= self.general_page(ui, &mut action),
-                                Page::Playback => changed |= self.playback_page(ui),
+                                Page::Playback => changed |= self.playback_page(ui, &mut action),
                                 Page::Picture => self.picture_page(ui, &mut action),
                                 Page::Sound => self.sound_page(ui, &mut action),
                                 Page::Subtitles => self.subtitles_page(ui, &mut action),
@@ -282,17 +284,46 @@ impl VitascopeApp {
         }
     }
 
-    fn playback_page(&mut self, ui: &mut egui::Ui) -> bool {
+    fn playback_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) -> bool {
         let mut changed = false;
         // 跳轉秒數的標題：按鍵從對照表來（換了按鍵、預設組時跟著改）
         let seek_labels = [self.keymap.seek_label(false), self.keymap.seek_label(true)];
-        let s = &mut self.settings;
         changed |= ui
             .checkbox(
-                &mut s.auto_next,
+                &mut self.settings.auto_next,
                 tr!("播完自動播放下一個", "Play the next file automatically"),
             )
             .changed();
+        // 播放順序：跟右鍵選單、播放清單的按鈕走同一條路（馬上套用、存檔、提示）
+        let mut shuffle = self.settings.play_order.shuffle;
+        if ui.checkbox(&mut shuffle, tr!("隨機播放", "Shuffle")).changed() {
+            *action = Some(Action::SetShuffle(shuffle));
+        }
+        ui.indent("shuffle_note", |ui| {
+            ui.weak(tr!(
+                "隨機的順序不會記住：下次開啟影戲時重新洗牌，從上次的檔案開始",
+                "The shuffled order isn't kept: next time VitaScope starts, it reshuffles from the last file"
+            ));
+        });
+        let repeat = self.shown_repeat();
+        let repeat_locked = self.repeat_locked().then(adjust_locked_hover);
+        let picked = ui
+            .horizontal(|ui| {
+                combo(
+                    ui,
+                    tr!("重複播放", "Repeat"),
+                    "settings_repeat",
+                    repeat,
+                    &[Repeat::Off, Repeat::One, Repeat::All],
+                    repeat_option,
+                    repeat_locked,
+                )
+            })
+            .inner;
+        if let Some(r) = picked {
+            *action = Some(Action::SetRepeat(r));
+        }
+        let s = &mut self.settings;
         changed |= ui
             .checkbox(
                 &mut s.resume,

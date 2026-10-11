@@ -52,6 +52,8 @@ enum ListOp {
     AddFolder,
     Open,
     Save,
+    /// 標題列的 🔀 / 🔁（播放順序，不改清單本身）
+    Order(super::Action),
 }
 
 impl VitascopeApp {
@@ -206,6 +208,8 @@ impl VitascopeApp {
         let count = self.playlist.as_ref().map_or(0, Playlist::len);
         let current = self.playlist.as_ref().and_then(Playlist::current_index);
         let selected = self.playlist_selected.filter(|i| *i < count);
+        // 隨機播放時標出接下來會播的那一項
+        let next = self.shuffled_next();
 
         let side = self.side_header(ui, |ui| {
             ui.menu_button("…", |ui| {
@@ -263,6 +267,10 @@ impl VitascopeApp {
         if let Some(side) = side {
             op = Some(ListOp::Side(side));
         }
+        // 標題列下面一排：隨機播放、重複播放（標題列放不下：兩個分頁的標題就佔滿預設的寬度）
+        if let Some(a) = ui.horizontal(|ui| self.play_order_buttons(ui)).inner {
+            op = Some(ListOp::Order(a));
+        }
 
         let Some(list) = &self.playlist else {
             ui.weak(crate::tr!(
@@ -306,7 +314,20 @@ impl VitascopeApp {
                 resp.widget_info(|| {
                     WidgetInfo::selected(WidgetType::SelectableLabel, true, selected == Some(i), &name)
                 });
-                paint_row(ui, rect, &resp, &name, selected == Some(i), current == Some(i));
+                let marker = (next == Some(i)).then(|| next_marker_rect(ui, rect));
+                let text_right = marker.map_or(rect.right(), |m| m.left() - 4.0);
+                paint_row(
+                    ui,
+                    rect,
+                    text_right,
+                    &resp,
+                    &name,
+                    selected == Some(i),
+                    current == Some(i),
+                );
+                if let Some(m) = marker {
+                    next_marker(ui, m);
+                }
                 // 先點 A 再很快地雙擊 B，egui 會把 B 的第二下算成三連擊
                 if resp.double_clicked() || resp.triple_clicked() {
                     op = Some(ListOp::Play(i));
@@ -367,6 +388,7 @@ impl VitascopeApp {
                 | ListOp::AddFiles
                 | ListOp::AddFolder
                 | ListOp::Open
+                | ListOp::Order(_)
         );
         // 手動改過清單：背景還在掃描的資料夾結果不能再蓋掉它
         if edits {
@@ -422,6 +444,7 @@ impl VitascopeApp {
             ListOp::AddFolder => self.add_folder_dialog(),
             ListOp::Open => self.open_playlist_dialog(),
             ListOp::Save => self.save_playlist_dialog(),
+            ListOp::Order(a) => self.run(ctx, a),
         }
         if edits {
             self.persist_playlist();
@@ -657,8 +680,47 @@ impl VitascopeApp {
     }
 }
 
-/// 畫一列：選取的底色、目前播放的「▶」與藍字、檔名太長時截斷
-fn paint_row(ui: &egui::Ui, rect: Rect, resp: &egui::Response, name: &str, selected: bool, current: bool) {
+/// 隨機播放時「下一個」那一列右邊的小字
+fn next_marker_text() -> RichText {
+    RichText::new(crate::tr!("下一個", "Next")).small().weak()
+}
+
+/// 「下一個」在 `row` 這一列裡的位置（先算好，名稱畫到它左邊為止）
+fn next_marker_rect(ui: &egui::Ui, row: Rect) -> Rect {
+    let galley = egui::WidgetText::from(next_marker_text()).into_galley(
+        ui,
+        Some(TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Small,
+    );
+    let size = galley.size();
+    Rect::from_min_size(
+        egui::pos2(row.right() - size.x - 6.0, row.center().y - size.y / 2.0),
+        size,
+    )
+}
+
+/// 畫「下一個」：是一個標籤（螢幕閱讀器、介面測試讀得到），只感應滑鼠停留、不接收點擊，點了照樣是那一列。
+/// 畫在那一列的底色之後，選取、滑鼠停著的列才不會蓋掉它
+fn next_marker(ui: &mut egui::Ui, rect: Rect) {
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    child.add(
+        egui::Label::new(next_marker_text())
+            .selectable(false)
+            .sense(Sense::hover()),
+    );
+}
+
+/// 畫清單的一列：名稱畫到 `text_right` 為止（右邊可能有「下一個」）
+fn paint_row(
+    ui: &egui::Ui,
+    rect: Rect,
+    text_right: f32,
+    resp: &egui::Response,
+    name: &str,
+    selected: bool,
+    current: bool,
+) {
     let visuals = ui.visuals();
     if selected {
         ui.painter().rect_filled(rect, 2.0, visuals.selection.bg_fill);
@@ -685,7 +747,7 @@ fn paint_row(ui: &egui::Ui, rect: Rect, resp: &egui::Response, name: &str, selec
     let galley = egui::WidgetText::from(text).into_galley(
         ui,
         Some(TextWrapMode::Truncate),
-        rect.width() - gutter - 4.0,
+        (text_right - rect.left() - gutter - 4.0).max(0.0),
         egui::TextStyle::Body,
     );
     let pos = egui::pos2(rect.left() + gutter, rect.center().y - galley.size().y / 2.0);

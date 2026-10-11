@@ -31,7 +31,7 @@ use crate::picture::{
     Upscaler,
 };
 use crate::player::{AsyncKey, EngineCaps, MAX_SPEED, MIN_SPEED, Player, PlayerEvent, TrackKind};
-use crate::playlist::{Playlist, Shuffler};
+use crate::playlist::{Playlist, Repeat, Shuffler};
 use crate::settings::{OnTop, Settings, SideTab, SubStyle, WindowGeometry};
 use crate::sound::{EqPreset, Leveling};
 use crate::theme::{self, Palette, ThemeChoice};
@@ -215,6 +215,12 @@ enum Action {
     OpenExportDir(export_panel::ExportDir),
     /// 變更匯出的資料夾（資料夾對話框）
     ChooseExportDir(export_panel::ExportDir),
+    /// 播放順序：隨機播放開／關（快捷鍵）、指定（右鍵選單、播放清單的按鈕、設定頁）
+    ToggleShuffle,
+    SetShuffle(bool),
+    /// 重複播放：依序切換（關閉 → 全部 → 單一檔案）/ 指定
+    CycleRepeat,
+    SetRepeat(Repeat),
 }
 
 /// 起始畫面上按的
@@ -948,6 +954,16 @@ impl VitascopeApp {
         &mut self.player
     }
 
+    /// 測試用：同資料夾的背景掃描還沒送來之前，改成由測試決定什麼時候「掃完」（模擬很慢的網路磁碟）。
+    /// 回傳的發送端送出掃描結果就是掃完了，丟掉它就是掃描失敗；沒有在掃描時 None
+    #[doc(hidden)]
+    pub fn hold_playlist_scan(&mut self) -> Option<mpsc::Sender<Playlist>> {
+        self.playlist_scan.as_ref()?;
+        let (tx, rx) = mpsc::channel();
+        self.playlist_scan = Some(rx);
+        Some(tx)
+    }
+
     /// 匯出用的快取資料夾（`<快取>/export`）；沒有快取資料夾（自動測試、`--shot`）時 None
     pub fn export_cache_dir(&self) -> Option<PathBuf> {
         self.cache_root.as_deref().map(crate::export::cache_dir)
@@ -1469,6 +1485,10 @@ impl VitascopeApp {
             Action::ShowExport(tab) => self.show_export(tab),
             Action::OpenExportDir(which) => self.open_export_dir(which),
             Action::ChooseExportDir(which) => self.choose_export_dir(which),
+            Action::ToggleShuffle => self.set_shuffle(!self.settings.play_order.shuffle),
+            Action::SetShuffle(on) => self.set_shuffle(on),
+            Action::CycleRepeat => self.cycle_repeat(),
+            Action::SetRepeat(repeat) => self.set_repeat(repeat),
             Action::Settings => self.settings_open = !self.settings_open,
             Action::ToggleSmooth => self.toggle_smooth(),
             Action::Adjust(kind, delta) => self.step_adjust(kind, delta),
@@ -2716,6 +2736,8 @@ impl VitascopeApp {
             Command::ExportClip => Action::ShowExport(export_panel::ExportTab::Clip),
             Command::ExportGif => Action::ShowExport(export_panel::ExportTab::Gif),
             Command::ExportSheet => Action::ShowExport(export_panel::ExportTab::Sheet),
+            Command::ToggleShuffle => Action::ToggleShuffle,
+            Command::CycleRepeat => Action::CycleRepeat,
         }
     }
 
@@ -3543,13 +3565,11 @@ impl VitascopeApp {
         if self.cmd_item(ui, has_next, crate::tr!("下一個檔案", "Next file"), Command::NextFile) {
             action = Some(Action::NextFile);
         }
-        let mut settings_changed = ui
-            .checkbox(
-                &mut self.settings.auto_next,
-                crate::tr!("播完自動播放下一個", "Play the next file automatically"),
-            )
-            .changed();
-        settings_changed |= ui
+        // 播放順序 ▸（「播完自動播放下一個」也在裡面）
+        if let Some(a) = self.play_order_menu(ui) {
+            action = Some(a);
+        }
+        let settings_changed = ui
             .checkbox(
                 &mut self.settings.resume,
                 crate::tr!("從上次的位置繼續播放", "Resume from where I left off"),
@@ -3557,6 +3577,7 @@ impl VitascopeApp {
             .changed();
         ui.separator();
 
+        let st = &self.player.state;
         let speed = st.speed;
         let speed_keys = self.keymap.speed_keys();
         ui.menu_button(
@@ -3871,6 +3892,7 @@ impl VitascopeApp {
                 ui.label(egui::RichText::new(time).monospace());
             }
             // 速度不是 1× 時顯示在時間旁邊；視窗太窄、會擠到右邊的按鈕時就不顯示（OSD 和右鍵選單還看得到）
+            let mut speed_dropped = false;
             if (st.speed - 1.0).abs() > 1e-6 {
                 let font = ui.style().text_styles[&egui::TextStyle::Monospace].clone();
                 let galley = ui.painter().layout_no_wrap(
@@ -3884,6 +3906,30 @@ impl VitascopeApp {
                         crate::tr!("播放速度", "Playback speed"),
                         &self.keymap.speed_keys(),
                     ));
+                } else {
+                    speed_dropped = true;
+                }
+            }
+            // 隨機播放、重複單一檔案的圖示：視窗窄時比速度先拿掉（速度放不下時也不放）
+            let indicators = self.order_indicators();
+            if !indicators.is_empty() && !speed_dropped {
+                let font = egui::TextStyle::Body.resolve(ui.style());
+                let color = Palette::of(ui.visuals()).accent;
+                let galleys: Vec<_> = indicators
+                    .into_iter()
+                    .map(|(glyph, hover)| {
+                        let galley = ui.painter().layout_no_wrap(glyph.to_owned(), font.clone(), color);
+                        (galley, hover)
+                    })
+                    .collect();
+                let needed: f32 = galleys
+                    .iter()
+                    .map(|(g, _)| g.size().x + ui.spacing().item_spacing.x)
+                    .sum();
+                if ui.available_width() >= self.right_controls_width + needed {
+                    for (galley, hover) in galleys {
+                        ui.label(galley).on_hover_text(hover);
+                    }
                 }
             }
 
