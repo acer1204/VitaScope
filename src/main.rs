@@ -94,6 +94,8 @@ fn parse_args() -> (Launch, bool) {
         launch.persist_playlist = true;
         // 播完後的倒數：視窗還原、叫到前面、暫時置頂（自動截圖不動視窗）
         launch.countdown_raise = true;
+        // 播完後的睡眠、休眠、關機：真的系統只在這裡接上（自動截圖、自動測試都沒有，選單也就不列出）
+        launch.system = Some(Arc::new(vitascope::system_power::RealPower::new()));
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
         if launch.files.is_empty()
             && let Some((entries, current)) = vitascope::m3u::load_session_entries()

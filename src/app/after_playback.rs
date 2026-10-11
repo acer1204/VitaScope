@@ -7,7 +7,11 @@
 //!   捲動滾輪、移動滑鼠（超過幾點）、整個系統有鍵盤或滑鼠的動作（[`SystemPower::last_input_age`]，Wayland 查不到）、
 //!   開了檔案對話框、開檔、停止、任何操作。
 //! - 倒數時視窗還原、移到最上層、暫時置頂（`Launch.countdown_raise`，main.rs 打開；自動測試不動視窗）。
-//! - 睡眠、休眠、關機要有 `Launch.system`：沒有時（自動測試、`--shot`，以及接上各平台之前的正式版）選單不列出。
+//! - 睡眠、休眠、關機要有 `Launch.system`：沒有時（自動測試、`--shot`）選單不列出。系統能做哪些事在背景問：
+//!   啟動時、每次打開「播完後 ▸」或設定頁的選單、選了動作時（選不了也一樣）再問一次（休眠開關、別的使用者登入、polkit 規則可能變）。
+//!   選了動作時也先取得要的權限（[`SystemPower::prepare`]：macOS 的關機在這時跳出系統的詢問視窗，人還在電腦前面）。
+//!
+//! [`SystemPower::prepare`]: crate::system_power::SystemPower::prepare
 
 use super::{Action, VitascopeApp};
 use crate::keymap::Command;
@@ -177,6 +181,20 @@ impl VitascopeApp {
         matches!(self.countdown, Some(Pending::WaitExport(_)))
     }
 
+    /// 還在背景問系統能做哪些事（結果還沒處理；介面測試用：等它問完再改假系統的回答）
+    #[doc(hidden)]
+    pub fn power_probe_pending(&self) -> bool {
+        self.caps_probe.is_some()
+    }
+
+    /// 選了動作之後還在取得權限（[`SystemPower::prepare`] 的結果還沒處理；介面測試用）
+    ///
+    /// [`SystemPower::prepare`]: crate::system_power::SystemPower::prepare
+    #[doc(hidden)]
+    pub fn power_prepare_pending(&self) -> bool {
+        self.prepare_job.is_some()
+    }
+
     /// 播完後的「關閉影戲」送出了關閉視窗（介面測試用：測試的視窗不會真的關）
     #[doc(hidden)]
     pub fn close_requested(&self) -> bool {
@@ -191,27 +209,43 @@ impl VitascopeApp {
         };
         self.system.as_ref()?;
         match self.power_caps.of(power) {
-            Avail::No(_) if power == PowerAction::Hibernate => None,
+            // 休眠：系統沒有（Windows 沒開休眠、macOS、logind 說 no / na）就不列出。
+            // 只是要密碼的（logind 的 challenge）照樣列出、停用並說明：使用者可能想知道為什麼不能選
+            Avail::No(e) if power == PowerAction::Hibernate && *e != PowerError::NeedsPassword => None,
             avail => Some(avail.clone()),
         }
     }
 
-    /// 選擇播完後的動作（右鍵選單、設定頁、快捷鍵、控制列的 ⏳ 取消都走這裡）：只對這次有效、不存檔
-    pub fn set_after_playback(&mut self, a: AfterPlayback) {
-        let why = match self.after_avail(a) {
+    /// 選不了這個動作的原因（None = 可以選）
+    fn after_refusal(&self, a: AfterPlayback) -> Option<String> {
+        match self.after_avail(a) {
             Some(Avail::Yes) => None,
             Some(Avail::No(e)) => Some(e.message()),
             Some(Avail::Unknown) => {
                 Some(tr!("還在檢查系統是否支援", "Still checking whether the system supports it").into())
             }
-            None => Some(PowerError::NotSupported.message()),
-        };
-        if let Some(why) = why {
-            self.osd(tf!(
-                "播完後無法{}：{why}",
-                "Can't {} when playback ends: {why}",
-                a.noun()
-            ));
+            // 不列出的（沒有 SystemPower、系統沒有休眠）：系統說的原因（用快捷鍵選的時候看得到）
+            None => Some(
+                match a
+                    .power()
+                    .filter(|_| self.system.is_some())
+                    .map(|p| self.power_caps.of(p))
+                {
+                    Some(Avail::No(e)) => e.message(),
+                    _ => PowerError::NotSupported.message(),
+                },
+            ),
+        }
+    }
+
+    /// 選擇播完後的動作（右鍵選單、設定頁、快捷鍵、控制列的 ⏳ 取消都走這裡）：只對這次有效、不存檔
+    pub fn set_after_playback(&mut self, a: AfterPlayback) {
+        if let Some(why) = self.after_refusal(a) {
+            self.osd(refused(a, &why));
+            // 說不行用的是上次問的結果（可能過時了，例如剛打開休眠）：再問一次，下次選的時候用新的
+            if a.power().is_some() {
+                self.probe_power_caps();
+            }
             return;
         }
         // 倒數中不會走到這裡（按鍵、點擊先取消了倒數）；保險起見先不出聲地取消
@@ -232,6 +266,50 @@ impl VitascopeApp {
             text.push_str(repeating_note());
         }
         self.osd(text);
+        // 睡眠、休眠、關機：人在電腦前面的時候先取得權限（macOS 的關機會跳出系統的詢問），
+        // 也再問一次系統現在能不能做（之前問的可能過時了）。結果在 `poll_power` 處理
+        if let Some(power) = a.power() {
+            self.prepare_power(a, power);
+            self.probe_power_caps();
+        }
+    }
+
+    /// 在背景先取得執行 `power` 要的權限（[`SystemPower::prepare`]，可能等使用者回答系統的詢問）
+    ///
+    /// [`SystemPower::prepare`]: crate::system_power::SystemPower::prepare
+    fn prepare_power(&mut self, a: AfterPlayback, power: PowerAction) {
+        let Some(system) = self.system.clone() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let wake = self.egui_ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("vitascope-power-prepare".into())
+            .spawn(move || {
+                let _ = tx.send(system.prepare(power));
+                wake.request_repaint();
+            });
+        // 開不了執行緒：不擋（執行時系統還會再說一次）
+        if spawned.is_ok() {
+            self.prepare_job = Some((a, rx));
+        }
+    }
+
+    /// 選好的動作現在做不到了（取得權限被拒、再問一次系統說不行）：說明原因，回到「不做任何事」
+    fn after_no_longer_possible(&mut self, a: AfterPlayback, e: &PowerError) {
+        if self.after_playback != a {
+            return;
+        }
+        let pending = match &self.countdown {
+            Some(Pending::WaitExport(w)) => Some(*w),
+            Some(Pending::Running(run)) => Some(run.timer.action()),
+            None => None,
+        };
+        if pending == Some(a) {
+            self.countdown = None;
+        }
+        self.after_playback = AfterPlayback::Nothing;
+        self.osd(refused(a, &e.message()));
     }
 
     // ───────────── 播放結束 → 倒數 ─────────────
@@ -453,11 +531,15 @@ impl VitascopeApp {
         }
     }
 
-    /// 啟動時在背景問系統能做哪些事（有 `SystemPower` 時）
+    /// 在背景問系統能做哪些事（有 `SystemPower` 時）：啟動時、打開「播完後」的選單時、選了動作時。
+    /// 已經在問就不再開；問好之前沿用上次的結果（選單不會一直閃「檢查中…」）
     pub(super) fn probe_power_caps(&mut self) {
         let Some(system) = self.system.clone() else {
             return;
         };
+        if self.caps_probe.is_some() {
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         let wake = self.egui_ctx.clone();
         let spawned = std::thread::Builder::new()
@@ -478,9 +560,29 @@ impl VitascopeApp {
                 Ok(caps) => {
                     self.power_caps = caps;
                     self.caps_probe = None;
+                    // 選好的動作現在不能做了（例如休眠被關掉、改成要密碼）：現在就說，不要等到播完
+                    let a = self.after_playback;
+                    if let Some(power) = a.power()
+                        && let Avail::No(e) = self.power_caps.of(power).clone()
+                    {
+                        self.after_no_longer_possible(a, &e);
+                    }
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => self.caps_probe = None,
+            }
+        }
+        if let Some((a, rx)) = &self.prepare_job {
+            let a = *a;
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.prepare_job = None;
+                    if let Err(e) = result {
+                        self.after_no_longer_possible(a, &e);
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => self.prepare_job = None,
             }
         }
         if let Some((power, rx)) = &self.power_job {
@@ -542,16 +644,16 @@ impl VitascopeApp {
     }
 
     /// 右鍵選單「播完後：… ▸」（標題寫著選好的動作，每次打開選單都看得到）。回傳要做的動作
-    pub(super) fn after_playback_menu(&self, ui: &mut egui::Ui) -> Option<Action> {
+    pub(super) fn after_playback_menu(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let current = self.after_playback;
         let repeating = self.shown_repeat() != Repeat::Off;
         let mut action = None;
         let title = tf!("播完後：{}", "When playback ends: {}", current.noun());
-        ui.menu_button(title, |ui| {
+        let shown = ui.menu_button(title, |ui| {
             for a in AfterPlayback::ALL {
                 let Some(avail) = self.after_avail(a) else { continue };
                 // 使用者指定了按鍵的話寫在右邊（跟其他指令一樣從 keymap 來）
-                let hint = command_of(a).map(|c| self.keymap.hint(c)).unwrap_or_default();
+                let hint = self.keymap.hint(command_of(a));
                 let mut r = super::with_hint(ui, &hint, |ui| {
                     ui.add_enabled(avail == Avail::Yes, egui::RadioButton::new(current == a, a.label()))
                 });
@@ -570,16 +672,30 @@ impl VitascopeApp {
             ui.separator();
             ui.weak(tr!("只對這次有效", "For this session only"));
         });
+        self.recheck_power_when_opened(shown.inner.is_some(), false);
         action
     }
 
+    /// 「播完後」的選單（`combo` = 設定頁的下拉選單，否則右鍵選單）剛打開：再問一次系統能做哪些事
+    fn recheck_power_when_opened(&mut self, open: bool, combo: bool) {
+        let was = if combo {
+            std::mem::replace(&mut self.after_combo_open, open)
+        } else {
+            std::mem::replace(&mut self.after_menu_open, open)
+        };
+        if open && !was {
+            self.probe_power_caps();
+        }
+    }
+
     /// 「設定 → 播放」的「播完後」。不算改了設定（不存檔、不會讓設定視窗寫設定檔）：回傳要做的動作
-    pub(super) fn after_playback_row(&self, ui: &mut egui::Ui) -> Option<Action> {
+    pub(super) fn after_playback_row(&mut self, ui: &mut egui::Ui) -> Option<Action> {
         let current = self.after_playback;
         let mut action = None;
+        let mut open = false;
         ui.horizontal(|ui| {
             let label = ui.label(tr!("播完後", "When playback ends"));
-            let mut combo = egui::ComboBox::from_id_salt("settings_after_playback")
+            let shown = egui::ComboBox::from_id_salt("settings_after_playback")
                 .selected_text(current.label())
                 .show_ui(ui, |ui| {
                     for a in AfterPlayback::ALL {
@@ -594,14 +710,15 @@ impl VitascopeApp {
                             action = Some(Action::SetAfterPlayback(a));
                         }
                     }
-                })
-                .response
-                .labelled_by(label.id);
+                });
+            open = shown.inner.is_some();
+            let mut combo = shown.response.labelled_by(label.id);
             if self.shown_repeat() != Repeat::Off {
                 combo = combo.on_hover_text(repeating_hover());
             }
             let _ = combo;
         });
+        self.recheck_power_when_opened(open, true);
         ui.indent("after_playback_note", |ui| {
             ui.weak(tr!(
                 "只對這次有效：下次開啟影戲時是「不做任何事」",
@@ -618,13 +735,20 @@ impl VitascopeApp {
     }
 }
 
-/// 選這個動作的快捷鍵指令（睡眠、休眠、關機的在 E5 加）
-fn command_of(a: AfterPlayback) -> Option<Command> {
+/// 選這個動作的快捷鍵指令
+fn command_of(a: AfterPlayback) -> Command {
     match a {
-        AfterPlayback::Nothing => Some(Command::AfterPlaybackNone),
-        AfterPlayback::Close => Some(Command::AfterPlaybackClose),
-        AfterPlayback::Sleep | AfterPlayback::Hibernate | AfterPlayback::Shutdown => None,
+        AfterPlayback::Nothing => Command::AfterPlaybackNone,
+        AfterPlayback::Close => Command::AfterPlaybackClose,
+        AfterPlayback::Sleep => Command::AfterPlaybackSleep,
+        AfterPlayback::Hibernate => Command::AfterPlaybackHibernate,
+        AfterPlayback::Shutdown => Command::AfterPlaybackShutdown,
     }
+}
+
+/// 選不了這個動作（OSD）
+fn refused(a: AfterPlayback, why: &str) -> String {
+    tf!("播完後無法{}：{why}", "Can't {} when playback ends: {why}", a.noun())
 }
 
 /// macOS：程式被隱藏（⌘H）時取消隱藏（倒數要看得到）。winit 只會把看得到的視窗叫到前面

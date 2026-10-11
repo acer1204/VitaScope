@@ -1209,6 +1209,78 @@ fn a_failed_power_action_says_why() {
     assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
 }
 
+/// 選了關機、系統的詢問（macOS 的「自動化」）還沒回答時改選了別的：之後才回來的「被拒」不影響新選的
+#[test]
+fn a_late_refusal_for_an_earlier_choice_keeps_the_new_choice() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    fake.hold_prepares();
+    let (_dir, _path, mut h) = after_case(
+        "after-late-refusal",
+        Launch {
+            system: Some(fake.clone()),
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Shutdown,
+    );
+    step_until_app(&mut h, "選了關機：取得權限（等使用者回答）", |_| {
+        !fake.prepares().is_empty()
+    });
+    assert!(h.state().power_prepare_pending());
+    h.state_mut().set_after_playback(AfterPlayback::Close);
+    h.step();
+    fake.release_prepares(Err(PowerError::MacAutomationDenied));
+    step_until_app(&mut h, "關機的權限被拒（處理完）", |app| {
+        !app.power_prepare_pending()
+    });
+    h.run_steps(2);
+    let app = h.state();
+    assert_eq!(app.after_playback(), AfterPlayback::Close, "被拒的是之前選的關機");
+    assert!(
+        app.osd_text().is_none_or(|t| !t.contains("無法")),
+        "{:?}",
+        app.osd_text()
+    );
+    assert_eq!(fake.prepares(), [PowerAction::Shutdown]);
+    assert!(fake.runs().is_empty());
+}
+
+/// 選了關機、還沒回答系統的詢問就播完了（開始倒數）：之後被拒的話倒數也停掉，不會時間到又去關機
+#[test]
+fn a_refusal_during_the_countdown_stops_it() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    fake.hold_prepares();
+    let (_dir, _path, mut h) = after_case(
+        "after-refusal-countdown",
+        Launch {
+            system: Some(fake.clone()),
+            countdown_override: Some(LONG_COUNTDOWN),
+            ..Default::default()
+        },
+        AfterPlayback::Shutdown,
+    );
+    step_until_app(&mut h, "選了關機：取得權限（等使用者回答）", |_| {
+        !fake.prepares().is_empty()
+    });
+    finish_and_count_down(&mut h);
+    assert!(h.state().power_prepare_pending(), "還沒回答");
+    fake.release_prepares(Err(PowerError::MacAutomationDenied));
+    step_until_app(&mut h, "關機的權限被拒（處理完）", |app| {
+        !app.power_prepare_pending()
+    });
+    // 處理的那一幀就說明（提示會自己消失：先看）
+    let app = h.state();
+    assert_eq!(app.countdown_remaining(), None, "倒數停掉");
+    assert_eq!(app.after_playback(), AfterPlayback::Nothing);
+    assert_eq!(
+        app.osd_text(),
+        Some("播完後無法關機：macOS 不允許影戲控制 loginwindow：請到「系統設定 → 隱私權與安全性 → 自動化」允許")
+    );
+    h.run_steps(2);
+    assert!(h.query_by_label("播放完畢").is_none(), "倒數畫面關掉");
+    assert!(fake.runs().is_empty());
+}
+
 #[test]
 fn any_key_cancels_the_countdown_and_is_not_also_a_shortcut() {
     let (_dir, _path, mut h) = after_case(

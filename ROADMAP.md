@@ -569,7 +569,31 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：真的 4K HDR、杜比視界 P8、長片（2 小時）的總覽圖：時間、顏色、花多久；中日韓檔名的標頭
   - [ ] 手動確認：電視錄影的 TS / M2TS 的總覽圖每張跟時間標記對得上
   - [ ] 手動確認：3840 寬、10 欄 × 20 列的 JPEG 在看圖軟體開得了；邊播 4K 邊做總覽圖時主畫面不掉格
-- [ ] 播放清單：隨機、單一 / 全部重複、播完後動作（關閉、休眠、關機）
+- [x] 播放清單：隨機、單一 / 全部重複、播完後動作（關閉、睡眠、休眠、關機）
+  - 播放順序（E1–E3）：隨機播放這一輪每個檔案播一次（SplitMix64 洗牌，PgUp 沿著播過的順序往回），重複單一檔案用 mpv 的 `loop-file`
+    （不能跳轉的來源自己重播），重複全部播完從頭（重新洗牌）；自動播下一個時跳過開不起來的檔案，整輪都開不起來就停。
+    右鍵選單「播放順序 ▸」、播放清單的 🔀 / 🔁、「設定 → 播放」、控制列的 🔀 / 🔂。隨機的順序不記（下次開啟時重新洗牌）。
+  - 播完後（E4–E5）：只對這次有效（`AfterPlayback` 刻意不能存檔）；播放結束時先倒數（`egui::Modal`：關閉 10 秒、睡眠 / 休眠 30 秒、關機 60 秒），
+    視窗還原、叫到前面、暫時置頂；任何按鍵（`handle_keys` 的最前面，按鍵被吃掉）、點擊、滾輪、移動滑鼠、開檔、停止、開了檔案對話框都取消，
+    整個系統的輸入也算（Windows `GetLastInputInfo`、macOS `CGEventSourceSecondsSinceLastEventType`、X11 的 XScreenSaver；
+    叫視窗時 winit 模擬的 Alt 不算：叫視窗後 0.4 秒內的不看，目前只有單元測試，見下面的手動確認）。正在匯出時等匯出做完。執行前先存檔。
+    真的睡眠、關機只在 main.rs 接上（`Launch.system` = `RealPower`；自動測試、`--shot` 沒有，選單不列出）：
+    Windows `SetSuspendState` / `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG)`（先打開 SeShutdownPrivilege，不加 `EWX_FORCE`），
+    新式待命（AoAc）的電腦睡眠停用、沒開休眠不列出休眠；macOS `/usr/bin/pmset sleepnow`、請 loginwindow 關機（`/usr/bin/osascript`），
+    選「關機」時先用 `AEDeterminePermissionToAutomateTarget` 問「自動化」權限（詢問視窗在人還在時出現；`Info.plist` 的 `NSAppleEventsUsageDescription`）；
+    Linux 透過 zbus 問 logind 的 `CanSuspend` / `CanHibernate` / `CanPowerOff`，"challenge"（要密碼）停用並說明，執行時 `interactive = false`。
+    啟動時、打開「播完後」的選單、選了動作時都在背景再問一次系統（S-B6）；Wayland 沒有整個系統的閒置時間，只看影戲視窗裡的動作
+  （自動：system_power 單元測試（倒數、長度、不能存檔、Windows 的新式待命 / 休眠 / 權限錯誤 / 閒置時間繞回 / 關機不加 `EWX_FORCE`、logind 的回答與 D-Bus 錯誤、
+  osascript 的參數與 -1743、「自動化」權限、中英文的原因、只有 main.rs 建立 `RealPower`；Windows 真的問一次能做哪些事、Linux 沒有 logind 時不當掉，**只問、不執行**）；
+  after_playback 單元測試（滑鼠的門檻與抖動、叫視窗時的 Alt 與系統輸入）；headless / kittest `tests/play_order.rs`（洗牌、重複、跳過開不起來的檔案、
+  倒數後只執行一次、各種取消、等匯出、關閉影戲、倒數中權限才被拒時停掉、改選之後才回來的被拒不影響新選的）；kittest `tests/ui.rs`（選單、設定頁、⏳、快捷鍵、系統支援哪些、打開選單時再問、選了先取得權限、
+  權限被拒與再問後不能做時回到不做任何事、沒有系統或沒有休眠時快捷鍵說明原因並再問一次、英文介面）；任何測試都只用假的 `SystemPower`）
+  - [ ] 手動確認：在自己的電腦真的試一次睡眠、休眠、關機（主人的電腦是新式待命、沒開休眠：只有關機能選，睡眠顯示停用與原因；
+    有沒存檔案的記事本時 Windows 顯示「這個 App 正在阻止關機」）
+  - [ ] 手動確認（Windows）：別的程式在前面時播完，倒數視窗叫到最上層後不會自己取消（winit 模擬的 Alt、真的 `GetLastInputInfo` 都不算）；
+    之後在別的程式裡打字、移動滑鼠會取消；原本在前面的程式的選單列可能閃一下
+  - [ ] 手動確認（macOS）：第一次選「關機」時跳出「自動化」的詢問，允許後真的關機、不允許時說明原因；⌘H 隱藏、縮到 Dock 時播完會叫出來
+  - [ ] 手動確認（Linux）：GNOME、KDE 上的睡眠與關機（logind），要密碼時停用；X11 在別的程式裡打字會取消倒數（Wayland 不會）
 - [ ] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
 - [ ] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
 - [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試

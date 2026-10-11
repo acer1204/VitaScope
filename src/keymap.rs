@@ -398,6 +398,12 @@ commands! {
     AfterPlaybackNone => "after-playback-none", Playback, once, ("播完後：不做任何事", "When playback ends: do nothing");
     /// 播完後的動作（預設沒有按鍵）：倒數 10 秒後關閉影戲
     AfterPlaybackClose => "after-playback-close", Playback, once, ("播完後：關閉影戲", "When playback ends: close VitaScope");
+    /// 播完後的動作（預設沒有按鍵）：倒數 30 秒後睡眠（系統不支援時選不了）
+    AfterPlaybackSleep => "after-playback-sleep", Playback, once, ("播完後：睡眠", "When playback ends: sleep");
+    /// 播完後的動作（預設沒有按鍵）：倒數 30 秒後休眠
+    AfterPlaybackHibernate => "after-playback-hibernate", Playback, once, ("播完後：休眠", "When playback ends: hibernate");
+    /// 播完後的動作（預設沒有按鍵）：倒數 60 秒後關機
+    AfterPlaybackShutdown => "after-playback-shutdown", Playback, once, ("播完後：關機", "When playback ends: shut down");
     VolumeUp => "volume-up", Sound, repeat, ("音量 +", "Volume up");
     VolumeDown => "volume-down", Sound, repeat, ("音量 −", "Volume down");
     ToggleMute => "toggle-mute", Sound, once, ("靜音", "Mute");
@@ -1429,6 +1435,10 @@ mod tests {
         // E4
         "after-playback-none",
         "after-playback-close",
+        // E5
+        "after-playback-sleep",
+        "after-playback-hibernate",
+        "after-playback-shutdown",
     ];
 
     #[test]
@@ -1553,6 +1563,9 @@ mod tests {
                 | C::CycleRepeat
                 | C::AfterPlaybackNone
                 | C::AfterPlaybackClose
+                | C::AfterPlaybackSleep
+                | C::AfterPlaybackHibernate
+                | C::AfterPlaybackShutdown
                 | C::AudioDelayReset
                 | C::NextAudioTrack
                 | C::ToggleEq
@@ -1588,6 +1601,9 @@ mod tests {
                                 | Command::CycleRepeat
                                 | Command::AfterPlaybackNone
                                 | Command::AfterPlaybackClose
+                                | Command::AfterPlaybackSleep
+                                | Command::AfterPlaybackHibernate
+                                | Command::AfterPlaybackShutdown
                         ),
                         "{preset:?} {p:?}：{cmd:?} 預設不給按鍵（{chord:?}）"
                     );
@@ -1608,6 +1624,16 @@ mod tests {
             Some(Command::AfterPlaybackClose)
         );
         assert_eq!(Command::AfterPlaybackClose.group(), Group::Playback);
+        // 睡眠、休眠、關機（E5）：一樣不給預設按鍵
+        for (id, cmd) in [
+            ("after-playback-sleep", Command::AfterPlaybackSleep),
+            ("after-playback-hibernate", Command::AfterPlaybackHibernate),
+            ("after-playback-shutdown", Command::AfterPlaybackShutdown),
+        ] {
+            assert_eq!(Command::from_id(id), Some(cmd));
+            assert_eq!(cmd.group(), Group::Playback);
+            assert!(!cmd.repeatable(), "{cmd:?}");
+        }
     }
 
     #[test]

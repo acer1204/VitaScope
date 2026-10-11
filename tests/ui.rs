@@ -23,7 +23,7 @@ use vitascope::playlist::{Playlist, Repeat};
 use vitascope::power::PowerSource;
 use vitascope::screens::{Refresh, RefreshSource};
 use vitascope::settings::{OnTop, Settings, SideTab};
-use vitascope::system_power::{AfterPlayback, Avail, PowerCaps, PowerError};
+use vitascope::system_power::{AfterPlayback, Avail, PowerAction, PowerCaps, PowerError};
 use vitascope::theme::ThemeChoice;
 use vitascope::ytdl::{Failure, Hint, Resolve, YtdlError};
 
@@ -17459,6 +17459,293 @@ fn settings_playback_page_picks_the_action_without_writing_settings() {
     assert_eq!(combo_value(&h, "播完後"), "關閉影戲");
     assert_eq!(h.state().osd_text(), Some("播完後：關閉影戲"));
     assert_eq!(std::fs::read(&path).ok(), saved, "只對這次有效：設定視窗不寫設定檔");
+}
+
+/// 等選單裡的項目變成可以選（系統能做哪些事是在背景問的）
+fn wait_enabled(h: &mut Harness<'_, VitascopeApp>, label: &str) {
+    let start = Instant::now();
+    while h.get_by_label(label).accesskit_node().is_disabled() {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "「{label}」一直是停用的（沒問到系統支援哪些）"
+        );
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// 背景問系統能做哪些事、取得權限都做完，結果也處理了。之後才改假系統的回答：
+/// 不會被還在跑的那一次讀到（慢的 CI 上背景執行緒可能很晚才跑）
+fn power_settled(h: &mut Harness<'_, VitascopeApp>) {
+    step_until_app(h, "背景問系統、取得權限都做完", |app| {
+        !app.power_probe_pending() && !app.power_prepare_pending()
+    });
+}
+
+/// 播完後的動作用快捷鍵選（F9 睡眠、F10 休眠、F11 關機）
+fn power_keys() -> Settings {
+    let mut settings = Settings::default();
+    for (id, key) in [
+        ("after-playback-sleep", "F9"),
+        ("after-playback-hibernate", "F10"),
+        ("after-playback-shutdown", "F11"),
+    ] {
+        settings.keys.custom.insert(id.into(), vec![key.into()]);
+    }
+    settings
+}
+
+/// 每次打開「播完後 ▸」都再問一次系統（休眠被關掉、改成要密碼…）：選單跟著變。
+/// 只要密碼的（logind 的 challenge）休眠照樣列出、停用並說明；系統沒有的休眠不列出
+#[test]
+fn opening_the_after_menu_asks_the_system_again() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    let (_dir, mut h) = after_ui_case(
+        "after-recheck",
+        Launch {
+            system: Some(fake.clone()),
+            ..Default::default()
+        },
+        Settings::default(),
+    );
+    open_after_menu(&mut h, "播完後：不做任何事");
+    wait_enabled(&mut h, "休眠");
+    close_menus(&mut h);
+    // 打開選單時問的那一次做完、處理完
+    power_settled(&mut h);
+    // 系統變了：休眠要密碼、關機不允許
+    fake.set_caps(PowerCaps {
+        hibernate: Avail::No(PowerError::NeedsPassword),
+        shutdown: Avail::No(PowerError::LogindRefuses("no".into())),
+        ..PowerCaps::all_yes()
+    });
+    let asked = fake.caps_calls();
+    open_after_menu(&mut h, "播完後：不做任何事");
+    let start = Instant::now();
+    while !h.get_by_label("關機").accesskit_node().is_disabled() {
+        assert!(start.elapsed() < TIMEOUT, "打開選單時沒有再問一次系統");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fake.caps_calls(), asked + 1, "打開選單時問一次（不是每一幀都問）");
+    assert!(
+        h.get_by_label("休眠").accesskit_node().is_disabled(),
+        "要密碼的休眠：列出但停用"
+    );
+    hover_menu_tooltip(&mut h, "休眠", "需要系統管理員密碼：離開電腦時不會執行");
+    hover_menu_tooltip(&mut h, "關機", "系統不允許（logind：no）");
+    assert!(!h.get_by_label("睡眠").accesskit_node().is_disabled());
+    // 選單開著的時候不會一直問
+    h.run_steps(10);
+    assert_eq!(fake.caps_calls(), asked + 1);
+    close_menus(&mut h);
+    // 休眠被關掉了（Windows 沒開休眠）：不列出
+    fake.set_caps(PowerCaps {
+        hibernate: Avail::No(PowerError::HibernateOff),
+        ..PowerCaps::all_yes()
+    });
+    open_after_menu(&mut h, "播完後：不做任何事");
+    let start = Instant::now();
+    while h.query_by_label("休眠").is_some() {
+        assert!(start.elapsed() < TIMEOUT, "系統沒有休眠：不列出");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wait_enabled(&mut h, "關機");
+    assert_eq!(fake.caps_calls(), asked + 2);
+    assert!(fake.runs().is_empty() && fake.prepares().is_empty(), "打開選單只是問");
+}
+
+/// 「設定 → 播放」的下拉選單打開時也再問一次系統
+#[test]
+fn the_settings_combo_asks_the_system_again() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    let (_dir, mut h) = after_ui_case(
+        "after-recheck-settings",
+        Launch {
+            system: Some(fake.clone()),
+            ..Default::default()
+        },
+        Settings::default(),
+    );
+    // 啟動時問的結果到了才改（不然啟動時就問到新的答案）
+    open_after_menu(&mut h, "播完後：不做任何事");
+    wait_enabled(&mut h, "睡眠");
+    close_menus(&mut h);
+    power_settled(&mut h);
+    fake.set_caps(PowerCaps {
+        sleep: Avail::No(PowerError::ModernStandby),
+        ..PowerCaps::all_yes()
+    });
+    let asked = fake.caps_calls();
+    open_settings_page(&mut h, "播放");
+    assert_eq!(fake.caps_calls(), asked, "打開設定頁不問");
+    combo_in_view(&mut h, "播完後");
+    wait_menu_item(&mut h, "關機");
+    let start = Instant::now();
+    while !h.get_by_label("睡眠").accesskit_node().is_disabled() {
+        assert!(start.elapsed() < TIMEOUT, "打開下拉選單時沒有再問一次系統");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fake.caps_calls(), asked + 1, "是下拉選單打開時問的（問一次）");
+    hover_menu_tooltip(
+        &mut h,
+        "睡眠",
+        "這台電腦使用新式待命（Modern Standby），不能由程式進入睡眠",
+    );
+}
+
+/// 選了睡眠 / 休眠 / 關機（快捷鍵也一樣）：先取得權限（macOS 的關機在這時跳出系統的詢問）、再問一次系統；
+/// 權限被拒時馬上說明、回到「不做任何事」，不等到播完
+#[test]
+fn choosing_a_power_action_prepares_it_and_a_refusal_resets_it() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    let (_dir, mut h) = after_ui_case(
+        "after-prepare",
+        Launch {
+            system: Some(fake.clone()),
+            ..Default::default()
+        },
+        power_keys(),
+    );
+    // 選單寫出指定的按鍵；啟動時問的結果到了
+    open_after_menu(&mut h, "播完後：不做任何事");
+    wait_enabled(&mut h, "睡眠");
+    for key in ["F9", "F10", "F11"] {
+        h.get_by_label(key);
+    }
+    close_menus(&mut h);
+    // 打開選單時問的那一次做完、處理完（之後的次數只算選的時候問的）
+    power_settled(&mut h);
+    let asked = fake.caps_calls();
+    press_key(&mut h, egui::Key::F9);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Sleep);
+    assert_eq!(h.state().osd_text(), Some("播完後：睡眠"));
+    let start = Instant::now();
+    while fake.prepares().is_empty() || fake.caps_calls() == asked {
+        assert!(start.elapsed() < TIMEOUT, "選了之後沒有先取得權限、再問一次系統");
+        h.step();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    power_settled(&mut h);
+    assert_eq!(fake.prepares(), [PowerAction::Sleep]);
+    assert_eq!(fake.caps_calls(), asked + 1);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Sleep, "可以做：留著");
+    // 沒有說不行（提示會自己消失，不看它還在不在）
+    assert!(
+        h.state().osd_text().is_none_or(|t| !t.contains("無法")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    // 關機的權限被拒（macOS 的「自動化」）
+    fake.prepare_fails_with(PowerError::MacAutomationDenied);
+    // 選上了（背景的結果可能在同一幀就回來，所以看被要求的權限）
+    press_key(&mut h, egui::Key::F11);
+    step_until_app(&mut h, "權限被拒，回到不做任何事", |app| {
+        app.after_playback() == AfterPlayback::Nothing
+    });
+    assert_eq!(fake.prepares(), [PowerAction::Sleep, PowerAction::Shutdown]);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播完後無法關機：macOS 不允許影戲控制 loginwindow：請到「系統設定 → 隱私權與安全性 → 自動化」允許")
+    );
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("⏳").is_none());
+    assert!(fake.runs().is_empty(), "只是選，什麼都沒執行");
+}
+
+/// 選好之後再問系統，說現在不能做了（改成要密碼）：說明、回到「不做任何事」
+#[test]
+fn a_recheck_that_says_no_resets_the_armed_action() {
+    let fake = Arc::new(FakePower::new(PowerCaps::all_yes()));
+    let (_dir, mut h) = after_ui_case(
+        "after-recheck-no",
+        Launch {
+            system: Some(fake.clone()),
+            ..Default::default()
+        },
+        power_keys(),
+    );
+    open_after_menu(&mut h, "播完後：不做任何事");
+    wait_enabled(&mut h, "睡眠");
+    close_menus(&mut h);
+    press_key(&mut h, egui::Key::F9);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Sleep);
+    // 選的時候那一次（取得權限、再問一次系統）做完、處理完，才改系統的回答
+    step_until_app(&mut h, "選的時候取得權限", |_| !fake.prepares().is_empty());
+    power_settled(&mut h);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Sleep);
+    fake.set_caps(PowerCaps {
+        sleep: Avail::No(PowerError::NeedsPassword),
+        ..PowerCaps::all_yes()
+    });
+    // 打開選單時再問：選好的睡眠不能做了（問到的結果可能在子選單打開的同一幀回來，標題跟著變：不等標題）
+    wait_window_fit(&mut h);
+    h.get_by_label("影片畫面").click_secondary();
+    h.run_steps(2);
+    h.get_by_label_contains("播完後：睡眠").hover();
+    step_until_app(&mut h, "不能做了，回到不做任何事", |app| {
+        app.after_playback() == AfterPlayback::Nothing
+    });
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播完後無法睡眠：需要系統管理員密碼：離開電腦時不會執行")
+    );
+    assert!(fake.runs().is_empty());
+}
+
+/// 沒有讓電腦睡眠的方法（自動測試、`--shot`）或系統沒有休眠時，快捷鍵選了也說明原因、不會選上
+#[test]
+fn power_keys_without_support_say_why() {
+    let (_dir, mut h) = after_ui_case("after-keys-none", Launch::default(), power_keys());
+    press_key(&mut h, egui::Key::F11);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert_eq!(h.state().osd_text(), Some("播完後無法關機：這台電腦不支援"));
+    drop(h);
+    let fake = Arc::new(FakePower::new(PowerCaps {
+        hibernate: Avail::No(PowerError::HibernateOff),
+        ..PowerCaps::all_yes()
+    }));
+    let (_dir, mut h) = after_ui_case(
+        "after-keys-nohib",
+        Launch {
+            system: Some(fake.clone()),
+            ..Default::default()
+        },
+        power_keys(),
+    );
+    open_after_menu(&mut h, "播完後：不做任何事");
+    wait_enabled(&mut h, "睡眠");
+    assert!(h.query_by_label("休眠").is_none());
+    close_menus(&mut h);
+    power_settled(&mut h);
+    // 系統變了（剛打開休眠），影戲還不知道
+    fake.set_caps(PowerCaps::all_yes());
+    let asked = fake.caps_calls();
+    // 不列出的休眠：快捷鍵選的時候說出系統的原因（上次問到的）
+    press_key(&mut h, egui::Key::F10);
+    assert_eq!(h.state().after_playback(), AfterPlayback::Nothing);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("播完後無法休眠：休眠沒有開啟（系統管理員可以執行 powercfg /hibernate on）")
+    );
+    assert!(fake.prepares().is_empty() && fake.runs().is_empty());
+    // 說不行時也再問一次系統：下次按的時候用新的回答
+    step_until_app(&mut h, "選不了時再問一次系統", |_| fake.caps_calls() > asked);
+    power_settled(&mut h);
+    assert_eq!(fake.caps_calls(), asked + 1);
+    press_key(&mut h, egui::Key::F10);
+    assert_eq!(
+        h.state().after_playback(),
+        AfterPlayback::Hibernate,
+        "{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().osd_text(), Some("播完後：休眠"));
+    step_until_app(&mut h, "選了之後取得權限", |_| !fake.prepares().is_empty());
+    assert_eq!(fake.prepares(), [PowerAction::Hibernate]);
+    assert!(fake.runs().is_empty());
 }
 
 #[test]

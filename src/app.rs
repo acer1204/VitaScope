@@ -420,9 +420,14 @@ pub struct VitascopeApp {
     countdown_raise: bool,
     /// 讓電腦睡眠、休眠、關機的方法（沒有時選單不列出）
     system: Option<Arc<dyn SystemPower>>,
-    /// 系統能做哪些事（啟動時在背景問）
+    /// 系統能做哪些事（啟動時、打開「播完後」的選單時、選了動作時在背景問）
     power_caps: PowerCaps,
     caps_probe: Option<Receiver<PowerCaps>>,
+    /// 選了睡眠 / 休眠 / 關機時在背景取得權限（macOS 的關機會跳出系統的詢問）：結果
+    prepare_job: Option<(AfterPlayback, Receiver<Result<(), PowerError>>)>,
+    /// 上一幀「播完後 ▸」的右鍵選單、設定頁的下拉選單開著（剛打開時再問一次系統）
+    after_menu_open: bool,
+    after_combo_open: bool,
     /// 正在執行的睡眠 / 休眠 / 關機（背景執行緒）：結果
     power_job: Option<(PowerAction, Receiver<Result<(), PowerError>>)>,
     /// 播完後的「關閉影戲」送出了關閉視窗
@@ -652,7 +657,7 @@ pub struct Launch {
     /// 預設 None（自動測試、`--shot`：不清、不碰使用者的資料夾），播放器用 `paths::cache_root()`
     pub cache_root: Option<PathBuf>,
     /// 讓電腦睡眠、休眠、關機的方法（「播完後 ▸」）；預設 None（自動測試、`--shot`：選單不列出睡眠、休眠、關機，
-    /// 絕不會讓電腦睡眠或關機）
+    /// 絕不會讓電腦睡眠或關機）。只有 main.rs 設成真的（`system_power::RealPower`）
     pub system: Option<Arc<dyn SystemPower>>,
     /// 測試用：播完後的倒數改成這麼久（None = 照動作：關閉影戲 10 秒，睡眠 / 休眠 30 秒，關機 60 秒）
     #[doc(hidden)]
@@ -867,6 +872,9 @@ impl VitascopeApp {
             system: launch.system,
             power_caps: PowerCaps::default(),
             caps_probe: None,
+            prepare_job: None,
+            after_menu_open: false,
+            after_combo_open: false,
             power_job: None,
             close_requested: false,
             loop_file_sent: "no",
@@ -2814,6 +2822,9 @@ impl VitascopeApp {
             Command::CycleRepeat => Action::CycleRepeat,
             Command::AfterPlaybackNone => Action::SetAfterPlayback(AfterPlayback::Nothing),
             Command::AfterPlaybackClose => Action::SetAfterPlayback(AfterPlayback::Close),
+            Command::AfterPlaybackSleep => Action::SetAfterPlayback(AfterPlayback::Sleep),
+            Command::AfterPlaybackHibernate => Action::SetAfterPlayback(AfterPlayback::Hibernate),
+            Command::AfterPlaybackShutdown => Action::SetAfterPlayback(AfterPlayback::Shutdown),
         }
     }
 

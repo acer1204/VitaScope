@@ -13,6 +13,8 @@
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>
   <key>LSMinimumSystemVersion</key><string>@MIN_OS@</string>
   <key>NSHighResolutionCapable</key><true/>
+  <!-- 播完後關機：請 loginwindow 關機（Apple Event），macOS 第一次會問使用者，這段文字就是詢問視窗裡的說明 -->
+  <key>NSAppleEventsUsageDescription</key><string>播完後關機時，影戲要請 macOS 關機。To shut down your Mac when playback ends, VitaScope asks macOS to shut down.</string>
   <key>CFBundleIconFile</key><string>VitaScope</string>
 
   <key>CFBundleDocumentTypes</key>
