@@ -709,6 +709,7 @@ mod tests {
             repeat: Repeat::Off,
             volume: 1.0,
             buffering: false,
+            can_play: true,
         }
     }
 

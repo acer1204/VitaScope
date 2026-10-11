@@ -8,7 +8,8 @@
 //!   要測的用假的（[`MediaBackend::Custom`]），絕不碰使用者的系統媒體控制。
 //! - 音訊檔的專輯封面：mpv 把封面當成影像，`screenshot-to-file … video` 存成 PNG 放在快取資料夾的 `covers/`
 //!   （`cover-<pid>-<第幾個檔案>.png`；MPRIS 要檔案，其他系統用內容）。換檔、關掉時刪掉自己的，啟動時清掉一天以上的。
-//! - 各系統：Windows 的 SMTC 在 `windows.rs`（也有視窗在最前面時的媒體鍵 `windows::msg_hook`）。
+//! - 各系統：Windows 的 SMTC 在 `windows.rs`（也有視窗在最前面時的媒體鍵 `windows::msg_hook`）；
+//!   Linux 的 MPRIS（D-Bus 的工作階段匯流排）在 `mpris.rs`。
 
 use crate::keymap::Command;
 use crate::playlist::Repeat;
@@ -24,10 +25,16 @@ pub use crate::instance::Wake;
 #[cfg(windows)]
 pub mod windows;
 
+// 純邏輯的部分（屬性、Metadata、指令）在每個系統的測試都跑；連 D-Bus 的部分只有 Linux 有（zbus 只在 Linux）
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+pub mod mpris;
+
 /// 位置跟預期的差超過這麼多秒就當成跳轉（跳轉、換章節、重複單一檔案繞回開頭）
 pub const SEEK_JUMP: f64 = 1.0;
 /// 播放中每隔多久再送一次進度（Windows 的時間軸要定期更新；其他系統送了也沒關係）
 pub const REFRESH_EVERY: Duration = Duration::from_secs(5);
+/// 系統改了設定（音量、速度、隨機、重複）之後，多久再送一次播放狀態（[`SessionSync::confirm`]）
+pub const CONFIRM_AFTER: Duration = Duration::from_secs(1);
 
 // ───────────── 設定 ─────────────
 
@@ -136,6 +143,8 @@ pub struct PlaybackInfo {
     pub volume: f64,
     /// 網路串流在等快取（paused-for-cache）：狀態還是播放中，但位置不會前進
     pub buffering: bool,
+    /// 按播放鍵有東西可以播（有檔案載入，或停止之後清單上還有停止前的、接下來要播的檔案；MPRIS 的 CanPlay）
+    pub can_play: bool,
 }
 
 impl PlaybackInfo {
@@ -145,6 +154,18 @@ impl PlaybackInfo {
             position: other.position,
             ..self.clone()
         } == *other
+    }
+
+    /// [`Update::Clear`] 之後系統顯示的狀態：停止、位置 0、不能跳轉、沒有在等快取；其他欄位（能不能播放、
+    /// 上一個／下一個、隨機、重複、速度、音量）還是這個的
+    pub fn cleared(&self) -> Self {
+        Self {
+            status: Status::Stopped,
+            position: 0.0,
+            seekable: false,
+            buffering: false,
+            ..self.clone()
+        }
     }
 }
 
@@ -177,7 +198,8 @@ pub enum Update {
     Playback { info: PlaybackInfo, seeked: bool },
     /// 目前檔案的專輯封面（每次送 [`Update::Track`] 之後都會再送一次：Windows 換標題時會把封面清掉）
     Cover(Cover),
-    /// 不再播放任何檔案（停止、播完卸載了）：系統顯示停止。工作階段還在，按播放鍵可以再開
+    /// 不再播放任何檔案（停止、播完卸載了）：系統顯示停止（播放狀態照 [`PlaybackInfo::cleared`]）。
+    /// 工作階段還在，按播放鍵可以再開
     Clear,
 }
 
@@ -231,9 +253,9 @@ impl MediaBackend {
     }
 }
 
-/// 這個作業系統的媒體控制做好了沒（各系統的實作加進來時打開）：Windows 的 SMTC
+/// 這個作業系統的媒體控制做好了沒（各系統的實作加進來時打開）：Windows 的 SMTC、Linux 的 MPRIS
 pub const fn system_supported() -> bool {
-    cfg!(windows)
+    cfg!(any(windows, all(unix, not(target_os = "macos"))))
 }
 
 /// 建立這個作業系統的工作階段（`identity`：程式名稱，MPRIS 用；Windows 顯示的是程式本身的名稱與圖示）
@@ -243,7 +265,13 @@ pub fn create_system(owner: Option<RawWindowHandle>, identity: &str, wake: Wake)
         let _ = identity;
         self::windows::create(owner, wake)
     }
-    #[cfg(not(windows))]
+    // MPRIS 跟視窗無關（Raise 由介面把主視窗叫到前面）
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = owner;
+        self::mpris::create(identity, wake)
+    }
+    #[cfg(target_os = "macos")]
     {
         let _ = (owner, identity, wake);
         Err(crate::tr!("這個系統還不支援", "Not supported on this system yet").to_owned())
@@ -261,6 +289,8 @@ pub struct SessionSync {
     sent: Option<(PlaybackInfo, Instant)>,
     /// 目前檔案的封面（換檔、停止時丟掉）
     cover: Option<Cover>,
+    /// 到這個時間一定再送一次播放狀態（[`Self::confirm`]）
+    confirm_at: Option<Instant>,
 }
 
 impl SessionSync {
@@ -287,9 +317,15 @@ impl SessionSync {
             }
             Some(_) => {}
             None if self.track.is_some() => {
-                // 有在播 → 沒有：只送一次
+                // 有在播 → 沒有：只送一次。Clear 只把系統顯示的改成停止（`cleared`）；停止後其他欄位跟上次送的
+                // 不一樣時（正在播的已經移出清單，按播放沒有東西可開；「下一個」之後馬上停止，上一個變成可以按），
+                // 先送停止後的播放狀態：這些欄位之後沒變就不會再送，系統會一直顯示停止前的
                 self.track = None;
                 self.cover = None;
+                let shown = self.sent.as_ref().map(|(last, _)| last.cleared());
+                if shown.as_ref() != Some(&playback.cleared()) {
+                    out.push(self.send(playback, false, now));
+                }
                 out.push(Update::Clear);
                 self.sent = Some((playback.clone(), now));
                 return out;
@@ -312,10 +348,18 @@ impl SessionSync {
         let seeked = (playback.position - expected).abs() > SEEK_JUMP;
         let changed = !last.same_state(playback);
         let refresh = playback.status == Status::Playing && !playback.buffering && elapsed >= REFRESH_EVERY;
-        if seeked || changed || refresh {
+        let confirm = self.confirm_at.is_some_and(|t| now >= t);
+        if seeked || changed || refresh || confirm {
             out.push(self.send(playback, seeked, now));
         }
         out
+    }
+
+    /// 系統送來的設定（音量、速度、隨機、重複）處理完了：[`CONFIRM_AFTER`] 之後一定再送一次播放狀態。
+    /// MPRIS 設定屬性時先顯示要的值（不然 zbus 會先送一次舊的值）；影戲沒照做（音量超過上限、沒有檔案時改速度…）
+    /// 而播放狀態也沒變時，系統會一直顯示要的值，這次送出的才把它改回真的值。等一下才送：播放器的值要一點時間才回來
+    pub fn confirm(&mut self, now: Instant) {
+        self.confirm_at = Some(now + CONFIRM_AFTER);
     }
 
     /// 目前檔案的封面讀好了：是這個檔案的就記下來，顯示片名與封面時回傳要送的更新
@@ -338,6 +382,9 @@ impl SessionSync {
     }
 
     fn send(&mut self, playback: &PlaybackInfo, seeked: bool, now: Instant) -> Update {
+        if self.confirm_at.is_some_and(|t| now >= t) {
+            self.confirm_at = None;
+        }
         self.sent = Some((playback.clone(), now));
         Update::Playback {
             info: playback.clone(),
@@ -540,6 +587,7 @@ mod tests {
             repeat: Repeat::Off,
             volume: 1.0,
             buffering: false,
+            can_play: true,
         }
     }
 
@@ -671,6 +719,7 @@ mod tests {
             |p| p.seekable = false,
             |p| p.status = Status::Paused,
             |p| p.buffering = true,
+            |p| p.can_play = false,
         ] {
             let mut p = playing(0.0);
             change(&mut p);
@@ -741,6 +790,65 @@ mod tests {
         let out = s.tick(Some(&track(2)), &playing(0.0), t0 + secs(22.0));
         assert!(matches!(&out[0], Update::Track(t) if t.file_gen == 2));
         assert_eq!(s.sent_track().map(|t| t.file_gen), Some(2));
+    }
+
+    /// 停止時其他欄位也變了（正在播的已經移出清單：按播放沒有東西可開）：Clear 之前先送停止後的播放狀態，
+    /// 系統才不會一直顯示「可以播放」（之後這些欄位沒變就不會再送）
+    #[test]
+    fn sync_clear_brings_what_changed_at_the_stop() {
+        let mut s = SessionSync::new();
+        let t0 = Instant::now();
+        s.tick(Some(&track(1)), &playing(3.0), t0);
+        let mut stopped = playing(3.0).cleared();
+        stopped.can_play = false;
+        stopped.can_prev = true;
+        assert_eq!(
+            s.tick(None, &stopped, t0 + secs(1.0)),
+            [
+                Update::Playback {
+                    info: stopped.clone(),
+                    seeked: false
+                },
+                Update::Clear
+            ]
+        );
+        assert!(s.tick(None, &stopped, t0 + secs(2.0)).is_empty());
+        // 只有 Clear 本來就會改的（狀態、位置、能不能跳轉、等快取）不一樣：只送 Clear
+        s.tick(Some(&track(2)), &playing(3.0), t0 + secs(3.0));
+        let mut buffering = playing(5.0);
+        buffering.buffering = true;
+        s.tick(Some(&track(2)), &buffering, t0 + secs(3.5));
+        assert_eq!(s.tick(None, &playing(0.0).cleared(), t0 + secs(4.0)), [Update::Clear]);
+    }
+
+    /// 系統改了設定之後（MPRIS 先顯示要的值）：等一下一定再送一次播放狀態，影戲沒照做時系統才會改回來
+    #[test]
+    fn sync_confirm_resends_once() {
+        let mut s = SessionSync::new();
+        let t0 = Instant::now();
+        s.tick(Some(&track(1)), &playing(3.0), t0);
+        let mut paused = playing(3.0);
+        paused.status = Status::Paused;
+        assert_eq!(s.tick(Some(&track(1)), &paused, t0 + secs(0.1)).len(), 1);
+        assert!(s.tick(Some(&track(1)), &paused, t0 + secs(0.2)).is_empty());
+        s.confirm(t0 + secs(0.2));
+        assert!(
+            s.tick(Some(&track(1)), &paused, t0 + secs(0.5)).is_empty(),
+            "等播放器的值回來"
+        );
+        assert_eq!(
+            s.tick(Some(&track(1)), &paused, t0 + secs(0.2) + CONFIRM_AFTER),
+            [Update::Playback {
+                info: paused.clone(),
+                seeked: false
+            }]
+        );
+        assert!(s.tick(Some(&track(1)), &paused, t0 + secs(5.0)).is_empty(), "只送一次");
+        // 停止中也一樣
+        s.tick(None, &paused.cleared(), t0 + secs(6.0));
+        s.confirm(t0 + secs(6.0));
+        assert_eq!(s.tick(None, &paused.cleared(), t0 + secs(8.0)).len(), 1);
+        assert!(s.tick(None, &paused.cleared(), t0 + secs(9.0)).is_empty());
     }
 
     #[test]
@@ -905,9 +1013,9 @@ mod tests {
     }
 
     #[test]
-    fn windows_has_a_system_session() {
-        // Windows 的 SMTC 做好了；其他系統的在之後的子批次打開
-        assert_eq!(system_supported(), cfg!(windows));
+    fn windows_and_linux_have_a_system_session() {
+        // Windows 的 SMTC、Linux 的 MPRIS 做好了；macOS 的在之後的子批次打開
+        assert_eq!(system_supported(), !cfg!(target_os = "macos"));
     }
 
     #[test]

@@ -853,6 +853,76 @@ fn play_after_the_stopped_file_was_removed_opens_the_next_one() {
     step_until_app(&mut h, "播放接下來的 c.mp4", |app| playing(app, "c.mp4"));
 }
 
+/// 系統的「可以播放」（MPRIS 的 CanPlay）：有檔案載入、或停止之後按播放會開清單上的檔案時才是；
+/// 清單上什麼都沒有了：不能播（按播放也不會開檔）
+#[test]
+fn can_play_follows_what_play_would_open() {
+    let dir = TempDir::new("can-play");
+    let a = dir.clip("a.mp4");
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![a], dir.settings());
+    step_until_app(&mut h, "a.mp4 開始播放、掃描完", |app| {
+        playing(app, "a.mp4") && app.playlist().is_some_and(|l| l.len() == 1)
+    });
+    step_until(&mut h, "系統收到「播放中」", || {
+        last_status(&fake) == Some(Status::Playing)
+    });
+    assert!(fake.last_playback().unwrap().can_play);
+    send(&mut h, &fake, MediaCommand::Stop);
+    step_until_app(&mut h, "停止", |app| !app.player().state.loaded);
+    step_until(&mut h, "系統收到停止", || {
+        fake.updates().last() == Some(&Update::Clear)
+    });
+    // 停止之後清單上還有 a.mp4：還是可以播（停止後跟停止前一樣，Clear 之外不另外送播放狀態）
+    assert!(fake.last_playback().unwrap().can_play);
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    click(&mut h, "1. a.mp4");
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(h.state().playlist().is_none_or(Playlist::is_empty), "a 移出清單了");
+    step_until(&mut h, "系統收到「不能播放」", || {
+        fake.last_playback().is_some_and(|p| !p.can_play)
+    });
+    send(&mut h, &fake, MediaCommand::Play);
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.loaded && !h.state().player().state.loading);
+}
+
+/// 正在播的檔案移出清單（照樣播完）之後停止：按播放沒有東西可開，系統收到「不能播放」
+/// （跟「停止」一起送；不然系統一直顯示停止前的「可以播放」）
+#[test]
+fn can_play_is_off_after_stopping_a_file_no_longer_on_the_list() {
+    let dir = TempDir::new("can-play-removed");
+    let a = dir.clip("a.mp4");
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![a], dir.settings());
+    step_until_app(&mut h, "a.mp4 開始播放、掃描完", |app| {
+        playing(app, "a.mp4") && app.playlist().is_some_and(|l| l.len() == 1)
+    });
+    step_until(&mut h, "系統收到「播放中」", || {
+        last_status(&fake) == Some(Status::Playing)
+    });
+    h.key_press(egui::Key::F6);
+    h.run_steps(2);
+    click(&mut h, "1. a.mp4");
+    h.key_press(egui::Key::Delete);
+    h.run_steps(2);
+    assert!(h.state().playlist().is_none_or(Playlist::is_empty), "a 移出清單了");
+    assert!(h.state().player().state.loaded, "正在播的照樣播");
+    assert!(fake.last_playback().unwrap().can_play, "還在播：可以播放");
+    send(&mut h, &fake, MediaCommand::Stop);
+    step_until_app(&mut h, "停止", |app| !app.player().state.loaded);
+    step_until(&mut h, "系統收到停止", || {
+        fake.updates().last() == Some(&Update::Clear)
+    });
+    let p = fake.last_playback().unwrap();
+    assert!(p.status == Status::Stopped && !p.can_play, "{p:?}");
+    send(&mut h, &fake, MediaCommand::Play);
+    wait_real(&mut h, 0.3);
+    assert!(!h.state().player().state.loaded && !h.state().player().state.loading);
+}
+
 /// 「下一個」接著馬上「停止」（同一批處理：新檔案可能還沒開始就被停掉，不會再有 StartFile）：
 /// 系統照樣收到「停止」，之後按播放照常開檔
 #[test]
@@ -1243,6 +1313,7 @@ fn smtc_session_round_trip() {
         repeat: Repeat::All,
         volume: 1.0,
         buffering: false,
+        can_play: true,
     };
     session.apply(&Update::Track(track.clone()));
     session.apply(&Update::Cover(Cover {
@@ -1374,6 +1445,7 @@ fn smtc_session_round_trip() {
             repeat: Repeat::Off,
             volume: 1.0,
             buffering: false,
+            can_play: true,
         },
         seeked: true,
     });
@@ -1444,5 +1516,673 @@ fn mpv_saves_album_art_as_png_and_refuses_files_without_it() {
         } else {
             assert!(!out.exists());
         }
+    }
+}
+
+// ───────────── Linux：MPRIS（測試自己開的 D-Bus 匯流排）─────────────
+
+/// MPRIS 的測試：每個測試自己開一個 `dbus-daemon --session`（私人的匯流排，用完就關），只連到它的位址，
+/// 絕不碰使用者真的工作階段匯流排（不讀 DBUS_SESSION_BUS_ADDRESS）。
+/// 沒有 dbus-daemon 時：開發機上跳過並說明；CI（有 `CI` 變數）上失敗，不能悄悄跳過（S-C10）
+#[cfg(all(unix, not(target_os = "macos")))]
+mod mpris {
+    use super::*;
+    use std::collections::HashMap;
+    use std::io::BufRead;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver};
+    use vitascope::media_keys::mpris::{
+        self as m, BUS_NAME, DESKTOP_ENTRY, NO_TRACK, OBJECT_PATH, PLAYER_IFACE, ROOT_IFACE,
+    };
+    use vitascope::media_keys::{Cover, MediaBackend, MediaSession, PlaybackInfo, TrackInfo, Wake};
+    use zbus::blocking::{Connection, MessageIterator, Proxy};
+    use zbus::zvariant::{ObjectPath, OwnedValue, Value};
+
+    /// 測試自己的匯流排（Drop 時關掉）
+    struct PrivateBus {
+        child: Child,
+        address: String,
+    }
+
+    impl PrivateBus {
+        /// None = 這台電腦沒有 dbus-daemon（不在 CI 上：跳過）
+        fn start() -> Option<Self> {
+            let spawned = Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn();
+            let mut child = match spawned {
+                Ok(child) => child,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    assert!(
+                        std::env::var_os("CI").is_none(),
+                        "CI 上一定要有 dbus-daemon（ci.yml 的 apt 要裝 dbus-daemon）：MPRIS 的測試不能跳過"
+                    );
+                    eprintln!("跳過：找不到 dbus-daemon（apt install dbus-daemon），MPRIS 的測試沒有跑");
+                    return None;
+                }
+                Err(e) => panic!("無法執行 dbus-daemon：{e}"),
+            };
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let address = line.trim().to_owned();
+            assert!(!address.is_empty(), "dbus-daemon 沒有印出位址");
+            Some(Self { child, address })
+        }
+
+        /// 匯流排突然不見了（像重新登入、dbus-daemon 當掉）
+        fn kill(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    /// 測試這一端（像 playerctl、桌面的媒體控制）
+    fn client(bus: &PrivateBus) -> Connection {
+        zbus::blocking::connection::Builder::address(bus.address.as_str())
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    /// `name` 的 `iface` 介面；屬性每次都問（不用快取，才看得到真的值）
+    fn proxy(conn: &Connection, name: &str, iface: &'static str) -> Proxy<'static> {
+        zbus::blocking::proxy::Builder::<Proxy>::new(conn)
+            .destination(name.to_owned())
+            .unwrap()
+            .path(OBJECT_PATH)
+            .unwrap()
+            .interface(iface)
+            .unwrap()
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .unwrap()
+    }
+
+    /// 名稱現在的擁有者（唯一名稱）；沒有人時 None
+    fn name_owner(conn: &Connection, name: &str) -> Option<String> {
+        conn.call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetNameOwner",
+            &(name,),
+        )
+        .ok()?
+        .body()
+        .deserialize::<String>()
+        .ok()
+    }
+
+    /// 收到的訊號
+    #[derive(Debug)]
+    enum Signal {
+        /// PropertiesChanged 帶的屬性
+        Changed(HashMap<String, OwnedValue>),
+        Seeked(i64),
+    }
+
+    /// 聽 `sender`（影戲的連線）送出的訊號
+    fn signals(conn: &Connection, sender: &str) -> Receiver<Signal> {
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(sender.to_owned())
+            .unwrap()
+            .path(OBJECT_PATH)
+            .unwrap()
+            .build();
+        let iter = MessageIterator::for_match_rule(rule, conn, None).unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for msg in iter.flatten() {
+                let header = msg.header();
+                let signal = match header.member().map(|m| m.as_str()) {
+                    Some("PropertiesChanged") => {
+                        let (iface, changed, _) = msg
+                            .body()
+                            .deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                            .unwrap();
+                        assert_eq!(iface, PLAYER_IFACE);
+                        Signal::Changed(changed)
+                    }
+                    Some("Seeked") => Signal::Seeked(msg.body().deserialize::<i64>().unwrap()),
+                    _ => continue,
+                };
+                if tx.send(signal).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
+
+    fn next_signal(rx: &Receiver<Signal>) -> Signal {
+        rx.recv_timeout(TIMEOUT).expect("等不到訊號")
+    }
+
+    /// 下一個 PropertiesChanged 帶的屬性名稱（排好）與內容
+    fn next_changed(rx: &Receiver<Signal>) -> (Vec<String>, HashMap<String, OwnedValue>) {
+        match next_signal(rx) {
+            Signal::Changed(map) => {
+                let mut names: Vec<String> = map.keys().cloned().collect();
+                names.sort();
+                (names, map)
+            }
+            other => panic!("要 PropertiesChanged，收到 {other:?}"),
+        }
+    }
+
+    /// 換檔時的 PropertiesChanged（可能分成幾個：Track 與 Playback 不一定一起處理）合起來，直到 Seeked；
+    /// 回傳變了的屬性（排好；同一個屬性只能送一次）、內容與 Seeked 的位置
+    fn changes_until_seeked(rx: &Receiver<Signal>) -> (Vec<String>, HashMap<String, OwnedValue>, i64) {
+        let mut all = HashMap::new();
+        loop {
+            match next_signal(rx) {
+                Signal::Changed(map) => {
+                    for (k, v) in map {
+                        assert!(!all.contains_key(&k), "{k} 送了兩次");
+                        all.insert(k, v);
+                    }
+                }
+                Signal::Seeked(us) => {
+                    let mut names: Vec<String> = all.keys().cloned().collect();
+                    names.sort();
+                    return (names, all, us);
+                }
+            }
+        }
+    }
+
+    fn next_seeked(rx: &Receiver<Signal>) -> i64 {
+        match next_signal(rx) {
+            Signal::Seeked(us) => us,
+            other => panic!("要 Seeked，收到 {other:?}"),
+        }
+    }
+
+    fn next_command(rx: &Receiver<MediaCommand>) -> MediaCommand {
+        rx.recv_timeout(TIMEOUT).expect("等不到指令")
+    }
+
+    fn string(v: &OwnedValue) -> String {
+        String::try_from(v.try_clone().unwrap()).unwrap()
+    }
+
+    fn object_path(v: &OwnedValue) -> String {
+        ObjectPath::try_from(v.try_clone().unwrap()).unwrap().to_string()
+    }
+
+    fn track(file_gen: u64) -> TrackInfo {
+        TrackInfo {
+            file_gen,
+            kind: MediaKind::Audio,
+            title: "測試的歌".into(),
+            artist: Some("演出者".into()),
+            album: Some("專輯".into()),
+            album_artist: Some("專輯演出者".into()),
+            track_no: Some(3),
+            duration: Some(200.0),
+            url: Some("file:///music/a.mp3".into()),
+            details: true,
+        }
+    }
+
+    fn info(status: Status, position: f64) -> PlaybackInfo {
+        PlaybackInfo {
+            status,
+            position,
+            rate: 1.0,
+            seekable: true,
+            can_next: true,
+            can_prev: false,
+            shuffle: false,
+            repeat: Repeat::Off,
+            volume: 0.8,
+            buffering: false,
+            can_play: true,
+        }
+    }
+
+    fn counting_wake() -> (Arc<AtomicUsize>, Wake) {
+        let n = Arc::new(AtomicUsize::new(0));
+        let c = n.clone();
+        let wake: Wake = Arc::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        });
+        (n, wake)
+    }
+
+    /// 等到條件成立（D-Bus 的另一端、背景執行緒）
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !cond() {
+            assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 系統（像 playerctl）讀得到影戲的檔案與狀態、送的指令影戲收得到；PropertiesChanged 只帶變了的屬性，
+    /// 跳轉時送 Seeked；第二個影戲拿 `.instance<pid>`，第一個的名稱不會被搶走（S-A1）
+    #[test]
+    fn mpris_round_trip() {
+        let Some(bus) = PrivateBus::start() else { return };
+        let (wakes, wake) = counting_wake();
+        let (mut first, commands) = m::connect_to(&bus.address, 1111, "VitaScope 測試", wake).unwrap();
+        assert_eq!(first.bus_name(), BUS_NAME);
+        let conn = client(&bus);
+        assert_eq!(name_owner(&conn, BUS_NAME).as_deref(), Some(first.unique_name()));
+        let root = proxy(&conn, BUS_NAME, ROOT_IFACE);
+        let player = proxy(&conn, BUS_NAME, PLAYER_IFACE);
+
+        // 固定的屬性
+        assert_eq!(root.get_property::<String>("Identity").unwrap(), "VitaScope 測試");
+        assert_eq!(root.get_property::<String>("DesktopEntry").unwrap(), DESKTOP_ENTRY);
+        assert!(root.get_property::<bool>("CanQuit").unwrap());
+        assert!(root.get_property::<bool>("CanRaise").unwrap());
+        assert!(!root.get_property::<bool>("HasTrackList").unwrap());
+        assert_eq!(
+            root.get_property::<Vec<String>>("SupportedUriSchemes").unwrap(),
+            ["file", "http", "https"]
+        );
+        assert!(
+            root.get_property::<Vec<String>>("SupportedMimeTypes")
+                .unwrap()
+                .contains(&"video/x-matroska".to_owned())
+        );
+        assert!(player.get_property::<bool>("CanControl").unwrap());
+        assert_eq!(player.get_property::<f64>("MinimumRate").unwrap(), 0.25);
+        assert_eq!(player.get_property::<f64>("MaximumRate").unwrap(), 4.0);
+        // 還沒有檔案：停止、NoTrack
+        assert_eq!(player.get_property::<String>("PlaybackStatus").unwrap(), "Stopped");
+        let meta = player.get_property::<HashMap<String, OwnedValue>>("Metadata").unwrap();
+        assert_eq!(object_path(&meta["mpris:trackid"]), NO_TRACK);
+        assert!(!player.get_property::<bool>("CanPlay").unwrap());
+
+        // 影戲開了檔案、從 30 秒開始：變了的屬性（排著的更新一起處理，通常合成一個 PropertiesChanged），接著 Seeked
+        let rx = signals(&conn, first.unique_name());
+        first.apply(&Update::Track(track(4)));
+        first.apply(&Update::Playback {
+            info: info(Status::Playing, 30.0),
+            seeked: true,
+        });
+        let (names, changed, us) = changes_until_seeked(&rx);
+        assert_eq!(
+            names,
+            [
+                "CanGoNext",
+                "CanPause",
+                "CanPlay",
+                "CanSeek",
+                "Metadata",
+                "PlaybackStatus",
+                "Volume"
+            ]
+        );
+        assert_eq!(string(&changed["PlaybackStatus"]), "Playing");
+        assert!((30_000_000..33_000_000).contains(&us), "{us}");
+        // Metadata 的型別（MPRIS 規格）：trackid 是物件路徑、長度是 x（微秒）、演出者是字串陣列
+        let meta = player.get_property::<HashMap<String, OwnedValue>>("Metadata").unwrap();
+        let get = |k: &str| meta[k].try_clone().unwrap();
+        assert_eq!(
+            object_path(&meta["mpris:trackid"]),
+            "/io/github/acer1204/vitascope/track/4"
+        );
+        assert_eq!(i64::try_from(get("mpris:length")).unwrap(), 200_000_000);
+        assert_eq!(String::try_from(get("xesam:title")).unwrap(), "測試的歌");
+        assert!(matches!(&*meta["xesam:artist"], Value::Array(_)), "演出者是陣列");
+        assert_eq!(Vec::<String>::try_from(get("xesam:artist")).unwrap(), ["演出者"]);
+        assert_eq!(
+            Vec::<String>::try_from(get("xesam:albumArtist")).unwrap(),
+            ["專輯演出者"]
+        );
+        assert_eq!(String::try_from(get("xesam:album")).unwrap(), "專輯");
+        assert_eq!(i32::try_from(get("xesam:trackNumber")).unwrap(), 3);
+        assert_eq!(String::try_from(get("xesam:url")).unwrap(), "file:///music/a.mp3");
+        assert!(!meta.contains_key("mpris:artUrl"), "還沒有封面");
+        // 位置：系統要的時候才算（播放中往後推算）
+        let pos = player.get_property::<i64>("Position").unwrap();
+        assert!((30_000_000..60_000_000).contains(&pos), "{pos}");
+        assert_eq!(player.get_property::<f64>("Volume").unwrap(), 0.8);
+        assert_eq!(player.get_property::<String>("LoopStatus").unwrap(), "None");
+
+        // 封面到了：artUrl 是快取資料夾裡的檔案（file://）
+        first.apply(&Update::Cover(Cover {
+            file_gen: 4,
+            png: Arc::new(vec![1, 2, 3]),
+            path: PathBuf::from("/tmp/vitascope 封面/cover-1-4.png"),
+        }));
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(names, ["Metadata"]);
+        let art = HashMap::<String, OwnedValue>::try_from(changed["Metadata"].try_clone().unwrap()).unwrap();
+        assert_eq!(
+            string(&art["mpris:artUrl"]),
+            "file:///tmp/vitascope%20%E5%B0%81%E9%9D%A2/cover-1-4.png"
+        );
+
+        // 只有位置變了（播放中的定期更新）：什麼都不送；接著暫停：只有 PlaybackStatus
+        first.apply(&Update::Playback {
+            info: info(Status::Playing, 35.0),
+            seeked: false,
+        });
+        first.apply(&Update::Playback {
+            info: info(Status::Paused, 35.5),
+            seeked: false,
+        });
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(names, ["PlaybackStatus"], "沒有多送其他屬性");
+        assert_eq!(string(&changed["PlaybackStatus"]), "Paused");
+        // 隨機、重複：只有那兩個
+        let mut shuffled = info(Status::Paused, 35.5);
+        shuffled.shuffle = true;
+        shuffled.repeat = Repeat::One;
+        first.apply(&Update::Playback {
+            info: shuffled.clone(),
+            seeked: false,
+        });
+        assert_eq!(next_changed(&rx).0, ["LoopStatus", "Shuffle"]);
+        // 跳轉（暫停中）：只有 Seeked（屬性沒變就不送 PropertiesChanged）
+        shuffled.position = 50.0;
+        first.apply(&Update::Playback {
+            info: shuffled,
+            seeked: true,
+        });
+        assert_eq!(next_seeked(&rx), 50_000_000);
+        assert_eq!(
+            player.get_property::<i64>("Position").unwrap(),
+            50_000_000,
+            "暫停中不動"
+        );
+
+        // 系統的指令 → 影戲
+        for (method, cmd) in [
+            ("PlayPause", MediaCommand::PlayPause),
+            ("Play", MediaCommand::Play),
+            ("Pause", MediaCommand::Pause),
+            ("Stop", MediaCommand::Stop),
+            ("Next", MediaCommand::Next),
+            ("Previous", MediaCommand::Previous),
+        ] {
+            player.call_method(method, &()).unwrap();
+            assert_eq!(next_command(&commands), cmd, "{method}");
+        }
+        player.call_method("Seek", &(-5_000_000_i64,)).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::SeekBy(-5.0));
+        let current = ObjectPath::try_from("/io/github/acer1204/vitascope/track/4").unwrap();
+        let stale = ObjectPath::try_from("/io/github/acer1204/vitascope/track/3").unwrap();
+        // 別的檔案的 SetPosition（換檔之前拖的）不理：下一個收到的是後面這個
+        player.call_method("SetPosition", &(&stale, 1_000_000_i64)).unwrap();
+        player.call_method("SetPosition", &(&current, 12_500_000_i64)).unwrap();
+        assert_eq!(
+            next_command(&commands),
+            MediaCommand::SeekTo {
+                secs: 12.5,
+                track: Some(4)
+            }
+        );
+        // 設定屬性：送指令；zbus 設定完自己送的 PropertiesChanged 帶的是要的值（不是原來的值）
+        player.set_property("LoopStatus", "Playlist").unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::SetRepeat(Repeat::All));
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(
+            (names, string(&changed["LoopStatus"])),
+            (vec!["LoopStatus".to_owned()], "Playlist".to_owned())
+        );
+        assert!(player.set_property("LoopStatus", "Forever").is_err(), "不認得的值");
+        player.set_property("Shuffle", false).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::SetShuffle(false));
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(names, ["Shuffle"]);
+        assert!(!bool::try_from(changed["Shuffle"].try_clone().unwrap()).unwrap());
+        player.set_property("Rate", 1.5).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::SetRate(1.5));
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(names, ["Rate"]);
+        assert_eq!(f64::try_from(changed["Rate"].try_clone().unwrap()).unwrap(), 1.5);
+        player.set_property("Volume", 0.25).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::SetVolume(0.25));
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(names, ["Volume"]);
+        assert_eq!(f64::try_from(changed["Volume"].try_clone().unwrap()).unwrap(), 0.25);
+        assert_eq!(player.get_property::<f64>("Volume").unwrap(), 0.25);
+        // 影戲照做了：同樣的值不再送一次（下一個 PropertiesChanged 只有後來真的變了的 PlaybackStatus）
+        let mut applied = info(Status::Paused, 50.0);
+        applied.repeat = Repeat::All;
+        applied.rate = 1.5;
+        applied.volume = 0.25;
+        first.apply(&Update::Playback {
+            info: applied.clone(),
+            seeked: false,
+        });
+        applied.status = Status::Playing;
+        first.apply(&Update::Playback {
+            info: applied.clone(),
+            seeked: false,
+        });
+        assert_eq!(next_changed(&rx).0, ["PlaybackStatus"], "沒有重送設定過的屬性");
+        // 影戲沒照做（音量超過上限）：系統先顯示要的值，影戲送來真的值時改回來
+        player.set_property("Volume", 5.0).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::SetVolume(5.0));
+        assert_eq!(next_changed(&rx).0, ["Volume"]);
+        applied.volume = 1.5;
+        first.apply(&Update::Playback {
+            info: applied.clone(),
+            seeked: false,
+        });
+        let (names, changed) = next_changed(&rx);
+        assert_eq!(names, ["Volume"]);
+        assert_eq!(f64::try_from(changed["Volume"].try_clone().unwrap()).unwrap(), 1.5);
+        assert_eq!(player.get_property::<f64>("Volume").unwrap(), 1.5);
+        // OpenUri：網址也可以（N-M12）；不支援的網址回錯誤、不送
+        assert!(player.call_method("OpenUri", &("ftp://example.com/a.mp4",)).is_err());
+        player.call_method("OpenUri", &("https://example.com/a.m3u8",)).unwrap();
+        assert_eq!(
+            next_command(&commands),
+            MediaCommand::OpenUri("https://example.com/a.m3u8".into())
+        );
+        root.call_method("Raise", &()).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::Raise);
+        root.call_method("Quit", &()).unwrap();
+        assert_eq!(next_command(&commands), MediaCommand::Quit);
+        assert!(commands.try_recv().is_err(), "沒有多出來的指令");
+        // 每個指令都叫醒介面（指令先送進通道才叫醒：數字可能晚一點才到）
+        wait_until("叫醒介面", || wakes.load(Ordering::SeqCst) >= 15);
+
+        // 第二個影戲：拿 `.instance<pid>`，第一個的名稱還是第一個的（不會被搶走，S-A1）
+        let (mut second, second_commands) = m::connect_to(&bus.address, 2222, "VitaScope 2", Arc::new(|| {})).unwrap();
+        assert_eq!(second.bus_name(), "org.mpris.MediaPlayer2.vitascope.instance2222");
+        assert_eq!(name_owner(&conn, BUS_NAME).as_deref(), Some(first.unique_name()));
+        assert_eq!(
+            name_owner(&conn, second.bus_name()).as_deref(),
+            Some(second.unique_name())
+        );
+        // 指令送到對的那一個
+        proxy(&conn, second.bus_name(), PLAYER_IFACE)
+            .call_method("Next", &())
+            .unwrap();
+        assert_eq!(next_command(&second_commands), MediaCommand::Next);
+        assert!(commands.try_recv().is_err(), "第一個收不到第二個的指令");
+        // 兩個名稱都有人用了：建立失敗、說明原因
+        assert!(m::connect_to(&bus.address, 2222, "VitaScope 3", Arc::new(|| {})).is_err());
+
+        // 結束：名稱放掉（系統的媒體控制不再顯示）；另一個不受影響
+        first.shutdown();
+        wait_until("第一個的名稱放掉了", || name_owner(&conn, BUS_NAME).is_none());
+        assert_eq!(
+            name_owner(&conn, "org.mpris.MediaPlayer2.vitascope.instance2222").as_deref(),
+            Some(second.unique_name())
+        );
+        assert!(second.alive());
+        second.shutdown();
+        wait_until("第二個的名稱放掉了", || {
+            name_owner(&conn, "org.mpris.MediaPlayer2.vitascope.instance2222").is_none()
+        });
+    }
+
+    /// 停止（卸載）之後：NoTrack、Stopped、不能跳轉；清單上還有檔案時可以按播放，沒有時不能
+    #[test]
+    fn mpris_clear_shows_stopped() {
+        let Some(bus) = PrivateBus::start() else { return };
+        let (mut session, _commands) = m::connect_to(&bus.address, 1, "VitaScope", Arc::new(|| {})).unwrap();
+        let conn = client(&bus);
+        let player = proxy(&conn, session.bus_name(), PLAYER_IFACE);
+        let rx = signals(&conn, session.unique_name());
+        session.apply(&Update::Track(track(1)));
+        session.apply(&Update::Playback {
+            info: info(Status::Playing, 1.0),
+            seeked: true,
+        });
+        changes_until_seeked(&rx);
+        session.apply(&Update::Clear);
+        let (names, _) = next_changed(&rx);
+        assert_eq!(names, ["CanPause", "CanSeek", "Metadata", "PlaybackStatus"]);
+        assert_eq!(player.get_property::<String>("PlaybackStatus").unwrap(), "Stopped");
+        assert_eq!(player.get_property::<i64>("Position").unwrap(), 0);
+        assert!(player.get_property::<bool>("CanPlay").unwrap());
+        assert!(!player.get_property::<bool>("CanSeek").unwrap());
+        let meta = player.get_property::<HashMap<String, OwnedValue>>("Metadata").unwrap();
+        assert_eq!(meta.len(), 1, "{meta:?}");
+        assert_eq!(object_path(&meta["mpris:trackid"]), NO_TRACK);
+
+        // 停止時清單上沒有東西可播了（SessionSync 在 Clear 之前送停止後的狀態）：CanPlay 變成 false、有送出去
+        session.apply(&Update::Track(track(2)));
+        session.apply(&Update::Playback {
+            info: info(Status::Playing, 1.0),
+            seeked: true,
+        });
+        changes_until_seeked(&rx);
+        let mut stopped = info(Status::Stopped, 0.0);
+        stopped.seekable = false;
+        stopped.can_play = false;
+        session.apply(&Update::Playback {
+            info: stopped,
+            seeked: false,
+        });
+        session.apply(&Update::Clear);
+        let mut changed = HashMap::new();
+        while !changed.contains_key("Metadata") {
+            changed.extend(next_changed(&rx).1);
+        }
+        assert_eq!(
+            changed
+                .get("CanPlay")
+                .map(|v| bool::try_from(v.try_clone().unwrap()).unwrap()),
+            Some(false)
+        );
+        assert!(!player.get_property::<bool>("CanPlay").unwrap());
+    }
+
+    /// 匯流排不見了（重新登入、dbus-daemon 當掉）：工作階段變成不能用、叫醒介面（介面在下一個檔案時重新建立）
+    #[test]
+    fn a_lost_bus_marks_the_session_dead() {
+        let Some(mut bus) = PrivateBus::start() else { return };
+        let (wakes, wake) = counting_wake();
+        let (mut session, _commands) = m::connect_to(&bus.address, 1, "VitaScope", wake).unwrap();
+        assert!(session.alive());
+        bus.kill();
+        wait_until("發現斷線", || !session.alive());
+        wait_until("叫醒介面", || wakes.load(Ordering::SeqCst) >= 1);
+        // 斷線之後的更新、結束都不會卡住
+        let start = Instant::now();
+        session.apply(&Update::Clear);
+        session.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(1), "{:?}", start.elapsed());
+    }
+
+    /// 真的影戲（介面、播放器）透過 MPRIS 控制：系統讀得到片名、狀態，暫停、跳轉、下一個都照做
+    #[test]
+    fn the_app_is_controlled_over_mpris() {
+        let Some(bus) = PrivateBus::start() else { return };
+        let dir = TempDir::new("mpris-app");
+        let files = [dir.clip("a.mp4"), dir.clip("b.mp4")];
+        let address = bus.address.clone();
+        let launch = Launch {
+            files: vec![files[0].clone()],
+            media: MediaBackend::Custom(Box::new(move |wake| {
+                m::connect_to(&address, 4321, "VitaScope", wake)
+                    .map(|(s, rx)| (Box::new(s) as Box<dyn MediaSession>, rx))
+            })),
+            ..Default::default()
+        };
+        let mut h = harness(launch, dir.settings());
+        step_until_app(&mut h, "a.mp4 開始播放、掃描完", |app| {
+            playing(app, "a.mp4") && app.playlist().is_some_and(|l| l.len() == 2)
+        });
+        step_until_app(&mut h, "工作階段建立了", |app| app.media_session_active());
+        let conn = client(&bus);
+        let player = proxy(&conn, BUS_NAME, PLAYER_IFACE);
+        let status = || player.get_property::<String>("PlaybackStatus").unwrap();
+        let meta = || player.get_property::<HashMap<String, OwnedValue>>("Metadata").unwrap();
+        let url = || meta().get("xesam:url").map(string);
+        step_until(&mut h, "系統看到 a.mp4 在播", || {
+            status() == "Playing" && url().is_some_and(|u| u.ends_with("/a.mp4"))
+        });
+        assert!(player.get_property::<bool>("CanGoNext").unwrap());
+        assert!(player.get_property::<bool>("CanSeek").unwrap());
+        // 標題是 mpv 的標題（檔名），不是隱藏片名時的程式名稱
+        step_until_app(&mut h, "mpv 的標題", |app| app.player().state.title.is_some());
+        let title = h.state().player().state.title.clone().unwrap();
+        assert_ne!(title, vitascope::app::app_name());
+        step_until(&mut h, "系統看到標題", || {
+            meta().get("xesam:title").map(string).as_ref() == Some(&title)
+        });
+        // 暫停（像按了媒體鍵）
+        player.call_method("PlayPause", &()).unwrap();
+        step_until_app(&mut h, "影戲暫停了", |app| app.player().state.paused);
+        step_until(&mut h, "系統看到暫停", || status() == "Paused");
+        // 拖系統的進度條（帶目前檔案的 track id）。暫停中只有跳超過 SEEK_JUMP 才會送給系統：
+        // 目標離暫停的位置夠遠（慢的電腦暫停得晚，位置不一定）
+        let paused_at = h.state().player().state.time_pos;
+        let target = if paused_at < 1.5 { 2.6 } else { 0.3 };
+        let target_us = (target * 1e6) as i64;
+        let owner = name_owner(&conn, BUS_NAME).unwrap();
+        let rx = signals(&conn, &owner);
+        let id = ObjectPath::try_from(meta()["mpris:trackid"].try_clone().unwrap()).unwrap();
+        player.call_method("SetPosition", &(&id, target_us)).unwrap();
+        step_until_app(&mut h, "跳到目標", |app| {
+            (app.player().state.time_pos - target).abs() < 0.2
+        });
+        step_until(&mut h, "系統的位置跟著變", || {
+            (player.get_property::<i64>("Position").unwrap() - target_us).abs() < 200_000
+        });
+        // 系統收到 Seeked（新的位置）
+        let seeked = std::cell::Cell::new(None);
+        step_until(&mut h, "Seeked", || {
+            while let Ok(sig) = rx.try_recv() {
+                if let Signal::Seeked(us) = sig {
+                    seeked.set(Some(us));
+                }
+            }
+            seeked.get().is_some()
+        });
+        let us = seeked.get().unwrap();
+        assert!(
+            (us - target_us).abs() < 200_000,
+            "{us} / {target_us}（暫停在 {paused_at}）"
+        );
+        // 下一個檔案
+        player.call_method("Next", &()).unwrap();
+        step_until_app(&mut h, "b.mp4", |app| {
+            app.player().state.loaded && app.player().state.path.as_deref().is_some_and(|p| p.ends_with("b.mp4"))
+        });
+        step_until(&mut h, "系統看到 b.mp4", || {
+            url().is_some_and(|u| u.ends_with("/b.mp4"))
+        });
+        let new_id = ObjectPath::try_from(meta()["mpris:trackid"].try_clone().unwrap()).unwrap();
+        assert_ne!(new_id, id, "換檔：新的 track id");
+        // 關掉「系統媒體控制」：名稱放掉
+        open_settings_page(&mut h, "系統");
+        click(&mut h, "系統媒體控制");
+        assert!(!h.state().settings().system_media.enabled);
+        step_until(&mut h, "名稱放掉了", || name_owner(&conn, BUS_NAME).is_none());
     }
 }

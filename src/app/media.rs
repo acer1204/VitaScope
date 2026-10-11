@@ -250,6 +250,18 @@ impl VitascopeApp {
             paused: st.loaded && self.player.paused_now(),
             file_gen: self.file_gen,
         };
+        // 系統改的設定：系統可能先顯示了要的值（MPRIS），等一下再送一次真的值（沒照做時改回來）
+        if matches!(
+            cmd,
+            MediaCommand::SetVolume(_)
+                | MediaCommand::SetRate(_)
+                | MediaCommand::SetShuffle(_)
+                | MediaCommand::SetRepeat(_)
+        ) {
+            self.media.sync.confirm(Instant::now());
+            // 閒著（暫停、停止）時也要醒來送
+            ctx.request_repaint_after(media_keys::CONFIRM_AFTER);
+        }
         match media_keys::step(&cmd, now) {
             Step::Command(c) => self.run_command(c),
             Step::PlayStopped => self.run(ctx, Action::Play),
@@ -281,13 +293,16 @@ impl VitascopeApp {
     /// 沒有在播時的「播放」：開清單上停止前的那個檔案（停止不會改清單）；
     /// 目前的已經移出清單、或是還原的清單（還沒開始播）時，開接下來要播的那一個（S-B10）
     pub(super) fn play_stopped(&mut self) {
-        let target = self
-            .playlist
-            .as_ref()
-            .and_then(|l| l.current_index().or_else(|| l.next_index()));
-        if let Some(i) = target {
+        if let Some(i) = self.stopped_target() {
             self.open_list_item(i);
         }
+    }
+
+    /// 沒有在播時按播放會開的清單項目（見 [`Self::play_stopped`]）；None = 沒有東西可以播
+    fn stopped_target(&self) -> Option<usize> {
+        self.playlist
+            .as_ref()
+            .and_then(|l| l.current_index().or_else(|| l.next_index()))
     }
 
     // ───────────── 送給系統的內容 ─────────────
@@ -451,6 +466,7 @@ impl VitascopeApp {
             },
             volume: self.player.volume_total() / 100.0,
             buffering: st.loaded && st.paused_for_cache,
+            can_play: st.loaded || self.stopped_target().is_some(),
         }
     }
 

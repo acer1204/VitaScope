@@ -44,13 +44,14 @@ jobs:
           python-version: "3.12"
 
       # libmpv（播放引擎）+ FFmpeg（產生測試樣本）+ 截圖檢查用的虛擬螢幕
+      # + dbus-daemon（MPRIS 的測試自己開一個私人的 D-Bus 匯流排；CI 上沒有它時測試會失敗，不會跳過）
       - name: 安裝 libmpv 與 FFmpeg（Linux）
         if: runner.os == 'Linux'
         # 套件伺服器偶爾卡住，預設要等 6 小時才會逾時
         timeout-minutes: 10
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1
+          sudo apt-get install -y xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1 dbus-daemon
           if [ "$VITASCOPE_LIBMPV" = vendor ]; then
             bash scripts/fetch-libmpv.sh
             sudo apt-get install -y ffmpeg   # 也帶進 libva2、libpulse0

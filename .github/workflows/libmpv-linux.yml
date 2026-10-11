@@ -149,10 +149,11 @@ jobs:
           tar -xJf "built/$ID.tar.xz" -C "$dest"
           find "$dest" -type f -exec touch {} +
       - name: 測試需要的套件（ffmpeg 只用來產生樣本，也帶進 libva2、libpulse0；視窗函式庫要給 AppImage 包進去）
+        # dbus-daemon：MPRIS 的測試自己開一個私人的 D-Bus 匯流排；CI 上沒有它時測試會失敗，不會跳過（跟 ci.yml 一樣）
         timeout-minutes: 10
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1 appstream
+          sudo apt-get install -y ffmpeg xvfb libgl1-mesa-dri libegl1 libxkbcommon-x11-0 libxcursor1 libxi6 libwayland-cursor0 libwayland-egl1 appstream dbus-daemon
       - run: python scripts/gen_samples.py
       - name: 測試
         # 播放引擎卡住時（例如 DASH 分離器無限循環）測試程式會一直等，不要拖到整個工作逾時
