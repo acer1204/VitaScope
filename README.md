@@ -30,6 +30,8 @@ Windows / macOS / Linux 同一套程式碼，目標是功能看齊 PotPlayer。
   AppImage 需要 FUSE（沒有的話加 `--appimage-extract-and-run` 執行）與 OpenSSL 3（libssl3，桌面系統都有）。中文介面需要中文字型（例如 `fonts-noto-cjk`），
   開檔對話框需要 xdg-desktop-portal 或 zenity。沒有顯示卡加速的環境（例如虛擬機，使用 Mesa 的軟體繪圖）
   會自動改用較簡單的畫面處理，畫質稍差但可以正常播放。
+  鍵盤的媒體鍵由桌面環境（GNOME、KDE…）透過 MPRIS 交給影戲；沒有桌面環境的視窗管理員（i3、sway、Openbox…）要自己把媒體鍵
+  綁到 `playerctl play-pause`、`playerctl next`、`playerctl previous`、`playerctl stop`。
   tar.gz 用系統的 libmpv 播 DASH 網址（`.mpd`）只能盡力而為：載入中按停止、換檔時可能會卡住（系統的 FFmpeg 沒有這個修正；
   AppImage 與 Windows、macOS 版用影戲自己建置的播放引擎，已經修正）。
 
@@ -191,7 +193,10 @@ yt-dlp、deno 只在你按「下載」時才下載（見下面的「網站影片
   Linux 透過 systemd-logind，要系統管理員密碼的項目停用。
   macOS 第一次選「關機」時系統會問要不要讓影戲控制「loginwindow」，要允許才能關機（「系統設定 → 隱私權與安全性 → 自動化」可以改）。
   Wayland 不能把倒數的視窗移到最上層，也查不到別的程式裡的輸入（只看影戲視窗裡的鍵盤、滑鼠）
-- [ ] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
+- [x] 系統媒體整合：鍵盤的媒體鍵、耳機與藍牙耳機的按鍵、系統的媒體控制都能播放、暫停、停止、換上一個 / 下一個檔案，
+  也顯示片名、進度與音訊檔的專輯封面。Windows：音量浮動視窗、快速設定、鎖定畫面（SMTC）；macOS：控制中心與選單列的「正在播放」、
+  F7–F9、AirPods；Linux：GNOME、KDE 的媒體控制與 `playerctl`（MPRIS）。「設定 → 系統」可以關掉，
+  或只顯示「影戲 VitaScope」不顯示片名與封面
 - [ ] 深色 / 淺色主題、迷你播放器、子母畫面
 - [ ] 「罕見」格式盡力支援（Windows / macOS 的自動測試全數通過；Linux CI 的 FFmpeg 6.1 做不出 MKV 旋轉樣本，只列在報告裡）
 

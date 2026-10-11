@@ -1072,6 +1072,12 @@ impl VitascopeApp {
         &self.settings
     }
 
+    /// 測試用：直接改設定（像在設定視窗改了；不存檔）
+    #[doc(hidden)]
+    pub fn settings_mut(&mut self) -> &mut Settings {
+        &mut self.settings
+    }
+
     /// 目前的畫面調整（介面測試用）
     pub fn geometry(&self) -> &Geometry {
         &self.geometry

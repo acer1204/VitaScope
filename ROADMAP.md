@@ -594,7 +594,28 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
     之後在別的程式裡打字、移動滑鼠會取消；原本在前面的程式的選單列可能閃一下
   - [ ] 手動確認（macOS）：第一次選「關機」時跳出「自動化」的詢問，允許後真的關機、不允許時說明原因；⌘H 隱藏、縮到 Dock 時播完會叫出來
   - [ ] 手動確認（Linux）：GNOME、KDE 上的睡眠與關機（logind），要密碼時停用；X11 在別的程式裡打字會取消倒數（Wayland 不會）
-- [ ] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
+- [x] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
+  - 共用核心（E6，`media_keys/mod.rs`、`app/media.rs`）：`SessionSync` 決定送什麼（換檔、標籤變了才送檔案資訊；播放狀態變了才送，
+    播放中每 5 秒更新進度，跳轉時標出來；等快取時位置不動不算跳轉）；系統的指令走跟按鍵一樣的 `Command` → `Action`，
+    停止後按播放開停止的那個檔案、任何指令都取消播完後的倒數；第一個檔案載入時才建立工作階段，「設定 → 系統」可以關掉或隱藏片名與封面；
+    音訊檔的封面由 mpv 存成 PNG（快取資料夾的 `covers/`，換檔、關閉時刪掉）。真的系統只在 main.rs 接上（`Launch.media`），測試都用假的。
+  - Windows（E7，`media_keys/windows.rs`）：SMTC 在介面執行緒用主視窗建立、交給背景執行緒更新；換標題的 `ClearAll` 之後把封面放回去（S-B12）；
+    系統那一端斷線（檔案總管重開）時下一個檔案重新建立；影戲在最前面時，winit 吃掉的媒體鍵經訊息掛鉤交給 `DefWindowProcW`（S-B1）。
+  - Linux（E8，`media_keys/mpris.rs`）：zbus 的工作階段匯流排；名稱只帶 `DoNotQueue`，第二個影戲拿 `vitascope.instance<pid>`，不搶第一個的（S-A1）；
+    `OpenUri` 開 `file://`、`http(s)://`；可寫的屬性先顯示要的值、影戲沒照做時改回來。
+  - macOS（E9，`media_keys/macos.rs`）：`MPNowPlayingInfoCenter` 與 `MPRemoteCommandCenter`（objc2-media-player，含 `MPRemoteControlTypes`，S-A5）；
+    全部在主執行緒（建立時檢查），每次重建的 `nowPlayingInfo` 都放封面（S-B12），一定設 `playbackState`；
+    「往前 / 往後跳」的秒數跟著「設定 → 播放」的「← / → 跳轉」（`seek_short`）。
+  （自動：`media_keys` 單元測試（`SessionSync`、指令對應、`file://` 網址、封面檔案、SMTC 的重複模式與時間軸、MPRIS 的屬性與 Metadata、
+  macOS 的字典內容、按鈕與遠端指令，三個系統都跑）；kittest `tests/media_keys.rs`（假的系統：檔案資訊與狀態、指令控制播放器、
+  取消倒數、封面、隱藏片名、不重複送、斷線重建、跳的秒數跟著設定）；Linux 在私人的 D-Bus 匯流排上的 MPRIS 往返（CI 一定要有 dbus-daemon）；
+  macOS CI 的 `tests/now_playing.rs`（`now_playing_info_round_trip`：真的設定 `nowPlayingInfo` 讀回來比對、按鈕的狀態、遠端指令的處理；
+  主執行緒才能用，所以不用 libtest，只在 CI 跑）；Windows `smtc_session_round_trip`（`#[ignore]`，在開發機上手動跑：從系統那一端按影戲的按鈕））
+  - [ ] 手動確認（Windows）：鍵盤的媒體鍵在影戲在最前面、在後面、縮到最小時都能用；Windows 11 的音量浮動視窗與鎖定畫面顯示片名、封面、進度；
+    藍牙耳機的按鍵；同時開兩個影戲（等主人確認）
+  - [ ] 手動確認（Linux）：GNOME、KDE 的媒體控制與鎖定畫面（X11、Wayland），桌面環境的媒體鍵，`playerctl` 的播放、暫停、跳轉、開網址
+  - [ ] 手動確認（macOS）：F7–F9 在影戲在前面、在後面時都能用；控制中心的「正在播放」顯示片名、封面、進度，拖動進度、
+    按鈕是上一個 / 下一個檔案（不是往前 / 往後跳幾秒）；AirPods 的按鍵（這裡沒有 Mac，目前只有 CI 的自動測試）
 - [ ] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
 - [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試
 

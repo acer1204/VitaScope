@@ -51,6 +51,8 @@ pub(super) struct MediaUi {
     covers_dir: Option<PathBuf>,
     /// 這次執行請 mpv 存過封面（之後換檔、結束時都要清：mpv 在自己的執行緒寫檔，可能換檔之後才寫好）
     covers_made: bool,
+    /// 上次告訴工作階段的「往前 / 往後跳」秒數（設定的短跳轉；macOS 的按鈕用）
+    skip_sent: Option<f64>,
     /// 送給系統的更新數、整理過幾次檔案資訊（介面測試用）
     applied: u64,
     track_builds: u64,
@@ -173,6 +175,14 @@ impl VitascopeApp {
         if self.media.session.is_none() && !self.media_start(ctx) {
             return;
         }
+        // 「往前 / 往後跳」的秒數跟著設定的短跳轉（建立後、改了設定時才送）
+        let skip = self.settings.seek_short;
+        if self.media.skip_sent != Some(skip)
+            && let Some(session) = &mut self.media.session
+        {
+            session.set_skip_interval(skip);
+            self.media.skip_sent = Some(skip);
+        }
         let commands: Vec<MediaCommand> = self
             .media
             .commands
@@ -205,6 +215,7 @@ impl VitascopeApp {
                 self.media.sync = SessionSync::new();
                 self.media.cover = None;
                 self.media.lost_at = None;
+                self.media.skip_sent = None;
                 true
             }
             Err(e) => {
@@ -224,6 +235,7 @@ impl VitascopeApp {
         self.media.sync = SessionSync::new();
         self.media.track = None;
         self.media.cover = None;
+        self.media.skip_sent = None;
         self.remove_covers();
     }
 

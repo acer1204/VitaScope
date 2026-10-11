@@ -106,6 +106,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSApplication",
     "NSGraphics",
+    "NSImage",
     "NSResponder",
     "NSScreen",
     "NSView",
@@ -115,13 +116,34 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSAppleEventDescriptor",
     "NSAppleEventManager",
+    "NSArray",
+    "NSData",
     "NSDictionary",
     "NSEnumerator",
+    "NSGeometry",
     "NSNotification",
+    "NSObject",
     "NSString",
     "NSURL",
     "NSValue",
 ] }
+# 系統媒體控制：「正在播放」（MPNowPlayingInfoCenter）與遠端指令（MPRemoteCommandCenter：媒體鍵 F7–F9、AirPods、
+# 控制中心）。不開預設功能（不會帶進 AVFoundation）；MPRemoteControlTypes 是隨機、重複的型別（S-A5）。
+# 封面（MPMediaItemArtwork）要 block2、objc2-app-kit（NSImage）、objc2-core-foundation（CGSize）
+objc2-media-player = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "MPMediaItem",
+    "MPNowPlayingInfoCenter",
+    "MPRemoteCommand",
+    "MPRemoteCommandCenter",
+    "MPRemoteCommandEvent",
+    "MPRemoteControlTypes",
+] }
+# 遠端指令的處理、封面的請求（Objective-C 的 block）；本來就在相依樹裡
+block2 = "0.6"
 
 [profile.release]
 opt-level = 3
@@ -139,3 +161,12 @@ egui_kittest = { version = "0.36", features = ["eframe"] }
 # Windows：SMTC 的實機測試（#[ignore]）從系統那一端找到影戲的工作階段、按它的按鈕
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62", default-features = false, features = ["Media_Control"] }
+
+# macOS：「正在播放」的測試在主執行緒上自己轉 run loop（等系統的值）
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSDate", "NSRunLoop"] }
+
+# macOS 的「正在播放」只能在主執行緒用：這個測試程式不用 libtest（libtest 在別的執行緒跑測試），自己的 main 就在主執行緒
+[[test]]
+name = "now_playing"
+harness = false

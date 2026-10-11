@@ -19,6 +19,8 @@ struct Shared {
     fail: Mutex<Option<String>>,
     /// 目前的工作階段斷線了（`MediaSession::alive` 回傳 false；新建立的又是好的）
     lost: Mutex<bool>,
+    /// 影戲告訴工作階段的「往前 / 往後跳」秒數（`MediaSession::set_skip_interval`；每次建立的都記在一起）
+    skips: Mutex<Vec<f64>>,
 }
 
 #[derive(Clone, Default)]
@@ -115,6 +117,11 @@ impl FakeMedia {
         })
     }
 
+    /// 影戲告訴工作階段的「往前 / 往後跳」秒數（依序）
+    pub fn skip_intervals(&self) -> Vec<f64> {
+        self.0.skips.lock().unwrap().clone()
+    }
+
     pub fn covers(&self) -> Vec<Cover> {
         self.updates()
             .into_iter()
@@ -139,6 +146,11 @@ impl MediaSession for FakeSession {
 
     fn alive(&self) -> bool {
         !*self.shared.lost.lock().unwrap()
+    }
+
+    fn set_skip_interval(&mut self, secs: f64) {
+        assert!(!self.ended, "工作階段結束之後不能再設定");
+        self.shared.skips.lock().unwrap().push(secs);
     }
 
     fn shutdown(&mut self) {

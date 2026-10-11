@@ -2,7 +2,8 @@
 //!
 //! 這裡用假的系統（`support::fake_media`）：影戲送出的更新記下來，測試自己送指令（像使用者按了媒體鍵）。
 //! 絕不碰真的系統媒體控制（`Launch` 的預設沒有）。各系統真的實作的測試是 `#[ignore]` 的（會短暫出現在
-//! 系統的媒體控制裡），在開發機上手動跑：Windows `smtc_session_round_trip`。
+//! 系統的媒體控制裡），在開發機上手動跑：Windows `smtc_session_round_trip`。macOS 的在 `tests/now_playing.rs`
+//! （「正在播放」只能在主執行緒用，那個測試程式不用 libtest；只在 CI 跑）。
 //!
 //! 樣本來自 `python scripts/gen_samples.py`。
 
@@ -646,6 +647,29 @@ fn a_failed_session_says_why_and_is_retried_after_toggling() {
     assert_eq!(fake.attempts(), 2);
     h.run_steps(2);
     assert!(h.query_by_label("無法啟用：測試用的錯誤").is_none());
+}
+
+/// 「往前 / 往後跳」的秒數（macOS 的控制中心、Touch Bar 的按鈕）跟著設定的短跳轉：工作階段建立時送一次，
+/// 改了設定再送一次，沒改不重送；關掉再打開時新的工作階段一建立就送
+#[test]
+fn the_skip_interval_follows_the_short_seek_setting() {
+    let dir = TempDir::new("skip");
+    let fake = FakeMedia::new();
+    let mut settings = dir.settings();
+    settings.seek_short = 7.0;
+    let mut h = with_media(&fake, vec![dir.clip("a.mp4")], settings);
+    step_until(&mut h, "建立工作階段", || fake.created() == 1);
+    wait_real(&mut h, 0.3);
+    assert_eq!(fake.skip_intervals(), [7.0], "建立時送一次，之後不重送");
+    h.state_mut().settings_mut().seek_short = 12.0;
+    wait_real(&mut h, 0.3);
+    assert_eq!(fake.skip_intervals(), [7.0, 12.0]);
+    h.state_mut().settings_mut().system_media.enabled = false;
+    step_until(&mut h, "結束工作階段", || fake.shutdowns() == 1);
+    h.state_mut().settings_mut().system_media.enabled = true;
+    step_until(&mut h, "重新建立", || fake.created() == 2);
+    wait_real(&mut h, 0.2);
+    assert_eq!(fake.skip_intervals(), [7.0, 12.0, 12.0]);
 }
 
 /// 設定頁的選項、快捷鍵頁的「媒體鍵」只在能用時顯示（自動測試的預設、還不支援的系統：沒有）

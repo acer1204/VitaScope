@@ -9,7 +9,8 @@
 //! - 音訊檔的專輯封面：mpv 把封面當成影像，`screenshot-to-file … video` 存成 PNG 放在快取資料夾的 `covers/`
 //!   （`cover-<pid>-<第幾個檔案>.png`；MPRIS 要檔案，其他系統用內容）。換檔、關掉時刪掉自己的，啟動時清掉一天以上的。
 //! - 各系統：Windows 的 SMTC 在 `windows.rs`（也有視窗在最前面時的媒體鍵 `windows::msg_hook`）；
-//!   Linux 的 MPRIS（D-Bus 的工作階段匯流排）在 `mpris.rs`。
+//!   Linux 的 MPRIS（D-Bus 的工作階段匯流排）在 `mpris.rs`；macOS 的「正在播放」與遠端指令在 `macos.rs`
+//!   （只能在主執行緒用：介面的執行緒就是主執行緒）。
 
 use crate::keymap::Command;
 use crate::playlist::Repeat;
@@ -28,6 +29,10 @@ pub mod windows;
 // 純邏輯的部分（屬性、Metadata、指令）在每個系統的測試都跑；連 D-Bus 的部分只有 Linux 有（zbus 只在 Linux）
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 pub mod mpris;
+
+// 純邏輯的部分（字典的內容、按鈕、指令）在每個系統的測試都跑；呼叫 MediaPlayer.framework 的部分只有 macOS 有
+#[cfg(any(test, target_os = "macos"))]
+pub mod macos;
 
 /// 位置跟預期的差超過這麼多秒就當成跳轉（跳轉、換章節、重複單一檔案繞回開頭）
 pub const SEEK_JUMP: f64 = 1.0;
@@ -213,6 +218,9 @@ pub trait MediaSession {
     fn alive(&self) -> bool {
         true
     }
+    /// 「往前 / 往後跳」按鈕的秒數（設定的「短跳轉」；建立後、設定改了時介面呼叫）。
+    /// 只有 macOS 的遠端指令有這種按鈕（控制中心、Touch Bar）；其他系統不用
+    fn set_skip_interval(&mut self, _secs: f64) {}
 }
 
 /// 建立好的工作階段，和它送來的指令
@@ -253,12 +261,13 @@ impl MediaBackend {
     }
 }
 
-/// 這個作業系統的媒體控制做好了沒（各系統的實作加進來時打開）：Windows 的 SMTC、Linux 的 MPRIS
+/// 這個作業系統有沒有媒體控制：Windows 的 SMTC、macOS 的「正在播放」、Linux 的 MPRIS
 pub const fn system_supported() -> bool {
-    cfg!(any(windows, all(unix, not(target_os = "macos"))))
+    // Windows、macOS、Linux（以及其他有 D-Bus 的 unix）都有
+    cfg!(any(windows, unix))
 }
 
-/// 建立這個作業系統的工作階段（`identity`：程式名稱，MPRIS 用；Windows 顯示的是程式本身的名稱與圖示）
+/// 建立這個作業系統的工作階段（`identity`：程式名稱，MPRIS 用；Windows、macOS 顯示的是程式本身的名稱與圖示）
 pub fn create_system(owner: Option<RawWindowHandle>, identity: &str, wake: Wake) -> Result<Opened, String> {
     #[cfg(windows)]
     {
@@ -271,10 +280,11 @@ pub fn create_system(owner: Option<RawWindowHandle>, identity: &str, wake: Wake)
         let _ = owner;
         self::mpris::create(identity, wake)
     }
+    // 「正在播放」是整個程式一份、跟視窗無關；要在主執行緒建立（介面的執行緒就是）
     #[cfg(target_os = "macos")]
     {
-        let _ = (owner, identity, wake);
-        Err(crate::tr!("這個系統還不支援", "Not supported on this system yet").to_owned())
+        let _ = (owner, identity);
+        self::macos::create(wake)
     }
 }
 
@@ -1013,9 +1023,12 @@ mod tests {
     }
 
     #[test]
-    fn windows_and_linux_have_a_system_session() {
-        // Windows 的 SMTC、Linux 的 MPRIS 做好了；macOS 的在之後的子批次打開
-        assert_eq!(system_supported(), !cfg!(target_os = "macos"));
+    fn every_desktop_system_has_a_system_session() {
+        // Windows 的 SMTC、macOS 的「正在播放」、Linux（以及其他有 D-Bus 的 unix）的 MPRIS
+        assert_eq!(
+            system_supported(),
+            cfg!(any(windows, target_os = "macos", all(unix, not(target_os = "macos"))))
+        );
     }
 
     #[test]
