@@ -860,6 +860,8 @@ pub struct Player {
     open_pending: bool,
     /// 測試用：影片軌一律當成這個杜比視界 profile（見 `set_fake_dolby_vision`）
     fake_dolby_vision: Option<i64>,
+    /// 測試用：介面記下的軌道清單固定是這些，mpv 送來的不再蓋掉（見 `set_fake_tracks`）
+    fake_tracks: Option<Vec<Track>>,
     /// 像素著色器：使用者的組合（app 給的；VITASCOPE_MPV_OPTS 指定了 glsl-shaders 時是使用者原本的清單，不改）
     shader_user: Vec<String>,
     /// 翻轉用的著色器（左右、上下）；每個檔案各自的，開新檔時拿掉
@@ -1045,6 +1047,7 @@ impl Player {
             fell_back_before_open: false,
             open_pending: false,
             fake_dolby_vision: None,
+            fake_tracks: None,
             shaders_applied: Some(shader_base.clone()),
             shader_user: shader_base,
             shader_flip: [None, None],
@@ -1342,6 +1345,27 @@ impl Player {
     #[doc(hidden)]
     pub fn set_fake_dolby_vision(&mut self, profile: Option<i64>) {
         self.fake_dolby_vision = profile;
+        self.apply_fake_dolby_vision();
+    }
+
+    /// 測試用：介面記下的軌道清單固定是 `tracks`，之後 mpv 送來的清單不再蓋掉它（None = 照 mpv 的，馬上重讀）。
+    /// 模擬 mpv 還沒送軌道清單、或還沒送選了哪些。mpv 什麼時候再送一次清單說不準（解碼器、音訊輸出開好、加了字幕都會再送），
+    /// 直接改 `state.tracks` 的話，慢的電腦上下一幀就可能被蓋掉
+    #[doc(hidden)]
+    pub fn set_fake_tracks(&mut self, tracks: Option<Vec<Track>>) {
+        self.fake_tracks = tracks;
+        if self.fake_tracks.is_some() {
+            self.apply_fake_tracks();
+        } else {
+            self.refresh_tracks();
+        }
+    }
+
+    /// 收到 mpv 的軌道清單之後：換成測試用的（軌道清單、杜比視界）
+    fn apply_fake_tracks(&mut self) {
+        if let Some(tracks) = &self.fake_tracks {
+            self.state.tracks = tracks.clone();
+        }
         self.apply_fake_dolby_vision();
     }
 
@@ -3131,7 +3155,7 @@ impl Player {
                     .as_str()
                     .and_then(|j| serde_json::from_str(j).ok())
                     .unwrap_or_default();
-                self.apply_fake_dolby_vision();
+                self.apply_fake_tracks();
             }
             "media-title" => s.title = value.as_str().map(str::to_owned),
             "path" => s.path = value.as_str().map(str::to_owned),
@@ -3193,7 +3217,7 @@ impl Player {
             && let Ok(tracks) = serde_json::from_str(&json)
         {
             self.state.tracks = tracks;
-            self.apply_fake_dolby_vision();
+            self.apply_fake_tracks();
         }
     }
 

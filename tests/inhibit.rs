@@ -20,6 +20,7 @@ use support::fake_inhibit::FakeInhibitor;
 use support::fake_power::FakePower;
 use vitascope::app::{Launch, VitascopeApp};
 use vitascope::inhibit::{StopScreensaver, Want};
+use vitascope::mpv::{Event, Value};
 use vitascope::player::{Options, Player, TrackKind};
 use vitascope::settings::Settings;
 use vitascope::system_power::{AfterPlayback, PowerAction, PowerCaps};
@@ -224,17 +225,39 @@ fn nothing_is_requested_before_the_tracks_are_known() {
     let mut h = harness(headless(&[]), with(&fake, sample("common/mp4_h264_aac.mp4")));
     wait_playing(&mut h);
     step_until(&mut h, "螢幕不關", |_| fake.current() == Want::Display);
-    // 模擬軌道清單到了、但還不知道選了哪些（mpv 先送清單、之後才送選了哪些）：影像軌還沒選不代表只有聲音
-    for t in &mut h.state_mut().player_mut().state.tracks {
+    // 模擬軌道清單到了、但還不知道選了哪些（mpv 先送清單、之後才送選了哪些）：影像軌還沒選不代表只有聲音。
+    // 用 `set_fake_tracks` 固定住介面記下的清單：直接改 `state.tracks` 的話，mpv 之後再送的清單
+    // （解碼器、音訊輸出開好時都會再送；慢的 CI 上就在下一幀）會把它蓋回選好的清單
+    let mut unselected = h.state().player().state.tracks.clone();
+    for t in &mut unselected {
         t.selected = false;
     }
+    h.state_mut().player_mut().set_fake_tracks(Some(unselected));
+    track_list_again(&mut h);
     h.step();
     assert_eq!(fake.current(), Want::Nothing, "{:?}", fake.history());
     // 模擬軌道清單還沒到（快的電腦上 mpv 在 FileLoaded 之前就送了，等不到這個時機）
-    h.state_mut().player_mut().state.tracks.clear();
+    h.state_mut().player_mut().set_fake_tracks(Some(Vec::new()));
+    track_list_again(&mut h);
     h.step();
     assert_eq!(fake.current(), Want::Nothing, "{:?}", fake.history());
     assert!(!fake.history().contains(&Want::System), "{:?}", fake.history());
+    // 選了哪些也知道了：螢幕不關
+    h.state_mut().player_mut().set_fake_tracks(None);
+    step_until(&mut h, "知道選了影像軌：螢幕不關", |_| {
+        fake.current() == Want::Display
+    });
+}
+
+/// mpv 這一幀又送了一次軌道清單（選好的；CI 上就是這樣在測試改完之後蓋掉的）。用注入的，不靠 mpv 什麼時候送
+fn track_list_again(h: &mut Harness<'_, VitascopeApp>) {
+    let json = h.state().player().get_string("track-list").unwrap();
+    assert!(json.contains("\"selected\":true"), "前提：mpv 的清單選了軌道 {json}");
+    h.state_mut().player_mut().inject_event(Event::PropertyChange {
+        id: 0,
+        name: "track-list".into(),
+        value: Value::String(json),
+    });
 }
 
 #[test]

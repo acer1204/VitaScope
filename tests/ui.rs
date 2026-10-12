@@ -1495,7 +1495,7 @@ fn viewport_commands(h: &Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand
         .unwrap_or_default()
 }
 
-/// 在影片上按右鍵、點選單裡的項目。選單比視窗長時（小影片的視窗只有 421 高）先用滾輪捲到看得到
+/// 在影片上按右鍵、點選單裡的項目。選單比視窗長時（小影片的視窗只有 421 高、迷你播放器只有 308 高）先捲到看得到
 fn click_context_item(h: &mut Harness<'_, VitascopeApp>, label: &str) {
     hover_context_item(h, label);
     h.get_by_label_contains(label).click();
@@ -1568,15 +1568,61 @@ impl<'a> MenuItem<'a> {
         Self { label, exact: false }
     }
 
-    /// 現在畫面上的這一項：範圍、完整的標籤、停用了沒。還沒畫出來時 None
-    fn find(self, h: &Harness<'_, VitascopeApp>) -> Option<(egui::Rect, String, bool)> {
-        let node = if self.exact {
+    /// 現在畫面上的這一項（無障礙樹的節點）。還沒畫出來時 None
+    fn node<'h>(self, h: &'h Harness<'_, VitascopeApp>) -> Option<egui_kittest::Node<'h>>
+    where
+        'a: 'h,
+    {
+        if self.exact {
             h.query_by_label(self.label)
         } else {
             h.query_by_label_contains(self.label)
-        }?;
+        }
+    }
+
+    /// 現在畫面上的這一項：範圍、完整的標籤、停用了沒。還沒畫出來時 None
+    fn find(self, h: &Harness<'_, VitascopeApp>) -> Option<(egui::Rect, String, bool)> {
+        let node = self.node(h)?;
         let a = node.accesskit_node();
         Some((node.rect(), a.label().unwrap_or_default().to_string(), a.is_disabled()))
+    }
+
+    /// egui 記下的這一項：`rect` 是整個項目，`interact_rect` 是滑鼠碰得到的部分（被選單的捲動區域裁掉之後），
+    /// `contains_pointer()` = 滑鼠在它上面、沒被別的圖層（例如子選單）蓋住（停用的項目也算）。
+    /// 兩幀之間 `read_response` 讀到的是再前一幀的（egui 在一幀結束時才把它換成「上一幀」）：
+    /// 範圍跟無障礙樹（最新的一幀）一樣才算數，不一樣（剛移動、剛捲動）時 None
+    fn response(self, h: &Harness<'_, VitascopeApp>) -> Option<egui::Response> {
+        let node = self.node(h)?;
+        let now = node.rect();
+        let r = h.ctx.read_response(widget_id(&node))?;
+        ((r.rect.min - now.min).length() < 0.5 && (r.rect.max - now.max).length() < 0.5).then_some(r)
+    }
+
+    /// 整個項目都看得到：在視窗裡，也沒被選單的捲動區域裁掉。egui 記的還不是最新的一幀時 None（再跑一幀）。
+    /// 只看在不在視窗裡不夠：選單有邊框，從按右鍵的地方往下開（放不下才往上移），捲動區域常比視窗小一截，
+    /// 被裁掉的項目也在視窗裡，滑鼠移到它的中心卻碰不到它
+    fn shown(self, h: &Harness<'_, VitascopeApp>) -> Option<bool> {
+        let r = self.response(h)?;
+        Some(h.ctx.content_rect().contains_rect(r.rect) && r.interact_rect.expand(0.5).contains_rect(r.rect))
+    }
+
+    /// egui 算滑鼠在這一項上面（點下去會點到它）
+    fn under_pointer(self, h: &Harness<'_, VitascopeApp>) -> bool {
+        self.response(h).is_some_and(|r| r.contains_pointer())
+    }
+
+    /// 請 egui 把這一項捲到它所在的捲動區域中間：無障礙的「捲到看得到」（AccessKit 的 ScrollIntoView，螢幕閱讀器用的），
+    /// 跟滑鼠在哪裡無關
+    fn scroll_into_view(self, h: &mut Harness<'_, VitascopeApp>) {
+        let Some((target_node, target_tree)) = self.node(h).map(|n| n.accesskit_node().locate()) else {
+            return;
+        };
+        h.event(egui::Event::AccessKitActionRequest(egui::accesskit::ActionRequest {
+            action: egui::accesskit::Action::ScrollIntoView,
+            target_tree,
+            target_node,
+            data: None,
+        }));
     }
 
     /// 等到這一項出現（子選單不一定下一幀就打開：CI 比較慢，選單也可能因為視窗剛改完大小換了位置）
@@ -1592,58 +1638,67 @@ impl<'a> MenuItem<'a> {
         }
     }
 
-    /// 等到這一項出現、捲到看得到（選單比視窗長時用滾輪捲）、等它停下來，回傳它現在的範圍。
-    /// 每次都讀現在的視窗大小：視窗可能剛配合影片改小，原本看得到的項目跑到視窗外
+    /// 等到這一項出現、整個看得到（選單比視窗長時捲動選單）、停下來，回傳它現在的範圍。
+    /// 每次都重新看：視窗可能剛配合影片改小，原本看得到的項目跑到視窗外。
+    /// 不用滾輪捲：滾輪要滑鼠停在選單上，項目從滑鼠下面滑過，滑過有子選單（⏵）的項目就打開它的子選單。
+    /// 窄的視窗（迷你播放器 480 寬）兩邊都放不下子選單，egui 把它疊在選單上、蓋住滑鼠，之後的滾輪都捲到子選單，
+    /// 選單不動，要點的項目一直在看不到的地方。哪個項目剛好停在滑鼠下面看選單的內容與上次捲到哪裡：
+    /// 本機剛好沒事，windows-latest 上迷你播放器的測試點不到「回到一般視窗」「結束影戲」、打不開「視窗置頂」
     fn bring_into_view(self, h: &mut Harness<'_, VitascopeApp>) -> egui::Rect {
-        for _ in 0..10 {
+        let start = Instant::now();
+        loop {
             apply_pending_resize(h);
-            let (item, ..) = self.wait(h);
-            let screen = h.ctx.content_rect();
-            // 往下捲（滾輪往下 = 負的）看下面的項目，往上捲看上面的
-            let delta = if item.bottom() > screen.bottom() {
-                -120.0
-            } else if item.top() < screen.top() {
-                120.0
-            } else {
-                break;
-            };
-            let over_menu = egui::pos2(item.center().x, screen.center().y);
-            h.event(egui::Event::PointerMoved(over_menu));
-            h.event(egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, delta),
-                modifiers: egui::Modifiers::NONE,
-                phase: egui::TouchPhase::Move,
-            });
-            h.run_steps(2);
-        }
-        // 捲動有動畫：等項目停下來再移過去（不然滑鼠停在動畫途中的位置，項目捲走後就不在它上面了）
-        let (mut last, ..) = self.wait(h);
-        for _ in 0..30 {
-            h.step();
-            let (now, ..) = self.wait(h);
-            if now == last {
-                break;
+            let (before, ..) = self.wait(h);
+            match self.shown(h) {
+                Some(true) => {
+                    // 停下來才算（選單剛打開、視窗剛改大小時，位置還會變一兩幀）
+                    h.step();
+                    let (now, ..) = self.wait(h);
+                    if now == before && self.shown(h) == Some(true) {
+                        return now;
+                    }
+                }
+                Some(false) => {
+                    self.scroll_into_view(h);
+                    h.run_steps(2);
+                }
+                None => h.step(),
             }
-            last = now;
+            assert!(
+                start.elapsed() < MENU_TIMEOUT,
+                "「{}」一直捲不到看得到的地方（範圍, 碰得到的部分）：{:?}",
+                self.label,
+                self.response(h).map(|r| (r.rect, r.interact_rect))
+            );
         }
-        last
     }
 
-    /// 等到這一項出現、捲到看得到、等它停下來，把滑鼠移到它上面。有子選單的項目等到子選單打開
+    /// 等到這一項出現、捲到看得到、等它停下來，把滑鼠移到它上面，而且 egui 也算滑鼠在它上面
+    /// （版面剛好變了就再來一次；一直不是就在這裡失敗，不要等到點下去沒反應才發現）。有子選單的項目等到子選單打開
     fn hover(self, h: &mut Harness<'_, VitascopeApp>) {
         // 之後用完整的標籤找：子選單打開後可能有別的項目也含 `label`（例如「字幕 ⏵」裡的「第二字幕 ⏵」）
         let (_, full, disabled) = self.wait(h);
         let me = MenuItem::exact(&full);
-        let item = me.bring_into_view(h);
-        me.point_at(h, item);
-        if full.ends_with('⏵') && !disabled {
+        let submenu = full.ends_with('⏵') && !disabled;
+        let start = Instant::now();
+        loop {
+            let item = me.bring_into_view(h);
+            me.point_at(h, item);
+            // 有子選單的項目：窄的視窗裡它的子選單可能疊在它上面（這時滑鼠在子選單上）
+            if me.under_pointer(h) || (submenu && submenu_open(h, &full)) {
+                break;
+            }
+            assert!(
+                start.elapsed() < MENU_TIMEOUT,
+                "滑鼠移到「{full}」上，egui 卻不算在它上面（被別的子選單蓋住了？）"
+            );
+        }
+        if submenu {
             me.wait_submenu(h);
         }
     }
 
-    /// 把滑鼠移到 `item`（這一項剛才的範圍）上。捲動時滑鼠可能停在有子選單的項目上（子選單會打開）：
-    /// 移過來之後多跑幾幀，等那個子選單關掉
+    /// 把滑鼠移到 `item`（這一項剛才的範圍）上，多跑幾幀（有子選單的項目，子選單要一兩幀才打開）
     fn point_at(self, h: &mut Harness<'_, VitascopeApp>, item: egui::Rect) {
         h.event(egui::Event::PointerMoved(item.center()));
         h.run_steps(3);
@@ -1667,23 +1722,27 @@ impl<'a> MenuItem<'a> {
     }
 }
 
+/// 無障礙樹的節點對應的 egui 代號（`Id::accesskit_id` 的反過來）
+fn widget_id(node: &egui_kittest::Node<'_>) -> egui::Id {
+    let (local, _) = node.accesskit_node().locate();
+    // SAFETY: 不是記憶體安全的問題：值本來就是 egui 的代號
+    unsafe { egui::Id::from_high_entropy_bits(local.0) }
+}
+
 /// 標籤是 `header` 的項目的子選單開著（這一幀畫了它的子選單）。
 /// 子選單是畫面最上層的一個區域，裡面那一層的代號是 egui 從項目的代號算出來的（`SubMenu::id_from_widget_id`）
 fn submenu_open(h: &Harness<'_, VitascopeApp>, header: &str) -> bool {
     let Some(item) = h.query_by_label(header) else {
         return false;
     };
-    let (local, _) = item.accesskit_node().locate();
-    // SAFETY: 不是記憶體安全的問題：值本來就是 egui 的代號（`Id::accesskit_id` 的反過來）
-    let id = unsafe { egui::Id::from_high_entropy_bits(local.0) };
-    let submenu = egui::containers::menu::SubMenu::id_from_widget_id(id).accesskit_id();
+    let submenu = egui::containers::menu::SubMenu::id_from_widget_id(widget_id(&item)).accesskit_id();
     h.root()
         .children()
         .any(|area| area.children().any(|ui| ui.accesskit_node().locate().0 == submenu))
 }
 
 /// 測試的選單工具：選單打開、滑鼠移到項目上之後視窗才配合影片變小（CI 上開檔後調整視窗可能晚好幾幀），
-/// 項目跑到視窗外。等子選單時要重新捲到看得到再移過去（以前只會一直移到視窗外的舊位置，等到逾時）
+/// 選單跟著移動、項目移走了（可能跑到視窗外）。等子選單時要重新捲到看得到再移過去（以前只會一直移到舊的位置，等到逾時）
 #[test]
 fn menu_helper_scrolls_again_when_the_window_shrinks_under_the_menu() {
     if !has_net_samples("menu_helper_scrolls_again_when_the_window_shrinks_under_the_menu") {
@@ -1701,15 +1760,99 @@ fn menu_helper_scrolls_again_when_the_window_shrinks_under_the_menu() {
     h.run_steps(2);
     let site = MenuItem::exact("網站影片 ⏵");
     let before = site.bring_into_view(&mut h);
-    // 這時視窗才變小：項目跑到視窗下面
+    // 這時視窗才變小：選單跟著移動，滑鼠還在舊的位置
     h.set_size(small);
     h.run_steps(2);
     let (moved, ..) = site.wait(&mut h);
-    assert!(moved.bottom() > small.y, "前提：項目跑到視窗外 {moved:?}");
+    assert_ne!(moved, before, "前提：項目移走了");
     site.point_at(&mut h, before);
+    assert!(
+        site.response(&h).is_some_and(|r| !r.contains_pointer()),
+        "前提：舊的位置已經不在項目上 {before:?} → {moved:?}"
+    );
     site.wait_submenu(&mut h);
     wait_menu_item(&mut h, "選擇畫質 ⏵");
-    assert_eq!(h.state().player().state.volume, 100.0, "滾輪捲的是選單，不是音量");
+    assert_eq!(h.state().player().state.volume, 100.0, "捲動選單沒有動到音量");
+}
+
+/// 測試的選單工具：視窗改了大小（`set_size`、迷你播放器）之後，選單裡上、中、下的項目都要真的點得到。
+/// 以前用滾輪捲、只看項目在不在視窗裡：(1) 選單的捲動區域常比視窗小一截，被它裁掉的項目也算看得到，
+/// 滑鼠移到中心卻不在項目上；(2) 捲動時項目從滑鼠下面滑過，經過有子選單的項目就打開它，窄的視窗兩邊放不下，
+/// 子選單疊在選單上、蓋住滑鼠，之後的滾輪捲不動選單。哪個項目剛好停在哪裡看選單的內容與上次捲到哪裡
+/// （windows-latest 上迷你播放器的四個測試都點不到），所以掃過一排視窗大小，每一次都問 egui 滑鼠是不是真的在項目上
+#[test]
+fn menu_helper_reaches_every_item_after_the_window_size_changes() {
+    let mut h = playing_multitrack();
+    wait_window_fit(&mut h);
+    for height in (300..=460).step_by(4) {
+        h.set_size(egui::vec2(480.0, height as f32));
+        apply_pending_resize(&mut h);
+        // 這個順序：上一項捲到的位置是下一項的起點（選單記得捲到哪裡）
+        for label in ["視窗置頂", "關於影戲", "開啟檔案…", "全螢幕", "設定…"] {
+            hover_context_item(&mut h, label);
+            assert!(pointer_reached(&h, label), "480×{height}：滑鼠不在「{label}」上");
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+        }
+    }
+    // 真的點下去：最矮的視窗裡最下面的「關於影戲」
+    h.set_size(egui::vec2(480.0, 300.0));
+    click_context_item(&mut h, "關於影戲");
+    h.run_steps(2);
+    h.get_by_label("acer1204/VitaScope");
+}
+
+/// 滑鼠在選單的這一項上（egui 算的；點下去會點到它），或它的子選單開著（窄的視窗裡子選單可能疊在它上面）
+fn pointer_reached(h: &Harness<'_, VitascopeApp>, label: &str) -> bool {
+    let (_, full, _) = MenuItem::contains(label).find(h).unwrap();
+    let on_it = MenuItem::exact(&full).response(h).is_some_and(|r| r.contains_pointer());
+    on_it || submenu_open(h, &full)
+}
+
+/// 測試的選單工具，迷你播放器（480×308）：選單從哪個捲動位置開始，CI 上點不到的那幾項都點得到。
+/// 先把選單裡的每一項輪流捲到中間當成起點（不動滑鼠），再去找要點的項目
+#[test]
+fn menu_helper_reaches_the_mini_player_items_from_any_scroll_position() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    // 先暫停：播到結尾時「暫停」變成「播放」，起點的標籤就找不到了（慢的 CI 上這個測試可能比影片長）
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    let open_menu = |h: &mut Harness<'_, VitascopeApp>| {
+        wait_window_fit(h);
+        h.get_by_label("影片畫面").click_secondary();
+        h.run_steps(2);
+        wait_menu_item_contains(h, "結束影戲");
+    };
+    // 選單（不含子選單）裡的每一項
+    open_menu(&mut h);
+    let menu = h
+        .root()
+        .children()
+        .find(|area| area.query_by_label("結束影戲").is_some())
+        .expect("選單");
+    let starts: Vec<String> = menu
+        .query_all(egui_kittest::kittest::by().role(egui::accesskit::Role::Button))
+        .filter_map(|n| n.accesskit_node().label().map(|l| l.to_string()))
+        .collect();
+    assert!(starts.len() > 20, "{starts:?}");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    for start in &starts {
+        for label in ["回到一般視窗", "視窗置頂", "結束影戲"] {
+            open_menu(&mut h);
+            MenuItem::exact(start).bring_into_view(&mut h);
+            hover_menu_item(&mut h, label);
+            assert!(pointer_reached(&h, label), "從「{start}」開始：滑鼠不在「{label}」上");
+            h.key_press(egui::Key::Escape);
+            h.run_steps(2);
+        }
+    }
+    assert_eq!(h.state().window_mode(), WindowMode::Mini, "Esc 只關掉選單");
+    // 真的點下去
+    click_context_item(&mut h, "結束影戲");
+    assert!(viewport_commands(&h).contains(&egui::ViewportCommand::Close));
 }
 
 /// 測試的選單工具 `wait_window_fit`：開檔後載入好、還不知道影片尺寸時（CI 上可能晚好幾幀）也要等視窗配合影片調整。
