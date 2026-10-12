@@ -34,6 +34,9 @@ raw-window-handle = "0.6"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TTML / DFXP 字幕轉成 SRT（FFmpeg 讀不了 TTML）。本來就在相依樹裡（Linux 的 wayland-scanner 建置時用的），
+# 現在程式本身也用；不展開 DTD、外部實體
+quick-xml = "0.41"
 # 檢查更新（查詢 GitHub Releases）
 ureq = "3"
 # 網址的解析（主機名稱、帳號密碼、查詢參數）；本來就在相依樹裡（webbrowser 用的）

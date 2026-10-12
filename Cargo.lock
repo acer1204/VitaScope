@@ -3292,6 +3292,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "objc2-media-player",
  "png",
+ "quick-xml",
  "raw-window-handle",
  "rfd",
  "ring",

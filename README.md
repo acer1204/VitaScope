@@ -462,6 +462,7 @@ src/
 ├─ screens.rs    螢幕清單、精確的更新率（Windows、macOS、X11）、遠端桌面
 ├─ power.rs      接著電源還是用電池（使用電池時暫停流暢播放）
 ├─ subs.rs       外掛字幕：尋找、編碼偵測、繁簡判斷
+├─ ttml.rs       TTML / DFXP 字幕轉成 SRT（播放引擎讀不了 TTML）
 ├─ playlist.rs   播放清單：同資料夾的檔案、自然排序、編輯
 ├─ m3u.rs        播放清單檔（.m3u / .m3u8）的讀寫、下次開啟時還原
 ├─ history.rs    播放紀錄：最近開啟的檔案、續播位置

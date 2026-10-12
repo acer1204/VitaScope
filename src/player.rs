@@ -2388,6 +2388,11 @@ impl Player {
         let mode = if select { AddMode::SelectExisting } else { AddMode::Auto };
         match subs::load(&sub_path, &video) {
             Ok(sub) => self.add_external(&sub, mode),
+            // 轉不了的 TTML：說明原因（原檔交給 mpv 也讀不了，只會說「載入失敗」）
+            Err(e) if subs::is_conversion_error(&e) => Err(mpv::Error {
+                code: libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED,
+                context: e.to_string(),
+            }),
             // 讀不了（例如不是本機檔案）就直接交給 mpv
             Err(_) => self.mpv.command(&["sub-add", path, mode.flag()]),
         }

@@ -43,6 +43,7 @@ pub mod syscmd;
 pub mod system_power;
 pub mod theme;
 pub mod thumbs;
+pub mod ttml;
 pub mod update;
 pub mod video;
 pub mod web;

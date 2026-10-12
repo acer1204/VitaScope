@@ -3413,6 +3413,112 @@ fn pasted_subtitle_url_is_added_to_the_video() {
     assert!(playing(&h.state().player().state, "mkv_multitrack.mkv"), "影片照樣播");
 }
 
+/// 拖放 TTML：內容是 TTML 的 `.xml` 也算字幕（轉成 SRT，加到正在播的影片，不是當成影片開）；
+/// 轉不了的 TTML 說明原因
+#[test]
+fn dropped_ttml_is_converted_and_broken_ttml_says_why() {
+    let dir = TempDir::new("ttml-drop");
+    let xml = dir.0.join("字幕.xml");
+    std::fs::write(
+        &xml,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tt xmlns=\"http://www.w3.org/ns/ttml\" xml:lang=\"en\"><body><div>\
+         <p begin=\"00:00:00.000\" end=\"00:01:00.000\">TTML subtitle</p></div></body></tt>\n",
+    )
+    .unwrap();
+    let broken = dir.0.join("壞掉.ttml");
+    std::fs::write(
+        &broken,
+        "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"1s\">a</span></body></tt>",
+    )
+    .unwrap();
+    let mut h = playing_multitrack();
+    drop_file(&mut h, xml);
+    // 提示會過期：拖放的那一幀就看
+    assert_eq!(h.state().osd_text(), Some("載入字幕：字幕.xml"));
+    step_until(&mut h, "選上轉好的 TTML", |s| {
+        s.selected(TrackKind::Sub).is_some_and(|t| {
+            t.external && t.codec.as_deref() == Some("subrip") && t.title.as_deref() == Some("字幕.xml")
+        })
+    });
+    assert!(playing(&h.state().player().state, "mkv_multitrack.mkv"), "影片照樣播");
+
+    drop_file(&mut h, broken);
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(
+        osd.starts_with("無法載入字幕：無法轉換 TTML 字幕：XML 格式錯誤"),
+        "{osd}"
+    );
+    assert!(playing(&h.state().player().state, "mkv_multitrack.mkv"), "影片照樣播");
+
+    // 「載入字幕檔…」選了 DFXP
+    let dfxp = dir.0.join("字幕.dfxp");
+    std::fs::write(
+        &dfxp,
+        "<tt xmlns=\"http://www.w3.org/2006/10/ttaf1\" xmlns:ttp=\"http://www.w3.org/2006/10/ttaf1#parameter\" \
+         ttp:tickRate=\"10000000\"><body><div><p begin=\"0t\" end=\"600000000t\">DFXP subtitle</p></div></body></tt>",
+    )
+    .unwrap();
+    h.state_mut().on_dialog_result(DialogKind::LoadSubtitle, vec![dfxp]);
+    assert_eq!(h.state().osd_text(), Some("載入字幕：字幕.dfxp"));
+    step_until(&mut h, "選上轉好的 DFXP", |s| {
+        s.selected(TrackKind::Sub)
+            .is_some_and(|t| t.codec.as_deref() == Some("subrip") && t.title.as_deref() == Some("字幕.dfxp"))
+    });
+}
+
+/// 一份 TTML（給拖放的測試，存成 .xml）
+const TTML_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<tt xmlns=\"http://www.w3.org/ns/ttml\" xml:lang=\"en\">     <body><div><p begin=\"00:00:00.000\" end=\"00:01:00.000\">TTML subtitle</p></div></body></tt>
+";
+
+/// 影片跟同名的 TTML `.xml` 一起拖進來：.xml 不會被自動找到（看副檔名找的），要照拖進來的字幕加上去，不能弄丟
+#[test]
+fn dropping_a_video_with_its_ttml_xml_loads_the_subtitle() {
+    let dir = TempDir::new("drop-video-ttml");
+    let video = dir.clip("影片.mp4");
+    let xml = dir.0.join("影片.en.xml");
+    std::fs::write(&xml, TTML_XML).unwrap();
+    let mut h = harness(None);
+    h.step();
+    for f in [&xml, &video] {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(&mut h, "播放並選上轉好的 TTML", |s| {
+        playing(s, "影片.mp4")
+            && s.selected(TrackKind::Sub).is_some_and(|t| {
+                t.external && t.codec.as_deref() == Some("subrip") && t.title.as_deref() == Some("en.xml")
+            })
+    });
+    assert_eq!(h.state().player().state.tracks_of(TrackKind::Sub).count(), 1);
+}
+
+/// 副檔名不認得的檔案跟 TTML `.xml` 一起拖進來：開那個檔案（不是把 .xml 當成影片開），.xml 是它的字幕
+#[test]
+fn dropping_an_unknown_file_with_a_ttml_xml_opens_the_file() {
+    let dir = TempDir::new("drop-unknown-ttml");
+    let video = dir.clip("影片.vitascope-unknown");
+    let xml = dir.0.join("字幕.xml");
+    std::fs::write(&xml, TTML_XML).unwrap();
+    let mut h = harness(None);
+    h.step();
+    // .xml 放前面：拖放的順序裡第一個不是字幕的才是要開的
+    for f in [&xml, &video] {
+        h.input_mut()
+            .dropped_files
+            .push(std::sync::Arc::new(Dropped(f.clone())));
+    }
+    h.step();
+    step_until(&mut h, "開那個檔案並選上轉好的 TTML", |s| {
+        playing(s, "影片.vitascope-unknown")
+            && s.selected(TrackKind::Sub).is_some_and(|t| {
+                t.external && t.codec.as_deref() == Some("subrip") && t.title.as_deref() == Some("字幕.xml")
+            })
+    });
+}
+
 /// 還原上次的播放清單：網址顯示存下的標題（playlist.m3u8 的 #EXTINF），不是網址的最後一段
 #[test]
 fn restored_playlist_shows_saved_titles() {

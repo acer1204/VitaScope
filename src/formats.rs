@@ -32,6 +32,12 @@ pub const SUBTITLE: &[&str] = &[
     "lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp",
 ];
 
+/// 「載入字幕檔…」的篩選：字幕的副檔名，加上 TTML 也常用的 `xml`。
+/// `xml` 不放進 `SUBTITLE`：大部分的 .xml 不是字幕，拖放時要看內容（[`is_subtitle_path`]）
+pub fn subtitle_dialog_exts() -> Vec<&'static str> {
+    SUBTITLE.iter().copied().chain(["xml"]).collect()
+}
+
 /// 播放清單檔（開啟 = 載入清單，見 `m3u.rs`）
 pub const PLAYLIST: &[&str] = &["m3u", "m3u8"];
 
@@ -41,6 +47,15 @@ fn ext_of(path: &std::path::Path) -> Option<String> {
 
 pub fn is_subtitle(path: &std::path::Path) -> bool {
     ext_of(path).is_some_and(|e| SUBTITLE.contains(&e.as_str()))
+}
+
+/// 拖放、貼上的檔案是不是字幕：字幕的副檔名，或內容是 TTML 的 `.xml`
+/// （讀檔案開頭的 2 KiB 判斷；只有 .xml 才讀，網址不讀）
+pub fn is_subtitle_path(path: &std::path::Path) -> bool {
+    is_subtitle(path)
+        || (ext_of(path).as_deref() == Some("xml")
+            && !path.to_string_lossy().contains("://")
+            && crate::subs::is_ttml_file(path))
 }
 
 pub fn is_playlist(path: &std::path::Path) -> bool {
@@ -172,6 +187,38 @@ mod tests {
         }
         // 二進位的 EBU-STL 也用 .stl，FFmpeg 讀不了
         assert!(!is_subtitle(std::path::Path::new("片.stl")));
+    }
+
+    #[test]
+    fn ttml_xml_files_are_subtitles_by_content() {
+        let dir = std::env::temp_dir().join(format!("vitascope-formats-xml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttml = dir.join("字幕.xml");
+        std::fs::write(
+            &ttml,
+            "<?xml version=\"1.0\"?>
+<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"1s\" end=\"2s\">a</p></body></tt>",
+        )
+        .unwrap();
+        let other = dir.join("feed.XML");
+        std::fs::write(&other, "<?xml version=\"1.0\"?><rss><channel/></rss>").unwrap();
+        // 副檔名的判斷（清單、網址）不看內容：.xml 不算字幕
+        assert!(!is_subtitle(&ttml));
+        assert!(!SUBTITLE.contains(&"xml"));
+        // 拖放、貼上：看內容
+        assert!(is_subtitle_path(&ttml));
+        assert!(!is_subtitle_path(&other));
+        assert!(!is_subtitle_path(&dir.join("不存在.xml")));
+        assert!(!is_subtitle_path(std::path::Path::new("https://example.com/字幕.xml")));
+        assert!(is_subtitle_path(std::path::Path::new("片.srt")), "其他字幕照副檔名");
+        assert_eq!(media_kind(&ttml), None);
+        // 「載入字幕檔…」列出 TTML、DFXP，也列出 .xml
+        let exts = subtitle_dialog_exts();
+        for ext in ["ttml", "dfxp", "xml", "srt", "lrc"] {
+            assert!(exts.contains(&ext), "{ext}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

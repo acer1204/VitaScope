@@ -2,6 +2,8 @@
 //! - MPL2、SubViewer、LRC、JACOsub、RealText、PJS、AQTitle、VPlayer、SCC（CEA-608）
 //!   都走影戲自己的外掛字幕流程（轉成 UTF-8 的暫存檔再交給 mpv），跳到 2 秒時畫面上的字幕要對。
 //!   AQTitle、PJS、VPlayer 的暫存檔不能有 BOM（FFmpeg 的格式偵測從第一個位元組開始比對）
+//! - TTML / DFXP（FFmpeg 讀不了）：影戲轉成 SRT 再交給 mpv；內容是 TTML 的 `.xml` 也是。
+//!   影片旁邊同名的 `.ttml` 自動載入；轉不了的說明原因
 //! - 純音訊檔旁邊的 LRC 歌詞：播放器把目前的那一句放在 `state.sub_text`（介面畫在歌名下面），
 //!   mpv 畫在封面上的那份藏起來；影片不觀察 sub-text。封面上的 ASS 歌詞（樣式、卡拉 OK 效果）照舊由 mpv 畫
 //!
@@ -178,6 +180,52 @@ fn scc() -> String {
     lines.join("\n")
 }
 
+/// TTML 的時鐘時間 `HH:MM:SS.mmm`
+fn clock(t: f64) -> String {
+    let (h, m, s, ms) = hmsm(t);
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+/// TTML（現行的命名空間、時鐘時間）。第二句有樣式（斜體）、在畫面上方的區域：
+/// 轉成 SRT 的 `<i>`、`{\an8}`，mpv 的 sub-text 不含這些標記
+fn ttml() -> String {
+    let mut s = String::from(concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<tt xmlns=\"http://www.w3.org/ns/ttml\" xmlns:tts=\"http://www.w3.org/ns/ttml#styling\" xml:lang=\"en\">\n",
+        "<head><styling><style xml:id=\"it\" tts:fontStyle=\"italic\"/></styling>\n",
+        "<layout><region xml:id=\"top\" tts:origin=\"10% 5%\" tts:extent=\"80% 20%\"/></layout></head>\n",
+        "<body><div>\n",
+    ));
+    for (i, (a, b, t)) in CUES.iter().enumerate() {
+        let attrs = if i == 1 { " style=\"it\" region=\"top\"" } else { "" };
+        s += &format!("<p begin=\"{}\" end=\"{}\"{attrs}>{t}</p>\n", clock(*a), clock(*b));
+    }
+    s + "</div></body></tt>\n"
+}
+
+/// DFXP（舊版的命名空間、`ttp:tickRate`、`t` 偏移時間、`<br/>`、斜體的 span）
+fn dfxp() -> String {
+    let ticks = |t: f64| format!("{}t", (t * 10_000_000.0).round() as u64);
+    let mut s = String::from(concat!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+        "<tt xmlns=\"http://www.w3.org/2006/10/ttaf1\" xmlns:tts=\"http://www.w3.org/2006/10/ttaf1#styling\" ",
+        "xmlns:ttp=\"http://www.w3.org/2006/10/ttaf1#parameter\" ttp:tickRate=\"10000000\">\n",
+        "<body><div>\n",
+    ));
+    for (i, (a, b, t)) in CUES.iter().enumerate() {
+        let text = match i {
+            0 => "First<br/>line".to_owned(),
+            1 => {
+                let (first, rest) = t.split_once(' ').unwrap();
+                format!("<span tts:fontStyle=\"italic\">{first}</span> {rest}")
+            }
+            _ => (*t).to_owned(),
+        };
+        s += &format!("<p begin=\"{}\" end=\"{}\">{text}</p>\n", ticks(*a), ticks(*b));
+    }
+    s + "</div></body></tt>\n"
+}
+
 /// 一種格式：說明、檔名、內容、mpv 回報的字幕編碼
 struct Format {
     what: &'static str,
@@ -211,6 +259,10 @@ fn rare_formats() -> Vec<Format> {
         f("AQTitle", "aqtitle.aqt", aqtitle(), "text"),
         f("VPlayer", "vplayer.txt", vplayer(), "vplayer"),
         f("SCC", "captions.scc", scc(), "eia_608"),
+        // 影戲轉成 SRT 再交給 mpv
+        f("TTML", "subtitles.ttml", ttml(), "subrip"),
+        f("DFXP", "subtitles.dfxp", dfxp(), "subrip"),
+        f("TTML（.xml）", "subtitles.en.xml", ttml(), "subrip"),
     ]
 }
 
@@ -300,6 +352,71 @@ fn rare_text_subtitles_show_the_cue() {
         }
     }
     assert!(failed.is_empty(), "這些格式不行：\n{}", failed.join("\n"));
+}
+
+#[test]
+fn ttml_next_to_the_video_is_loaded() {
+    // 影片旁邊同名的 .ttml 自動載入（轉成 SRT）：標題是原本的後綴、語言照 xml:lang
+    let dir = TempDir::new("ttml-auto");
+    let video = dir.0.join("影片.mp4");
+    std::fs::copy(sample("common/mp4_h264_aac.mp4"), &video).unwrap();
+    std::fs::write(dir.0.join("影片.ttml"), ttml()).unwrap();
+    let mut p = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    p.set_pause(true).unwrap();
+    p.open(&video.to_string_lossy()).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    p.wait_state(TIMEOUT, |s| s.tracks_of(TrackKind::Sub).any(|t| t.external))
+        .expect("自動載入同名的 TTML");
+    let track = p.state.tracks_of(TrackKind::Sub).find(|t| t.external).cloned().unwrap();
+    assert_eq!(track.codec.as_deref(), Some("subrip"), "{track:?}");
+    assert_eq!(track.title.as_deref(), Some("ttml"), "{track:?}");
+    assert_eq!(track.lang.as_deref(), Some("en"), "{track:?}");
+    assert!(
+        track.external_filename.as_deref().is_some_and(|f| f.ends_with(".srt")),
+        "交給 mpv 的是轉好的 SRT：{track:?}"
+    );
+    p.select_track(TrackKind::Sub, Some(track.id)).unwrap();
+    p.wait_state(TIMEOUT, |s| {
+        s.selected(TrackKind::Sub).is_some_and(|t| t.id == track.id)
+    })
+    .expect("選上 TTML");
+    assert_eq!(sub_text_at(&mut p, PROBE_TIME), PROBE_TEXT);
+    // 樣式、位置跟著轉過去：斜體、畫面上方（mpv 0.37 的屬性名稱是 sub-text-ass）
+    let ass = p
+        .get_string("sub-text/ass")
+        .or_else(|_| p.get_string("sub-text-ass"))
+        .unwrap();
+    assert!(ass.contains(r"\an8") && ass.contains(r"\i1"), "{ass:?}");
+    // 原檔留著，用來換編碼重新載入
+    let info = p.external_sub_info(&track).expect("記得原檔");
+    assert_eq!(info.original, dir.0.join("影片.ttml"));
+}
+
+#[test]
+fn broken_ttml_says_why() {
+    // 轉不了的 TTML 說明原因；不再把原檔交給 mpv（mpv 讀不了，只會說「載入失敗」）
+    let dir = TempDir::new("ttml-broken");
+    let path = dir.0.join("壞掉.ttml");
+    std::fs::write(
+        &path,
+        ttml().replace(
+            "</p>
+</div>",
+            "</span>
+</div>",
+        ),
+    )
+    .unwrap();
+    let mut p = paused_on_test_pattern();
+    let err = p.add_subtitle(&path.to_string_lossy()).unwrap_err();
+    assert!(err.context.starts_with("無法轉換 TTML 字幕：XML 格式錯誤"), "{err}");
+    // 直接讀 mpv 的軌道清單（sub-add 是同步指令：加了的話已經在清單裡）
+    let tracks: Vec<serde_json::Value> = serde_json::from_str(&p.get_string("track-list").unwrap()).unwrap();
+    assert!(!tracks.iter().any(|t| t["type"] == "sub"), "沒有加進字幕軌：{tracks:?}");
 }
 
 // ───────────── 歌詞 ─────────────

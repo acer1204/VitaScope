@@ -1955,19 +1955,7 @@ impl VitascopeApp {
         } else {
             DialogKind::LoadAudio
         };
-        let (title, filter, exts) = if subtitle {
-            (
-                crate::tr!("載入字幕檔", "Load subtitle file"),
-                crate::tr!("字幕檔", "Subtitle files"),
-                formats::SUBTITLE.to_vec(),
-            )
-        } else {
-            (
-                crate::tr!("載入音軌檔", "Load audio file"),
-                crate::tr!("音訊檔", "Audio files"),
-                formats::all_audio(),
-            )
-        };
+        let (title, filter, exts) = load_dialog_filter(subtitle);
         let mut dialog = self
             .file_dialog()
             .set_title(title)
@@ -3028,8 +3016,12 @@ impl VitascopeApp {
         let Some(first) = dropped.first().cloned() else { return };
         let dropped_count = dropped.len();
         let dropped_paths = dropped.clone();
-        // 字幕的網址也是字幕（加到正在播的影片，mpv 讀得到網路上的字幕）
-        let mut subs: Vec<PathBuf> = dropped.iter().filter(|p| formats::is_subtitle(p)).cloned().collect();
+        // 字幕的網址也是字幕（加到正在播的影片，mpv 讀得到網路上的字幕）；內容是 TTML 的 .xml 也是
+        let mut subs: Vec<PathBuf> = dropped
+            .iter()
+            .filter(|p| formats::is_subtitle_path(p))
+            .cloned()
+            .collect();
         crate::playlist::sort_by_name(&mut subs);
         let media = media_in_order(&dropped);
         let all_subs = subs.len() == dropped_count;
@@ -3057,10 +3049,7 @@ impl VitascopeApp {
         }
         if media.is_empty() {
             // 副檔名不在清單上的檔案：照樣交給 mpv 試試看，字幕等它載入完再加
-            let other = dropped_paths
-                .into_iter()
-                .find(|p| !formats::is_subtitle(p))
-                .unwrap_or(first);
+            let other = dropped_paths.into_iter().find(|p| !subs.contains(p)).unwrap_or(first);
             self.open(&other);
             if !subs.is_empty() {
                 let other = std::path::absolute(&other).unwrap_or(other);
@@ -3069,8 +3058,11 @@ impl VitascopeApp {
             return;
         }
         // 屬於某個拖進來的影片的字幕（同資料夾、檔名以影片名稱開頭），那個影片載入時就會自動找到；
-        // 只有其他的字幕才加到第一個影片
+        // 只有其他的字幕才加到第一個影片。內容是 TTML 的 .xml 不會被自動找到（看副檔名找的），一律加上去
         let belongs_to_some_video = |sub: &Path| {
+            if !formats::is_subtitle(sub) {
+                return false;
+            }
             let name = sub
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
@@ -5185,6 +5177,23 @@ fn is_url(path: &str) -> bool {
     path.contains("://")
 }
 
+/// 「載入字幕檔…」「載入音軌檔…」的（標題, 篩選的名稱, 副檔名）。字幕也列出 TTML 常用的 `.xml`
+fn load_dialog_filter(subtitle: bool) -> (&'static str, &'static str, Vec<&'static str>) {
+    if subtitle {
+        (
+            crate::tr!("載入字幕檔", "Load subtitle file"),
+            crate::tr!("字幕檔", "Subtitle files"),
+            formats::subtitle_dialog_exts(),
+        )
+    } else {
+        (
+            crate::tr!("載入音軌檔", "Load audio file"),
+            crate::tr!("音訊檔", "Audio files"),
+            formats::all_audio(),
+        )
+    }
+}
+
 /// 一次開好幾個時算不算影音：副檔名是影音的檔案，或任何網址（`watch?v=…` 這類網址沒有副檔名）；
 /// 字幕的網址除外（照以前一樣加到正在播的影片）
 fn is_media_or_url(path: &Path) -> bool {
@@ -5465,8 +5474,8 @@ fn next_track(ids: &[i64], current: Option<i64>, allow_off: bool) -> Option<Opti
 #[cfg(test)]
 mod tests {
     use super::{
-        fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, media_in_order, mpv_opts_override, next_track,
-        short_versions,
+        fmt_delay, fmt_speed, fmt_time, is_mesa_software_renderer, load_dialog_filter, media_in_order,
+        mpv_opts_override, next_track, short_versions,
     };
     use std::path::PathBuf;
 
@@ -5492,6 +5501,17 @@ mod tests {
         );
         let mixed = [PathBuf::from("https://x.example/z.mp4"), local("a.mp4")];
         assert_eq!(media_in_order(&mixed), mixed);
+    }
+
+    /// 「載入字幕檔…」的篩選列出 TTML、DFXP，也列出 `.xml`（內容是 TTML 的會轉換）；音軌的不列字幕
+    #[test]
+    fn load_dialog_filters() {
+        let (_, _, subs) = load_dialog_filter(true);
+        for ext in ["srt", "ass", "lrc", "ttml", "dfxp", "xml"] {
+            assert!(subs.contains(&ext), "{ext}");
+        }
+        let (_, _, audio) = load_dialog_filter(false);
+        assert!(audio.contains(&"flac") && !audio.contains(&"xml") && !audio.contains(&"srt"));
     }
 
     #[test]
