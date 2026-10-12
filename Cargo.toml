@@ -94,16 +94,17 @@ libc = "0.2"
 # Linux（X11）：啟動時查有哪些螢幕（上次的視窗位置在拔掉的螢幕上時不還原）；winit 本來就用它
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11-dl = "2.21"
-# 播完後的睡眠、休眠、關機：systemd-logind（D-Bus 系統匯流排）。本來就在相依樹裡（accesskit_unix、atspi 用的），
-# 只用同步的 zbus::blocking（blocking-api 只是多編譯一些 zbus 的程式碼，沒有新套件）
+# 播完後的睡眠、休眠、關機：systemd-logind（D-Bus 系統匯流排）；跟隨系統的深淺色：桌面的設定 portal。
+# 本來就在相依樹裡（accesskit_unix、atspi 用的），只用同步的 zbus::blocking（blocking-api 只是多編譯一些 zbus 的程式碼，沒有新套件）
 zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 # 啟動時查有哪些螢幕（NSScreen）；視窗所在螢幕的編號（NSView → NSWindow → NSScreen.deviceDescription）；
-# 播完後倒數時取消隱藏（NSApplication）
+# 播完後倒數時取消隱藏（NSApplication）；換回跟隨系統時讀系統現在的外觀（NSApplication.effectiveAppearance）
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSAppearance",
     "NSApplication",
     "NSGraphics",
     "NSImage",

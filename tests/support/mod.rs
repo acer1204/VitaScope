@@ -7,4 +7,6 @@ pub mod fake_media;
 pub mod fake_power;
 pub mod fake_ytdl;
 pub mod http;
+#[cfg(all(unix, not(target_os = "macos")))]
+pub mod private_bus;
 pub mod release;

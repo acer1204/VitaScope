@@ -103,6 +103,11 @@ fn parse_args() -> (Launch, bool) {
         launch.media = vitascope::media_keys::MediaBackend::System;
         // 播放影片時螢幕不關閉（mpv 的 stop-screensaver 對嵌入的畫面無效）：真的系統只在這裡接上
         launch.inhibitor = Some(Arc::new(vitascope::inhibit::RealInhibitor::new()));
+        // Linux：winit 不回報系統的深淺色，跟隨系統時問桌面的設定 portal（第一次選跟隨系統時才連；自動截圖不連）
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            launch.theme_source = Some(Box::new(vitascope::theme::portal::Portal::session()));
+        }
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
         if launch.files.is_empty()
             && let Some((entries, current)) = vitascope::m3u::load_session_entries()

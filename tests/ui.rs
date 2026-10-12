@@ -7102,6 +7102,275 @@ fn theme_labels_in_english() {
     assert_eq!(h.state().osd_text(), Some("Appearance: dark"));
 }
 
+// ───────────── 跟隨系統：Linux 的 portal、標題列、macOS 的舊值（F4） ─────────────
+
+/// 假的系統深淺色來源（像 Linux 桌面的設定 portal）：測試決定回答什麼，回答時叫 App 給的 wake
+#[derive(Clone, Default)]
+struct FakeThemeSource {
+    value: Arc<std::sync::Mutex<Option<egui::Theme>>>,
+    wake: Arc<std::sync::Mutex<Option<vitascope::instance::Wake>>>,
+    watched: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl vitascope::theme::ThemeSource for FakeThemeSource {
+    fn watch(&mut self, wake: vitascope::instance::Wake) {
+        self.watched.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.wake.lock().unwrap() = Some(wake);
+    }
+
+    fn get(&self) -> Option<egui::Theme> {
+        *self.value.lock().unwrap()
+    }
+}
+
+impl FakeThemeSource {
+    /// portal 回答（或系統改了設定）
+    fn answer(&self, theme: Option<egui::Theme>) {
+        *self.value.lock().unwrap() = theme;
+        let wake = self.wake.lock().unwrap().clone().expect("App 開始問了才會回答");
+        wake();
+    }
+
+    fn watched(&self) -> usize {
+        self.watched.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// 跑 `n` 幀，回傳期間送出的標題列深淺色（`SetTheme`）
+fn window_themes(h: &mut Harness<'_, VitascopeApp>, n: usize) -> Vec<egui::SystemTheme> {
+    let mut out = Vec::new();
+    for _ in 0..n {
+        h.step();
+        out.extend(viewport_commands(h).into_iter().filter_map(|c| match c {
+            egui::ViewportCommand::SetTheme(t) => Some(t),
+            _ => None,
+        }));
+    }
+    out
+}
+
+/// 設定 → 一般 → 外觀：從 `from` 換成 `to`（設定視窗要開著），回傳期間送出的標題列深淺色
+fn pick_theme(h: &mut Harness<'_, VitascopeApp>, from: &str, to: &str) -> Vec<egui::SystemTheme> {
+    h.get_by_value(from).click();
+    let mut out = window_themes(h, 2);
+    h.get_by_label(to).click();
+    out.extend(window_themes(h, 3));
+    out
+}
+
+/// 視窗失去 / 取得焦點（像系統的設定程式跑到前面、再回到影戲）
+fn set_focused(h: &mut Harness<'_, VitascopeApp>, focused: bool) {
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .focused = Some(focused);
+}
+
+#[test]
+fn linux_follow_system_uses_the_portal_answer() {
+    // Linux：winit 不回報系統的深淺色（system_theme 一律 None），App 問桌面的設定 portal
+    let fake = FakeThemeSource::default();
+    let mut settings = Settings::default();
+    settings.theme = ThemeChoice::System;
+    let launch = Launch {
+        theme_source: Some(Box::new(fake.clone())),
+        ..Default::default()
+    };
+    let mut h = harness_like_eframe_launch(launch, settings, None);
+    assert_eq!(fake.watched(), 1, "選了跟隨系統：一開始就問");
+    assert!(
+        !h.ctx.options(|o| o.sync_window_theme),
+        "標題列由 App 自己送（egui 的「系統預設」在 X11 一律是深色）"
+    );
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "還沒回答：深色");
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.get_by_label("偵測不到系統的深淺色設定，暫時用深色");
+    // portal 回答淺色：介面、標題列都換成淺色，提示不見
+    fake.answer(Some(egui::Theme::Light));
+    let sent = window_themes(&mut h, 3);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert!(!h.ctx.global_style().visuals.dark_mode);
+    assert!(luma(control_bar_fill(&h)) > 200, "淺色的控制列");
+    assert_eq!(sent, [egui::SystemTheme::Light], "標題列送淺色（不是系統預設）");
+    assert!(h.query_by_label_contains("偵測不到系統的深淺色設定").is_none());
+    // 沒變不重送
+    assert_eq!(window_themes(&mut h, 3), []);
+    // 系統改成深色（SettingChanged）
+    fake.answer(Some(egui::Theme::Dark));
+    assert_eq!(window_themes(&mut h, 3), [egui::SystemTheme::Dark]);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(control_bar_fill(&h), egui::Color32::from_gray(24));
+    // 強制淺色：系統是深色也一樣，標題列也是淺色
+    let sent = pick_theme(&mut h, "跟隨系統", "淺色");
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert_eq!(sent, [egui::SystemTheme::Light]);
+    // 系統改成淺色、再回到跟隨系統：用最新的回答，不再問一次（一直在注意）
+    fake.answer(Some(egui::Theme::Light));
+    assert_eq!(window_themes(&mut h, 3), [], "看到的沒變");
+    let sent = pick_theme(&mut h, "淺色", "跟隨系統");
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    assert_eq!(sent, [], "看到的沒變：不送，也不送系統預設");
+    assert_eq!(fake.watched(), 1);
+    // portal 不見了之後回答不了（None）：深色，提示又出現
+    fake.answer(None);
+    assert_eq!(window_themes(&mut h, 3), [egui::SystemTheme::Dark]);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    h.get_by_label("偵測不到系統的深淺色設定，暫時用深色");
+}
+
+#[test]
+fn portal_is_asked_only_after_choosing_follow_system() {
+    let fake = FakeThemeSource::default();
+    let launch = Launch {
+        theme_source: Some(Box::new(fake.clone())),
+        ..Default::default()
+    };
+    // 深色（預設）：不連 portal
+    let mut h = harness_like_eframe_launch(launch, Settings::default(), None);
+    assert_eq!(fake.watched(), 0, "沒選跟隨系統時不問");
+    assert!(!h.ctx.options(|o| o.sync_window_theme));
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    let sent = pick_theme(&mut h, "深色", "淺色");
+    assert_eq!(sent, [egui::SystemTheme::Light], "強制的選擇也由 App 送");
+    assert_eq!(fake.watched(), 0);
+    // 選跟隨系統：開始問，還沒回答時是深色
+    let sent = pick_theme(&mut h, "淺色", "跟隨系統");
+    assert_eq!(fake.watched(), 1);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    assert_eq!(sent, [egui::SystemTheme::Dark]);
+    fake.answer(Some(egui::Theme::Light));
+    assert_eq!(window_themes(&mut h, 3), [egui::SystemTheme::Light]);
+    // 換來換去也只開始一次
+    pick_theme(&mut h, "跟隨系統", "深色");
+    pick_theme(&mut h, "深色", "跟隨系統");
+    assert_eq!(fake.watched(), 1);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+}
+
+#[test]
+fn title_bar_theme_is_sent_again_when_the_window_gets_focus_back() {
+    // Windows：選了深色、系統是淺色。系統每次廣播設定變更，winit 就把標題列改回系統的淺色；
+    // 視窗重新取得焦點時（例如改完系統設定回到影戲）再送一次深色
+    let mut h = harness_like_eframe(Settings::default(), Some(egui::Theme::Light));
+    set_focused(&mut h, true);
+    assert_eq!(window_themes(&mut h, 2), [], "一直有焦點：不送");
+    set_focused(&mut h, false);
+    assert_eq!(window_themes(&mut h, 2), []);
+    set_focused(&mut h, true);
+    let again: &[egui::SystemTheme] = if cfg!(windows) {
+        &[egui::SystemTheme::Dark]
+    } else {
+        // macOS 強制的外觀不會被改回去；Linux 的標題列由 App 自己管
+        &[]
+    };
+    assert_eq!(window_themes(&mut h, 3), again);
+    // 淺色也一樣
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    let sent = pick_theme(&mut h, "深色", "淺色");
+    assert_eq!(sent, [egui::SystemTheme::Light], "egui 自己送一次（偏好變了）");
+    set_focused(&mut h, false);
+    window_themes(&mut h, 2);
+    set_focused(&mut h, true);
+    let again: &[egui::SystemTheme] = if cfg!(windows) {
+        &[egui::SystemTheme::Light]
+    } else {
+        &[]
+    };
+    assert_eq!(window_themes(&mut h, 3), again);
+    // 跟隨系統：系統的廣播本來就是對的，不送
+    let sent = pick_theme(&mut h, "淺色", "跟隨系統");
+    assert_eq!(sent, [egui::SystemTheme::SystemDefault]);
+    set_focused(&mut h, false);
+    window_themes(&mut h, 2);
+    set_focused(&mut h, true);
+    assert_eq!(window_themes(&mut h, 3), []);
+}
+
+/// 跑 `n` 幀，每一幀之前先跑 `raw_input_hook`（像 eframe）。eframe 的 hook 改的是這一批輸入的複本，
+/// winit（egui-winit）自己記的系統深淺色不變；kittest 會把這一批的值留到下一幀，所以跑完改回來
+fn hooked_steps(h: &mut Harness<'_, VitascopeApp>, n: usize) {
+    for _ in 0..n {
+        let winit = h.input().system_theme;
+        hooked_window_step(h);
+        h.input_mut().system_theme = winit;
+    }
+}
+
+#[test]
+fn stale_system_theme_is_replaced_after_switching_back_to_follow_system() {
+    // macOS：淺色啟動 → 選深色（強制）→ 系統改成深色（winit 不理，一直回報淺色）→ 選跟隨系統。
+    // 這時 winit 不會通知（它看到的沒變），要讀一次系統現在的外觀
+    let os = Arc::new(std::sync::Mutex::new(Some(egui::Theme::Dark)));
+    let read = os.clone();
+    let launch = Launch {
+        os_appearance: Some(Arc::new(move || *read.lock().unwrap())),
+        ..Default::default()
+    };
+    let mut h = harness_like_eframe_launch(launch, Settings::default(), Some(egui::Theme::Light));
+    hooked_steps(&mut h, 2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "強制深色");
+    h.key_press(egui::Key::F5);
+    hooked_steps(&mut h, 2);
+    h.get_by_value("深色").click();
+    hooked_steps(&mut h, 2);
+    h.get_by_label("跟隨系統").click();
+    hooked_steps(&mut h, 3);
+    assert_eq!(h.state().settings().theme, ThemeChoice::System);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "系統現在是深色（不是 winit 的舊值）");
+    assert!(h.ctx.global_style().visuals.dark_mode);
+    // 系統改回淺色：winit 通知了，但值跟它的舊值一樣（看不出來）→ 照樣跟著換
+    *os.lock().unwrap() = Some(egui::Theme::Light);
+    hooked_steps(&mut h, 2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    // 系統又改成深色：winit 回報的變了（真的 ThemeChanged）→ 之後照 winit 的
+    *os.lock().unwrap() = Some(egui::Theme::Dark);
+    h.input_mut().system_theme = Some(egui::Theme::Dark);
+    hooked_steps(&mut h, 2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+    *os.lock().unwrap() = Some(egui::Theme::Light);
+    hooked_steps(&mut h, 2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "winit 已經對了：不再看讀到的");
+}
+
+#[test]
+fn stale_system_theme_fix_stops_when_a_fixed_theme_is_chosen() {
+    let os = Arc::new(std::sync::Mutex::new(Some(egui::Theme::Dark)));
+    let read = os.clone();
+    let launch = Launch {
+        os_appearance: Some(Arc::new(move || *read.lock().unwrap())),
+        ..Default::default()
+    };
+    let mut h = harness_like_eframe_launch(launch, Settings::default(), Some(egui::Theme::Light));
+    hooked_steps(&mut h, 2);
+    h.key_press(egui::Key::F5);
+    hooked_steps(&mut h, 2);
+    h.get_by_value("深色").click();
+    hooked_steps(&mut h, 2);
+    h.get_by_label("跟隨系統").click();
+    hooked_steps(&mut h, 3);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark, "前提：蓋掉了 winit 的舊值");
+    // 換成淺色、系統改成淺色（winit 還是不理）、再換回跟隨系統：讀到的跟 winit 的一樣，不蓋
+    h.get_by_value("跟隨系統").click();
+    hooked_steps(&mut h, 2);
+    h.get_by_label("淺色").click();
+    hooked_steps(&mut h, 3);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    *os.lock().unwrap() = Some(egui::Theme::Light);
+    h.get_by_value("淺色").click();
+    hooked_steps(&mut h, 2);
+    h.get_by_label("跟隨系統").click();
+    hooked_steps(&mut h, 3);
+    assert_eq!(h.ctx.theme(), egui::Theme::Light);
+    // winit 收到系統改成深色：照 winit 的（讀到的不看了）
+    h.input_mut().system_theme = Some(egui::Theme::Dark);
+    hooked_steps(&mut h, 2);
+    assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+}
+
 // ───────────── 快捷鍵對照表 ─────────────
 
 /// 這一幀有沒有畫出內容剛好是 `text` 的文字

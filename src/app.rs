@@ -1,6 +1,7 @@
 //! 播放器視窗：影片畫面、控制列、快捷鍵、全螢幕。
 
 mod after_playback;
+mod appearance;
 mod bookmarks_panel;
 mod capture;
 mod control_panel;
@@ -443,6 +444,8 @@ pub struct VitascopeApp {
     media: media::MediaUi,
     /// 視窗模式（一般視窗、迷你播放器）：切換中要等的事、一般視窗要還原的位置大小
     modes: window_modes::ModeUi,
+    /// 外觀：跟隨系統的深淺色從哪裡來（Linux 的 portal）、標題列的深淺色
+    appearance: appearance::Appearance,
     /// 讓螢幕不關閉、電腦不睡眠的方法（None = 不要求），和上次要求的
     inhibitor: Option<Arc<dyn Inhibitor>>,
     inhibit_sent: Want,
@@ -704,6 +707,14 @@ pub struct Launch {
     /// 測試用：macOS 子母畫面改的視窗（比例鎖、Spaces 行為）換成假的，看 app 叫了什麼；None = 主視窗（自動測試沒有視窗：不改）
     #[doc(hidden)]
     pub pip_window: Option<Box<dyn crate::window_mode::PipWindow>>,
+    /// 跟隨系統時另外問系統深淺色的地方：Linux 的 main.rs 設成桌面的設定 portal（winit 在 Linux 不回報）。
+    /// 預設 None（自動測試、`--shot`：不連使用者的 D-Bus；Windows、macOS 由 winit 回報）。
+    /// 有的時候標題列的深淺色也由 App 自己送（X11 的「系統預設」一律是深色）
+    pub theme_source: Option<Box<dyn crate::theme::ThemeSource>>,
+    /// 測試用：當成 macOS，用這個讀系統現在的外觀（換回跟隨系統時 winit 回報的可能是舊的）；
+    /// None = 這個平台的（macOS 讀 NSApp，其他系統不用）
+    #[doc(hidden)]
+    pub os_appearance: Option<crate::theme::OsAppearance>,
 }
 
 impl VitascopeApp {
@@ -711,8 +722,8 @@ impl VitascopeApp {
         crate::i18n::set_lang(settings.language);
         crate::fonts::install_cjk(&cc.egui_ctx);
         // 一定要明確設主題偏好：eframe 預設跟隨系統，只設深色樣式的話系統是淺色時第一幀就變成淺色
-        theme::install(&cc.egui_ctx);
-        theme::apply(&cc.egui_ctx, settings.theme);
+        let mut appearance = appearance::Appearance::new(launch.theme_source, launch.os_appearance);
+        appearance.start(&cc.egui_ctx, settings.theme);
 
         // 啟動時音量最多 100%：上次放大到 150% 也從 100% 開始，開啟時不會突然很大聲（set_volume 限制在 0–100）
         let _ = player.set_volume(settings.volume);
@@ -919,6 +930,7 @@ impl VitascopeApp {
             system: launch.system,
             media,
             modes: window_modes::ModeUi::new(launch.screen_areas),
+            appearance,
             inhibitor: launch.inhibitor,
             inhibit_sent: Want::Nothing,
             power_caps: PowerCaps::default(),
@@ -1934,13 +1946,6 @@ impl VitascopeApp {
             }
             _ => {}
         }
-    }
-
-    /// 換外觀：馬上套用、存檔
-    fn set_theme(&mut self, ctx: &egui::Context, choice: ThemeChoice) {
-        self.settings.theme = choice;
-        theme::apply(ctx, choice);
-        self.save_settings();
     }
 
     /// 選單「載入字幕檔…」「載入音軌檔…」：從目前影片的資料夾開始找
@@ -4915,6 +4920,8 @@ impl eframe::App for VitascopeApp {
             self.countdown_press_held = ctx.input(|i| i.pointer.any_down());
         }
         self.render_tick(ctx);
+        // 跟隨系統：portal 的回答（Linux）；標題列的深淺色
+        self.theme_tick(ctx);
         for ev in self.player.poll() {
             self.on_player_event(ev);
         }
@@ -4998,9 +5005,11 @@ impl eframe::App for VitascopeApp {
         }
     }
 
-    /// egui 處理這一批輸入之前：子母畫面的系統拖曳結束了卻沒送「放開」時補一個（P-A3）
+    /// egui 處理這一批輸入之前：子母畫面的系統拖曳結束了卻沒送「放開」時補一個（P-A3）；
+    /// macOS 換回跟隨系統後 winit 回報的舊深淺色換成系統現在的（P-C9）
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.fix_lost_release(ctx, raw_input);
+        self.theme_raw_input(raw_input);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

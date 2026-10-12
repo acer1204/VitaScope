@@ -631,7 +631,22 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
     把「關閉螢幕」設成 1 分鐘、播一部 15 分鐘以上的影片不碰電腦，螢幕不會關；只播音樂時 SYSTEM 底下有影戲、螢幕照常關
   - [ ] 手動確認（macOS）：播放時 `pmset -g assertions` 有影戲的 PreventUserIdleDisplaySleep，暫停後消失
   - [ ] 手動確認（Linux）：GNOME、KDE 播放影片時螢幕不會變暗、不會鎖定，暫停後照設定的時間關閉
-- [ ] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
+- [x] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
+  - 深色 / 淺色 / 跟隨系統（A1、F4，`theme.rs`、`app/appearance.rs`）：「設定 → 一般 → 外觀」，預設深色。啟動時兩種主題都放 egui 的
+    標準樣式、明確設定主題偏好（v0.3.0 只設了深色樣式，系統是淺色的 Windows、macOS 第一幀就換成 egui 的淺色樣式）。
+    自己畫的顏色從 `Palette` 拿；影片畫面和蓋在影片上的東西（`dark_overlay`）兩種主題都是深色。跟隨系統：Windows、macOS 由 winit 回報；
+    Linux 的 winit 不回報，問桌面的設定 portal（`org.freedesktop.portal.Settings` 的 `org.freedesktop.appearance` / `color-scheme`，
+    zbus 的背景執行緒：先訂閱 `SettingChanged` 再 `ReadOne`，舊的 portal 用 `Read`；1 深色，0 / 2 淺色），回答放在 egui 的
+    `fallback_theme`；第一次選跟隨系統時才連（真的只在 main.rs 接上，`Launch.theme_source`），斷線時保留最後的值、30 秒後再連，
+    問不到時用深色並在設定頁說明。標題列：Windows 選了深色或淺色時，視窗重新取得焦點就再送一次（winit 沒記下來，系統的設定廣播會改回系統的顏色）；
+    Linux 由 App 自己送看到的深淺色、關掉 egui 的同步（egui 的「系統預設」在 X11 一律是深色）；macOS 換回跟隨系統時 winit 回報的可能是舊的，
+    讀 NSApp 的外觀在 `raw_input_hook` 蓋掉，直到 winit 回報的變了
+  - 迷你播放器（F1，`window_mode.rs`、`app/window_modes.rs`）：480 寬的小視窗、預設置頂（「迷你播放器置頂」），只留播放、進度、時間、音量、⏳、▣、🗖；
+    進入前記下一般視窗（含最大化），全螢幕、最大化時先離開再縮小（macOS 等視窗大小穩定 300 ms），系統把它變成全螢幕或最大化時回到一般視窗；
+    位置與寬度記在 `compact`（用之前檢查還在螢幕上）；要大視窗的功能先回到一般視窗
+  - 子母畫面（Windows、Linux，F2）：沒有邊框、一律置頂、比例跟影片一樣；拖曳畫面移動（`StartDrag`）、邊緣 8 點拉大小（`BeginResize`），
+    系統的拖曳結束時沒送「放開」就在 `raw_input_hook` 補一個，大小穩定 150 ms 後比例改回影片的；單擊不暫停，滑鼠移上去才有控制項；
+    右鍵選單只有幾項；純音訊不能用
   - 子母畫面（macOS，F3）：系統的邊緣改大小，視窗的內容比例鎖在影片的比例（`contentAspectRatio`），換檔、長寬比、旋轉、裁切
     （mpv 重新設定畫面）之後換成新的；Spaces 行為（每個桌面都有、可以放在別的全螢幕旁邊）盡力而為。回到一般視窗、換成迷你播放器的那一刻
     就解除、還原，所以全螢幕之前一定是原本的行為（`FullScreenAuxiliary` 的視窗自己不能全螢幕）
@@ -639,8 +654,25 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
     （旋轉、裁切、換檔途中不解除、比例鎖被清掉後大小一變就再設、全螢幕之前已經還原成原本的、換成迷你播放器、被系統最大化）；
     macOS CI 的 `tests/pip_mac.rs`（真的 `NSWindow`：設比例、`contentResizeIncrements` 設回 1×1 之後再設、解除後 AppKit 的狀態真的變了、
     Spaces 行為的設定與還原、別的執行緒不碰視窗；主執行緒才能用，所以不用 libtest））
+  （外觀自動：theme 單元測試（兩種樣式、主題偏好與 portal 的回答、`color-scheme` 的值、標題列什麼時候送、macOS 的舊值什麼時候蓋掉、
+  portal 回覆的 `v` 與 `v(v)` 和 `SettingChanged` 用真的 D-Bus 訊息編碼再解開、只有 main.rs 連使用者的 portal）；kittest（像 eframe 一樣
+  系統是淺色時選深色不會被改掉、跟隨系統、設定頁的提示、切換與存檔、淺色主題的控制列與播放清單、蓋在影片上的一律深色、英文介面；
+  假的 portal：回答、改變、問不到、標題列送看到的深淺色、只在選了跟隨系統時才問；重新取得焦點時再送（Windows）；macOS 的舊值）；
+  Linux 在私人的 D-Bus 匯流排上用假的 portal（新的、只有 `Read` 的舊的、別的設定不理、沒有 portal、匯流排不見了保留最後的值、
+  匯流排回來後再連（重新讀、重新訂閱）、連續兩次問不到就放棄、結束時關掉連線、整個 App 接起來跟著換；CI 一定要有 dbus-daemon）；
+  `tests/theme_shot.rs`（`#[ignore]`，真的視窗截圖：淺色主題的控制列、
+  黑的影片畫面）。迷你播放器、子母畫面自動：`window_mode` 單元測試（大小、位置、比例、拉邊緣、補「放開」）；kittest（進入與回到一般視窗、
+  最大化與全螢幕、記住位置、第二個螢幕、Wayland、快捷鍵與選單、子母畫面的拖曳與比例）；實機 `tests/pacing_window.rs`（`#[ignore]`，
+  RTX 3090 + 120 Hz 電視：子母畫面的顯示器同步每格 5 次更新、視窗樣式、回到一般視窗的位置大小））
+  - [ ] 手動確認（Windows）：選深色、系統是淺色時，改一下系統設定（例如強調色、桌布）再回到影戲，標題列仍是深色；淺色、系統是深色也一樣
+  - [ ] 手動確認（Windows）：子母畫面在不同 DPI 的螢幕之間拖曳（225% 電視 ↔ 100% 螢幕），放開後保持影片的比例；Aero Snap 子母畫面之後比例改回來；
+    子母畫面在 120 Hz 電視上開「流暢播放」
+  - [ ] 手動確認（Linux）：GNOME、KDE 選「跟隨系統」時跟著系統的深淺色（改了系統設定馬上換），X11 的標題列也跟著；
+    沒有 portal 的視窗管理員是深色、設定頁有說明
+  - [ ] 手動確認（Linux）：X11 的迷你播放器、子母畫面置頂、拖曳移動、拉邊緣改大小；Wayland 只能改大小（不能置頂、不能指定位置），進入時提示一次
   - [ ] 手動確認（macOS）：子母畫面用觸控板拖曳移動；拉邊緣改大小時一直保持影片的比例（旋轉、裁切之後也是）；全螢幕時進入子母畫面，
-    大小對、沒有標題列；回到一般視窗後綠色按鈕照樣能全螢幕；子母畫面在別的桌面、別的程式的全螢幕上看不看得到（盡力而為，不保證）
+    大小對、沒有標題列；回到一般視窗後綠色按鈕照樣能全螢幕；子母畫面在別的桌面、別的程式的全螢幕上看不看得到（盡力而為，不保證）；
+    選「跟隨系統」時系統改深淺色馬上跟著換；淺色啟動 → 選深色 → 系統改成深色 → 選「跟隨系統」，是深色
     （這裡沒有 Mac，目前只有 CI 的自動測試）
 - [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試
 
@@ -1010,3 +1042,16 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   `windowDidEndLiveResize:`），AppKit 的 `contentAspectRatio` 跟它互斥，設了就清掉。子母畫面的比例鎖只設一次會在使用者第一次拉邊緣時就不見，
   所以大小一變就再設一次（改大小的途中程式照樣在畫）。`collectionBehavior` 的互斥位元（`CanJoinAllSpaces` 與 `MoveToActiveSpace`、
   `FullScreenPrimary` / `Auxiliary` / `None`）同時設時 AppKit 丟例外，要先拿掉。
+- **egui 的 `set_visuals` 只改「目前」那個主題的樣式，而 eframe 預設跟隨系統**：建立 App 時還沒有任何一幀，系統的深淺色還不知道，
+  深色樣式放進本來就是深色的那一份；第一幀 Windows、macOS 回報淺色，egui 就換成它自己的淺色樣式，蓋在寫死的深色面板上
+  （v0.3.0 在淺色系統上的問題）。兩種樣式都要設、主題偏好要明確設。kittest 的 Harness 建立前會自己設成深色，測不出來，
+  測試要像 eframe 一樣把偏好改回跟隨系統、自己給 `system_theme`。
+- **winit 在 Linux 不回報系統的深淺色**（X11、Wayland 都沒有 ThemeChanged），egui 跟隨系統時用 `fallback_theme`：要自己問桌面的設定 portal。
+  portal 的 `Read` 回覆的值多包一層 variant（`v(v)`，舊的 portal 只有它），`ReadOne`（第 2 版起）才是 `v`。另外 X11 的
+  `set_theme(None)`（egui 跟隨系統送的「系統預設」）寫的是 `_GTK_THEME_VARIANT = dark`，所以 Linux 由 App 自己送看到的深淺色。
+- **winit 在 Windows 設標題列的深淺色時沒有記下來**：系統每次廣播設定變更（`WM_SETTINGCHANGE`，常常發生）就照系統的設定改回去，
+  egui 只在主題偏好變了時送一次。重新取得焦點時自己再送（繞過 egui 的快取）。
+- **macOS 的視窗強制外觀時，winit 不理系統的外觀變化**，換回跟隨系統時只在它的說法有變（舊值 ≠ 新值）才通知，
+  所以 egui 的 `system_theme` 可能一直是舊的；系統改回那個舊值時 winit 也會通知，但值一樣看不出來。換回跟隨系統時讀 NSApp 的外觀蓋掉，
+  蓋掉的期間每一批輸入都再讀，winit 回報的值變了才交還給它。kittest 會把 `raw_input_hook` 改過的 `system_theme` 留到下一幀（eframe 不會），
+  測試要自己改回 winit 的值。

@@ -170,7 +170,7 @@ impl VitascopeApp {
                     });
                 ui.end_row();
                 // 提示緊接在外觀下面（不要跑到視窗置頂那一列底下）
-                if crate::theme::system_unknown(ui.ctx(), self.settings.theme) {
+                if self.system_theme_unknown(ui.ctx()) {
                     ui.label("");
                     ui.weak(tr!(
                         "偵測不到系統的深淺色設定，暫時用深色",
