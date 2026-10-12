@@ -48,9 +48,11 @@ impl VitascopeApp {
     fn preview_allowed(&self) -> bool {
         let st = &self.player.state;
         // 本機的 HLS .m3u8 也是串流（片段在網路上）
+        // 子母畫面太小，不顯示預覽畫面（P-C7）
         st.loaded
             && st.has_video()
             && self.autoshot.is_none()
+            && !self.pip()
             && st
                 .path
                 .as_deref()
@@ -163,5 +165,12 @@ impl VitascopeApp {
     pub fn preview_shown(&self) -> Option<(u32, [usize; 2])> {
         let b = self.preview.last?;
         Some((b, self.preview.textures.get(&b)?.size()))
+    }
+
+    /// 測試用：忘記上一次畫的縮圖（做好的留著），之後 `preview_shown` 只看得到之後畫的
+    #[doc(hidden)]
+    pub fn forget_preview_shown(&mut self) {
+        self.preview.last = None;
+        self.preview.requested = None;
     }
 }

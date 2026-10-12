@@ -594,8 +594,8 @@ fn fixed_rows(platform: keymap::Platform, backspace_free: bool) -> Vec<(String, 
         (
             "Esc".to_owned(),
             tr!(
-                "關閉視窗、離開迷你播放器或全螢幕、取消正在連線的網址",
-                "Close a window, leave the mini player or fullscreen, cancel a URL that's connecting"
+                "關閉視窗、離開迷你播放器、子母畫面或全螢幕、取消正在連線的網址",
+                "Close a window, leave the mini player, picture-in-picture or fullscreen, cancel a URL that's connecting"
             ),
         ),
         (

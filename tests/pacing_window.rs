@@ -40,6 +40,14 @@ fn pacing_sample(name: &str) -> PathBuf {
     p
 }
 
+/// 執行中的影戲（`run_with` 的 `watch`；現在只有 Windows 的視窗樣式測試用）
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Watch {
+    pid: u32,
+    /// 到目前為止的記錄（stderr）
+    stderr: String,
+}
+
 /// 一次執行的結果
 struct Run {
     dir: PathBuf,
@@ -61,6 +69,19 @@ fn run_media(name: &str, settings: &str, env: &[(&str, &str)], media: &Path) -> 
 
 /// 同上，開始播放後 `delay` 秒截圖
 fn run_full(name: &str, settings: &str, env: &[(&str, &str)], media: &Path, delay: f64) -> Run {
+    run_with(name, settings, env, media, delay, true, |_| {})
+}
+
+/// 同上：`fullscreen` = 以全螢幕啟動；`watch` 在影戲執行中每 0.1 秒呼叫一次（看視窗的狀態之類的）
+fn run_with(
+    name: &str,
+    settings: &str,
+    env: &[(&str, &str)],
+    media: &Path,
+    delay: f64,
+    fullscreen: bool,
+    mut watch: impl FnMut(&Watch),
+) -> Run {
     let _screen = SCREEN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join("vitascope-pacing-window").join(name);
     let _ = std::fs::remove_dir_all(&dir);
@@ -88,9 +109,11 @@ fn run_full(name: &str, settings: &str, env: &[(&str, &str)], media: &Path, dela
         log.display()
     );
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vitascope"));
-    cmd.arg("--new-window")
-        .arg("--fullscreen")
-        .arg(media)
+    cmd.arg("--new-window");
+    if fullscreen {
+        cmd.arg("--fullscreen");
+    }
+    cmd.arg(media)
         .arg("--shot")
         .arg(dir.join("shot.png"))
         .arg("--shot-delay")
@@ -105,11 +128,13 @@ fn run_full(name: &str, settings: &str, env: &[(&str, &str)], media: &Path, dela
         .env_remove("VITASCOPE_TEST_MINIMIZE")
         .env_remove("VITASCOPE_TEST_BUSY_UI")
         .env_remove("VITASCOPE_TEST_STALL")
+        .env_remove("VITASCOPE_TEST_WINDOW_MODE")
         .envs(env.iter().copied())
         .stdout(std::process::Stdio::null())
         .stderr(std::fs::File::create(dir.join("stderr.txt")).unwrap());
     let mut child = cmd.spawn().expect("無法啟動影戲");
     let start = Instant::now();
+    let stderr_path = dir.join("stderr.txt");
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -117,6 +142,19 @@ fn run_full(name: &str, settings: &str, env: &[(&str, &str)], media: &Path, dela
         if start.elapsed() > Duration::from_secs(90) {
             let _ = child.kill();
             panic!("影戲 90 秒還沒結束（{}）", dir.display());
+        }
+        let stderr = String::from_utf8_lossy(&std::fs::read(&stderr_path).unwrap_or_default()).into_owned();
+        // 檢查失敗（panic）時也要關掉影戲，不要留一個視窗在螢幕上
+        let watched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            watch(&Watch {
+                pid: child.id(),
+                stderr,
+            })
+        }));
+        if let Err(e) = watched {
+            let _ = child.kill();
+            let _ = child.wait();
+            std::panic::resume_unwind(e);
         }
         std::thread::sleep(Duration::from_millis(100));
     };
@@ -818,6 +856,290 @@ fn audio_mode_does_not_block_the_interface() {
     }
 }
 
+/// 子母畫面的實機測試用的設定：一直依螢幕同步、靜音
+const SMOOTH_MUTED: &str = r#"{ "smooth": "always", "muted": true }"#;
+
+/// 影戲換視窗模式的記錄：`[vitascope] 視窗模式：一般視窗 → 子母畫面（480×270）` → (從, 到, 大小)
+fn mode_switches(stderr: &str) -> Vec<(String, String, (f32, f32))> {
+    stderr
+        .lines()
+        .filter_map(|l| {
+            let rest = l.split_once("視窗模式：")?.1;
+            let (from, rest) = rest.split_once(" → ")?;
+            let (to, rest) = rest.split_once('（')?;
+            let size = rest.split(['）', '，']).next()?;
+            let (w, h) = size.split_once('×')?;
+            Some((from.to_owned(), to.to_owned(), (w.parse().ok()?, h.parse().ok()?)))
+        })
+        .collect()
+}
+
+/// 子母畫面也照樣依螢幕同步（RTX 3090 + 120 Hz 電視）：全螢幕開始播放，第 3 秒換成子母畫面、第 9 秒回到一般視窗；
+/// 換好之後（4–8.5 秒、10 秒到截圖前）每格都是剛好 5 次螢幕更新（≥ 99.5%），mpv 一直等得到畫面
+#[test]
+#[ignore = "會在螢幕上開視窗（約 15 秒），中途換成子母畫面再回到一般視窗；在開發機上手動跑"]
+fn pip_keeps_display_sync() {
+    let r = run(
+        "pip-sync",
+        SMOOTH_MUTED,
+        &[("VITASCOPE_TEST_WINDOW_MODE", "pip@3,normal@9")],
+    );
+    let switches = mode_switches(&r.stderr);
+    eprintln!("視窗模式：{switches:?}");
+    assert!(
+        switches.iter().any(|(f, t, _)| f == "一般視窗" && t == "子母畫面"),
+        "沒有換成子母畫面：\n{}",
+        r.stderr
+    );
+    assert!(
+        switches.iter().any(|(f, t, _)| f == "子母畫面" && t == "一般視窗"),
+        "沒有回到一般視窗：\n{}",
+        r.stderr
+    );
+    let fps = assumed_fps(&r.log).unwrap_or_else(|| panic!("mpv 沒有依螢幕同步（{}）\n{}", r.dir.display(), r.stderr));
+    assert!(
+        (fps - 120.0).abs() < 0.01 || (fps - 119.88).abs() < 0.01,
+        "預期 120 或 119.88 Hz 的螢幕，mpv 用的是 {fps}"
+    );
+    let samples = vsyncs(&r.log);
+    let t0 = samples.first().expect("沒有每格的同步記錄（cplayer trace）").0;
+    for (name, from, to, least) in [
+        ("子母畫面", t0 + 4.0, t0 + 8.5, 100),
+        ("回到一般視窗後", t0 + 10.0, t0 + SHOT_DELAY - 0.3, 40),
+    ] {
+        let (total, fives, hist) = cadence(&samples, from, to);
+        let ratio = fives as f64 / total.max(1) as f64;
+        eprintln!(
+            "{name}：{fives}/{total} 格是 5 次（{:.2}%），分布 {hist:?}",
+            ratio * 100.0
+        );
+        assert!(total >= least, "{name}：格數太少 {total}");
+        assert!(
+            ratio >= 0.995,
+            "{name}：每格 5 次的比例 {:.2}% 不到 99.5%：{hist:?}",
+            ratio * 100.0
+        );
+    }
+    let pos = shot_position(&r.stderr).expect("沒有截圖時的播放位置");
+    let shot = t0 + pos + 0.05;
+    let stuck: Vec<f64> = stuck(&r.log)
+        .into_iter()
+        .filter(|t| (t0 + 1.0..shot).contains(t))
+        .collect();
+    assert!(stuck.is_empty(), "播放中 mpv 等不到畫面（截圖在 {shot:.3}）：{stuck:?}");
+}
+
+/// 從一般視窗換成子母畫面再回來：子母畫面是影片的比例，回到一般視窗時的大小跟換之前一樣（記錄裡的還原大小）；
+/// Windows 再看真的視窗：回來之後外框的位置、大小、內容大小都跟換之前一樣（±1 像素）
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒），中途換成子母畫面再回到一般視窗；在開發機上手動跑"]
+fn pip_and_back_restore_geometry() {
+    // Windows：換之前（連續兩次看到一樣的，不是正在變的）、回來之後（有標題列）的真的視窗
+    #[cfg(windows)]
+    let (mut before, mut prev, mut back_win) = (None::<Look>, None::<Look>, None::<Look>);
+    let r = run_with(
+        "pip-geometry",
+        r#"{ "muted": true }"#,
+        &[("VITASCOPE_TEST_WINDOW_MODE", "pip@2,normal@5")],
+        &sample(),
+        8.0,
+        false,
+        |_w| {
+            #[cfg(windows)]
+            {
+                let Some(s) = main_window(_w.pid) else {
+                    return;
+                };
+                let fitted = _w.stderr.contains("視窗配合影片");
+                let entered = _w.stderr.contains("視窗模式：一般視窗 → 子母畫面");
+                let left = _w.stderr.contains("視窗模式：子母畫面 → 一般視窗");
+                if fitted && !entered && prev == Some(s) {
+                    before = Some(s);
+                }
+                prev = Some(s);
+                if left && s.outer.1 > s.client.1 {
+                    back_win = Some(s);
+                }
+            }
+        },
+    );
+    let switches = mode_switches(&r.stderr);
+    eprintln!("視窗模式：{switches:?}");
+    let entered = switches
+        .iter()
+        .find(|(f, t, _)| f == "一般視窗" && t == "子母畫面")
+        .unwrap_or_else(|| panic!("沒有換成子母畫面：\n{}", r.stderr));
+    // 平移影片是 16:9
+    let (w, h) = entered.2;
+    assert!((w / h - 16.0 / 9.0).abs() < 0.02, "子母畫面的比例：{w}×{h}");
+    let back = switches
+        .iter()
+        .find(|(f, t, _)| f == "子母畫面" && t == "一般視窗")
+        .unwrap_or_else(|| panic!("沒有回到一般視窗：\n{}", r.stderr));
+    // 換之前的一般視窗：影戲配合影片調整過的大小（記錄的「視窗配合影片」）
+    let fitted = r
+        .stderr
+        .lines()
+        .find_map(|l| {
+            let size = l.split_once("[vitascope] 視窗配合影片 ")?.1.split_once(" → ")?.1;
+            let (w, h) = size.trim().split_once('×')?;
+            Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))
+        })
+        .unwrap_or_else(|| panic!("沒有配合影片調整視窗的記錄：\n{}", r.stderr));
+    assert_eq!(back.2, fitted, "回到換之前的大小：\n{}", r.stderr);
+    #[cfg(windows)]
+    {
+        let before = before.unwrap_or_else(|| panic!("沒看到換之前的視窗：\n{}", r.stderr));
+        let back = back_win.unwrap_or_else(|| panic!("沒看到回來之後的視窗：\n{}", r.stderr));
+        eprintln!("換之前 {before:?}\n回來後 {back:?}");
+        let close = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs() <= 1 && (a.1 - b.1).abs() <= 1;
+        assert!(
+            close(before.pos, back.pos) && close(before.outer, back.outer) && close(before.client, back.client),
+            "真的視窗回到換之前的位置大小：換之前 {before:?}，回來後 {back:?}"
+        );
+        assert!(!back.top, "回來後不置頂");
+    }
+}
+
+/// `--shot` 截的是子母畫面（`VITASCOPE_TEST_WINDOW_MODE=pip@1`）：截圖就是影片，比例跟影片一樣（±1%）
+#[test]
+#[ignore = "會在螢幕上開視窗（約 5 秒），換成子母畫面後截圖；在開發機上手動跑"]
+fn pip_screenshot_has_the_video_aspect() {
+    let r = run_with(
+        "pip-shot",
+        r#"{ "muted": true }"#,
+        &[("VITASCOPE_TEST_WINDOW_MODE", "pip@1")],
+        &sample(),
+        3.0,
+        false,
+        |_| {},
+    );
+    assert!(
+        mode_switches(&r.stderr)
+            .iter()
+            .any(|(f, t, _)| f == "一般視窗" && t == "子母畫面"),
+        "沒有換成子母畫面：
+{}",
+        r.stderr
+    );
+    let shot = vitascope::screenshot::decode_png(&r.dir.join("shot.png")).expect("讀不到截圖");
+    let ratio = shot.w as f64 / shot.h as f64;
+    eprintln!("子母畫面的截圖：{}×{}", shot.w, shot.h);
+    assert!(
+        (ratio / (16.0 / 9.0) - 1.0).abs() < 0.01,
+        "截圖 {}×{} 不是 16:9",
+        shot.w,
+        shot.h
+    );
+}
+
+/// Windows：視窗的樣子（實體像素）
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Look {
+    /// 置頂（WS_EX_TOPMOST）
+    top: bool,
+    /// 外框左上角、外框大小、內容大小
+    pos: (i32, i32),
+    outer: (i32, i32),
+    client: (i32, i32),
+}
+
+#[cfg(windows)]
+fn look(hwnd: windows_sys::Win32::Foundation::HWND) -> Look {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetClientRect, GetWindowLongPtrW, GetWindowRect, WS_EX_TOPMOST,
+    };
+    // SAFETY: RECT 是純資料；hwnd 是影戲還開著的視窗（關掉的話這些呼叫只會失敗）
+    let (ex, outer, client) = unsafe {
+        let mut outer: RECT = std::mem::zeroed();
+        let mut client: RECT = std::mem::zeroed();
+        GetWindowRect(hwnd, &mut outer);
+        GetClientRect(hwnd, &mut client);
+        (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32, outer, client)
+    };
+    Look {
+        top: ex & WS_EX_TOPMOST != 0,
+        pos: (outer.left, outer.top),
+        outer: (outer.right - outer.left, outer.bottom - outer.top),
+        client: (client.right - client.left, client.bottom - client.top),
+    }
+}
+
+/// Windows：這個程式（`pid`）看得到的頂層視窗裡最大的那個（主視窗；另外還有幾點大的輔助視窗）。
+/// 內容小於 100×50 的不算：截完圖結束時主視窗會先變成 0×0（那時看到的不是回到一般視窗的樣子）
+#[cfg(windows)]
+fn main_window(pid: u32) -> Option<Look> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
+    struct Find {
+        pid: u32,
+        found: Vec<Look>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> i32 {
+        // SAFETY: lparam 是下面傳進來的 &mut Find，EnumWindows 回傳前都有效
+        let find = unsafe { &mut *(lparam as *mut Find) };
+        let mut owner = 0u32;
+        // SAFETY: hwnd 是 EnumWindows 給的視窗
+        unsafe { GetWindowThreadProcessId(hwnd, &mut owner) };
+        // SAFETY: 同上
+        if owner == find.pid && unsafe { IsWindowVisible(hwnd) } != 0 {
+            find.found.push(look(hwnd));
+        }
+        1
+    }
+    let mut find = Find { pid, found: Vec::new() };
+    // SAFETY: callback 只在這個呼叫期間用 `find`
+    unsafe { EnumWindows(Some(each), &mut find as *mut Find as LPARAM) };
+    find.found
+        .into_iter()
+        .filter(|l| l.client.0 >= 100 && l.client.1 >= 50)
+        .max_by_key(|l| l.outer.0 * l.outer.1)
+}
+
+/// Windows：子母畫面沒有標題列、邊框（內容蓋滿整個視窗）、一律置頂（WS_EX_TOPMOST）；
+/// 回到一般視窗後標題列回來、不置頂（「視窗置頂」預設不置頂）。
+/// winit 的無邊框不拿掉 WS_CAPTION（Aero Snap 要它），是在 WM_NCCALCSIZE 把非內容區變成 0：看的是外框跟內容一樣大
+#[cfg(windows)]
+#[test]
+#[ignore = "會在螢幕上開視窗（約 10 秒），中途換成子母畫面再回到一般視窗；在開發機上手動跑"]
+fn pip_window_styles_windows() {
+    let mut in_pip = None;
+    let mut back = None;
+    let r = run_with(
+        "pip-styles",
+        r#"{ "muted": true }"#,
+        &[("VITASCOPE_TEST_WINDOW_MODE", "pip@2,normal@5")],
+        &sample(),
+        8.0,
+        false,
+        |w| {
+            let Some(s) = main_window(w.pid) else {
+                return;
+            };
+            let entered = w.stderr.contains("視窗模式：一般視窗 → 子母畫面");
+            let left = w.stderr.contains("視窗模式：子母畫面 → 一般視窗");
+            // 換好之後（標題列已經拿掉、標題列已經回來）才記：記錄出現時指令可能還沒做完
+            if entered && !left && s.outer == s.client {
+                in_pip = Some(s);
+            }
+            if left && s.outer.1 > s.client.1 {
+                back = Some(s);
+            }
+        },
+    );
+    let s = in_pip.unwrap_or_else(|| panic!("子母畫面的標題列沒有拿掉：\n{}", r.stderr));
+    eprintln!("子母畫面：{s:?}");
+    assert!(s.top, "子母畫面置頂");
+    let ratio = f64::from(s.client.0) / f64::from(s.client.1);
+    assert!((ratio - 16.0 / 9.0).abs() < 0.02, "16:9：{s:?}");
+    let s = back.unwrap_or_else(|| panic!("回到一般視窗後標題列沒有回來：\n{}", r.stderr));
+    eprintln!("回到一般視窗：{s:?}");
+    assert!(!s.top, "一般視窗不置頂");
+    assert!(s.outer.1 > s.client.1, "有標題列：外框比內容高");
+}
+
 #[test]
 fn log_parsing() {
     let log = "[   1.096][t][cplayer] s=1.001000 vsyncs=5 dur=0.041708 ratio=5.000000 err=0\n\
@@ -854,4 +1176,15 @@ fn log_parsing() {
     assert!(avsync_after(stderr, "沒有這行").is_empty());
     assert_eq!(longest_stuck(&[1.0, 4.0, 4.2, 4.4, 4.6, 9.0, 9.2]), (4, 4.6));
     assert_eq!(longest_stuck(&[]), (0, 0.0));
+    assert_eq!(
+        mode_switches(
+            "[vitascope] 視窗模式：一般視窗 → 子母畫面（480×270）\n\
+             [vitascope] 視窗模式：子母畫面 → 一般視窗（960×540，最大化）\n\
+             [vitascope] 視窗模式：迷你播放器被系統改成最大化，回到一般視窗\n"
+        ),
+        vec![
+            ("一般視窗".to_owned(), "子母畫面".to_owned(), (480.0, 270.0)),
+            ("子母畫面".to_owned(), "一般視窗".to_owned(), (960.0, 540.0)),
+        ]
+    );
 }

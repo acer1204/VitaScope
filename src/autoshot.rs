@@ -3,6 +3,7 @@
 //! 截的是 egui 實際畫出來的整個視窗，所以能驗證 mpv → FBO → 視窗這條渲染路徑，
 //! 不需要外部工具控制螢幕；之後 CI 的介面測試也用這個。
 
+use crate::window_mode::WindowMode;
 use eframe::egui::{self, ViewportCommand};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,6 +22,9 @@ pub struct AutoShot {
     busy: bool,
     /// 開始播放後第幾秒讓介面卡住多久（模擬開著對話框、拖動視窗；見 `stall_at`）
     stall: Option<(Duration, Duration)>,
+    /// 開始播放後這些時間換視窗模式（子母畫面的實機測試，見 `window_mode::parse_test_modes`）、已經換了幾個
+    modes: Vec<(WindowMode, Duration)>,
+    modes_done: usize,
 }
 
 /// `VITASCOPE_TEST_MINIMIZE=3,6`：開始播放後第 3 秒縮到最小、第 6 秒還原（可以再接下去，輪流）。
@@ -58,7 +62,33 @@ impl AutoShot {
             minimize_done: 0,
             busy: false,
             stall: None,
+            modes: Vec::new(),
+            modes_done: 0,
         }
+    }
+
+    /// `VITASCOPE_TEST_WINDOW_MODE=pip@3,normal@9`：開始播放後這些時間換視窗模式（照時間排好的）
+    pub fn window_modes_at(mut self, modes: Vec<(WindowMode, Duration)>) -> Self {
+        self.modes = modes;
+        self
+    }
+
+    /// 時間到了要換的視窗模式（一次一個；還沒開始計時、截圖之後都沒有）
+    pub fn due_mode(&mut self) -> Option<WindowMode> {
+        let elapsed = self.start?.elapsed();
+        if self.requested {
+            return None;
+        }
+        let (mode, at) = *self.modes.get(self.modes_done)?;
+        (elapsed >= at).then(|| {
+            self.modes_done += 1;
+            eprintln!(
+                "[vitascope] 測試：換成{}（開始播放後 {:.1} 秒）",
+                mode.log_name(),
+                elapsed.as_secs_f64()
+            );
+            mode
+        })
     }
 
     /// 開始播放後 `at` 讓介面執行緒停 `len`（像以前開著檔案對話框、拖曳視窗；見 `parse_stall`）
@@ -130,6 +160,7 @@ impl AutoShot {
                 .copied()
                 .into_iter()
                 .chain(self.stall.map(|(at, _)| at))
+                .chain(self.modes.get(self.modes_done).map(|(_, at)| *at))
                 .fold(self.delay, Duration::min);
             ctx.request_repaint_after(next.saturating_sub(elapsed));
             return false;
@@ -240,6 +271,26 @@ mod tests {
             center_luma(&egui::ColorImage::filled([0, 0], egui::Color32::BLACK)),
             0.0
         );
+    }
+
+    /// `VITASCOPE_TEST_WINDOW_MODE`：開始播放後才算時間，照順序一次換一個；時間還沒到不換
+    #[test]
+    fn window_modes_fire_in_order_after_playback_starts() {
+        let s = Duration::from_secs;
+        let mut shot = AutoShot::new(PathBuf::from("x.png"), s(60))
+            .window_modes_at(vec![(WindowMode::Pip, s(0)), (WindowMode::Normal, s(0))]);
+        assert_eq!(shot.due_mode(), None, "還沒開始播放");
+        shot.arm();
+        assert_eq!(shot.due_mode(), Some(WindowMode::Pip));
+        assert_eq!(shot.due_mode(), Some(WindowMode::Normal));
+        assert_eq!(shot.due_mode(), None);
+        let mut shot = AutoShot::new(PathBuf::from("x.png"), s(60)).window_modes_at(vec![(WindowMode::Pip, s(3600))]);
+        shot.arm();
+        assert_eq!(shot.due_mode(), None, "時間還沒到");
+        // 沒有設定：都沒有
+        let mut shot = AutoShot::new(PathBuf::from("x.png"), s(60));
+        shot.arm();
+        assert_eq!(shot.due_mode(), None);
     }
 
     #[test]

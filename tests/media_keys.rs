@@ -1192,6 +1192,55 @@ fn raise_keeps_the_mini_player() {
     assert_eq!(h.state().window_mode(), vitascope::window_mode::WindowMode::Mini);
 }
 
+/// 子母畫面開著時，系統的媒體控制叫視窗到前面：只叫到前面，不離開子母畫面、標題列不加回來（S-B9）
+#[test]
+fn raise_keeps_pip() {
+    let dir = TempDir::new("raise-pip");
+    let fake = FakeMedia::new();
+    let mut h = with_media(&fake, vec![dir.clip("a.mp4")], dir.settings());
+    step_until_app(&mut h, "a.mp4 開始播放", |app| playing(app, "a.mp4"));
+    step_until(&mut h, "工作階段建立了", || fake.created() == 1);
+    step_until_app(&mut h, "視窗配合影片調整完", |app| !app.window_fit_pending());
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        });
+    }
+    h.step();
+    assert_eq!(h.state().window_mode(), vitascope::window_mode::WindowMode::Pip);
+    step_until_app(&mut h, "子母畫面換好", |app| !app.window_mode_pending());
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .minimized = Some(true);
+    fake.send(MediaCommand::Raise);
+    h.step();
+    let cmds = viewport_commands(&h);
+    assert!(cmds.contains(&egui::ViewportCommand::Focus), "{cmds:?}");
+    assert!(cmds.contains(&egui::ViewportCommand::Minimized(false)), "{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::InnerSize(_)
+                | egui::ViewportCommand::MinInnerSize(_)
+                | egui::ViewportCommand::Fullscreen(_)
+                | egui::ViewportCommand::WindowLevel(_)
+                | egui::ViewportCommand::Decorations(_)
+        )),
+        "大小、層級、標題列都不動：{cmds:?}"
+    );
+    h.run_steps(3);
+    assert_eq!(h.state().window_mode(), vitascope::window_mode::WindowMode::Pip);
+}
+
 /// 網路串流在等快取：系統收到「在等」（位置不會前進，不會被當成一直在跳轉），等到了再收到一次
 #[test]
 fn a_stall_for_cache_reaches_the_session() {

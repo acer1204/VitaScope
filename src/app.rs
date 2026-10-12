@@ -238,10 +238,12 @@ enum Action {
     Quit,
     /// 迷你播放器開 / 關（Ctrl（⌘）+ Shift + M、控制列的 🗗、右鍵選單）
     ToggleMini,
-    /// 回到一般視窗（迷你播放器的 🗖、Esc、右鍵選單；雙擊「全螢幕」在迷你播放器裡也是這個）
+    /// 回到一般視窗（迷你播放器、子母畫面的 🗖、Esc、右鍵選單；雙擊「全螢幕」在迷你播放器裡也是這個，子母畫面裡雙擊一律是這個）
     NormalWindow,
     /// 「迷你播放器置頂」開 / 關（設定頁；迷你播放器裡的 Ctrl+T、右鍵選單也走 `set_mini_on_top`）
     SetMiniOnTop(bool),
+    /// 子母畫面開 / 關（Ctrl（⌘）+ Shift + P、右鍵選單、迷你控制列的 ▣）
+    TogglePip,
 }
 
 /// 起始畫面上按的
@@ -1583,6 +1585,7 @@ impl VitascopeApp {
             }
             Action::ExitFullscreen => self.request_fullscreen(ctx, false),
             Action::ToggleMini => self.toggle_mini(ctx),
+            Action::TogglePip => self.toggle_pip(ctx),
             Action::NormalWindow => self.leave_compact(ctx, window_modes::Then::Nothing),
             Action::SetMiniOnTop(on) => self.set_mini_on_top(ctx, on, false),
             // 要大視窗的功能：迷你播放器裡先回到一般視窗（開關類的一律是打開，藏起來的設定視窗不會被這一下關掉）
@@ -1852,6 +1855,10 @@ impl VitascopeApp {
                     self.sync_shape(true);
                 }
                 self.osd(crate::tr!("畫面已重設", "Picture reset"));
+            }
+            // 子母畫面一律置頂（沒有可以切換的）
+            Action::CycleOnTop if self.pip() => {
+                self.osd(crate::tr!("子母畫面一律置頂", "Picture-in-picture always stays on top"))
             }
             // 迷你播放器裡：切換「迷你播放器置頂」（一般視窗的模式在迷你播放器置頂時看不出差別）
             Action::CycleOnTop if self.compact() => {
@@ -2132,6 +2139,10 @@ impl VitascopeApp {
         if self.countdown_on_top() {
             return true;
         }
+        // 子母畫面：一律置頂
+        if self.pip() {
+            return true;
+        }
         // 迷你播放器：「迷你播放器置頂」開著時一律置頂；關掉時照一般視窗的模式
         if self.compact() && self.settings.compact.mini_on_top {
             return true;
@@ -2377,6 +2388,8 @@ impl VitascopeApp {
                 // 不能跳轉的檔案不用 mpv 的 loop-file（跳不回開頭）
                 self.play_order_file_loaded();
                 self.on_file_loaded();
+                // 子母畫面：下一幀看這個檔案有沒有影像（沒有的話換成迷你播放器）
+                self.modes.file_loaded = true;
             }
             // 網站的播放清單（yt-dlp 解析出來的）：跟網路上的 .m3u 一樣展開成播放清單，照一般的開檔開要播的那一個
             PlayerEvent::NetPlaylist {
@@ -2922,6 +2935,7 @@ impl VitascopeApp {
             Command::About => Action::About,
             Command::CycleTheme => Action::CycleTheme,
             Command::MiniPlayer => Action::ToggleMini,
+            Command::Pip => Action::TogglePip,
             Command::OpenFile => Action::Open,
             Command::OpenUrl => Action::OpenUrl,
             Command::Screenshot => Action::Screenshot,
@@ -2958,8 +2972,9 @@ impl VitascopeApp {
     }
 
     fn esc_window_open(&self, w: EscWindow) -> bool {
-        // 迷你播放器裡藏起來的視窗看不到，Esc 不關它們（媒體資訊是蓋在影片上的，看得到）
-        if self.compact() && !matches!(w, EscWindow::MediaInfo) {
+        // 迷你播放器、子母畫面裡藏起來的視窗看不到，Esc 不關它們（媒體資訊是蓋在影片上的，迷你播放器裡看得到；
+        // 子母畫面太小，不畫）
+        if self.compact() && (self.pip() || !matches!(w, EscWindow::MediaInfo)) {
             return false;
         }
         match w {
@@ -3529,7 +3544,13 @@ impl VitascopeApp {
 
     fn video_area(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        let response = ui.allocate_rect(rect, Sense::click());
+        // 子母畫面：拖曳畫面是移動視窗（一般視窗只要點擊：稍微動到的點擊也算點擊）
+        let sense = if self.pip() {
+            Sense::click_and_drag()
+        } else {
+            Sense::click()
+        };
+        let response = ui.allocate_rect(rect, sense);
         // 無障礙資訊：螢幕閱讀器、介面測試（例如打開右鍵選單）找得到影片畫面
         response
             .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, crate::tr!("影片畫面", "Video")));
@@ -3565,6 +3586,14 @@ impl VitascopeApp {
         let blocked = self.countdown_blocks_video();
         if !blocked {
             self.video_mouse(ui.ctx(), &response);
+        }
+        // 子母畫面：拖曳移動、拉邊緣改大小，滑鼠移上去時的控制項（選單開著時點畫面只是關掉選單）
+        if self.pip() {
+            let input = !blocked && !self.popup_open_at_start;
+            self.modes.pip_lift = self.pip_ui(ui, rect, &response, input);
+        } else {
+            self.modes.pip_lift = 0.0;
+            self.modes.pip_controls = false;
         }
 
         // 拖曳檔案到視窗上方時的提示
@@ -3607,7 +3636,10 @@ impl VitascopeApp {
         }
         response.context_menu(|ui| self.context_menu(ui));
 
-        self.paint_info(&ui.ctx().clone(), rect);
+        // 媒體資訊：子母畫面太小不畫（打開時回到一般視窗）
+        if !self.pip() {
+            self.paint_info(&ui.ctx().clone(), rect);
+        }
         self.paint_osd(ui, rect);
     }
 
@@ -3621,11 +3653,17 @@ impl VitascopeApp {
         let now = ctx.input(|i| i.time);
         let max_delay = ctx.options(|o| o.input_options.max_double_click_delay);
         let click = self.settings.keys.mouse.command(MouseInput::Click);
-        if response.double_clicked() {
+        // 子母畫面：單擊只是取得焦點（不暫停，暫停用中間的 ▶ / ⏸），雙擊一律回到一般視窗（設計 §5.10）
+        let click = click.filter(|_| !self.pip());
+        if response.double_clicked() && self.pip() {
+            if self.video_click.take().is_some_and(|c| now - c.time <= max_delay) {
+                self.run(ctx, Action::NormalWindow);
+            }
+        } else if response.double_clicked() {
             // 第一下點在別的地方（例如起始畫面的「最近開啟」）：這一下不算
             if let Some(first) = self.video_click.take().filter(|c| now - c.time <= max_delay) {
-                // 雙擊的選項：全螢幕、迷你播放器（F2 加子母畫面）。
-                // 在迷你播放器裡雙擊「全螢幕」是回到一般視窗（NormalWindow），不是全螢幕（F2：子母畫面也是）
+                // 雙擊的選項：全螢幕、迷你播放器、子母畫面。
+                // 在迷你播放器裡雙擊「全螢幕」是回到一般視窗（NormalWindow），不是全螢幕（子母畫面在上面：雙擊一律回來）
                 match self.settings.keys.mouse.command(MouseInput::DoubleClick) {
                     Some(cmd) => {
                         // 第一下單擊已經切換過暫停（或靜音），這裡切回來，結果只有全螢幕改變（跟 PotPlayer 一樣）
@@ -3740,6 +3778,14 @@ impl VitascopeApp {
     /// 在影片上按右鍵的選單。視窗矮（例如小影片的 640×421）時選單會超出視窗，下面的項目點不到，
     /// 所以放在可以捲動的區域裡
     fn context_menu(&mut self, ui: &mut egui::Ui) {
+        // 子母畫面：視窗小，有子選單的完整選單放不下，只放幾個（P-C7）
+        if self.pip() {
+            if let Some(a) = self.pip_menu_items(ui) {
+                let ctx = ui.ctx().clone();
+                self.run(&ctx, a);
+            }
+            return;
+        }
         // 扣掉選單的邊框和上下的空隙
         let max_height = (ui.ctx().content_rect().height() - 48.0).max(120.0);
         egui::ScrollArea::vertical()
@@ -3910,6 +3956,15 @@ impl VitascopeApp {
             .shortcut_text(self.keymap.hint(Command::MiniPlayer));
         if ui.add(mini).clicked() {
             action = Some(Action::ToggleMini);
+        }
+        // 子母畫面：沒有影像的檔案不能用（看得到、按不了，說明原因）
+        let pip = egui::Button::selectable(false, Command::Pip.label()).shortcut_text(self.keymap.hint(Command::Pip));
+        if ui
+            .add_enabled(!self.pip_unavailable(), pip)
+            .on_disabled_hover_text(Self::pip_unavailable_text())
+            .clicked()
+        {
+            action = Some(Action::TogglePip);
         }
         if compact && menu_item(ui, true, crate::tr!("回到一般視窗", "Back to the normal window"), "Esc") {
             action = Some(Action::NormalWindow);
@@ -4924,6 +4979,15 @@ impl eframe::App for VitascopeApp {
             // 實機測試比對播放位置（縮到最小時聲音照樣播、位置照樣走）
             eprintln!("[vitascope] 截圖時的播放位置：{:.3} 秒", self.player.state.time_pos);
         }
+        // 實機測試（VITASCOPE_TEST_WINDOW_MODE）：時間到了換視窗模式
+        if let Some(mode) = self.autoshot.as_mut().and_then(AutoShot::due_mode) {
+            self.set_window_mode(ctx, mode);
+        }
+    }
+
+    /// egui 處理這一批輸入之前：子母畫面的系統拖曳結束了卻沒送「放開」時補一個（P-A3）
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        self.fix_lost_release(ctx, raw_input);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -4936,7 +5000,11 @@ impl eframe::App for VitascopeApp {
 
         let palette = Palette::of(ui.visuals());
         let panel_frame = Frame::NONE.fill(palette.panel).inner_margin(Margin::symmetric(10, 6));
-        if self.compact() {
+        if self.pip() {
+            // 子母畫面：只有影片（控制項在滑鼠移上去時蓋在影片上）
+            self.controls_height = 0.0;
+            self.pointer_over_controls = false;
+        } else if self.compact() {
             // 迷你播放器：影片下面一列精簡的控制列（固定高度：進入時照這個高度算視窗大小）
             let r = egui::Panel::bottom("mini_controls")
                 .frame(panel_frame)
@@ -5013,6 +5081,10 @@ impl eframe::App for VitascopeApp {
                 self.pointer_over_controls = false;
                 ctx.set_cursor_icon(CursorIcon::None);
             }
+        }
+        // 子母畫面的控制項蓋在影片下面時，字幕也往上推
+        if self.pip() {
+            overlay_height = self.modes.pip_lift;
         }
         self.lift_subtitles(overlay_height);
         // 這一幀畫的對話框自己記下來（下一幀的 handle_keys 看）

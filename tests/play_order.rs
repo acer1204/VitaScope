@@ -1632,6 +1632,112 @@ fn the_countdown_in_the_mini_player_keeps_the_mini_player() {
     assert_eq!(h.state().window_mode(), WindowMode::Mini, "Esc 只取消倒數");
 }
 
+/// Ctrl（⌘）+ Shift + P（同一幀按下、放開），等子母畫面換好
+fn enter_pip(h: &mut Harness<'_, VitascopeApp>) {
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::COMMAND
+            },
+        });
+    }
+    h.step();
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    step_until_app(h, "子母畫面換好", |app| !app.window_mode_pending());
+}
+
+/// 子母畫面裡的倒數（S-B9）：放得下就留在子母畫面（叫到前面，不改大小），倒數畫面整個在視窗裡；
+/// Esc 只取消倒數
+#[test]
+fn the_countdown_in_pip_keeps_pip_when_it_fits() {
+    let (_dir, _path, mut h) = after_case(
+        "after-pip",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            countdown_raise: true,
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    enter_pip(&mut h);
+    let pip = h.ctx.content_rect().size();
+    assert!(pip.x >= 320.0 && pip.y >= 180.0, "前提：預設大小 {pip:?}");
+    seek_near_end(&mut h);
+    let cmds = commands_until(&mut h, "播完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    assert!(cmds.contains(&egui::ViewportCommand::Focus), "叫到前面：{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::InnerSize(_)
+                | egui::ViewportCommand::MinInnerSize(_)
+                | egui::ViewportCommand::Decorations(_)
+        )),
+        "不改大小、不加標題列：{cmds:?}"
+    );
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    h.run_steps(2);
+    let screen = h.ctx.content_rect();
+    let panel = h.get_by_label("播放完畢").rect();
+    assert!(screen.contains_rect(panel), "倒數畫面放得下：{panel:?} 視窗 {screen:?}");
+    for pressed in [true, false] {
+        h.input_mut().events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.step();
+    assert_cancelled(&h, "Esc");
+    h.run_steps(3);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip, "Esc 只取消倒數");
+}
+
+/// 子母畫面被縮得很小（放不下倒數畫面）：倒數開始時回到一般視窗，倒數一定看得到（S-B9）
+#[test]
+fn the_countdown_in_a_tiny_pip_returns_to_the_normal_window() {
+    let (_dir, _path, mut h) = after_case(
+        "after-tiny-pip",
+        Launch {
+            countdown_override: Some(LONG_COUNTDOWN),
+            countdown_raise: true,
+            ..Default::default()
+        },
+        AfterPlayback::Close,
+    );
+    enter_pip(&mut h);
+    let pip = h.ctx.content_rect().size();
+    // 使用者縮到最小附近（比例照舊，不會被改回來）
+    let tiny = egui::vec2(200.0, (200.0 * pip.y / pip.x).round());
+    h.set_size(tiny);
+    h.run_steps(2);
+    seek_near_end(&mut h);
+    let cmds = commands_until(&mut h, "播完：開始倒數", |app| {
+        app.countdown_remaining().is_some()
+    });
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert!(cmds.contains(&egui::ViewportCommand::Decorations(true)), "{cmds:?}");
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, egui::ViewportCommand::InnerSize(s) if s.x >= 640.0)),
+        "還原一般視窗的大小：{cmds:?}"
+    );
+    step_until_app(&mut h, "回到一般視窗", |app| !app.window_mode_pending());
+    h.run_steps(2);
+    let screen = h.ctx.content_rect();
+    let panel = h.get_by_label("播放完畢").rect();
+    assert!(screen.contains_rect(panel), "{panel:?} 視窗 {screen:?}");
+    assert!(h.state().countdown_remaining().is_some(), "倒數照樣進行");
+}
+
 #[test]
 fn after_playback_is_back_to_nothing_after_a_restart() {
     let dir = TempDir::new("after-restart");

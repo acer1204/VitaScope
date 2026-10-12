@@ -17983,11 +17983,17 @@ fn mini_areas() -> Vec<vitascope::screens::Area> {
 const MINI_FRAME: egui::Vec2 = egui::vec2(16.0, 39.0);
 const MINI_INSET: egui::Vec2 = egui::vec2(8.0, 31.0);
 
-/// 模擬視窗管理員回報的位置大小：外框左上角 `pos`、內容大小 `size`
+/// 模擬視窗管理員回報的位置大小：外框左上角 `pos`、內容大小 `size`。
+/// 子母畫面沒有標題列、邊框（`Decorations(false)`）：外框就是內容
 fn report_window(h: &mut Harness<'_, VitascopeApp>, pos: egui::Pos2, size: egui::Vec2) {
+    let (frame, inset) = if h.state().window_mode() == WindowMode::Pip {
+        (egui::Vec2::ZERO, egui::Vec2::ZERO)
+    } else {
+        (MINI_FRAME, MINI_INSET)
+    };
     let v = h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default();
-    v.outer_rect = Some(egui::Rect::from_min_size(pos, size + MINI_FRAME));
-    v.inner_rect = Some(egui::Rect::from_min_size(pos + MINI_INSET, size));
+    v.outer_rect = Some(egui::Rect::from_min_size(pos, size + frame));
+    v.inner_rect = Some(egui::Rect::from_min_size(pos + inset, size));
     v.monitor_size = Some(egui::vec2(1920.0, 1080.0));
 }
 
@@ -19289,4 +19295,1098 @@ fn mini_player_in_english() {
         "Keep the mini player on top",
         "always stays above other windows; when off, it follows “Always on top”",
     );
+}
+
+// ───────────── 子母畫面（F2） ─────────────
+
+/// Ctrl（macOS：⌘）+ Shift + P
+fn toggle_pip_key(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    let mods = egui::Modifiers {
+        shift: true,
+        ..egui::Modifiers::COMMAND
+    };
+    press_window_key(h, mods, egui::Key::P)
+}
+
+/// 16:9 的影片在 1920 寬的螢幕上的子母畫面：螢幕寬度的 ¼
+const PIP_16_9: egui::Vec2 = egui::vec2(480.0, 270.0);
+
+/// 子母畫面的預設位置：工作區右下角，離邊緣 24 點（沒有標題列、邊框；macOS、X11 多留工作列）
+fn pip_default_pos(size: egui::Vec2) -> egui::Pos2 {
+    let allowance = if cfg!(windows) {
+        0.0
+    } else {
+        vitascope::window_mode::TASKBAR_ALLOWANCE
+    };
+    egui::pos2(1920.0 - size.x - 24.0, 1040.0 - size.y - 24.0 - allowance)
+}
+
+/// 播 640×360 的多軌樣本，進入子母畫面、等切換做完
+fn in_pip(file: PathBuf) -> Harness<'static, VitascopeApp> {
+    let mut h = mini_case(file);
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip, "前提：進入了子母畫面");
+    h
+}
+
+/// 跑一幀（像視窗管理員），之前先跑 eframe 的 `raw_input_hook`（kittest 不會呼叫它；系統的拖曳結束後補「放開」在那裡）
+fn hooked_window_step(h: &mut Harness<'_, VitascopeApp>) -> Vec<egui::ViewportCommand> {
+    use eframe::App as _;
+    let ctx = h.ctx.clone();
+    let mut raw = std::mem::take(h.input_mut());
+    h.state_mut().raw_input_hook(&ctx, &mut raw);
+    *h.input_mut() = raw;
+    window_step(h)
+}
+
+/// 一直跑（`hooked_window_step`）直到送出 `want`，回傳期間的所有指令
+fn hooked_steps_until_cmd(
+    h: &mut Harness<'_, VitascopeApp>,
+    what: &str,
+    want: &egui::ViewportCommand,
+) -> Vec<egui::ViewportCommand> {
+    let start = Instant::now();
+    let mut all = Vec::new();
+    while !all.contains(want) {
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：{what}（{want:?}；指令：{all:?}）");
+        std::thread::sleep(Duration::from_millis(10));
+        all.extend(hooked_window_step(h));
+    }
+    all
+}
+
+/// 實際經過一段時間（像視窗管理員一樣跟著指令改視窗，`hooked`：先跑 `raw_input_hook`），回傳期間送出的所有指令。
+/// 用來確定「不改」：比例改回來要等大小停下來 150 毫秒（真的時間），只跑幾幀看不出來
+fn window_steps_for(h: &mut Harness<'_, VitascopeApp>, seconds: f64, hooked: bool) -> Vec<egui::ViewportCommand> {
+    let end = Instant::now() + Duration::from_secs_f64(seconds);
+    let mut all = Vec::new();
+    while Instant::now() < end {
+        all.extend(if hooked { hooked_window_step(h) } else { window_step(h) });
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    all
+}
+
+/// 現在的外框左上角（模擬的視窗管理員回報的）
+fn outer_pos(h: &Harness<'_, VitascopeApp>) -> egui::Pos2 {
+    h.input().viewports[&egui::ViewportId::ROOT].outer_rect.unwrap().min
+}
+
+/// 影片畫面上離中間的 ▶ / ⏸、右上的 🗖、下面的進度條、邊緣都遠的地方（點這裡是點畫面本身）
+fn pip_spot(h: &Harness<'_, VitascopeApp>) -> egui::Pos2 {
+    let r = h.get_by_label("影片畫面").rect();
+    egui::pos2(r.left() + r.width() * 0.22, r.top() + r.height() * 0.4)
+}
+
+/// `pip_spot`，英文介面（影片畫面叫 Video）
+fn pip_spot_en(h: &Harness<'_, VitascopeApp>) -> egui::Pos2 {
+    let r = h.get_by_label("Video").rect();
+    egui::pos2(r.left() + r.width() * 0.22, r.top() + r.height() * 0.4)
+}
+
+/// 子母畫面：在 `at` 按右鍵（打開右鍵選單）
+fn pip_right_click(h: &mut Harness<'_, VitascopeApp>, at: egui::Pos2) {
+    h.event(egui::Event::PointerMoved(at));
+    for pressed in [true, false] {
+        h.event(egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    h.step();
+    h.run_steps(2);
+}
+
+/// 子母畫面：沒有標題列（Decorations(false)，在大小之前）、最小 160×90、一律置頂、大小照影片比例（螢幕寬度的 ¼）、
+/// 放在工作區右下角；只有影片（沒有控制列）。雙擊、Esc、再按一次都回到原本的一般視窗，標題列加回來
+#[test]
+fn pip_is_borderless_on_top_and_aspect_sized() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv")); // 640×360
+    let normal = h.ctx.content_rect().size();
+    let before = h.state().settings().window;
+    let cmds = toggle_pip_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    let min = cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::PIP_MIN),
+    );
+    let deco = cmd_index(&cmds, &egui::ViewportCommand::Decorations(false));
+    let inner = cmd_index(&cmds, &egui::ViewportCommand::InnerSize(PIP_16_9));
+    assert!(min < inner && deco < inner, "最小大小、標題列在大小之前：{cmds:?}");
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(pip_default_pos(PIP_16_9)));
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+    );
+    window_settled(&mut h);
+    let size = h.ctx.content_rect().size();
+    assert_eq!(size, PIP_16_9);
+    assert!(
+        (size.x / size.y - 16.0 / 9.0).abs() * size.y <= 1.0,
+        "比例 ±1 點：{size:?}"
+    );
+    // 只有影片：影片畫面就是整個視窗，沒有控制列、側邊面板
+    assert_eq!(h.get_by_label("影片畫面").rect().size(), PIP_16_9);
+    assert!(h.query_by_label("⛶").is_none() && h.query_by_label("🔊").is_none());
+    assert_eq!(h.state().settings().window, before, "一般視窗記的位置大小不動");
+    // 雙擊：回到一般視窗（標題列先加回來）
+    let paused = paused_now(&h);
+    let spot = pip_spot(&h);
+    double_click(&mut h, spot);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    let cmds = viewport_commands(&h);
+    // 像視窗管理員一樣照這一幀的指令改視窗（`double_click` 自己跑幀）
+    let size = h.input().screen_rect.map_or(normal, |r| r.size());
+    report_window(&mut h, egui::pos2(200.0, 150.0), size);
+    let deco = cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    let inner = cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    assert!(deco < inner, "{cmds:?}");
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::NORMAL_MIN),
+    );
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(egui::pos2(200.0, 150.0)));
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+        "雙擊不是全螢幕"
+    );
+    assert_eq!(paused_now(&h), paused, "雙擊不暫停");
+    window_settled(&mut h);
+    assert_eq!(h.ctx.content_rect().size(), normal);
+    assert_eq!(h.state().settings().window, before);
+    h.get_by_label("⛶");
+    // Esc、再按一次也回來
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    let cmds = press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal, "Esc 回到一般視窗");
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    window_settled(&mut h);
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    let cmds = toggle_pip_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+}
+
+/// 子母畫面裡單擊畫面不暫停（只是取得焦點，設計 §5.10）；中間的 ⏸ / ▶ 才暫停、播放
+#[test]
+fn single_click_in_pip_does_not_pause() {
+    let mut h = in_pip(sample("common/mp4_long.mp4"));
+    step_until(&mut h, "播放中", |s| !s.paused);
+    let spot = pip_spot(&h);
+    h.event(egui::Event::PointerMoved(spot));
+    h.event(left_button(spot, true));
+    h.event(left_button(spot, false));
+    h.step();
+    h.run_steps(3);
+    assert!(!paused_now(&h), "單擊不暫停");
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    // 控制項（滑鼠剛動過）：中間的 ⏸
+    h.get_by_label("⏸").click();
+    h.step();
+    assert!(paused_now(&h), "⏸ 暫停");
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.event(egui::Event::PointerMoved(spot));
+    h.step();
+    h.get_by_label("▶").click();
+    h.step();
+    assert!(!paused_now(&h), "▶ 播放");
+}
+
+/// 單擊是靜音時（設定 → 快捷鍵 → 滑鼠）子母畫面裡也不做；雙擊設成「不動作」時，子母畫面裡雙擊照樣回到一般視窗
+#[test]
+fn pip_ignores_the_click_binding_and_double_click_always_returns() {
+    let mut h = mini_case(sample("common/mp4_long.mp4"));
+    {
+        let mouse = &mut h.state_mut().settings_mut().keys.mouse;
+        mouse.set(
+            vitascope::keymap::MouseInput::Click,
+            Some(vitascope::keymap::Command::ToggleMute),
+        );
+        mouse.set(vitascope::keymap::MouseInput::DoubleClick, None);
+    }
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    let spot = pip_spot(&h);
+    double_click(&mut h, spot);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert!(!muted_now(&h), "單擊的靜音不做");
+    window_settled(&mut h);
+    // 雙擊設成子母畫面：一般視窗裡雙擊進入，子母畫面裡雙擊回來
+    h.state_mut().settings_mut().keys.mouse.set(
+        vitascope::keymap::MouseInput::DoubleClick,
+        Some(vitascope::keymap::Command::Pip),
+    );
+    h.state_mut()
+        .settings_mut()
+        .keys
+        .mouse
+        .set(vitascope::keymap::MouseInput::Click, None);
+    let video = h.get_by_label("影片畫面").rect().center();
+    double_click(&mut h, video);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    window_settled(&mut h);
+    let spot = pip_spot(&h);
+    double_click(&mut h, spot);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+}
+
+/// 全螢幕時進入子母畫面：先離開全螢幕，系統說結束了才拿掉標題列、送子母畫面的大小
+#[test]
+fn entering_pip_from_fullscreen_waits_for_exit() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window.unwrap();
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(true);
+    h.set_size(egui::vec2(1920.0, 1080.0));
+    report_window(&mut h, egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    let cmds = toggle_pip_key(&mut h);
+    assert!(cmds.contains(&egui::ViewportCommand::Fullscreen(false)), "{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::Decorations(_) | egui::ViewportCommand::InnerSize(_)
+        )),
+        "全螢幕結束之前只送離開全螢幕：{cmds:?}"
+    );
+    assert!(inner_sizes(&window_step(&mut h)).is_empty());
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.set_size(egui::vec2(before.size[0], before.size[1]));
+    let cmds = window_steps_until(&mut h, "進入子母畫面", |app| app.window_mode() == WindowMode::Pip);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(false));
+    assert!(inner_sizes(&cmds).contains(&PIP_16_9), "{cmds:?}");
+    window_settled(&mut h);
+    // 回來：全螢幕之前的一般視窗（不是全螢幕）
+    let cmds = toggle_pip_key(&mut h);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::InnerSize(egui::vec2(before.size[0], before.size[1])),
+    );
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(true)));
+}
+
+/// 子母畫面裡要全螢幕：先回到一般視窗（標題列加回來），還原好了才全螢幕
+#[test]
+fn fullscreen_from_pip_restores_first() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let normal = h.state().settings().window.unwrap().size;
+    let cmds = press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::InnerSize(egui::vec2(normal[0], normal[1])),
+    );
+    assert!(
+        !cmds.contains(&egui::ViewportCommand::Fullscreen(true)),
+        "還原好之前不全螢幕：{cmds:?}"
+    );
+    let later = window_settled(&mut h);
+    assert!(later.contains(&egui::ViewportCommand::Fullscreen(true)), "{later:?}");
+}
+
+/// 沒有影像的檔案（純音訊）不能用子母畫面：快捷鍵提示原因；選單、迷你控制列的 ▣ 看得到但按不了
+#[test]
+fn pip_disabled_for_audio_only() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![sample("general/audio_flac.flac")],
+            screen_areas: Some(mini_areas()),
+            ..Default::default()
+        },
+        settings,
+    );
+    step_until(&mut h, "播放、知道選了哪幾軌", |s| {
+        playing(s, "audio_flac.flac") && s.tracks.iter().any(|t| t.selected)
+    });
+    h.run_steps(2);
+    let cmds = toggle_pip_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert!(
+        !cmds.iter().any(|c| matches!(
+            c,
+            egui::ViewportCommand::Decorations(_) | egui::ViewportCommand::InnerSize(_)
+        )),
+        "{cmds:?}"
+    );
+    assert_eq!(h.state().osd_text(), Some("這個檔案沒有影像，不能用子母畫面"));
+    hover_context_item(&mut h, "迷你播放器");
+    let (_, _, disabled) = MenuItem::contains("子母畫面").wait(&mut h);
+    assert!(disabled, "選單裡的「子母畫面」停用");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    // 迷你播放器（純音訊可以）的 ▣ 也停用
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    let pip = h.get_by_label("▣");
+    assert!(pip.accesskit_node().is_disabled());
+}
+
+/// 子母畫面的大小被改了（視窗管理員、拉邊緣）：停下來 150 毫秒後照影片比例改回來（改得多的那一邊不動）
+#[test]
+fn pip_snaps_after_resize_settles() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let pos = outer_pos(&h);
+    let resized = Instant::now();
+    h.set_size(egui::vec2(500.0, 500.0));
+    report_window(&mut h, pos, egui::vec2(500.0, 500.0));
+    let want = egui::ViewportCommand::InnerSize(egui::vec2(889.0, 500.0));
+    let mut early = Vec::new();
+    let start = Instant::now();
+    loop {
+        let cmds = window_step(&mut h);
+        if resized.elapsed() < Duration::from_millis(100) {
+            early.extend(cmds.iter().cloned());
+        }
+        if cmds.contains(&want) {
+            break;
+        }
+        assert!(start.elapsed() < TIMEOUT, "沒有照比例改回來");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        resized.elapsed() >= vitascope::window_mode::SETTLE,
+        "停下來 150 毫秒之後才改"
+    );
+    assert!(inner_sizes(&early).is_empty(), "還在變的時候不改：{early:?}");
+    window_settled(&mut h);
+    assert_eq!(h.ctx.content_rect().size(), egui::vec2(889.0, 500.0));
+    // 改回來之後不再改（等超過 150 毫秒）
+    let later = window_steps_for(&mut h, 0.5, false);
+    assert!(inner_sizes(&later).is_empty(), "{later:?}");
+}
+
+/// 視窗管理員不照改（並排的視窗、限制大小；這裡每一幀都把大小改回去）：只要求一次，不會每一幀都送、在兩個大小之間來回
+#[test]
+fn pip_snap_asks_once_when_the_window_manager_keeps_its_size() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let pos = outer_pos(&h);
+    let kept = egui::vec2(500.0, 500.0);
+    let mut cmds = Vec::new();
+    let step = |h: &mut Harness<'_, VitascopeApp>, cmds: &mut Vec<egui::ViewportCommand>| {
+        h.set_size(kept);
+        report_window(h, pos, kept);
+        cmds.extend(window_step(h));
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // 等到要求了一次，之後再過 0.8 秒（大小一直停在 500×500）
+    let start = Instant::now();
+    while inner_sizes(&cmds).is_empty() {
+        assert!(start.elapsed() < TIMEOUT, "沒有照比例改：{cmds:?}");
+        step(&mut h, &mut cmds);
+    }
+    let asked = Instant::now();
+    while asked.elapsed() < Duration::from_millis(800) {
+        step(&mut h, &mut cmds);
+    }
+    assert_eq!(inner_sizes(&cmds), [egui::vec2(889.0, 500.0)], "只要求一次：{cmds:?}");
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+}
+
+/// 拉左上角改大小（BeginResize）：系統接手；改完照比例改回來時右下角不動（Windows：結束時有真的放開）
+#[test]
+fn pip_corner_resize_keeps_the_opposite_corner() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let pos = outer_pos(&h);
+    let corner = h.get_by_label("影片畫面").rect().left_top() + egui::vec2(2.0, 2.0);
+    h.input_mut()
+        .events
+        .extend([egui::Event::PointerMoved(corner), left_button(corner, true)]);
+    let cmds = hooked_window_step(&mut h);
+    // macOS 用系統自己的邊緣改大小（`BeginResize` 在那裡不能用；比例由 F3 的 contentAspectRatio 鎖住）：
+    // 按在邊緣不送任何系統的拖曳
+    if cfg!(target_os = "macos") {
+        assert!(
+            !cmds.iter().any(|c| matches!(
+                c,
+                egui::ViewportCommand::BeginResize(_) | egui::ViewportCommand::StartDrag
+            )),
+            "{cmds:?}"
+        );
+        assert!(!h.state().os_drag_pending());
+        return;
+    }
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::BeginResize(egui::ResizeDirection::NorthWest),
+    );
+    assert!(!cmds.contains(&egui::ViewportCommand::StartDrag), "{cmds:?}");
+    assert!(h.state().os_drag_pending());
+    // 系統改了大小（左上角往左上拉），結束時送了放開
+    let dragged = pos - egui::vec2(120.0, 30.0);
+    h.set_size(egui::vec2(600.0, 300.0));
+    report_window(&mut h, dragged, egui::vec2(600.0, 300.0));
+    h.input_mut().events.push(left_button(corner, false));
+    hooked_window_step(&mut h);
+    assert!(!h.state().os_drag_pending(), "真的放開了：不用補");
+    let cmds = hooked_steps_until_cmd(
+        &mut h,
+        "照比例改回來",
+        &egui::ViewportCommand::InnerSize(egui::vec2(600.0, 338.0)),
+    );
+    // 寬度改得多：高度照比例變高，下面的邊不動（往上長）
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(egui::pos2(dragged.x, dragged.y - 38.0)),
+    );
+    assert!(!paused_now(&h), "拉邊緣不暫停");
+}
+
+/// 放在右下角的子母畫面拉左邊、上面改大小：照比例改回來時右下角不動（算出來的那一邊往上、往左長，
+/// 不會跑到工作列下面、螢幕外面，設計 P§5.4）
+#[cfg(not(target_os = "macos"))] // macOS 用系統的邊緣（F3）
+#[test]
+fn pip_edge_resize_keeps_the_bottom_right_corner() {
+    for (dir, drag, size, want) in [
+        // 拉左邊往左 160：寬 640，高照比例變 360
+        (
+            egui::ResizeDirection::West,
+            egui::vec2(-160.0, 0.0),
+            egui::vec2(640.0, 270.0),
+            egui::vec2(640.0, 360.0),
+        ),
+        // 拉上面往上 90：高 360，寬照比例變 640
+        (
+            egui::ResizeDirection::North,
+            egui::vec2(0.0, -90.0),
+            egui::vec2(480.0, 360.0),
+            egui::vec2(640.0, 360.0),
+        ),
+    ] {
+        let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+        let pos = outer_pos(&h);
+        assert_eq!(pos, pip_default_pos(PIP_16_9), "前提：在右下角");
+        let video = h.get_by_label("影片畫面").rect();
+        let edge = match dir {
+            egui::ResizeDirection::West => egui::pos2(video.left() + 2.0, video.center().y),
+            _ => egui::pos2(video.center().x, video.top() + 2.0),
+        };
+        h.input_mut()
+            .events
+            .extend([egui::Event::PointerMoved(edge), left_button(edge, true)]);
+        cmd_index(&hooked_window_step(&mut h), &egui::ViewportCommand::BeginResize(dir));
+        // 系統改了大小（拉的那一邊動了），結束時送了放開
+        h.set_size(size);
+        report_window(&mut h, pos + drag, size);
+        h.input_mut().events.push(left_button(edge, false));
+        let cmds = hooked_steps_until_cmd(&mut h, "照比例改回來", &egui::ViewportCommand::InnerSize(want));
+        let bottom_right = pos + PIP_16_9;
+        cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(bottom_right - want));
+        // 整個在工作區（1920×1040）裡
+        let r = egui::Rect::from_min_size(bottom_right - want, want);
+        assert!(r.right() <= 1920.0 && r.bottom() <= 1040.0, "{dir:?}：{r:?}");
+    }
+}
+
+/// X11：拉邊緣拉到一半停住一下就照比例改了一次（大小停下來 150 毫秒；放開可能收不到，不能等放開），之後繼續拉：
+/// 放開後的那一次照樣知道拉的是左邊，右下角不動（拉的是哪一邊不在中途用掉）
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn pip_snap_during_a_drag_keeps_the_edge_for_the_final_snap() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let pos = outer_pos(&h);
+    let bottom = pos.y + PIP_16_9.y;
+    let video = h.get_by_label("影片畫面").rect();
+    let edge = egui::pos2(video.left() + 2.0, video.center().y);
+    h.input_mut()
+        .events
+        .extend([egui::Event::PointerMoved(edge), left_button(edge, true)]);
+    cmd_index(
+        &hooked_window_step(&mut h),
+        &egui::ViewportCommand::BeginResize(egui::ResizeDirection::West),
+    );
+    // 拉到 600 寬停住：拖曳中就改回比例（下面不動）
+    h.set_size(egui::vec2(600.0, 270.0));
+    report_window(&mut h, pos - egui::vec2(120.0, 0.0), egui::vec2(600.0, 270.0));
+    let cmds = hooked_steps_until_cmd(
+        &mut h,
+        "拖曳中停住也照比例改",
+        &egui::ViewportCommand::InnerSize(egui::vec2(600.0, 338.0)),
+    );
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(egui::pos2(pos.x - 120.0, bottom - 338.0)),
+    );
+    assert!(h.state().os_drag_pending());
+    window_steps_for(&mut h, 0.3, true);
+    // 繼續往左拉 40，放開
+    let now = outer_pos(&h);
+    h.set_size(egui::vec2(640.0, 338.0));
+    report_window(&mut h, now - egui::vec2(40.0, 0.0), egui::vec2(640.0, 338.0));
+    h.input_mut().events.push(left_button(edge, false));
+    let cmds = hooked_steps_until_cmd(
+        &mut h,
+        "放開後照比例改",
+        &egui::ViewportCommand::InnerSize(egui::vec2(640.0, 360.0)),
+    );
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(egui::pos2(pos.x - 160.0, bottom - 360.0)),
+    );
+}
+
+/// 系統的拖曳（StartDrag）結束時沒送放開（X11、macOS，P-A3）：照樣照比例改回來；視窗停下來之後的第一個滑鼠移動補一個放開，
+/// 控制項之後會消失（不補的話 egui 一直以為按著，控制項永遠不消失）
+#[test]
+fn pip_drag_without_a_release_snaps_and_hides_the_controls() {
+    let mut h = in_pip(sample("common/mp4_long.mp4"));
+    step_until(&mut h, "播放中", |s| !s.paused);
+    let spot = pip_spot(&h);
+    h.input_mut()
+        .events
+        .extend([egui::Event::PointerMoved(spot), left_button(spot, true)]);
+    hooked_window_step(&mut h);
+    h.input_mut()
+        .events
+        .push(egui::Event::PointerMoved(spot + egui::vec2(30.0, 0.0)));
+    let cmds = hooked_steps_until_cmd(&mut h, "拖曳交給系統", &egui::ViewportCommand::StartDrag);
+    assert!(
+        !cmds.iter().any(|c| matches!(c, egui::ViewportCommand::BeginResize(_))),
+        "{cmds:?}"
+    );
+    assert!(h.state().os_drag_pending());
+    // 視窗管理員移動了視窗，大小也變了；之後沒有放開、也收不到滑鼠移動
+    let moved = outer_pos(&h) - egui::vec2(300.0, 200.0);
+    h.set_size(egui::vec2(600.0, 300.0));
+    report_window(&mut h, moved, egui::vec2(600.0, 300.0));
+    let snap = egui::ViewportCommand::InnerSize(egui::vec2(600.0, 338.0));
+    if cfg!(windows) {
+        // Windows 系統的拖曳中（程式照樣在畫）不改：結束時一定有放開，那時才改
+        let during = window_steps_for(&mut h, 1.0, true);
+        assert!(inner_sizes(&during).is_empty(), "拖曳中不改：{during:?}");
+    } else {
+        hooked_steps_until_cmd(&mut h, "沒有放開也照比例改回來", &snap);
+    }
+    assert!(h.state().pip_controls_shown(), "egui 以為還按著：控制項一直在");
+    assert!(h.state().os_drag_pending());
+    // 視窗停下來之後滑鼠動了：補放開
+    let start = Instant::now();
+    let mut after = Vec::new();
+    while h.state().os_drag_pending() {
+        assert!(start.elapsed() < TIMEOUT, "沒有補放開");
+        h.input_mut()
+            .events
+            .push(egui::Event::PointerMoved(spot + egui::vec2(31.0, 1.0)));
+        after.extend(hooked_window_step(&mut h));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!h.ctx.input(|i| i.pointer.any_down()), "egui 知道放開了");
+    if cfg!(windows) {
+        if !after.contains(&snap) {
+            hooked_steps_until_cmd(&mut h, "放開之後照比例改回來", &snap);
+        }
+    } else {
+        assert!(inner_sizes(&after).is_empty(), "改過了，不再改：{after:?}");
+    }
+    // 滑鼠停住 2 秒：控制項消失
+    let start = Instant::now();
+    while h.state().pip_controls_shown() {
+        assert!(start.elapsed() < TIMEOUT, "控制項一直沒有消失");
+        hooked_window_step(&mut h);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(h.query_by_label("🗖").is_none());
+    assert!(!paused_now(&h), "拖曳不暫停");
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+}
+
+/// 系統的拖曳中滑鼠離開了視窗（X11 視窗管理員接手時 egui 收到 PointerGone，沒有滑鼠位置），之後焦點變了：
+/// 照樣補放開（不然 egui 一直以為按著，P-A3）
+#[test]
+fn pip_focus_change_after_the_pointer_left_still_releases() {
+    let mut h = in_pip(sample("common/mp4_long.mp4"));
+    let spot = pip_spot(&h);
+    h.input_mut()
+        .events
+        .extend([egui::Event::PointerMoved(spot), left_button(spot, true)]);
+    hooked_window_step(&mut h);
+    h.input_mut()
+        .events
+        .push(egui::Event::PointerMoved(spot + egui::vec2(30.0, 0.0)));
+    hooked_steps_until_cmd(&mut h, "拖曳交給系統", &egui::ViewportCommand::StartDrag);
+    h.input_mut().events.push(egui::Event::PointerGone);
+    hooked_window_step(&mut h);
+    assert!(h.state().os_drag_pending());
+    assert!(
+        h.ctx
+            .input(|i| i.pointer.latest_pos().is_none() && i.pointer.any_down()),
+        "前提：egui 沒有滑鼠位置、還以為按著"
+    );
+    h.input_mut().events.push(egui::Event::WindowFocused(false));
+    hooked_window_step(&mut h);
+    assert!(!h.state().os_drag_pending());
+    assert!(!h.ctx.input(|i| i.pointer.any_down()), "egui 知道放開了");
+}
+
+/// 雙擊中間的 ▶ / ⏸（最順手雙擊的地方）：跟雙擊畫面一樣回到一般視窗，暫停不變
+#[test]
+fn double_click_on_the_pip_play_button_returns() {
+    let mut h = in_pip(sample("common/mp4_long.mp4"));
+    step_until(&mut h, "播放中", |s| !s.paused);
+    for paused in [false, true] {
+        if paused {
+            toggle_pip_key(&mut h);
+            window_settled(&mut h);
+            h.key_press(egui::Key::Space);
+            step_until(&mut h, "暫停", |s| s.paused);
+        }
+        assert_eq!(paused_now(&h), paused, "前提");
+        let center = h.get_by_label("影片畫面").rect().center();
+        // 控制項已經出現（中間的按鈕在那裡）
+        h.event(egui::Event::PointerMoved(center));
+        h.step();
+        assert!(h.state().pip_controls_shown(), "前提：控制項出現了");
+        h.get_by_label(if paused { "▶" } else { "⏸" });
+        double_click(&mut h, center);
+        assert_eq!(h.state().window_mode(), WindowMode::Normal, "雙擊回到一般視窗");
+        assert_eq!(paused_now(&h), paused, "第一下的切換切回來了");
+        window_settled(&mut h);
+        assert_eq!(paused_now(&h), paused);
+    }
+}
+
+/// 控制項：滑鼠移上去才出現（中間 ⏸、下面的進度、右上 🗖），停住 2 秒後消失；🗖 回到一般視窗
+#[test]
+fn pip_controls_appear_on_hover() {
+    let mut h = in_pip(sample("common/mp4_long.mp4"));
+    let spot = pip_spot(&h);
+    h.event(egui::Event::PointerMoved(spot));
+    h.step();
+    assert!(h.state().pip_controls_shown());
+    h.get_by_label("進度");
+    h.get_by_label("🗖");
+    let start = Instant::now();
+    while h.state().pip_controls_shown() {
+        assert!(start.elapsed() < TIMEOUT, "控制項一直沒有消失");
+        h.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(start.elapsed() >= Duration::from_millis(1500), "停住 2 秒才消失");
+    assert!(h.query_by_label("🗖").is_none() && h.query_by_label("進度").is_none());
+    // 滑鼠離開視窗：沒有控制項
+    h.event(egui::Event::PointerMoved(spot + egui::vec2(1.0, 0.0)));
+    h.step();
+    assert!(h.state().pip_controls_shown());
+    h.event(egui::Event::PointerGone);
+    h.step();
+    assert!(!h.state().pip_controls_shown());
+    h.event(egui::Event::PointerMoved(spot));
+    h.step();
+    h.get_by_label("🗖").click();
+    h.step();
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&viewport_commands(&h), &egui::ViewportCommand::Decorations(true));
+}
+
+/// 子母畫面的右鍵選單：只有播放 / 暫停、靜音、回到一般視窗、迷你播放器、結束影戲（P-C7）
+#[test]
+fn pip_context_menu_is_short() {
+    let mut h = in_pip(sample("common/mp4_long.mp4"));
+    // 在中間（▶ / ⏸ 上）按右鍵也有選單
+    let center = h.get_by_label("影片畫面").rect().center();
+    pip_right_click(&mut h, center);
+    for item in ["暫停", "靜音", "回到一般視窗", "迷你播放器", "結束影戲"] {
+        MenuItem::contains(item).wait(&mut h);
+    }
+    for absent in ["開啟檔案", "播放速度", "視窗置頂", "設定…", "子母畫面"] {
+        assert!(h.query_by_label_contains(absent).is_none(), "選單裡不該有「{absent}」");
+    }
+    // 靜音
+    h.get_by_label_contains("靜音").click();
+    h.step();
+    assert!(muted_now(&h));
+    // 換成迷你播放器：標題列加回來
+    let spot = pip_spot(&h);
+    pip_right_click(&mut h, spot);
+    MenuItem::contains("迷你播放器").wait(&mut h);
+    h.get_by_label_contains("迷你播放器").click();
+    let cmds = window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    window_settled(&mut h);
+    // 結束影戲
+    h.get_by_label("▣").click();
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip, "迷你控制列的 ▣");
+    let spot = pip_spot(&h);
+    pip_right_click(&mut h, spot);
+    MenuItem::exact("結束影戲").wait(&mut h);
+    h.get_by_label("結束影戲").click();
+    h.step();
+    assert!(viewport_commands(&h).contains(&egui::ViewportCommand::Close));
+}
+
+/// 一般視窗、迷你播放器的右鍵選單有「子母畫面」（快捷鍵寫在右邊）
+#[test]
+fn context_menu_enters_pip() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    hover_context_item(&mut h, "子母畫面");
+    h.get_by_label_contains("子母畫面").click();
+    h.step();
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+}
+
+/// 迷你播放器 ↔ 子母畫面直接換（一般視窗記的不動）：迷你播放器的位置照有標題列的大小算；回來時是原本的一般視窗
+#[test]
+fn mini_and_pip_switch_directly() {
+    let mut h = mini_case(sample("common/mkv_multitrack.mkv"));
+    let normal = h.ctx.content_rect().size();
+    let before = h.state().settings().window;
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    let cmds = toggle_pip_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(false));
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(PIP_16_9));
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(pip_default_pos(PIP_16_9)));
+    window_settled(&mut h);
+    let cmds = toggle_mini_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::MINI_MIN),
+    );
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(mini_16_9()));
+    // 子母畫面沒有標題列（量不到）：用一般視窗量的標題列算，迷你播放器整個在工作區裡
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::OuterPosition(mini_default_pos(mini_16_9())),
+    );
+    window_settled(&mut h);
+    let cmds = toggle_mini_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(normal));
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(egui::pos2(200.0, 150.0)));
+    window_settled(&mut h);
+    assert_eq!(h.state().settings().window, before);
+}
+
+/// 子母畫面一律置頂（「視窗置頂」是不置頂、「迷你播放器置頂」關掉也一樣）；Ctrl+T 只提示；回到一般視窗時照模式
+#[test]
+fn pip_is_always_on_top() {
+    let mut settings = Settings::default();
+    settings.compact.mini_on_top = false;
+    let mut h = mini_case_with(sample("common/mkv_multitrack.mkv"), settings, Launch::default());
+    assert_eq!(h.state().settings().on_top, OnTop::Never, "前提");
+    let cmds = toggle_pip_key(&mut h);
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop),
+    );
+    window_settled(&mut h);
+    assert_eq!(press_ctrl_t(&mut h), [], "層級不變");
+    assert_eq!(h.state().osd_text(), Some("子母畫面一律置頂"));
+    assert_eq!(h.state().settings().on_top, OnTop::Never, "模式不動");
+    assert!(!h.state().settings().compact.mini_on_top);
+    assert_eq!(levels_during(&mut h, 0.3), [], "沒變就不重送");
+    let cmds = toggle_pip_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+}
+
+/// 子母畫面記住自己的位置大小（跟迷你播放器各記各的；一般視窗記的不動），下次用記住的寬度（高度照影片）
+#[test]
+fn pip_remembers_its_own_place() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window;
+    let moved = egui::pos2(300.0, 200.0);
+    let size = egui::vec2(640.0, 360.0);
+    h.set_size(size);
+    report_window(&mut h, moved, size);
+    let start = Instant::now();
+    while h.state().settings().compact.pip.is_none_or(|g| g.pos != [300.0, 200.0]) {
+        assert!(start.elapsed() < TIMEOUT, "記住子母畫面的位置");
+        window_step(&mut h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.state().settings().compact.pip.unwrap().size, [640.0, 360.0]);
+    assert_eq!(h.state().settings().compact.mini, None, "迷你播放器的不動");
+    assert_eq!(h.state().settings().window, before);
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4")); // 4:3
+    step_until_app(&mut h, "換好 4:3 的影片", |app| {
+        app.player().state.video_size == Some([320, 240]) && !app.window_fit_pending()
+    });
+    let cmds = toggle_pip_key(&mut h);
+    cmd_index(&cmds, &egui::ViewportCommand::InnerSize(egui::vec2(640.0, 480.0)));
+    // 右下角對齊上次的（變高的部分往上長）
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(egui::pos2(300.0, 80.0)));
+}
+
+/// 子母畫面裡換了檔案：寬度不變、高度照新影片的比例，右下角不動
+#[test]
+fn new_file_in_pip_keeps_the_width() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4")); // 4:3
+    let cmds = window_steps_until(&mut h, "配合 4:3 的影片", |app| {
+        let s = &app.player().state;
+        s.video_size == Some([320, 240]) && !app.window_fit_pending()
+    });
+    let taller = egui::vec2(480.0, 360.0);
+    assert!(inner_sizes(&cmds).contains(&taller), "{cmds:?}");
+    cmd_index(&cmds, &egui::ViewportCommand::OuterPosition(pip_default_pos(taller)));
+    window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    // 比例對：不會再「改回比例」（等超過 150 毫秒）
+    let later = window_steps_for(&mut h, 0.5, false);
+    assert!(inner_sizes(&later).is_empty(), "{later:?}");
+}
+
+/// 子母畫面裡開了沒有影像的檔案（純音訊）：子母畫面只有影片，換成迷你播放器（提示原因；標題列加回來、一般視窗記的不動）
+#[test]
+fn audio_only_file_in_pip_switches_to_the_mini_player() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    let before = h.state().settings().window;
+    // 換檔途中（mpv 先送空的軌道清單，介面還是「載入了」）：不是純音訊，不換
+    h.state_mut().player_mut().state.tracks.clear();
+    for _ in 0..3 {
+        window_step(&mut h);
+    }
+    assert_eq!(h.state().window_mode(), WindowMode::Pip, "換檔途中的空軌道清單不算");
+    drop_file(&mut h, sample("general/audio_flac.flac"));
+    let cmds = window_steps_until(&mut h, "換成迷你播放器", |app| {
+        app.window_mode() == WindowMode::Mini && !app.window_mode_pending()
+    });
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::MINI_MIN),
+    );
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, egui::ViewportCommand::OuterPosition(_))),
+        "{cmds:?}"
+    );
+    assert_eq!(h.state().osd_text(), Some("這個檔案沒有影像，子母畫面換成迷你播放器"));
+    assert!(playing(&h.state().player().state, "audio_flac.flac"));
+    // 回到一般視窗：原本的
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    assert_eq!(h.state().settings().window, before);
+}
+
+/// 一開始就全螢幕、直接進入子母畫面（一直沒量到標題列），再換成迷你播放器：標題列加回來之後量到了再放一次，
+/// 整個迷你播放器在工作區裡（不會有一截在工作列下面）
+#[test]
+fn mini_from_pip_without_a_measured_frame_fits_the_work_area() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![sample("common/mkv_multitrack.mkv")],
+            screen_areas: Some(mini_areas()),
+            ..Default::default()
+        },
+        settings,
+    );
+    // 啟動時就是全螢幕（`--fullscreen`）：沒有一般視窗的標題列可以量
+    let full = egui::vec2(1920.0, 1080.0);
+    let v = h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default();
+    v.fullscreen = Some(true);
+    v.outer_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, full));
+    v.inner_rect = v.outer_rect;
+    v.monitor_size = Some(full);
+    h.set_size(full);
+    settle(&mut h, "mkv_multitrack.mkv");
+    toggle_pip_key(&mut h);
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .fullscreen = Some(false);
+    h.set_size(egui::vec2(960.0, 540.0));
+    report_window(&mut h, egui::pos2(200.0, 150.0), egui::vec2(960.0, 540.0));
+    window_steps_until(&mut h, "進入子母畫面", |app| app.window_mode() == WindowMode::Pip);
+    window_settled(&mut h);
+    toggle_mini_key(&mut h);
+    let start = Instant::now();
+    let want = mini_default_pos(mini_16_9());
+    while h.state().window_mode_pending() || outer_pos(&h) != want {
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "迷你播放器沒有放回工作區裡：{:?}（應該是 {want:?}）",
+            outer_pos(&h)
+        );
+        window_step(&mut h);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    let outer = h.input().viewports[&egui::ViewportId::ROOT].outer_rect.unwrap();
+    assert!(outer.bottom() <= 1040.0 && outer.right() <= 1920.0, "{outer:?}");
+    // 放好之後不再動
+    let later = window_steps_for(&mut h, 0.3, false);
+    assert!(
+        !later
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::OuterPosition(_))),
+        "{later:?}"
+    );
+}
+
+/// F6、媒體資訊（子母畫面太小）在子母畫面裡：回到一般視窗再打開
+#[test]
+fn playlist_and_media_info_return_from_pip() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F6);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    window_settled(&mut h);
+    assert!(h.state().settings().show_playlist);
+    h.key_press(egui::Key::F6);
+    window_settled(&mut h);
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    press_window_key(&mut h, egui::Modifiers::COMMAND, egui::Key::I);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal, "媒體資訊：回到一般視窗");
+    h.get_by_label_contains("640×360（16:9）");
+    // 媒體資訊開著時進入：藏起來；Esc 回到一般視窗（不是關掉看不到的媒體資訊）
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    assert!(h.query_by_label_contains("640×360（16:9）").is_none(), "子母畫面裡不畫");
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label_contains("640×360（16:9）");
+}
+
+/// 系統把子母畫面最大化（Win+↑）：回到一般模式，標題列加回來（P-B2）
+#[test]
+fn maximizing_pip_from_outside_restores_decorations() {
+    let mut h = in_pip(sample("common/mkv_multitrack.mkv"));
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(true);
+    h.set_size(egui::vec2(1920.0, 1040.0));
+    let cmds = window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(true));
+    cmd_index(
+        &cmds,
+        &egui::ViewportCommand::MinInnerSize(vitascope::window_mode::NORMAL_MIN),
+    );
+    cmd_index(&cmds, &egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+}
+
+/// Wayland：子母畫面一律要置頂，所以「迷你播放器置頂」關著也提示一次；不能指定位置
+#[test]
+fn pip_on_wayland() {
+    let mut settings = Settings::default();
+    settings.compact.mini_on_top = false;
+    let mut h = mini_case_with(
+        sample("common/mkv_multitrack.mkv"),
+        settings,
+        Launch {
+            wayland: Some(true),
+            screen_areas: Some(Vec::new()),
+            ..Default::default()
+        },
+    );
+    let cmds = toggle_pip_key(&mut h);
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::OuterPosition(_))),
+        "{cmds:?}"
+    );
+    cmd_index(&cmds, &egui::ViewportCommand::Decorations(false));
+    assert_eq!(
+        h.state().osd_text(),
+        Some("這個桌面環境（Wayland）不讓程式自己置頂，視窗可能被其他視窗蓋住")
+    );
+}
+
+#[test]
+fn pip_in_english() {
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = mini_case_with(sample("common/mkv_multitrack.mkv"), settings, Launch::default());
+    h.get_by_label("Video").click_secondary();
+    h.run_steps(2);
+    MenuItem::contains("Picture-in-picture").hover(&mut h);
+    h.get_by_label_contains("Picture-in-picture").click();
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    press_ctrl_t(&mut h);
+    assert_eq!(h.state().osd_text(), Some("Picture-in-picture always stays on top"));
+    let spot = pip_spot_en(&h);
+    pip_right_click(&mut h, spot);
+    for item in ["Back to the normal window", "Mini player", "Quit VitaScope", "Mute"] {
+        MenuItem::contains(item).wait(&mut h);
+    }
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    let spot = pip_spot_en(&h);
+    h.event(egui::Event::PointerMoved(spot));
+    h.step();
+    hover_until_tooltip_contains(&mut h, "🗖", "Back to the normal window (double-click)");
+    // 純音訊：英文的原因
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    settings.auto_next = false;
+    let mut h = harness_with(Some(sample("general/audio_flac.flac")), settings);
+    step_until(&mut h, "播放、知道選了哪幾軌", |s| {
+        playing(s, "audio_flac.flac") && s.tracks.iter().any(|t| t.selected)
+    });
+    toggle_pip_key(&mut h);
+    assert_eq!(
+        h.state().osd_text(),
+        Some("This file has no video for picture-in-picture")
+    );
+}
+
+/// 子母畫面的進度條不顯示預覽畫面（視窗太小，P-C7）。先在一般視窗做好進度條中間的縮圖（快取裡有，
+/// 允許顯示的話第一幀就畫得出來），子母畫面停在同一個位置也不顯示：不靠縮圖做得多快
+#[test]
+fn pip_progress_bar_has_no_thumbnail() {
+    let mut h = mini_case(sample("common/mp4_long.mp4")); // 90 秒
+    let bar = h.get_by_label("進度").rect();
+    h.event(egui::Event::PointerMoved(bar.center()));
+    step_until_app(&mut h, "一般視窗顯示縮圖", |app| app.preview_shown().is_some());
+    let (bucket, _) = h.state().preview_shown().unwrap();
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().forget_preview_shown();
+    let spot = pip_spot(&h);
+    h.event(egui::Event::PointerMoved(spot));
+    h.step();
+    let bar = h.get_by_label("進度").rect();
+    for i in 0..13 {
+        // 一直動一點點（控制項不會消失），掃過進度條中間左右 3 點：一定經過一般視窗做好的那一段
+        let x = bar.center().x + (i as f32 - 6.0) * 0.5;
+        h.event(egui::Event::PointerMoved(egui::pos2(x, bar.center().y)));
+        h.step();
+        assert!(h.state().pip_controls_shown());
+        assert!(h.state().preview_shown().is_none(), "子母畫面不顯示預覽畫面");
+    }
+    // 回到一般視窗：同一段的縮圖照常顯示
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    let bar = h.get_by_label("進度").rect();
+    h.event(egui::Event::PointerMoved(bar.center()));
+    step_until_app(&mut h, "一般視窗顯示縮圖", |app| {
+        app.preview_shown().is_some_and(|(b, _)| b == bucket)
+    });
 }

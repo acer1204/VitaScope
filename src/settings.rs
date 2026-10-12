@@ -732,6 +732,7 @@ mod tests {
         );
         assert!(s.compact.mini_on_top, "迷你播放器預設置頂");
         assert_eq!(s.compact.mini, None, "迷你播放器預設放在螢幕右下角");
+        assert_eq!(s.compact.pip, None, "子母畫面預設放在螢幕右下角");
         assert_eq!(s.compact, CompactWindows::default());
         assert_eq!(s.keys.preset, crate::keymap::KeyPreset::Vitascope, "快捷鍵預設是影戲的");
         assert!(s.keys.custom.is_empty());
@@ -874,6 +875,58 @@ mod tests {
         let back = Settings::load_from(path.clone());
         assert!(!back.compact.mini_on_top, "A 改的不能被 B 蓋回去");
         assert_eq!(back.compact.mini.unwrap().pos, [5.0, 6.0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 子母畫面的位置大小（F2）：存檔讀回；讀不懂的只有它用預設值；太小的拉到子母畫面的最小值；
+    /// 兩個視窗一個記迷你播放器、一個記子母畫面，兩個都留下；舊的設定檔（只有迷你播放器）讀進來沒有子母畫面
+    #[test]
+    fn compact_pip_geometry_round_trip_lenient_and_merge() {
+        let dir = temp_dir("compact-pip");
+        let path = dir.join("settings.json");
+        let mut s = Settings::load_from(path.clone());
+        s.compact.pip = Some(WindowGeometry {
+            pos: [1400.0, 760.0],
+            size: [480.0, 270.0],
+            maximized: false,
+        });
+        s.save().unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains(r#""pip": {"#));
+        assert_eq!(Settings::load_from(path.clone()).compact, s.compact);
+        let s = lenient(r#"{"compact": {"mini_on_top": false, "pip": [1, 2]}, "volume": 33.0}"#);
+        assert_eq!(s.compact.pip, None);
+        assert!(!s.compact.mini_on_top, "同一組的其他項目照讀");
+        assert_eq!(s.volume, 33.0);
+        let s = lenient(r#"{"compact": {"mini_on_top": false}}"#);
+        assert_eq!(s.compact.pip, None, "F1 寫的設定檔");
+        std::fs::write(
+            &path,
+            r#"{"compact": {"pip": {"pos": [1.0, 2.0], "size": [10.0, 10.0], "maximized": false}}}"#,
+        )
+        .unwrap();
+        let min = crate::window_mode::PIP_MIN;
+        assert_eq!(
+            Settings::load_from(path.clone()).compact.pip.unwrap().size,
+            [min.x, min.y]
+        );
+        std::fs::remove_file(&path).unwrap();
+        let mut a = Settings::load_from(path.clone());
+        let mut b = Settings::load_from(path.clone());
+        a.compact.mini = Some(WindowGeometry {
+            pos: [5.0, 6.0],
+            size: [480.0, 308.0],
+            maximized: false,
+        });
+        a.save().unwrap();
+        b.compact.pip = Some(WindowGeometry {
+            pos: [7.0, 8.0],
+            size: [320.0, 180.0],
+            maximized: false,
+        });
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.compact.mini.unwrap().pos, [5.0, 6.0]);
+        assert_eq!(back.compact.pip.unwrap().pos, [7.0, 8.0]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

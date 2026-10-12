@@ -365,6 +365,8 @@ impl VitascopeApp {
         let now = Instant::now();
         let mut run = Running::new(a, len, now);
         let ctx = self.egui_ctx.clone();
+        // 子母畫面小到放不下倒數畫面：回到一般視窗（放得下就留著，跟迷你播放器一樣）
+        self.make_room_for_countdown(&ctx);
         if self.countdown_raise {
             run.refocus = ctx.input(|i| i.viewport().minimized) == Some(true);
             self.raise_window(&ctx);

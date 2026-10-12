@@ -453,6 +453,8 @@ commands! {
     CycleTheme => "cycle-theme", Window, once, ("切換深色／淺色", "Switch dark/light");
     /// 迷你播放器（再按一次回到一般視窗）
     MiniPlayer => "mini-player", Window, once, ("迷你播放器", "Mini player");
+    /// 子母畫面（再按一次回到一般視窗）
+    Pip => "pip", Window, once, ("子母畫面", "Picture-in-picture");
     OpenFile => "open-file", Files, once, ("開啟檔案", "Open file");
     Screenshot => "screenshot", Files, once, ("擷取畫面（存檔）", "Save screenshot");
     CopyFrame => "copy-frame", Files, once, ("擷取畫面（剪貼簿）", "Copy frame");
@@ -585,6 +587,8 @@ fn vitascope_preset(platform: Platform) -> Vec<(Command, Chord)> {
         (C::Playlist, Chord::new(N, Key::F6)),
         // 迷你播放器：Ctrl（⌘）+ Shift + M（只按 M 是靜音、Ctrl+M 留著不用）
         (C::MiniPlayer, Chord::new(Mods { shift: true, ..CMD }, Key::M)),
+        // 子母畫面：Ctrl（⌘）+ Shift + P（Ctrl+P 照舊是上下翻轉：修飾鍵多的優先）
+        (C::Pip, Chord::new(Mods { shift: true, ..CMD }, Key::P)),
     ];
     // macOS 的 Ctrl+F1 是系統的「鍵盤操作」快捷鍵，選單上寫 Cmd+I（QuickTime 的「影片檢閱器」）
     let info = [Chord::new(CMD, Key::F1), Chord::new(CMD, Key::I)];
@@ -681,12 +685,12 @@ impl MouseInput {
 
     /// 可以選的指令（另外都可以選「不動作」）；None = 任何指令。
     /// 單擊只能是開關（雙擊時要把第一下做的切回來）。
-    /// 雙擊：全螢幕、迷你播放器（在迷你播放器裡雙擊「全螢幕」是回到一般視窗，見 app.rs 的 `video_mouse`）。
-    /// F2 要接手：子母畫面做好時把它加進來（子母畫面裡雙擊「全螢幕」一樣是回到一般視窗）
+    /// 雙擊：全螢幕、迷你播放器、子母畫面（在迷你播放器裡雙擊「全螢幕」是回到一般視窗；子母畫面裡雙擊一律是回到一般視窗，
+    /// 見 app.rs 的 `video_mouse`）
     pub fn choices(self) -> Option<&'static [Command]> {
         match self {
             MouseInput::Click => Some(&[Command::TogglePause, Command::ToggleMute]),
-            MouseInput::DoubleClick => Some(&[Command::Fullscreen, Command::MiniPlayer]),
+            MouseInput::DoubleClick => Some(&[Command::Fullscreen, Command::MiniPlayer, Command::Pip]),
             MouseInput::Middle | MouseInput::Back | MouseInput::Forward => None,
         }
     }
@@ -1445,6 +1449,8 @@ mod tests {
         "after-playback-shutdown",
         // F1
         "mini-player",
+        // F2
+        "pip",
     ];
 
     #[test]
@@ -1560,6 +1566,7 @@ mod tests {
                 | C::About
                 | C::CycleTheme
                 | C::MiniPlayer
+                | C::Pip
                 | C::OpenFile
                 | C::Screenshot
                 | C::CopyFrame
@@ -1633,6 +1640,46 @@ mod tests {
         assert_eq!(Command::MiniPlayer.label(), "Mini player");
         set_lang(Lang::ZhTw);
         assert_eq!(Command::MiniPlayer.label(), "迷你播放器");
+    }
+
+    /// 子母畫面（F2）：兩組預設都是 Ctrl（macOS：⌘）+ Shift + P；Ctrl+P 照舊是上下翻轉、只按 P 是新增書籤
+    #[test]
+    fn pip_key_in_both_presets() {
+        for preset in KeyPreset::ALL {
+            for p in Platform::ALL {
+                let map = Keymap::build(
+                    &KeySettings {
+                        preset,
+                        ..Default::default()
+                    },
+                    p,
+                );
+                let cmd_shift = Modifiers {
+                    shift: true,
+                    ..command_mods(p)
+                };
+                assert_eq!(map.lookup(Key::P, cmd_shift), Some(Command::Pip), "{preset:?} {p:?}");
+                assert_eq!(
+                    map.lookup(Key::P, command_mods(p)),
+                    Some(Command::FlipV),
+                    "{preset:?} {p:?}"
+                );
+                assert_eq!(
+                    map.lookup(Key::P, Modifiers::NONE),
+                    Some(Command::BookmarkAdd),
+                    "{preset:?} {p:?}"
+                );
+                let shown = if p.is_mac() { "Cmd+Shift+P" } else { "Ctrl+Shift+P" };
+                assert_eq!(map.hint(Command::Pip), shown, "{preset:?} {p:?}");
+            }
+        }
+        assert_eq!(Command::from_id("pip"), Some(Command::Pip));
+        assert_eq!(Command::Pip.group(), Group::Window);
+        assert!(!Command::Pip.repeatable());
+        set_lang(Lang::En);
+        assert_eq!(Command::Pip.label(), "Picture-in-picture");
+        set_lang(Lang::ZhTw);
+        assert_eq!(Command::Pip.label(), "子母畫面");
     }
 
     /// 這個平台上 egui 收到的 Ctrl（macOS：⌘）
@@ -2052,12 +2099,15 @@ mod tests {
     /// v0.3.0 之後刻意改的按鍵（批次二 B1、B2）：P 新增書籤、H 書籤清單（以前都沒有作用）；Shift+PgUp / PgDn 上一個 / 下一個書籤
     /// （以前多按的 Shift 不影響，是換檔）。Ctrl+P、Ctrl+Shift+PgUp 之類有 Ctrl 的照舊。
     /// C3：Ctrl（⌘）+ U 開啟網址（以前沒有作用；只按 U 照舊是飽和度 +）。
-    /// F1：Ctrl（⌘）+ Shift + M 迷你播放器（以前沒有作用：多按的 Shift 不影響，但只有 M 沒有 Ctrl 的靜音）
+    /// F1：Ctrl（⌘）+ Shift + M 迷你播放器（以前沒有作用：多按的 Shift 不影響，但只有 M 沒有 Ctrl 的靜音）。
+    /// F2：Ctrl（⌘）+ Shift + P 子母畫面（以前多按的 Shift 不影響，是 Ctrl+P 的上下翻轉）
     fn changed_after_v030(mods: Modifiers, key: Key) -> Option<Option<Command>> {
         let no_ctrl = !mods.ctrl && !mods.command && !mods.mac_cmd;
         match key {
             Key::U if mods.command => Some(Some(Command::OpenUrl)),
             Key::M if mods.command && mods.shift => Some(Some(Command::MiniPlayer)),
+            // F2：Ctrl（⌘）+ Shift + P 子母畫面（以前多按的 Shift 不影響，是上下翻轉；Ctrl+P 照舊）
+            Key::P if mods.command && mods.shift => Some(Some(Command::Pip)),
             Key::P if no_ctrl => Some(Some(Command::BookmarkAdd)),
             Key::H if no_ctrl => Some(Some(Command::BookmarkList)),
             Key::PageUp if no_ctrl && mods.shift => Some(Some(Command::BookmarkPrev)),
@@ -2590,10 +2640,10 @@ mod tests {
             Some(&[Command::TogglePause, Command::ToggleMute][..])
         );
         assert!(MouseInput::Middle.choices().is_none(), "中鍵、側鍵可以是任何指令");
-        // 雙擊：全螢幕、迷你播放器（F1；子母畫面在 F2 加）
+        // 雙擊：全螢幕、迷你播放器（F1）、子母畫面（F2）
         assert_eq!(
             MouseInput::DoubleClick.choices(),
-            Some(&[Command::Fullscreen, Command::MiniPlayer][..])
+            Some(&[Command::Fullscreen, Command::MiniPlayer, Command::Pip][..])
         );
         // 名稱：兩種語言都有、不重複
         for lang in [Lang::ZhTw, Lang::En] {
