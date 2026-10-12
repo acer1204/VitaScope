@@ -509,6 +509,8 @@ pub struct VitascopeApp {
     playlist_view: (f32, f32),
     /// 主視窗（開檔對話框的擁有者；視窗置頂時對話框才不會被蓋在下面）
     owner: Option<Owner>,
+    /// macOS 子母畫面改視窗（比例鎖、Spaces 行為）的方法：主視窗，或測試的假視窗；自動測試沒有視窗時 None
+    pip_window: Option<Box<dyn crate::window_mode::PipWindow>>,
     /// Wayland：不讓程式自己把視窗設成置頂
     wayland: bool,
     /// 最後送給視窗的層級（true = 置頂；啟動時是 main.rs 建立視窗時設的）。
@@ -699,6 +701,9 @@ pub struct Launch {
     /// 測試用：當成接著這些螢幕（迷你播放器的位置；空的 = 沒有螢幕資訊，像 Wayland）；None = 問作業系統
     #[doc(hidden)]
     pub screen_areas: Option<Vec<crate::screens::Area>>,
+    /// 測試用：macOS 子母畫面改的視窗（比例鎖、Spaces 行為）換成假的，看 app 叫了什麼；None = 主視窗（自動測試沒有視窗：不改）
+    #[doc(hidden)]
+    pub pip_window: Option<Box<dyn crate::window_mode::PipWindow>>,
 }
 
 impl VitascopeApp {
@@ -784,6 +789,11 @@ impl VitascopeApp {
         // 建立視窗時的層級（main.rs 用同一個 `at_launch`）：只有「永遠置頂」，「播放時置頂」等開始播放才置頂
         let on_top_sent = settings.on_top.at_launch();
         // 自動測試沒有真的視窗（沒有 handle），查不到更新率，跟以前一樣播放
+        let pip_window = launch.pip_window.or_else(|| {
+            owner.map(|o| {
+                Box::new(crate::window_mode::native::Window(o.window)) as Box<dyn crate::window_mode::PipWindow>
+            })
+        });
         let probe = launch.platform.or_else(|| {
             owner.map(|o| Box::new(pacing::RealProbe::new(o.window, &cc.egui_ctx)) as Box<dyn PlatformProbe>)
         });
@@ -943,6 +953,7 @@ impl VitascopeApp {
             playlist_follow: None,
             playlist_view: (0.0, 0.0),
             owner,
+            pip_window,
             wayland,
             on_top_sent,
             was_fullscreen: false,
@@ -4956,6 +4967,8 @@ impl eframe::App for VitascopeApp {
         self.update_title(ctx);
         // 視窗模式：切換進行到哪裡、系統把迷你播放器變成全螢幕 / 最大化了沒（在層級之前：換了模式，層級同一幀跟著換）
         self.mode_tick(ctx);
+        // macOS 子母畫面：比例鎖跟著影片的形狀（VideoReconfig、旋轉、裁切），使用者改大小時再設一次
+        self.pip_native_tick(ctx);
         self.keep_window_level(ctx);
         if self.frames >= 2 {
             if std::mem::take(&mut self.start_fullscreen) {

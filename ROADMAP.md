@@ -632,6 +632,16 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認（macOS）：播放時 `pmset -g assertions` 有影戲的 PreventUserIdleDisplaySleep，暫停後消失
   - [ ] 手動確認（Linux）：GNOME、KDE 播放影片時螢幕不會變暗、不會鎖定，暫停後照設定的時間關閉
 - [ ] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
+  - 子母畫面（macOS，F3）：系統的邊緣改大小，視窗的內容比例鎖在影片的比例（`contentAspectRatio`），換檔、長寬比、旋轉、裁切
+    （mpv 重新設定畫面）之後換成新的；Spaces 行為（每個桌面都有、可以放在別的全螢幕旁邊）盡力而為。回到一般視窗、換成迷你播放器的那一刻
+    就解除、還原，所以全螢幕之前一定是原本的行為（`FullScreenAuxiliary` 的視窗自己不能全螢幕）
+    （自動：`window_mode` 單元測試（比例鎖跟著模式與影片的形狀、Spaces 的位元，macOS 上對過 AppKit 的定義）；kittest 用假的視窗記下 app 對視窗做了什麼
+    （旋轉、裁切、換檔途中不解除、比例鎖被清掉後大小一變就再設、全螢幕之前已經還原成原本的、換成迷你播放器、被系統最大化）；
+    macOS CI 的 `tests/pip_mac.rs`（真的 `NSWindow`：設比例、`contentResizeIncrements` 設回 1×1 之後再設、解除後 AppKit 的狀態真的變了、
+    Spaces 行為的設定與還原、別的執行緒不碰視窗；主執行緒才能用，所以不用 libtest））
+  - [ ] 手動確認（macOS）：子母畫面用觸控板拖曳移動；拉邊緣改大小時一直保持影片的比例（旋轉、裁切之後也是）；全螢幕時進入子母畫面，
+    大小對、沒有標題列；回到一般視窗後綠色按鈕照樣能全螢幕；子母畫面在別的桌面、別的程式的全螢幕上看不看得到（盡力而為，不保證）
+    （這裡沒有 Mac，目前只有 CI 的自動測試）
 - [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試
 
 ### L4 擴充與專業
@@ -996,3 +1006,7 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **嵌入用的 `vo=libmpv` 不處理 `stop-screensaver`**：mpv 預設播放時不讓螢幕關閉，但那是畫面輸出（`VOCTRL_KILL_SCREENSAVER`）做的，
   `vo_libmpv.c` 的 `control()` 沒有這一項，所以嵌入 mpv 的程式播影片時螢幕照樣會關。要自己向系統要求
   （Windows 的電源要求、macOS 的 IOPM assertion、Linux 的 `org.freedesktop.ScreenSaver`），也要記得在睡眠、關機之前放掉。
+- **winit 在 macOS 每次開始、結束改大小都把 `contentResizeIncrements` 設回 1×1**（`windowWillStartLiveResize:` /
+  `windowDidEndLiveResize:`），AppKit 的 `contentAspectRatio` 跟它互斥，設了就清掉。子母畫面的比例鎖只設一次會在使用者第一次拉邊緣時就不見，
+  所以大小一變就再設一次（改大小的途中程式照樣在畫）。`collectionBehavior` 的互斥位元（`CanJoinAllSpaces` 與 `MoveToActiveSpace`、
+  `FullScreenPrimary` / `Auxiliary` / `None`）同時設時 AppKit 丟例外，要先拿掉。

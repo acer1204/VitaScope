@@ -20533,3 +20533,298 @@ fn pip_progress_bar_has_no_thumbnail() {
         app.preview_shown().is_some_and(|(b, _)| b == bucket)
     });
 }
+
+// ───────────── 子母畫面（macOS，F3） ─────────────
+
+/// app 叫了假視窗的什麼
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PipCall {
+    Aspect(Option<[f64; 2]>),
+    Float,
+    Restore(usize),
+}
+
+/// 假的 macOS 視窗：像 AppKit 一樣記著比例鎖、`collectionBehavior`，也記 app 叫了什麼（自動測試沒有真的視窗）
+#[derive(Debug, Default)]
+struct PipWin {
+    /// 現在的比例鎖（None = 沒有）
+    aspect: Option<[f64; 2]>,
+    behavior: usize,
+    calls: Vec<PipCall>,
+}
+
+#[derive(Clone)]
+struct FakePipWindow(Arc<std::sync::Mutex<PipWin>>);
+
+/// 一般視窗原本的 `collectionBehavior`：可以全螢幕、搬到目前的桌面、Managed（1 << 2）
+const NORMAL_SPACES: usize = vitascope::window_mode::spaces::FULL_SCREEN_PRIMARY
+    | vitascope::window_mode::spaces::MOVE_TO_ACTIVE_SPACE
+    | (1 << 2);
+
+impl FakePipWindow {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(PipWin {
+            behavior: NORMAL_SPACES,
+            ..Default::default()
+        })))
+    }
+
+    fn aspect(&self) -> Option<[f64; 2]> {
+        self.0.lock().unwrap().aspect
+    }
+
+    fn behavior(&self) -> usize {
+        self.0.lock().unwrap().behavior
+    }
+
+    /// 從上次拿到現在 app 叫了什麼
+    fn take_calls(&self) -> Vec<PipCall> {
+        std::mem::take(&mut self.0.lock().unwrap().calls)
+    }
+
+    /// 視窗現在是一般視窗的樣子：沒有比例鎖、`collectionBehavior` 是原本的
+    fn is_normal(&self) -> bool {
+        self.aspect().is_none() && self.behavior() == NORMAL_SPACES
+    }
+
+    /// winit 在使用者開始 / 結束改大小時把 `contentResizeIncrements` 設回 1×1：比例鎖就不見了
+    fn winit_resize_reset(&self) {
+        self.0.lock().unwrap().aspect = None;
+    }
+}
+
+impl vitascope::window_mode::PipWindow for FakePipWindow {
+    fn set_aspect(&self, aspect: Option<[f64; 2]>) -> bool {
+        let mut w = self.0.lock().unwrap();
+        w.calls.push(PipCall::Aspect(aspect));
+        w.aspect = aspect;
+        true
+    }
+
+    fn float_on_spaces(&self) -> Option<usize> {
+        let mut w = self.0.lock().unwrap();
+        w.calls.push(PipCall::Float);
+        let old = w.behavior;
+        w.behavior = vitascope::window_mode::pip_spaces(old);
+        Some(old)
+    }
+
+    fn restore_spaces(&self, saved: usize) {
+        let mut w = self.0.lock().unwrap();
+        w.calls.push(PipCall::Restore(saved));
+        w.behavior = saved;
+    }
+}
+
+/// 迷你播放器測試（`mini_case`），macOS 子母畫面改的視窗換成假的
+fn pip_window_case(file: PathBuf) -> (Harness<'static, VitascopeApp>, FakePipWindow) {
+    let fake = FakePipWindow::new();
+    let launch = Launch {
+        pip_window: Some(Box::new(fake.clone())),
+        ..Default::default()
+    };
+    let h = mini_case_with(file, Settings::default(), launch);
+    assert_eq!(fake.take_calls(), [], "一般視窗：不碰視窗");
+    assert!(fake.is_normal());
+    (h, fake)
+}
+
+/// `pip_window_case`，進入子母畫面
+fn pip_window_in_pip(file: PathBuf) -> (Harness<'static, VitascopeApp>, FakePipWindow) {
+    let (mut h, fake) = pip_window_case(file);
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip, "前提：進入了子母畫面");
+    (h, fake)
+}
+
+/// 視窗（假的）的比例鎖跟影片顯示的形狀一樣，app 記的也一樣
+fn lock_matches_video(app: &VitascopeApp, fake: &FakePipWindow) -> bool {
+    let video = app.player().state.video_size.map(|[w, h]| [w as f64, h as f64]);
+    video.is_some() && fake.aspect() == video && app.pip_native().aspect == video
+}
+
+/// macOS 子母畫面：進入的那一刻視窗的內容比例鎖在影片的比例（拉系統的邊緣改大小時就保持），旋轉、裁切之後
+/// （mpv 重新設定畫面，VideoReconfig）跟著換（P-C14）；Esc 回到一般視窗的那一刻解除、Spaces 行為還原成原本的
+#[test]
+fn pip_aspect_lock_follows_rotation_and_crop() {
+    let (mut h, fake) = pip_window_case(sample("common/mkv_multitrack.mkv")); // 640×360
+    let n = h.state().pip_native();
+    assert!(n.aspect.is_none() && !n.spaces, "一般視窗：沒有鎖 {n:?}");
+    toggle_pip_key(&mut h);
+    assert_eq!(h.state().pip_native().aspect, Some([640.0, 360.0]), "進入的那一幀就鎖");
+    assert_eq!(fake.aspect(), Some([640.0, 360.0]), "進入的那一幀視窗就鎖");
+    assert_eq!(fake.behavior(), vitascope::window_mode::pip_spaces(NORMAL_SPACES));
+    assert!(h.state().pip_native().spaces);
+    window_settled(&mut h);
+    let calls = fake.take_calls();
+    assert_eq!(
+        calls.iter().filter(|c| **c == PipCall::Float).count(),
+        1,
+        "Spaces 行為只開一次：{calls:?}"
+    );
+    // 旋轉 90°：變直的
+    press_window_key(&mut h, egui::Modifiers::ALT, egui::Key::K);
+    window_steps_until(&mut h, "旋轉後鎖直的比例", |app| {
+        app.player().state.video_size == Some([360, 640]) && lock_matches_video(app, &fake)
+    });
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    // 裁切（Ctrl+Q 兩下：先是原本的形狀，再來 4:3）：鎖裁切後的形狀
+    press_window_key(&mut h, egui::Modifiers::CTRL, egui::Key::Q);
+    window_steps_until(&mut h, "第一下", |app| app.geometry().crop == Some(0));
+    press_window_key(&mut h, egui::Modifiers::CTRL, egui::Key::Q);
+    window_steps_until(&mut h, "裁切後鎖新的比例", |app| {
+        let s = &app.player().state;
+        s.video_size.is_some_and(|v| v != [360, 640]) && lock_matches_video(app, &fake)
+    });
+    let ratio = h.state().pip_native().ratio().unwrap();
+    assert!((ratio - 9.0 / 16.0).abs() > 0.01, "裁切換了形狀：{ratio}");
+    window_settled(&mut h);
+    // Esc：回到一般視窗的那一幀就解除、還原成原本的
+    fake.take_calls();
+    press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::Escape);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    let n = h.state().pip_native();
+    assert!(n.aspect.is_none() && !n.spaces, "{n:?}");
+    assert!(fake.is_normal(), "{:?}", fake.0.lock().unwrap());
+    assert_eq!(
+        fake.take_calls(),
+        [PipCall::Aspect(None), PipCall::Restore(NORMAL_SPACES)]
+    );
+    window_settled(&mut h);
+    assert!(
+        h.state().pip_native().aspect.is_none(),
+        "一般視窗配合影片調整大小也不鎖"
+    );
+    assert_eq!(fake.take_calls(), [], "一般視窗：不碰視窗");
+}
+
+/// macOS：winit 在使用者開始、結束拉邊緣改大小時把比例鎖清掉（`contentResizeIncrements` 設回 1×1），
+/// 所以子母畫面裡大小一變（改大小的途中照樣在畫）就再設一次；大小沒變不用設
+#[test]
+fn pip_aspect_lock_is_set_again_when_the_size_changes() {
+    let (mut h, fake) = pip_window_in_pip(sample("common/mkv_multitrack.mkv"));
+    assert_eq!(fake.aspect(), Some([640.0, 360.0]));
+    fake.take_calls();
+    window_step(&mut h);
+    assert_eq!(fake.take_calls(), [], "大小沒變：不用設");
+    // 使用者開始拉邊緣：winit 清掉，視窗大了一點
+    fake.winit_resize_reset();
+    let size = h.ctx.content_rect().size();
+    h.set_size(size + egui::vec2(32.0, 18.0));
+    window_step(&mut h);
+    assert_eq!(fake.aspect(), Some([640.0, 360.0]), "大小變了的那一幀就設回來");
+    assert_eq!(fake.take_calls(), [PipCall::Aspect(Some([640.0, 360.0]))]);
+    // 換成迷你播放器（大小也變）：解除，之後在迷你播放器裡改大小不設
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    assert!(fake.is_normal());
+    fake.take_calls();
+    let size = h.ctx.content_rect().size();
+    h.set_size(size + egui::vec2(40.0, 20.0));
+    window_step(&mut h);
+    window_step(&mut h);
+    assert_eq!(fake.take_calls(), [], "迷你播放器：不碰視窗");
+}
+
+/// macOS 子母畫面裡換檔：換檔途中（mpv 還不知道新影片的形狀）比例鎖照舊，不會解除；新影片的形狀出來就換成它的
+#[test]
+fn pip_aspect_lock_follows_a_new_file_without_a_gap() {
+    let (mut h, fake) = pip_window_in_pip(sample("common/mkv_multitrack.mkv"));
+    assert_eq!(h.state().pip_native().aspect, Some([640.0, 360.0]));
+    fake.take_calls();
+    drop_file(&mut h, sample("common/mp4_h264_aac.mp4")); // 320×240
+    let start = Instant::now();
+    loop {
+        window_step(&mut h);
+        let n = h.state().pip_native();
+        assert!(n.aspect.is_some() && n.spaces, "換檔途中不解除：{n:?}");
+        assert!(fake.aspect().is_some(), "換檔途中視窗的鎖不解除");
+        if n.aspect == Some([320.0, 240.0]) && fake.aspect() == n.aspect {
+            break;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：鎖新影片的 4:3（{n:?}）");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    let calls = fake.take_calls();
+    assert!(
+        !calls.iter().any(|c| matches!(c, PipCall::Float | PipCall::Restore(_))),
+        "換檔不動 Spaces 行為：{calls:?}"
+    );
+}
+
+/// macOS：「可以放在別的全螢幕旁邊」的視窗自己不能全螢幕（`toggleFullScreen:` 不理它），所以子母畫面裡要全螢幕時，
+/// Spaces 行為在送出全螢幕之前就還原成原本的了（回到一般視窗的那一刻，P-B10）。換成迷你播放器、被系統最大化時也還原
+#[test]
+fn pip_native_settings_are_restored_before_fullscreen() {
+    let (mut h, fake) = pip_window_in_pip(sample("common/mkv_multitrack.mkv"));
+    assert!(h.state().pip_native().spaces);
+    assert!(!fake.is_normal());
+    fake.take_calls();
+    let cmds = press_window_key(&mut h, egui::Modifiers::NONE, egui::Key::F);
+    assert!(!cmds.contains(&egui::ViewportCommand::Fullscreen(true)), "{cmds:?}");
+    let n = h.state().pip_native();
+    assert!(!n.spaces && n.aspect.is_none(), "按下的那一幀就還原：{n:?}");
+    assert!(fake.is_normal(), "按下的那一幀視窗就還原：{:?}", fake.0.lock().unwrap());
+    assert_eq!(
+        fake.take_calls(),
+        [PipCall::Aspect(None), PipCall::Restore(NORMAL_SPACES)]
+    );
+    // 還原好了才全螢幕：那之前每一幀都是一般視窗的行為，全螢幕的那一幀也是
+    let start = Instant::now();
+    loop {
+        let cmds = window_step(&mut h);
+        let n = h.state().pip_native();
+        assert!(!n.spaces && n.aspect.is_none(), "{n:?}");
+        assert!(fake.is_normal(), "{:?}", fake.0.lock().unwrap());
+        if cmds.contains(&egui::ViewportCommand::Fullscreen(true)) {
+            break;
+        }
+        assert!(start.elapsed() < TIMEOUT, "等待逾時：全螢幕");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(fake.take_calls(), [], "一般視窗：不再碰視窗");
+    // 迷你播放器 ↔ 子母畫面：換過去的那一刻就改
+    let (mut h, fake) = pip_window_in_pip(sample("common/mkv_multitrack.mkv"));
+    toggle_mini_key(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    let n = h.state().pip_native();
+    assert!(!n.spaces && n.aspect.is_none(), "迷你播放器：{n:?}");
+    assert!(fake.is_normal(), "迷你播放器：{:?}", fake.0.lock().unwrap());
+    window_settled(&mut h);
+    // 迷你控制列的 ▣（畫面處理滑鼠時換的）：同一幀就鎖
+    h.get_by_label("▣").click();
+    h.step();
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    let n = h.state().pip_native();
+    assert!(n.spaces && n.aspect == Some([640.0, 360.0]), "再回到子母畫面：{n:?}");
+    assert_eq!(fake.aspect(), Some([640.0, 360.0]), "▣ 的那一幀視窗就鎖");
+    assert_eq!(fake.behavior(), vitascope::window_mode::pip_spaces(NORMAL_SPACES));
+    window_settled(&mut h);
+    // 雙擊畫面回到一般視窗（畫面處理滑鼠時離開，不是按鍵）：同一幀就還原
+    let spot = pip_spot(&h);
+    double_click(&mut h, spot);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    let n = h.state().pip_native();
+    assert!(!n.spaces && n.aspect.is_none(), "雙擊：{n:?}");
+    assert!(fake.is_normal(), "雙擊：{:?}", fake.0.lock().unwrap());
+    window_settled(&mut h);
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    assert!(h.state().pip_native().spaces);
+    assert!(!fake.is_normal());
+    // 系統把子母畫面最大化（Win+↑ 之類）：回到一般模式，一起還原
+    h.input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .maximized = Some(true);
+    h.set_size(egui::vec2(1920.0, 1040.0));
+    window_step(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    let n = h.state().pip_native();
+    assert!(!n.spaces && n.aspect.is_none(), "系統最大化：{n:?}");
+    assert!(fake.is_normal(), "系統最大化：{:?}", fake.0.lock().unwrap());
+}

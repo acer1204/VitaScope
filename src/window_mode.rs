@@ -11,7 +11,9 @@
 //!   macOS 離開 / 進入全螢幕有約一秒的動畫，動畫結束時 AppKit 會把視窗改回動畫前的大小，
 //!   中途送的大小、位置會被蓋掉，所以 macOS 要等位置大小穩定下來（P-A2）；
 //! - 子母畫面的移動、改大小（Windows、Linux）：邊緣多寬算改大小（[`resize_zone`]）、改完停下來之後把比例改回影片的
-//!   （[`SnapDebounce`]、[`snap_to_aspect`]）、系統的拖曳結束後沒送「放開」時補一個（[`OsDrag`]，P-A3）。
+//!   （[`SnapDebounce`]、[`snap_to_aspect`]）、系統的拖曳結束後沒送「放開」時補一個（[`OsDrag`]，P-A3）；
+//! - macOS 的子母畫面（[`NativePip`]、[`native`]）：系統的邊緣改大小時就保持影片的比例（`contentAspectRatio`）、
+//!   Spaces 的行為（盡力而為），回到一般視窗、全螢幕之前還原（P-B10、P-C14）。
 
 use crate::screens::Area;
 use crate::settings::WindowGeometry;
@@ -813,6 +815,198 @@ impl Switch {
     }
 }
 
+// ───────────── macOS 的子母畫面（F3） ─────────────
+
+/// `NSWindowCollectionBehavior` 的位元（AppKit 的值；macOS 的單元測試對過 objc2-app-kit 的定義）
+pub mod spaces {
+    /// 每個桌面（Space）都有這個視窗
+    pub const CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+    /// 叫到前面時搬到目前的桌面（跟 `CAN_JOIN_ALL_SPACES` 互斥）
+    pub const MOVE_TO_ACTIVE_SPACE: usize = 1 << 1;
+    /// 可以全螢幕（自己一個 Space）
+    pub const FULL_SCREEN_PRIMARY: usize = 1 << 7;
+    /// 可以放在別的程式的全螢幕旁邊；這種視窗自己不能全螢幕（`toggleFullScreen:` 不理它）
+    pub const FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+    /// 不能全螢幕
+    pub const FULL_SCREEN_NONE: usize = 1 << 9;
+}
+
+/// 子母畫面的 `collectionBehavior`：每個桌面都有、可以跟別的程式的全螢幕放在一起（盡力而為：一般的 `NSWindow`
+/// 不一定真的浮在別的程式的全螢幕 Space 上，P-B10）。同一組裡互斥的拿掉（AppKit 同時設會丟例外）：
+/// 「搬到目前的桌面」、「可以全螢幕」、「不能全螢幕」
+pub fn pip_spaces(old: usize) -> usize {
+    let exclusive = spaces::MOVE_TO_ACTIVE_SPACE | spaces::FULL_SCREEN_PRIMARY | spaces::FULL_SCREEN_NONE;
+    (old & !exclusive) | spaces::CAN_JOIN_ALL_SPACES | spaces::FULL_SCREEN_AUXILIARY
+}
+
+/// macOS 的子母畫面告訴視窗（AppKit）的東西現在是什麼：內容的比例鎖、Spaces 的行為。
+/// app 每一幀（換模式時馬上）照現在的模式、影片的形狀算一次（[`NativePip::step`]），有變才真的改視窗；
+/// 其他系統也照樣記（自動測試看這個），只是不碰視窗（[`native`] 在 macOS 以外什麼都不做）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NativePip {
+    /// 告訴視窗的內容比例（影片的寬、高）；None = 沒有鎖（一般視窗、迷你播放器）
+    pub aspect: Option<[f64; 2]>,
+    /// 子母畫面的 Spaces 行為開著
+    pub spaces: bool,
+    /// 開之前的 `collectionBehavior`（macOS 才有；回到一般視窗時照原樣還原）
+    pub saved: Option<usize>,
+    /// 上次看的內容大小
+    size: Option<Vec2>,
+}
+
+/// 這一幀要對視窗做的事（[`NativePip::step`]）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NativeStep {
+    /// 設定內容的比例鎖（`Some(None)` = 解除）
+    pub aspect: Option<Option<[f64; 2]>>,
+    /// 比例鎖換了（不是同一個比例再設一次）：記錄用
+    pub aspect_changed: bool,
+    /// 打開 / 關掉子母畫面的 Spaces 行為
+    pub spaces: Option<bool>,
+}
+
+impl NativePip {
+    /// `pip` = 現在是子母畫面（回到一般視窗、換成迷你播放器的那一刻就不是）；`video` = 影片顯示的寬高（長寬比、裁切、
+    /// 旋轉之後的，mpv 每次畫面設定好 `VideoReconfig` 時更新；不知道時沿用上次的比例，換檔途中不解除）；
+    /// `size` = 視窗內容現在的大小。
+    ///
+    /// 子母畫面裡大小一變就再設一次比例：winit 在每次使用者開始、結束改大小（`windowWillStartLiveResize:` /
+    /// `windowDidEndLiveResize:`）都把 `contentResizeIncrements` 設回 1×1，AppKit 這樣會清掉 `contentAspectRatio`
+    /// （兩個互斥）。改大小的途中程式照樣在畫，下一幀就設回來；改完停下來之後還有 [`SnapDebounce`] 把比例改回來
+    pub fn step(&mut self, pip: bool, video: Option<[f64; 2]>, size: Vec2) -> NativeStep {
+        let video = video.filter(|[w, h]| *w > 0.0 && *h > 0.0);
+        let want = if pip { video.or(self.aspect) } else { None };
+        let resized = self.size.is_some_and(|s| (s - size).abs().max_elem() >= 0.5);
+        let changed = want != self.aspect;
+        let mut step = NativeStep {
+            aspect_changed: changed,
+            ..Default::default()
+        };
+        if changed || (want.is_some() && resized) {
+            step.aspect = Some(want);
+        }
+        if pip != self.spaces {
+            step.spaces = Some(pip);
+        }
+        self.aspect = want;
+        self.spaces = pip;
+        self.size = Some(size);
+        step
+    }
+
+    /// 比例鎖（寬 / 高）；沒有鎖時 None
+    pub fn ratio(&self) -> Option<f64> {
+        self.aspect.map(|[w, h]| w / h)
+    }
+}
+
+/// app 對視窗做 macOS 子母畫面的那些事的方法：真的是 [`native::Window`]（主視窗的 handle），
+/// 自動測試沒有真的視窗，換成假的（記下 app 叫了什麼、什麼時候叫的）
+pub trait PipWindow {
+    /// 內容的比例鎖（[`native::set_aspect`]）；真的設了時回傳 true
+    fn set_aspect(&self, aspect: Option<[f64; 2]>) -> bool;
+    /// 打開 Spaces 行為（[`native::float_on_spaces`]），回傳原本的（還原用）
+    fn float_on_spaces(&self) -> Option<usize>;
+    /// 還原 Spaces 行為（[`native::restore_spaces`]）
+    fn restore_spaces(&self, saved: usize);
+}
+
+/// macOS 子母畫面對視窗（AppKit 的 `NSWindow`）做的事；macOS 以外什麼都不做。
+/// AppKit 只能在主執行緒用：不是主執行緒時也什麼都不做（eframe 的 `logic()` 在主執行緒）
+pub mod native {
+    use raw_window_handle::RawWindowHandle;
+
+    /// 主視窗（handle 在整個程式執行期間都不變）
+    #[derive(Debug, Clone, Copy)]
+    pub struct Window(pub RawWindowHandle);
+
+    impl super::PipWindow for Window {
+        fn set_aspect(&self, aspect: Option<[f64; 2]>) -> bool {
+            set_aspect(self.0, aspect)
+        }
+
+        fn float_on_spaces(&self) -> Option<usize> {
+            float_on_spaces(self.0)
+        }
+
+        fn restore_spaces(&self, saved: usize) {
+            restore_spaces(self.0, saved);
+        }
+    }
+
+    /// 內容的比例鎖：使用者用系統的邊緣改大小時保持 `aspect`（寬、高）；None = 解除
+    /// （`contentResizeIncrements` 設回 1×1，`contentAspectRatio` 就不再作用）。有視窗可以設時回傳 true
+    pub fn set_aspect(w: RawWindowHandle, aspect: Option<[f64; 2]>) -> bool {
+        #[cfg(target_os = "macos")]
+        if let RawWindowHandle::AppKit(h) = w {
+            return mac::set_aspect(h.ns_view, aspect);
+        }
+        let _ = (w, aspect);
+        false
+    }
+
+    /// 打開子母畫面的 Spaces 行為（[`super::pip_spaces`]），回傳原本的 `collectionBehavior`（還原用）
+    pub fn float_on_spaces(w: RawWindowHandle) -> Option<usize> {
+        #[cfg(target_os = "macos")]
+        if let RawWindowHandle::AppKit(h) = w {
+            return mac::float_on_spaces(h.ns_view);
+        }
+        let _ = w;
+        None
+    }
+
+    /// 還原 `collectionBehavior`（[`float_on_spaces`] 回傳的值）
+    pub fn restore_spaces(w: RawWindowHandle, saved: usize) {
+        #[cfg(target_os = "macos")]
+        if let RawWindowHandle::AppKit(h) = w {
+            mac::restore_spaces(h.ns_view, saved);
+        }
+        let _ = (w, saved);
+    }
+
+    #[cfg(target_os = "macos")]
+    mod mac {
+        use objc2::MainThreadMarker;
+        use objc2::rc::Retained;
+        use objc2_app_kit::{NSView, NSWindow, NSWindowCollectionBehavior};
+        use objc2_foundation::NSSize;
+        use std::ffi::c_void;
+        use std::ptr::NonNull;
+
+        fn window(view: NonNull<c_void>) -> Option<Retained<NSWindow>> {
+            // AppKit 只能在主執行緒用
+            MainThreadMarker::new()?;
+            // SAFETY: winit 給的 ns_view 是 NSView，主視窗在整個程式執行期間都存在
+            let view: &NSView = unsafe { view.cast::<NSView>().as_ref() };
+            view.window()
+        }
+
+        pub fn set_aspect(view: NonNull<c_void>, aspect: Option<[f64; 2]>) -> bool {
+            let Some(window) = window(view) else {
+                return false;
+            };
+            match aspect {
+                Some([w, h]) => window.setContentAspectRatio(NSSize::new(w, h)),
+                None => window.setContentResizeIncrements(NSSize::new(1.0, 1.0)),
+            }
+            true
+        }
+
+        pub fn float_on_spaces(view: NonNull<c_void>) -> Option<usize> {
+            let window = window(view)?;
+            let old = window.collectionBehavior().0;
+            window.setCollectionBehavior(NSWindowCollectionBehavior(super::super::pip_spaces(old)));
+            Some(old)
+        }
+
+        pub fn restore_spaces(view: NonNull<c_void>, saved: usize) {
+            if let Some(window) = window(view) {
+                window.setCollectionBehavior(NSWindowCollectionBehavior(saved));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1592,5 +1786,92 @@ mod tests {
             ..mini
         };
         assert_eq!(sw.tick(t0, &seen(moved, false, false), timing), Next::Done);
+    }
+
+    /// 子母畫面的 Spaces 行為：加上「每個桌面都有」、「可以放在別的全螢幕旁邊」，拿掉同一組互斥的；其他位元照留
+    #[test]
+    fn pip_spaces_adds_the_floating_bits_and_drops_the_exclusive_ones() {
+        use spaces::*;
+        let floating = CAN_JOIN_ALL_SPACES | FULL_SCREEN_AUXILIARY;
+        assert_eq!(pip_spaces(0), floating);
+        // winit 的一般視窗、使用者設過的：可以全螢幕、搬到目前的桌面 → 拿掉（不然 AppKit 丟例外）
+        assert_eq!(pip_spaces(FULL_SCREEN_PRIMARY | MOVE_TO_ACTIVE_SPACE), floating);
+        assert_eq!(pip_spaces(FULL_SCREEN_NONE), floating);
+        // 其他的（Managed = 1 << 2、ParticipatesInCycle = 1 << 5、Primary = 1 << 16）照留
+        let others = (1 << 2) | (1 << 5) | (1 << 16);
+        assert_eq!(pip_spaces(others | FULL_SCREEN_PRIMARY), others | floating);
+        // 已經是子母畫面的：不變
+        assert_eq!(pip_spaces(floating), floating);
+    }
+
+    /// 跟 AppKit（objc2-app-kit）的定義一樣
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spaces_bits_match_appkit() {
+        use objc2_app_kit::NSWindowCollectionBehavior as B;
+        assert_eq!(spaces::CAN_JOIN_ALL_SPACES, B::CanJoinAllSpaces.0);
+        assert_eq!(spaces::MOVE_TO_ACTIVE_SPACE, B::MoveToActiveSpace.0);
+        assert_eq!(spaces::FULL_SCREEN_PRIMARY, B::FullScreenPrimary.0);
+        assert_eq!(spaces::FULL_SCREEN_AUXILIARY, B::FullScreenAuxiliary.0);
+        assert_eq!(spaces::FULL_SCREEN_NONE, B::FullScreenNone.0);
+    }
+
+    /// macOS 子母畫面的比例鎖：進入時鎖影片的比例；影片的形狀變了（換檔、長寬比、裁切、旋轉）跟著換；不知道形狀時沿用；
+    /// 大小變了（使用者正在改大小，winit 把比例清掉了）再設一次；離開時解除。Spaces 行為只在進入、離開時改
+    #[test]
+    fn native_pip_follows_the_mode_and_the_video_shape() {
+        let mut n = NativePip::default();
+        let normal = vec2(853.0, 540.0);
+        let small = vec2(480.0, 270.0);
+        // 一般視窗：什麼都不做
+        assert_eq!(n.step(false, Some([640.0, 360.0]), normal), NativeStep::default());
+        assert_eq!(n.step(false, Some([640.0, 360.0]), normal), NativeStep::default());
+        // 進入子母畫面（同一幀，視窗還是一般視窗的大小）：鎖 16:9、打開 Spaces 行為
+        let s = n.step(true, Some([640.0, 360.0]), normal);
+        assert_eq!(s.aspect, Some(Some([640.0, 360.0])));
+        assert!(s.aspect_changed);
+        assert_eq!(s.spaces, Some(true));
+        assert_eq!(n.ratio(), Some(16.0 / 9.0));
+        assert!(n.spaces);
+        // 視窗變成子母畫面的大小：再設一次（winit 改大小時會清掉），不算換了比例；Spaces 不再改
+        let s = n.step(true, Some([640.0, 360.0]), small);
+        assert_eq!(s.aspect, Some(Some([640.0, 360.0])));
+        assert!(!s.aspect_changed);
+        assert_eq!(s.spaces, None);
+        // 大小沒變：不用設
+        assert_eq!(n.step(true, Some([640.0, 360.0]), small), NativeStep::default());
+        // 不到半點的變化不算
+        assert_eq!(
+            n.step(true, Some([640.0, 360.0]), small + vec2(0.3, 0.2)),
+            NativeStep::default()
+        );
+        // 旋轉（9:16）：換成新的比例
+        let s = n.step(true, Some([360.0, 640.0]), small);
+        assert_eq!(s.aspect, Some(Some([360.0, 640.0])));
+        assert!(s.aspect_changed);
+        // 換檔途中不知道形狀：沿用（不解除）
+        assert_eq!(n.step(true, None, small), NativeStep::default());
+        assert_eq!(n.step(true, Some([0.0, 0.0]), small), NativeStep::default());
+        assert_eq!(n.ratio(), Some(9.0 / 16.0));
+        // 裁成 4:3
+        let s = n.step(true, Some([480.0, 360.0]), small);
+        assert_eq!(s.aspect, Some(Some([480.0, 360.0])));
+        // 離開（回到一般視窗、換成迷你播放器）：解除、還原 Spaces 行為
+        let s = n.step(false, Some([480.0, 360.0]), small);
+        assert_eq!(s.aspect, Some(None));
+        assert!(s.aspect_changed);
+        assert_eq!(s.spaces, Some(false));
+        assert_eq!(n.ratio(), None);
+        assert!(!n.spaces);
+        // 之後大小變了也不再設
+        assert_eq!(n.step(false, Some([480.0, 360.0]), normal), NativeStep::default());
+        // 還不知道影片形狀時進入：Spaces 行為照開，知道形狀時才鎖
+        let mut n = NativePip::default();
+        let s = n.step(true, None, small);
+        assert_eq!(s.aspect, None);
+        assert_eq!(s.spaces, Some(true));
+        assert_eq!(n.step(true, None, normal).aspect, None, "沒有比例：大小變了也不設");
+        let s = n.step(true, Some([1920.0, 1080.0]), normal);
+        assert_eq!(s.aspect, Some(Some([1920.0, 1080.0])));
     }
 }

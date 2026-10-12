@@ -170,3 +170,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSD
 [[test]]
 name = "now_playing"
 harness = false
+
+# macOS 的子母畫面（AppKit 的 NSWindow）也只能在主執行緒用：同上，自己的 main
+[[test]]
+name = "pip_mac"
+harness = false

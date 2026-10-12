@@ -16,6 +16,9 @@
 //! - 子母畫面（Windows、Linux）：拖曳畫面移動（`StartDrag`）、拉邊緣改大小（`BeginResize`），改完停下來之後照影片的
 //!   比例改回來；系統的拖曳結束時沒送「放開」的話在 `raw_input_hook` 補一個（P-A3）。單擊畫面不暫停（只是取得焦點），
 //!   雙擊回到一般視窗；控制項在滑鼠移上去時才出現。沒有影像的檔案不能用。
+//! - 子母畫面（macOS，F3）：改大小用系統的邊緣，視窗的內容比例鎖在影片的比例（`contentAspectRatio`，拉的時候就保持），
+//!   影片的形狀變了（換檔、長寬比、裁切、旋轉）跟著換；Spaces 的行為盡力而為（P-B10、P-C14）。換模式的那一刻就改，
+//!   所以回到一般視窗（之後才可能全螢幕）之前已經還原：Spaces 行為是「可以放在別的全螢幕旁邊」的視窗不能自己全螢幕。
 
 use super::{Action, HIDE_AFTER, VitascopeApp, fmt_time, icon_button};
 use crate::keymap::Command;
@@ -25,7 +28,7 @@ use crate::system_power::AfterPlayback;
 use crate::theme::{self, Palette};
 use crate::tr;
 use crate::window_mode::{
-    self, DragEnd, NormalRestore, OsDrag, Seen, SnapDebounce, Stage, Switch, Timing, WinRect, WindowMode,
+    self, DragEnd, NativePip, NormalRestore, OsDrag, Seen, SnapDebounce, Stage, Switch, Timing, WinRect, WindowMode,
 };
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Rect, ResizeDirection, ViewportCommand, pos2, vec2};
 use std::time::{Duration, Instant};
@@ -107,6 +110,8 @@ pub(super) struct ModeUi {
     pub(super) pip_controls: bool,
     /// 子母畫面的控制項蓋住畫面下面多少（佔畫面高度的比例；字幕跟著往上推）
     pub(super) pip_lift: f32,
+    /// macOS 子母畫面告訴視窗的內容比例鎖、Spaces 行為（其他系統只記，不碰視窗）
+    native: NativePip,
 }
 
 impl ModeUi {
@@ -150,6 +155,12 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn pip_controls_shown(&self) -> bool {
         self.modes.pip_controls
+    }
+
+    /// 測試用：macOS 子母畫面告訴視窗的內容比例鎖、Spaces 行為（其他系統一樣記，只是不碰視窗）
+    #[doc(hidden)]
+    pub fn pip_native(&self) -> NativePip {
+        self.modes.native
     }
 
     /// 測試用：系統的拖曳（子母畫面的移動、改大小）還沒結束
@@ -430,6 +441,8 @@ impl VitascopeApp {
             size.x,
             size.y
         );
+        // macOS：子母畫面的比例鎖、Spaces 行為（從子母畫面換到迷你播放器時解除、還原）
+        self.pip_native_tick(ctx);
     }
 
     /// 回到一般視窗（`then`：還原好之後接著做的事）。還在等進入的（離開全螢幕、取消最大化）就取消
@@ -478,6 +491,8 @@ impl VitascopeApp {
             restore.size.y,
             if restore.maximized { "，最大化" } else { "" }
         );
+        // macOS：比例鎖、Spaces 行為馬上還原（之後可能接著全螢幕，P-B10）
+        self.pip_native_tick(ctx);
         ctx.request_repaint();
     }
 
@@ -494,7 +509,7 @@ impl VitascopeApp {
     fn run_then(&mut self, ctx: &egui::Context, then: Then) {
         match then {
             Then::Nothing => {}
-            Then::Fullscreen => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true)),
+            Then::Fullscreen => self.fullscreen_now(ctx),
             // 面板已經開在這一頁（例如等的時候又按了一次）就不動，不然會關掉
             Then::Side(tab) if self.settings.show_playlist && self.settings.side_tab == tab => {}
             Then::Side(tab) => self.toggle_side(ctx, tab),
@@ -518,8 +533,15 @@ impl VitascopeApp {
             Some(s) if s.to == WindowMode::Normal => self.modes.then = Then::Fullscreen,
             // 正在進入迷你播放器：取消，直接全螢幕
             Some(_) => self.leave_compact(ctx, Then::Fullscreen),
-            None => ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true)),
+            None => self.fullscreen_now(ctx),
         }
+    }
+
+    /// 送出全螢幕。macOS 子母畫面的 Spaces 行為（「可以放在別的全螢幕旁邊」的視窗自己不能全螢幕）一定已經還原：
+    /// 離開子母畫面的那一刻就還原了，這裡再確認一次（P-B10）
+    fn fullscreen_now(&mut self, ctx: &egui::Context) {
+        self.pip_native_tick(ctx);
+        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
     }
 
     /// 全螢幕的開關要切到哪一邊（已經全螢幕，或正在等回到一般視窗後全螢幕：關）
@@ -686,10 +708,43 @@ impl VitascopeApp {
         }
     }
 
+    /// 每一幀、換模式的那一刻：macOS 子母畫面的內容比例鎖跟著影片的形狀（`VideoReconfig` 之後的尺寸已經算進長寬比、
+    /// 裁切、旋轉），Spaces 行為跟著模式（[`NativePip::step`]）。其他系統的視窗什麼都不做，自動測試沒有視窗（或是假的）
+    pub(super) fn pip_native_tick(&mut self, ctx: &egui::Context) {
+        let st = &self.player.state;
+        let video = st
+            .video_size
+            .filter(|_| st.has_video())
+            .map(|[w, h]| [w as f64, h as f64]);
+        let size = ctx.content_rect().size();
+        let step = self.modes.native.step(self.pip(), video, size);
+        let window = self.pip_window.as_deref();
+        if let Some(aspect) = step.aspect {
+            // 真的設了才記（其他系統沒有這個鎖，靠改完之後的 SnapDebounce）
+            let applied = window.is_some_and(|w| w.set_aspect(aspect));
+            if applied && step.aspect_changed {
+                match aspect {
+                    Some([w, h]) => eprintln!("[vitascope] 子母畫面：改大小時保持 {w:.0}:{h:.0}"),
+                    None => eprintln!("[vitascope] 子母畫面：不再固定比例"),
+                }
+            }
+        }
+        match step.spaces {
+            Some(true) => self.modes.native.saved = window.and_then(|w| w.float_on_spaces()),
+            Some(false) => {
+                if let (Some(w), Some(saved)) = (window, self.modes.native.saved.take()) {
+                    w.restore_spaces(saved);
+                }
+            }
+            None => {}
+        }
+    }
+
     /// 系統把迷你播放器、子母畫面變成全螢幕 / 最大化：回到一般模式（標題列、最小大小、層級改回來）；
     /// 一般視窗的位置大小等那個狀態結束時再還原（全螢幕之前是迷你播放器的大小，系統會還原成那個）
     fn os_left_compact(&mut self, ctx: &egui::Context, fullscreen: bool) {
         let was = std::mem::replace(&mut self.modes.mode, WindowMode::Normal);
+        self.pip_native_tick(ctx);
         self.modes.changed_at = Some(Instant::now());
         self.modes.snap = None;
         if was == WindowMode::Pip {
