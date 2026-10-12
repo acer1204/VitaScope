@@ -1223,6 +1223,152 @@ fn audio_file_without_cover_shows_title() {
     h.get_by_label_contains("audio_flac.flac");
 }
 
+/// 暫存資料夾裡放一份音樂樣本 `rel`（取名「歌」）和同名的 LRC 歌詞（整首只有一句），開好、等到歌詞出現後暫停
+fn song_with_lyrics(dir: &TempDir, rel: &str) -> Harness<'static, VitascopeApp> {
+    let ext = std::path::Path::new(rel)
+        .extension()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let song = dir.0.join(format!("歌.{ext}"));
+    std::fs::copy(sample(rel), &song).unwrap();
+    std::fs::write(dir.0.join("歌.lrc"), "[ti:測試]\n[00:00.00]影戲播放器測試\n").unwrap();
+    let mut h = harness(Some(song));
+    step_until(&mut h, "出現歌詞", |s| {
+        s.sub_text.as_deref() == Some("影戲播放器測試")
+    });
+    // 暫停：歌詞不會再變（播到結尾也不會換檔）
+    h.state().player().set_pause(true).unwrap();
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.run_steps(2);
+    h
+}
+
+#[test]
+fn lrc_lyrics_drawn_for_audio_without_cover() {
+    let dir = TempDir::new("lyrics-plain");
+    let mut h = song_with_lyrics(&dir, "general/audio_flac.flac");
+    // 沒有封面：歌名在中間，歌詞在它下面
+    let title = h.get_by_label_contains("歌.flac").rect();
+    let lyric = h.get_by_label("影戲播放器測試").rect();
+    let video = h.get_by_label("影片畫面").rect();
+    assert!(
+        lyric.top() >= title.bottom(),
+        "歌詞在歌名下面：歌名 {title:?}，歌詞 {lyric:?}"
+    );
+    assert!(video.contains_rect(lyric), "歌詞在畫面裡：{lyric:?}／{video:?}");
+    assert!(
+        (lyric.center().x - video.center().x).abs() < 2.0,
+        "置中：{lyric:?}／{video:?}"
+    );
+    // mpv 不另外畫一份（只對這個檔案）
+    assert_eq!(h.state().player().get_string("sub-visibility").unwrap(), "no");
+    // 換成影片：mpv 照常畫字幕，介面不畫歌詞
+    drop_file(&mut h, sample("common/mkv_h264_aac_srt.mkv"));
+    step_until(&mut h, "換成影片", |s| {
+        playing(s, "mkv_h264_aac_srt.mkv") && s.has_video()
+    });
+    h.run_steps(2);
+    assert_eq!(h.state().player().get_string("sub-visibility").unwrap(), "yes");
+    assert!(h.query_by_label("影戲播放器測試").is_none(), "影片不畫歌詞");
+}
+
+#[test]
+fn lrc_lyrics_drawn_in_the_band_over_the_cover() {
+    let dir = TempDir::new("lyrics-cover");
+    let h = song_with_lyrics(&dir, "general/audio_mp3_cover.mp3");
+    assert!(
+        h.state().player().state.tracks_of(TrackKind::Video).any(|t| t.albumart),
+        "有專輯封面"
+    );
+    // 有封面：歌名、演出者、專輯和歌詞都在下方的底色上，歌詞在最下面
+    let title = h.get_by_label("測試歌曲").rect();
+    let album = h.get_by_label("範例專輯").rect();
+    let lyric = h.get_by_label("影戲播放器測試").rect();
+    let video = h.get_by_label("影片畫面").rect();
+    assert!(lyric.top() >= album.bottom(), "歌詞在專輯下面：{album:?}／{lyric:?}");
+    assert!(
+        title.top() > video.center().y,
+        "歌名在畫面的下半部：{title:?}／{video:?}"
+    );
+    assert!(lyric.bottom() <= video.bottom(), "歌詞在畫面裡：{lyric:?}／{video:?}");
+    // 封面上 mpv 自己的那份藏起來：不然會被底色蓋住、跟介面的重複
+    assert_eq!(h.state().player().get_string("sub-visibility").unwrap(), "no");
+}
+
+#[test]
+fn ass_lyrics_over_a_cover_left_to_mpv() {
+    // 封面上的 ASS 歌詞（樣式、位置、卡拉 OK 效果）照舊由 mpv 畫：介面不另外畫成純文字，也不留歌詞的位置
+    let dir = TempDir::new("lyrics-cover-ass");
+    let song = dir.0.join("歌.mp3");
+    std::fs::copy(sample("general/audio_mp3_cover.mp3"), &song).unwrap();
+    std::fs::write(
+        dir.0.join("歌.ass"),
+        "[Script Info]\nScriptType: v4.00+\n\n[Events]\n\
+         Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+         Dialogue: 0,0:00:00.00,0:00:10.00,Default,,0,0,0,,{\\k50}卡拉{\\k50}歌詞\n",
+    )
+    .unwrap();
+    let mut h = harness(Some(song));
+    step_until(&mut h, "選上 ASS", |s| {
+        s.selected(TrackKind::Sub)
+            .is_some_and(|t| t.codec.as_deref() == Some("ass"))
+    });
+    // mpv 讀得到這一句（純音訊檔照樣觀察 sub-text），只是介面不畫
+    step_until(&mut h, "字幕文字", |s| s.sub_text.as_deref() == Some("卡拉歌詞"));
+    h.state().player().set_pause(true).unwrap();
+    step_until(&mut h, "暫停", |s| s.paused);
+    h.run_steps(2);
+    assert!(
+        h.state().player().state.tracks_of(TrackKind::Video).any(|t| t.albumart),
+        "有專輯封面"
+    );
+    assert!(!h.state().player().state.lyrics_in_app());
+    assert_eq!(h.state().player().get_string("sub-visibility").unwrap(), "yes");
+    assert!(h.query_by_label_contains("歌詞").is_none(), "介面不畫 ASS 歌詞");
+    // 歌名照沒有歌詞時的位置（不留空白的歌詞列）：底色只包住歌名、演出者、專輯
+    let album = h.get_by_label("範例專輯").rect();
+    let video = h.get_by_label("影片畫面").rect();
+    assert!(
+        video.bottom() - album.bottom() < 40.0,
+        "專輯下面沒有留歌詞的位置：{album:?}／{video:?}"
+    );
+}
+
+#[test]
+fn dropped_lrc_lyrics_drawn_for_audio_already_playing() {
+    // 歌詞不同名（不會自動載入）：音樂播了之後才拖進來，一樣畫在歌名下面
+    let dir = TempDir::new("lyrics-dropped");
+    let song = dir.0.join("歌.flac");
+    std::fs::copy(sample("general/audio_flac.flac"), &song).unwrap();
+    let lrc = dir.0.join("別的名字.lrc");
+    std::fs::write(&lrc, "[ti:測試]\n[00:00.00]影戲播放器測試\n").unwrap();
+    let mut h = harness(Some(song));
+    step_until(&mut h, "播放", |s| playing(s, "歌.flac") && !s.tracks.is_empty());
+    // 暫停在中間：拖進來之後歌詞不會因為播完而變（純音訊檔暫停中也照位置更新字幕）
+    h.state().player().set_pause(true).unwrap();
+    h.state().player().seek_to(1.0, true).unwrap();
+    step_until(&mut h, "暫停", |s| s.paused);
+    assert!(
+        h.state().player().state.selected(TrackKind::Sub).is_none(),
+        "還沒有字幕"
+    );
+    assert!(h.query_by_label("影戲播放器測試").is_none());
+
+    drop_file(&mut h, lrc);
+    step_until(&mut h, "出現歌詞", |s| {
+        s.sub_text.as_deref() == Some("影戲播放器測試")
+    });
+    h.run_steps(2);
+    let title = h.get_by_label_contains("歌.flac").rect();
+    let lyric = h.get_by_label("影戲播放器測試").rect();
+    assert!(
+        lyric.top() >= title.bottom(),
+        "歌詞在歌名下面：歌名 {title:?}，歌詞 {lyric:?}"
+    );
+    assert_eq!(h.state().player().get_string("sub-visibility").unwrap(), "no");
+}
+
 #[test]
 fn subtitle_style_window_applies_changes_and_typing_is_not_a_shortcut() {
     let mut h = playing_multitrack();

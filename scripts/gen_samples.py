@@ -352,6 +352,12 @@ def samples() -> list[Sample]:
           None, "amr_nb"),
         S("audio_speex", "rare", "spx", None, ["-c:a", "libspeex", "-ar", "16000", "-ac", "1"], None, "speex",
           fmt=["-f", "ogg"]),
+        # 罕見的純音訊副檔名（formats::AUDIO_RARE：能播，但不加入檔案關聯）。都是 FFmpeg 內建的編碼器，每個平台都產生得了。
+        # .ra（RealAudio）不放：rm 封裝寫不出長度，格式矩陣的長度檢查會失敗
+        S("audio_aiff", "rare", "aiff", None, ["-c:a", "pcm_s16be", "-ac", "2"], None, "pcm_s16be", note="AIFF"),
+        S("audio_aifc_sowt", "rare", "aifc", None, ["-c:a", "pcm_s16le", "-ac", "2"], None, "pcm_s16le",
+          fmt=["-f", "aiff"], note="AIFF-C（sowt）"),
+        S("audio_caf_alac", "rare", "caf", None, ["-c:a", "alac", "-ac", "2"], None, "alac", note="Apple Lossless 的 CAF"),
         S("extsub_microdvd", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="microdvd", subs=["microdvd"],
           note="影格制字幕"),
     ]

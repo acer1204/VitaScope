@@ -256,6 +256,9 @@ pub struct State {
     pub net_failure: Option<Failure>,
     /// yt-dlp 成功了、但警告裡看得出的提醒（沒有 deno 時 YouTube 只有部分畫質之類）
     pub net_hints: Vec<Hint>,
+    /// 純音訊檔（沒有影像，可以有專輯封面）正在顯示的字幕文字（LRC 歌詞之類），介面畫在歌名下面；
+    /// 沒有字幕、兩句之間、有影像的檔案都是 None（只在純音訊檔時才向 mpv 要，見 `SUB_TEXT_ID`）
+    pub sub_text: Option<String>,
 }
 
 impl State {
@@ -277,6 +280,22 @@ impl State {
     /// 有實際影像（不是只有專輯封面）
     pub fn has_video(&self) -> bool {
         self.tracks_of(TrackKind::Video).any(|t| !t.albumart)
+    }
+
+    /// 歌詞（目前的字幕）由介面畫在歌名下面、mpv 自己的那份藏起來（見 `Player::watch_lyrics`）。
+    /// 只限純音訊檔，而且：
+    /// - 純文字的字幕（LRC、SRT 之類）：一律由介面畫；
+    /// - ASS／SSA：沒有封面時由介面畫成純文字（mpv 沒有畫面可畫），有封面時照舊交給 mpv（保留樣式、位置、卡拉 OK 效果）；
+    /// - 圖片字幕（PGS、VobSub…）與不認得的：交給 mpv（它們沒有文字可畫）
+    pub fn lyrics_in_app(&self) -> bool {
+        if self.tracks.is_empty() || self.has_video() {
+            return false;
+        }
+        let Some(codec) = self.selected(TrackKind::Sub).and_then(|t| t.codec.as_deref()) else {
+            return false;
+        };
+        let has_cover = self.tracks_of(TrackKind::Video).any(|t| t.albumart);
+        is_plain_text_sub(codec) || (!has_cover && matches!(codec, "ass" | "ssa"))
     }
 
     /// 讀取標籤（不分大小寫），例如 `tag("artist")`
@@ -578,6 +597,36 @@ fn sound_key(name: &str) -> AsyncKey {
 /// 觀察 audio-device-list 用的編號（接在 OBSERVED 後面；要用時才觀察，見 `Player::watch_audio_devices`）
 const DEVICE_LIST_ID: u64 = OBSERVED.len() as u64 + 1;
 
+/// 觀察 sub-text 用的編號：只在純音訊檔播放時觀察（歌詞），關檔時停止。
+/// 不放進 OBSERVED：mpv 每一格都重新讀 sub-text 比較有沒有變，ASS 字幕要掃過全部的字幕事件
+///（特效字幕有好幾萬筆），每部有字幕的影片都多這份工作會影響播放的流暢
+const SUB_TEXT_ID: u64 = OBSERVED.len() as u64 + 2;
+
+/// 純文字的字幕編碼（mpv 軌道清單的 codec）：sub-text 就是畫面上的字，介面畫得出一樣的內容。
+/// ASS／SSA 有樣式、位置、特效，圖片字幕（PGS、VobSub…）沒有文字，都不在這裡（見 `State::lyrics_in_app`）
+fn is_plain_text_sub(codec: &str) -> bool {
+    matches!(
+        codec,
+        "text"
+            | "subrip"
+            | "srt"
+            | "webvtt"
+            | "mov_text"
+            | "mpl2"
+            | "microdvd"
+            | "subviewer"
+            | "subviewer1"
+            | "jacosub"
+            | "realtext"
+            | "pjs"
+            | "vplayer"
+            | "sami"
+            | "stl"
+            | "eia_608"
+            | "ttml"
+    )
+}
+
 /// 畫質選項 → 非同步設定時的種類（回覆依種類分派）
 fn picture_key(name: &str) -> AsyncKey {
     match name {
@@ -852,6 +901,10 @@ pub struct Player {
     options_applied: HashMap<&'static str, String>,
     /// 已經開始觀察 audio-device-list（mpv 同時開始偵測裝置插拔）
     watching_devices: bool,
+    /// 正在觀察 sub-text（目前的檔案是純音訊，見 `SUB_TEXT_ID`）
+    watching_sub_text: bool,
+    /// 這個檔案的 sub-visibility 已經設成 no（歌詞由介面畫，見 `sync_lyrics_visibility`）
+    lyrics_hidden: bool,
     /// 測試用的假裝置清單：有的話不讀 mpv 的（見 `set_fake_audio_devices`）
     fake_devices: bool,
     /// 最近一次開檔（`open`）換掉的檔案，音訊輸出是改用的 null（見 `take_fell_back_before_open`）
@@ -1043,6 +1096,8 @@ impl Player {
             probe_noise: Vec::new(),
             options_applied: HashMap::new(),
             watching_devices: false,
+            watching_sub_text: false,
+            lyrics_hidden: false,
             fake_devices: false,
             fell_back_before_open: false,
             open_pending: false,
@@ -1332,6 +1387,51 @@ impl Player {
         if let Err(e) = self.mpv.observe(DEVICE_LIST_ID, "audio-device-list", Format::String) {
             eprintln!("[vitascope] 無法觀察音訊裝置清單：{e}");
         }
+    }
+
+    // ───────────── 歌詞（純音訊檔的字幕） ─────────────
+
+    /// 開檔後：純音訊檔（沒有影像，專輯封面不算）開始觀察 sub-text，介面自己把歌詞畫在歌名下面
+    ///（之後才拖進來、「載入字幕檔…」的歌詞也一樣）
+    fn watch_lyrics(&mut self) {
+        if self.state.tracks.is_empty() || self.state.has_video() || self.watching_sub_text {
+            return;
+        }
+        match self.mpv.observe(SUB_TEXT_ID, "sub-text", Format::String) {
+            Ok(()) => self.watching_sub_text = true,
+            Err(e) => eprintln!("[vitascope] 無法觀察字幕文字：{e}"),
+        }
+        self.sync_lyrics_visibility();
+    }
+
+    /// 介面畫歌詞時（`State::lyrics_in_app`），mpv 自己畫在專輯封面上的那份藏起來：不然會跟介面畫的重複，
+    /// 而且被歌名的底色蓋住。只對這個檔案（file-local；關檔時 mpv 自己還原）。
+    /// 換字幕（選別條、拖進 ASS 或圖片字幕）時重新判斷：介面畫不出來的交還給 mpv
+    fn sync_lyrics_visibility(&mut self) {
+        if !self.watching_sub_text {
+            return;
+        }
+        let hide = self.state.lyrics_in_app();
+        if hide == self.lyrics_hidden {
+            return;
+        }
+        let value = if hide { "no" } else { "yes" };
+        match self.mpv.set_property("file-local-options/sub-visibility", value) {
+            Ok(()) => self.lyrics_hidden = hide,
+            Err(e) => eprintln!("[vitascope] 無法設定封面上的字幕（{value}）：{e}"),
+        }
+    }
+
+    /// 關檔時停止觀察 sub-text（下一個檔案是影片時不能留著，見 `SUB_TEXT_ID`）
+    fn unwatch_lyrics(&mut self) {
+        if std::mem::take(&mut self.watching_sub_text)
+            && let Err(e) = self.mpv.unobserve(SUB_TEXT_ID)
+        {
+            eprintln!("[vitascope] 無法停止觀察字幕文字：{e}");
+        }
+        // file-local 的 sub-visibility 由 mpv 在關檔時還原
+        self.lyrics_hidden = false;
+        self.state.sub_text = None;
     }
 
     /// 測試用：當成 mpv 的裝置清單是這些（自動測試的電腦不一定有音訊裝置；之後 mpv 的清單不再蓋掉它）
@@ -2979,6 +3079,10 @@ impl Player {
         match ev {
             Event::PropertyChange { name, value, .. } => {
                 self.apply_property(&name, value);
+                // 純音訊檔換了字幕：重新判斷歌詞由誰畫
+                if matches!(name.as_str(), "sid" | "track-list") {
+                    self.sync_lyrics_visibility();
+                }
                 None
             }
             Event::Log { prefix, level, text } => {
@@ -3071,12 +3175,14 @@ impl Player {
                 }
                 self.site_chapters();
                 self.refresh_tracks();
+                self.watch_lyrics();
                 self.approx_setup();
                 Some(PlayerEvent::FileLoaded)
             }
             Event::EndFile { reason, error } => {
                 self.state.loading = false;
                 self.state.loaded = false;
+                self.unwatch_lyrics();
                 self.approx_reset();
                 // 網路上的播放清單（IPTV 的 .m3u 網址）：mpv 讀完清單、把項目放進自己的播放清單，接著就會自己開第一個。
                 // 這時就讀出來（mpv 接著會開別的項目）；介面照一般的開檔重新開，mpv 的清單回到只有一個
@@ -3197,6 +3303,10 @@ impl Player {
             // 關檔時 mpv 送「不可用」：跟著變回 false / None
             "paused-for-cache" => s.paused_for_cache = value.as_bool().unwrap_or(false),
             "cache-buffering-state" => s.cache_buffering = value.as_i64(),
+            // 兩句之間是空字串、沒有字幕時「不可用」：都當成沒有字。停止觀察後才到的舊通知不算
+            "sub-text" if self.watching_sub_text => {
+                s.sub_text = value.as_str().filter(|t| !t.trim().is_empty()).map(str::to_owned);
+            }
             // 讀不到（Value::None）時保留上一次的清單
             "audio-device-list" if !self.fake_devices => {
                 if let Some(json) = value.as_str() {
@@ -3848,6 +3958,110 @@ mod tests {
         p.handle(change("cache-buffering-state", Value::None));
         assert!(!p.state.paused_for_cache);
         assert_eq!(p.state.cache_buffering, None);
+    }
+
+    #[test]
+    fn sub_text_is_observed_on_demand() {
+        // sub-text 不放進 OBSERVED（每部影片每一格都要多算一次），用自己的編號、要用時才觀察
+        assert!(super::OBSERVED.iter().all(|(name, _)| *name != "sub-text"));
+        assert_eq!(super::SUB_TEXT_ID, super::OBSERVED.len() as u64 + 2);
+        assert_ne!(super::SUB_TEXT_ID, super::DEVICE_LIST_ID);
+
+        use crate::mpv::{Event, Value};
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let text = |v: Value| Event::PropertyChange {
+            id: super::SUB_TEXT_ID,
+            name: "sub-text".into(),
+            value: v,
+        };
+        // 沒在觀察（影片、停止觀察後才到的舊通知）：不算
+        p.handle(text(Value::String("舊的歌詞".into())));
+        assert_eq!(p.state.sub_text, None);
+        p.watching_sub_text = true;
+        p.handle(text(Value::String("影戲播放器測試".into())));
+        assert_eq!(p.state.sub_text.as_deref(), Some("影戲播放器測試"));
+        // 兩句之間（空字串）、不可用：沒有字
+        p.handle(text(Value::String(" \n".into())));
+        assert_eq!(p.state.sub_text, None);
+        p.handle(text(Value::String("下一句".into())));
+        p.handle(text(Value::None));
+        assert_eq!(p.state.sub_text, None);
+        // 關檔：停止觀察、清掉
+        p.handle(text(Value::String("最後一句".into())));
+        p.handle(Event::EndFile {
+            reason: crate::mpv::EndReason::Stop,
+            error: None,
+        });
+        assert!(!p.watching_sub_text);
+        assert_eq!(p.state.sub_text, None);
+        p.handle(text(Value::String("晚到的".into())));
+        assert_eq!(p.state.sub_text, None);
+    }
+
+    #[test]
+    fn sub_text_is_unobserved_when_the_file_ends() {
+        use std::time::Duration;
+        // 關檔時真的叫 mpv 停止觀察（不只是不理它的通知）：不然之後的影片每一格都還要多算一次，
+        // 每開一個音樂檔又多疊一個觀察
+        let song = concat!(env!("CARGO_MANIFEST_DIR"), "/samples/generated/general/audio_flac.flac");
+        assert!(
+            std::path::Path::new(song).exists(),
+            "找不到樣本 {song}，請先執行：python scripts/gen_samples.py"
+        );
+        let timeout = Duration::from_secs(15);
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        p.set_pause(true).unwrap();
+        let open = |p: &mut super::Player, path: &str| {
+            p.open(path).unwrap();
+            p.wait_for(timeout, |e| *e == super::PlayerEvent::FileLoaded).unwrap();
+        };
+        // 連開兩個音樂檔：只有一個觀察（第一個檔案關掉時停止了）
+        open(&mut p, song);
+        assert!(p.watching_sub_text);
+        open(&mut p, song);
+        assert!(p.watching_sub_text);
+        assert_eq!(
+            p.mpv.unobserve(super::SUB_TEXT_ID).unwrap(),
+            1,
+            "只有一個 sub-text 的觀察"
+        );
+        p.mpv
+            .observe(super::SUB_TEXT_ID, "sub-text", super::Format::String)
+            .unwrap();
+        // 換成影片：已經停止觀察
+        open(&mut p, "av://lavfi:testsrc2=size=320x240:rate=30:duration=3");
+        assert!(!p.watching_sub_text);
+        assert_eq!(p.mpv.unobserve(super::SUB_TEXT_ID).unwrap(), 0, "影片不觀察 sub-text");
+    }
+
+    #[test]
+    fn lyrics_in_app_only_for_text_it_can_draw() {
+        let track = |json: &str| serde_json::from_str::<super::Track>(json).unwrap();
+        let audio = || track(r#"{"id":1,"type":"audio","codec":"flac","selected":true}"#);
+        let cover = || track(r#"{"id":1,"type":"video","codec":"mjpeg","albumart":true,"selected":true}"#);
+        let sub = |codec: &str| track(&format!(r#"{{"id":1,"type":"sub","codec":"{codec}","selected":true}}"#));
+        let state = |tracks: Vec<super::Track>| super::State {
+            tracks,
+            ..Default::default()
+        };
+        // 沒有封面：文字字幕都由介面畫（ASS 也是，mpv 沒有畫面可畫）；圖片字幕沒有文字
+        for codec in ["text", "subrip", "webvtt", "mpl2", "pjs", "eia_608", "ass"] {
+            assert!(state(vec![audio(), sub(codec)]).lyrics_in_app(), "{codec}");
+        }
+        for codec in ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"] {
+            assert!(!state(vec![audio(), sub(codec)]).lyrics_in_app(), "{codec}");
+        }
+        // 有封面：純文字由介面畫在底色上；ASS 的樣式、卡拉 OK 效果和圖片字幕交給 mpv 畫在封面上
+        assert!(state(vec![cover(), audio(), sub("text")]).lyrics_in_app());
+        assert!(state(vec![cover(), audio(), sub("subrip")]).lyrics_in_app());
+        for codec in ["ass", "ssa", "hdmv_pgs_subtitle", "dvd_subtitle"] {
+            assert!(!state(vec![cover(), audio(), sub(codec)]).lyrics_in_app(), "{codec}");
+        }
+        // 沒選字幕、影片、還不知道有哪些軌道：都不是
+        assert!(!state(vec![audio()]).lyrics_in_app());
+        let video = track(r#"{"id":1,"type":"video","codec":"h264","selected":true}"#);
+        assert!(!state(vec![video, audio(), sub("text")]).lyrics_in_app());
+        assert!(!state(vec![]).lyrics_in_app());
     }
 
     #[test]

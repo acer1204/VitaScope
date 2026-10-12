@@ -10,8 +10,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// 文字字幕：讀進來轉碼
-pub const TEXT_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "smi", "sami", "sub", "txt"];
+/// 文字字幕：讀進來轉碼。後面一列是罕見的格式（MPL2、JACOsub、RealText、PJS、AQTitle、SCC、LRC 歌詞…）；
+/// `stl` 不收（也是二進位的 EBU-STL）
+pub const TEXT_EXTS: &[&str] = &[
+    "srt", "ass", "ssa", "vtt", "smi", "sami", "sub", "txt", //
+    "lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp",
+];
+/// 暫存檔名的版本：暫存檔的格式改了就換（舊版留下、內容一樣的暫存檔不能再用）。
+/// v2：不再加 UTF-8 BOM
+const CACHE_VERSION: &str = "v2";
 /// 圖形字幕或二進位容器：照原路徑交給 mpv
 pub const BINARY_EXTS: &[&str] = &["idx", "sup", "mks"];
 /// 字幕常放的子資料夾
@@ -198,11 +205,32 @@ impl ExternalSub {
     ///
     /// 不用 `memory://`：那樣整份字幕內容會變成 track-list 裡的檔名，每次軌道變化都要複製好幾 MB。
     pub fn load_path(&self) -> std::io::Result<PathBuf> {
+        if self.text.is_none() {
+            return Ok(self.path.clone());
+        }
+        self.write_into(&cache_dir())
+    }
+
+    /// 文字字幕寫到 `dir`（檔名是內容的雜湊，內容一樣就不再寫）；圖形字幕回傳原路徑
+    fn write_into(&self, dir: &Path) -> std::io::Result<PathBuf> {
         let Some(text) = &self.text else {
             return Ok(self.path.clone());
         };
+        std::fs::create_dir_all(dir)?;
+        let out = dir.join(self.cache_name(text));
+        if !out.exists() {
+            // 不加 BOM：合法的 UTF-8 mpv 一定當成 UTF-8 讀（不用 BOM 提示）；有 BOM 時，
+            // FFmpeg 的 AQTitle、PJS、VPlayer 格式偵測從第一個位元組開始比對，認不出來、載入失敗
+            std::fs::write(&out, text.as_bytes())?;
+        }
+        Ok(out)
+    }
+
+    /// 暫存檔名：版本、原檔路徑、內容的雜湊，加上原本的副檔名（mpv 靠副檔名幫忙判斷格式）
+    fn cache_name(&self, text: &str) -> String {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
+        CACHE_VERSION.hash(&mut h);
         self.path.hash(&mut h);
         text.hash(&mut h);
         let ext = self
@@ -210,16 +238,7 @@ impl ExternalSub {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let dir = cache_dir();
-        std::fs::create_dir_all(&dir)?;
-        let out = dir.join(format!("{:016x}.{ext}", h.finish()));
-        if !out.exists() {
-            // 加上 UTF-8 BOM，mpv 就不會再自己猜編碼
-            let mut data = vec![0xef, 0xbb, 0xbf];
-            data.extend_from_slice(text.as_bytes());
-            std::fs::write(&out, data)?;
-        }
-        Ok(out)
+        format!("{:016x}.{ext}", h.finish())
     }
 }
 
@@ -608,5 +627,92 @@ mod tests {
         let sub = load(&dir.join("[Group] Show - 01.tc.ass"), &video).unwrap();
         assert_eq!(sub.title, "tc.ass");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn text_sub(path: &str, text: &str) -> ExternalSub {
+        ExternalSub {
+            path: PathBuf::from(path),
+            title: String::new(),
+            lang: SubLang::Unknown,
+            text: Some(text.to_owned()),
+            encoding: Some("UTF-8"),
+        }
+    }
+
+    #[test]
+    fn converted_subtitles_have_no_bom() {
+        // FFmpeg 的 AQTitle、PJS、VPlayer 偵測從第一個位元組開始比對：有 BOM 就載入失敗
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-bom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, text) in [
+            ("歌.pjs", "20,26,\"VITASCOPE TEST\"\n"),
+            ("歌.aqt", "-->> 38\nVITASCOPE TEST\n\n"),
+            ("歌.txt", "00:00:01.50:影戲播放器測試\n"),
+        ] {
+            let sub = text_sub(&dir.join(name).to_string_lossy(), text);
+            let out = sub.write_into(&dir).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), text.as_bytes(), "{name}");
+            assert_eq!(out.extension(), Path::new(name).extension(), "{name}：保留副檔名");
+        }
+        // 圖形字幕照原路徑
+        let mut sup = text_sub("片.sup", "");
+        sup.text = None;
+        assert_eq!(sup.write_into(&dir).unwrap(), PathBuf::from("片.sup"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rare_text_subtitles_are_converted_and_found() {
+        // 罕見的文字字幕（LRC、PJS、AQTitle…）也跟 SRT 一樣轉成 UTF-8（Big5、GBK 的歌詞不會變亂碼），
+        // 也會自動找到影片旁邊同名的
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-rare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("影片.mkv");
+        std::fs::write(&video, b"").unwrap();
+        let rare = ["lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp"];
+        let (big5, _, _) = encoding_rs::BIG5.encode("[00:01.00]測試字幕\n");
+        for ext in rare {
+            let path = dir.join(format!("影片.{ext}"));
+            std::fs::write(&path, &big5).unwrap();
+            let sub = load_as(&path, &video, Some(encoding_rs::BIG5)).unwrap();
+            assert!(
+                sub.text.as_deref().is_some_and(|t| t.contains("測試字幕")),
+                "{ext}：要轉成 UTF-8"
+            );
+            assert_eq!(sub.encoding, Some("Big5"), "{ext}");
+        }
+        let found: Vec<String> = find_external(&video)
+            .iter()
+            .filter_map(|p| p.extension().map(|e| e.to_string_lossy().into_owned()))
+            .collect();
+        for ext in rare {
+            assert!(found.iter().any(|e| e == ext), "{ext}：自動找到同名的字幕（{found:?}）");
+        }
+        // 能拖放、選取的字幕副檔名（formats::SUBTITLE）不是轉碼的文字字幕，就是照原檔交給 mpv 的
+        for ext in crate::formats::SUBTITLE {
+            assert!(
+                TEXT_EXTS.contains(ext) || BINARY_EXTS.contains(ext),
+                "{ext} 不在 TEXT_EXTS / BINARY_EXTS"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cache_name_has_a_version() {
+        // 舊版留下的暫存檔（檔名是同樣的路徑和內容，但開頭有 BOM）不能再用：雜湊要包含版本
+        let text = "20,26,\"VITASCOPE TEST\"\n";
+        let sub = text_sub("字幕/影片.pjs", text);
+        use std::hash::{Hash, Hasher};
+        let mut old = std::collections::hash_map::DefaultHasher::new();
+        sub.path.hash(&mut old);
+        text.to_owned().hash(&mut old);
+        let name = sub.cache_name(text);
+        assert_ne!(name, format!("{:016x}.pjs", old.finish()));
+        assert!(name.ends_with(".pjs"), "{name}");
+        // 同樣的檔案、內容 → 同一個暫存檔；內容不同 → 不同的暫存檔
+        assert_eq!(name, sub.cache_name(text));
+        assert_ne!(name, sub.cache_name("20,26,\"OTHER\"\n"));
     }
 }

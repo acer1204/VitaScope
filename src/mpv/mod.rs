@@ -584,6 +584,14 @@ impl Mpv {
         check(code, || crate::tf!("觀察屬性 {name}", "observing property {name}"))
     }
 
+    /// 停止觀察用 `id` 註冊的屬性（之後不再收到它的變化）。回傳停止了幾個觀察（0 = 這個編號沒有在觀察）
+    pub fn unobserve(&self, id: u64) -> Result<u32> {
+        // 成功時回傳停止了幾個（不是錯誤碼）；只有負數才是錯誤
+        let code = unsafe { sys::mpv_unobserve_property(self.raw(), id) };
+        check(code, || crate::tf!("停止觀察屬性 {id}", "unobserving property {id}"))?;
+        Ok(code.unsigned_abs())
+    }
+
     /// 要求 mpv 把 `level` 以上的記錄訊息以 `Event::Log` 送來（"error"、"warn"、"info"…）。
     pub fn request_log_messages(&self, level: &str) -> Result<()> {
         let l = cstring(level);

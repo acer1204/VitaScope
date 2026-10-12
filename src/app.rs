@@ -1959,19 +1959,19 @@ impl VitascopeApp {
             (
                 crate::tr!("載入字幕檔", "Load subtitle file"),
                 crate::tr!("字幕檔", "Subtitle files"),
-                formats::SUBTITLE,
+                formats::SUBTITLE.to_vec(),
             )
         } else {
             (
                 crate::tr!("載入音軌檔", "Load audio file"),
                 crate::tr!("音訊檔", "Audio files"),
-                formats::AUDIO,
+                formats::all_audio(),
             )
         };
         let mut dialog = self
             .file_dialog()
             .set_title(title)
-            .add_filter(filter, exts)
+            .add_filter(filter, &exts)
             .add_filter(crate::tr!("所有檔案", "All files"), &["*"]);
         if let Some(dir) = self.player.state.path.as_deref().and_then(|p| Path::new(p).parent()) {
             dialog = dialog.set_directory(dir);
@@ -5230,13 +5230,28 @@ fn chapter_label(chapters: &[crate::player::Chapter], index: usize) -> String {
         .unwrap_or_else(|| crate::tf!("第 {} 章", "Chapter {}", index + 1))
 }
 
-/// 純音訊檔：歌名、演出者、專輯。有專輯封面時（mpv 把封面當成畫面畫出來）字放在下方，沒有封面就放中間
+/// 歌詞（純音訊檔的字幕）最多幾列：太長的一句換行，再長就截斷
+const LYRICS_ROWS: usize = 2;
+/// 歌詞一列的高度（18 點字）
+const LYRICS_ROW_HEIGHT: f32 = 24.0;
+
+/// 純音訊檔：歌名、演出者、專輯，下面是目前的歌詞（LRC 之類的字幕）。
+/// 有專輯封面時（mpv 把封面當成畫面畫出來）字放在下方的底色上，沒有封面就放中間。
+/// 歌詞由這裡畫：mpv 畫在封面上的那份會被底色蓋住，所以藏起來了（見 `Player::sync_lyrics_visibility`）。
+/// 介面畫不出來的字幕（封面上的 ASS、圖片字幕）照舊由 mpv 畫在封面上，這裡不畫也不留位置（`State::lyrics_in_app`）
 fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
     let has_cover = st.tracks_of(TrackKind::Video).any(|t| t.albumart);
     let title = st.tag("title").or(st.title.as_deref()).unwrap_or_default().to_owned();
     let details: Vec<&str> = ["artist", "album"].iter().filter_map(|k| st.tag(k)).collect();
     let lines = 1 + details.len();
-    let height = 24.0 + 22.0 * lines as f32 + 24.0;
+    // 選了介面畫得出來的字幕時一直留著歌詞的位置：兩句之間沒有字時，歌名和底色不會跳上跳下
+    let lyrics = st.lyrics_in_app();
+    let lyrics_height = if lyrics {
+        8.0 + LYRICS_ROW_HEIGHT * LYRICS_ROWS as f32
+    } else {
+        0.0
+    };
+    let height = 24.0 + 22.0 * lines as f32 + lyrics_height + 24.0;
     let area = if has_cover {
         let band = Rect::from_min_max(pos2(rect.left(), rect.bottom() - height), rect.max);
         ui.painter()
@@ -5263,6 +5278,17 @@ fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
     );
     for d in details {
         ui.add(egui::Label::new(egui::RichText::new(d).size(16.0).color(Color32::from_gray(170))).selectable(false));
+    }
+    if lyrics && let Some(text) = st.sub_text.as_deref() {
+        ui.add_space(8.0);
+        // 字幕裡的換行照留（最多兩列）；太長的換行，超過的截斷
+        let text: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let mut job = egui::text::LayoutJob::single_section(
+            text.join("\n"),
+            egui::TextFormat::simple(egui::FontId::proportional(18.0), Color32::from_gray(220)),
+        );
+        job.wrap.max_rows = LYRICS_ROWS;
+        ui.add(egui::Label::new(job).wrap().selectable(false));
     }
 }
 
