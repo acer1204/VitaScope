@@ -288,6 +288,12 @@ struct VideoClick {
     muted: bool,
 }
 
+/// 檔案載入完成時用掉的、只給那一次載入的東西（見 `VitascopeApp::reopen_extras`）
+struct ReopenExtras {
+    subs: Option<(PathBuf, Vec<PathBuf>)>,
+    keep: Option<network::ReloadKeep>,
+}
+
 pub struct VitascopeApp {
     player: Player,
     video: Option<VideoView>,
@@ -359,6 +365,11 @@ pub struct VitascopeApp {
     net_live: bool,
     /// 這個檔案已經提示過「直播已結束」
     live_end_shown: bool,
+    /// 這個檔案解不了的編碼已經提示過的（種類, 編碼；見 `decoder_tick`）
+    decoder_noted: Vec<(TrackKind, String)>,
+    /// 這個檔案載入完成時用掉的、一起拖進來的字幕和換畫質要還原的狀態：mpv 0.37 影像解不了、只播聲音重開時
+    /// 再給重開的那次用（見 `Player::reopened_audio_only`）
+    reopen_extras: Option<ReopenExtras>,
     /// 「設定 → 網路 → 進階」正在編輯的文字（離開欄位才寫回設定）
     net_draft: Option<network::NetDraft>,
     /// 網站影片換畫質：重開前記下的狀態（暫停、字幕、A-B…），載入完成時還原
@@ -886,6 +897,8 @@ impl VitascopeApp {
             url_prefill_wait: network::PREFILL_WAIT,
             net_live: false,
             live_end_shown: false,
+            decoder_noted: Vec::new(),
+            reopen_extras: None,
             net_draft: None,
             reload_keep: None,
             ytdl_path_problem: None,
@@ -1059,6 +1072,14 @@ impl VitascopeApp {
         self.fit_window_pending || self.refit_now || self.modes.switching()
     }
 
+    /// 影片畫面要不要畫 mpv 的畫面。沒有任何影像（連專輯封面都沒有，或解不了）的檔案不畫：
+    /// 不然會留著上一個檔案的最後一格（介面測試沒有 GL，從這裡檢查）
+    #[doc(hidden)]
+    pub fn paints_video(&self) -> bool {
+        let st = &self.player.state;
+        st.loading || (st.loaded && st.has_picture())
+    }
+
     /// 測試用：上一次滑鼠、鍵盤的動作（控制列、游標什麼時候隱藏）
     #[doc(hidden)]
     pub fn last_activity(&self) -> Instant {
@@ -1069,6 +1090,7 @@ impl VitascopeApp {
     #[doc(hidden)]
     pub fn deliver_player_event(&mut self, ev: PlayerEvent) {
         self.on_player_event(ev);
+        self.decoder_tick();
     }
 
     /// 測試用：改動介面記下的播放狀態（例如模擬還沒更新的 time-pos）
@@ -2378,6 +2400,16 @@ impl VitascopeApp {
                 self.audio_restore = None;
                 self.net_live = false;
                 self.live_end_shown = false;
+                // mpv 0.37 影像解不了、只播聲音重開的：還是同一個檔案（提示過的不再提示，載入完成時要做的再做一次）
+                if self.player.reopened_audio_only() {
+                    if let Some(extras) = self.reopen_extras.take() {
+                        self.pending_subs = extras.subs;
+                        self.reload_keep = extras.keep;
+                    }
+                } else {
+                    self.decoder_noted.clear();
+                    self.reopen_extras = None;
+                }
                 // 上一個檔案的音訊輸出開不起來、改用 null：mpv 換檔時沿用同一個輸出，不重開的話之後的檔案都沒有聲音。
                 // 看開檔那一刻直接問 mpv 的（mpv 自己開始的清單項目是 StartFile 時問的；觀察到的 current-ao 跟事件
                 // 分批的方式有關，可能已經是這個檔案的、或還沒收到上一個的，見 `Player::take_fell_back_before_open`）。
@@ -2506,13 +2538,54 @@ impl VitascopeApp {
         }
     }
 
+    /// 這個檔案有軌道解不了（`PlayerEvent::DecoderMissing`）：開始播之後提示一次，說是哪個編碼、其他的照常播。
+    /// 看播放器記下的清單、不看事件：mpv 的記錄比一般事件晚到，可能在載入完成之前（這時還不知道整個檔案開不開得起來，
+    /// 開不起來時錯誤畫面已經說明原因，不另外提示）或之後。同一批有好幾條時提示最重要的一條（影像 > 聲音 > 字幕），
+    /// 全部列在媒體資訊；專輯封面、自動選的字幕（`quiet`）解不了不提示
+    fn decoder_tick(&mut self) {
+        let st = &self.player.state;
+        // 開始播了才提示：整個檔案開不起來時錯誤畫面已經說明原因；mpv 0.37 影像解不了時，載入完成之後還會
+        // 整個停下、只播聲音重開（同一個檔案，見 `Player::reopened_audio_only`）
+        if !st.loaded || !self.player.playback_started() {
+            return;
+        }
+        let new: Vec<&crate::player::MissingDecoder> = st
+            .missing_decoders
+            .iter()
+            .filter(|m| !m.cover && !m.quiet)
+            .filter(|m| !self.decoder_noted.iter().any(|(k, c)| *k == m.kind && *c == m.codec))
+            .collect();
+        let rank = |k: TrackKind| match k {
+            TrackKind::Video => 0,
+            TrackKind::Audio => 1,
+            _ => 2,
+        };
+        let msg = new.iter().min_by_key(|m| rank(m.kind)).map(|m| {
+            let rest_plays = match m.kind {
+                TrackKind::Video => st.selected(TrackKind::Audio).is_some(),
+                TrackKind::Audio => st.has_video(),
+                _ => true,
+            };
+            m.notice(rest_plays)
+        });
+        let noted: Vec<(TrackKind, String)> = new.iter().map(|m| (m.kind, m.codec.clone())).collect();
+        self.decoder_noted.extend(noted);
+        if let Some(msg) = msg {
+            self.osd(msg);
+        }
+    }
+
     /// 檔案載入完成：加進最近開啟，有上次的位置就從那裡繼續
     fn on_file_loaded(&mut self) {
         // 選上的音軌會不會直通（開了直通時，開檔前先清空了濾鏡鏈）
         self.sound_file_loaded();
         self.preview_file_loaded();
-        // 網站影片換畫質重開的：只給這一次載入
+        // 網站影片換畫質重開的：只給這一次載入（mpv 0.37 只播聲音重開時再給一次，見 `reopen_extras`）
         let keep = self.reload_keep.take();
+        self.reopen_extras = Some(ReopenExtras {
+            subs: self.pending_subs.clone(),
+            keep: keep.clone(),
+        });
         let Ok(path) = self.player.get_string("path") else {
             return;
         };
@@ -3564,9 +3637,8 @@ impl VitascopeApp {
             .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, crate::tr!("影片畫面", "Video")));
         let st = &self.player.state;
 
-        // 沒有任何影像（連專輯封面都沒有）的檔案不畫：不然會留著上一個檔案的最後一格
-        let has_picture = st.tracks_of(TrackKind::Video).next().is_some();
-        if (st.loading || (st.loaded && has_picture))
+        // 沒有任何影像（連專輯封面都沒有，或解不了）的檔案不畫：不然會留著上一個檔案的最後一格
+        if self.paints_video()
             && let Some(video) = &self.video
         {
             video.paint(ui, rect);
@@ -4916,6 +4988,8 @@ impl eframe::App for VitascopeApp {
         self.theme_tick(ctx);
         for ev in self.player.poll() {
             self.on_player_event(ev);
+            // 解不了的編碼：檔案開始播了才提示（續播的提示之後，才不會被蓋掉）
+            self.decoder_tick();
         }
         // 系統的媒體控制：建立 / 結束、系統送來的指令、送出目前的檔案與播放狀態（縮到最小時也會跑）
         self.media_tick(ctx);
@@ -5249,7 +5323,8 @@ const LYRICS_ROW_HEIGHT: f32 = 24.0;
 /// 歌詞由這裡畫：mpv 畫在封面上的那份會被底色蓋住，所以藏起來了（見 `Player::sync_lyrics_visibility`）。
 /// 介面畫不出來的字幕（封面上的 ASS、圖片字幕）照舊由 mpv 畫在封面上，這裡不畫也不留位置（`State::lyrics_in_app`）
 fn audio_info(ui: &mut egui::Ui, rect: Rect, st: &crate::player::State) {
-    let has_cover = st.tracks_of(TrackKind::Video).any(|t| t.albumart);
+    // 解不了的封面不算（不畫，標題照沒有封面的排法）
+    let has_cover = st.tracks_of(TrackKind::Video).any(|t| t.albumart && st.decodable(t));
     let title = st.tag("title").or(st.title.as_deref()).unwrap_or_default().to_owned();
     let details: Vec<&str> = ["artist", "album"].iter().filter_map(|k| st.tag(k)).collect();
     let lines = 1 + details.len();

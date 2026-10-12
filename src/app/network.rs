@@ -1093,6 +1093,7 @@ impl TrackLabel {
 /// 網站影片換畫質（用別的格式重開）時保留的狀態，跟 PotPlayer 一樣：暫停、字幕（主字幕、第二字幕）、畫面的調整。
 /// 暫停、字幕延遲、A-B 重播 mpv 換檔時本來就沿用，重開後馬上設回去（`reload_site`）；這裡的在載入完成時還原
 /// （`restore_reload`）。換畫質不從上次的位置續播（接著現在的位置播），也沒有「下一個」的提示
+#[derive(Clone)]
 pub(super) struct ReloadKeep {
     /// 重開的網址（網頁）
     url: String,

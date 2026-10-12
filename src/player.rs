@@ -176,6 +176,209 @@ impl Track {
     }
 }
 
+/// mpv 記錄裡沒有編碼名稱時（`<?>`）、軌道清單沒有 codec 時，當成這個名稱
+const UNKNOWN_CODEC: &str = "<?>";
+
+/// 軌道的編碼名稱（沒有時是 [`UNKNOWN_CODEC`]，跟 mpv 記錄裡的寫法一樣）
+fn track_codec(t: &Track) -> &str {
+    t.codec.as_deref().filter(|c| !c.is_empty()).unwrap_or(UNKNOWN_CODEC)
+}
+
+/// FFmpeg 沒有（或播放引擎沒有建置）解碼器的字幕格式：開檔自動選字幕時跳過，不然每次開檔都選到、
+/// 每次都失敗（「這條字幕的格式影戲不支援」）。使用者自己選還是可以選。
+/// - dvb_teletext：要 libzvbi（有 GPL 的部分，引擎不收；有的系統 FFmpeg 有，但自動選字幕一樣跳過，各平台一致）
+/// - arib_caption：要 libaribcaption（引擎沒有建置）
+/// - ttml（MP4 裡的 stpp）、hdmv_text_subtitle（藍光的文字字幕）：FFmpeg 沒有解碼器
+const KNOWN_UNDECODABLE_SUBS: [&str; 4] = ["dvb_teletext", "arib_caption", "ttml", "hdmv_text_subtitle"];
+
+/// 解不了的編碼：mpv 開不起這條軌道的解碼器（記錄裡的「Failed to initialize a decoder for codec …」、
+/// 「Could not find subtitle decoder for format …」）。mpv 把這條軌道關掉，其他的照常播
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingDecoder {
+    pub kind: TrackKind,
+    /// mpv 的編碼名稱（`avs2`、`h264`、`dvb_teletext`…；不知道時是 `<?>`）
+    pub codec: String,
+    /// 播放引擎根本沒有這個編碼的解碼器（`decoder-list` 裡沒有；字幕一律是）。
+    /// false = 有解碼器、但開不起來：檔案可能損壞，或用了解碼器不支援的設定（profile、參數）
+    pub unsupported: bool,
+    /// 解不了的是專輯封面（不是影片）
+    pub cover: bool,
+    /// 不提示（媒體資訊照樣標）：解不了的字幕是自動選的（mpv 選了標成預設的、影戲開檔時選的），
+    /// 不是使用者自己選的。不然這種檔案每次開都提示一次
+    pub quiet: bool,
+}
+
+impl MissingDecoder {
+    /// 給人看的編碼名稱（「AVS2」「H.264」）
+    pub fn name(&self) -> String {
+        codec_display_name(&self.codec)
+    }
+
+    /// 媒體資訊上的一行：「AVS2（不支援）」「H.264（無法解碼）」
+    pub fn label(&self) -> String {
+        let name = self.name();
+        if self.unsupported {
+            crate::tf!("{name}（不支援）", "{name} (unsupported)")
+        } else {
+            crate::tf!("{name}（無法解碼）", "{name} (can't decode)")
+        }
+    }
+
+    /// 播放中的提示（OSD）。`rest_plays`：其他的照常播（影像解不了時有聲音、聲音解不了時有影像）
+    pub fn notice(&self, rest_plays: bool) -> String {
+        let name = self.name();
+        match (self.kind, self.unsupported, rest_plays) {
+            (TrackKind::Video, true, true) => crate::tf!(
+                "這個影片的影像編碼（{name}）影戲不支援，只播放聲音",
+                "This video's codec ({name}) isn't supported; playing the audio only"
+            ),
+            (TrackKind::Video, true, false) => crate::tf!(
+                "這個影片的影像編碼（{name}）影戲不支援",
+                "This video's codec ({name}) isn't supported"
+            ),
+            (TrackKind::Video, false, true) => crate::tf!(
+                "無法解碼 {name} 影像（檔案可能損壞，或用了引擎不支援的設定），只播放聲音",
+                "Can't decode the {name} video (the file may be damaged or use settings the engine doesn't support); playing the audio only"
+            ),
+            (TrackKind::Video, false, false) => crate::tf!(
+                "無法解碼 {name} 影像（檔案可能損壞，或用了引擎不支援的設定）",
+                "Can't decode the {name} video (the file may be damaged or use settings the engine doesn't support)"
+            ),
+            (TrackKind::Audio, true, true) => crate::tf!(
+                "這個檔案的音訊編碼（{name}）影戲不支援，只播放影像",
+                "This file's audio codec ({name}) isn't supported; playing the video only"
+            ),
+            (TrackKind::Audio, true, false) => crate::tf!(
+                "這個檔案的音訊編碼（{name}）影戲不支援",
+                "This file's audio codec ({name}) isn't supported"
+            ),
+            (TrackKind::Audio, false, true) => crate::tf!(
+                "無法解碼 {name} 聲音（檔案可能損壞，或用了引擎不支援的設定），只播放影像",
+                "Can't decode the {name} audio (the file may be damaged or use settings the engine doesn't support); playing the video only"
+            ),
+            (TrackKind::Audio, false, false) => crate::tf!(
+                "無法解碼 {name} 聲音（檔案可能損壞，或用了引擎不支援的設定）",
+                "Can't decode the {name} audio (the file may be damaged or use settings the engine doesn't support)"
+            ),
+            _ => crate::tf!(
+                "這條字幕的格式（{name}）影戲不支援",
+                "This subtitle format ({name}) isn't supported"
+            ),
+        }
+    }
+}
+
+/// 整個檔案因為解不了而開不起來時的說明：引擎沒有的編碼優先（「不支援的編碼：AVS2」），
+/// 都有解碼器的話是「無法解碼 H.264（…）」。只看影像、聲音（字幕解不了不會讓檔案開不起來）；沒有的話 None
+fn decoder_failure(missing: &[MissingDecoder]) -> Option<String> {
+    let av: Vec<&MissingDecoder> = missing.iter().filter(|m| m.kind != TrackKind::Sub).collect();
+    let names = |unsupported: bool| {
+        let mut names: Vec<String> = av
+            .iter()
+            .filter(|m| m.unsupported == unsupported)
+            .map(|m| m.name())
+            .collect();
+        names.dedup();
+        names.join(crate::tr!("、", ", "))
+    };
+    if av.iter().any(|m| m.unsupported) {
+        let names = names(true);
+        Some(crate::tf!("不支援的編碼：{names}", "Unsupported codec: {names}"))
+    } else if !av.is_empty() {
+        let names = names(false);
+        Some(crate::tf!(
+            "無法解碼 {names}（檔案可能損壞，或用了引擎不支援的設定）",
+            "Can't decode {names} (the file may be damaged or use settings the engine doesn't support)"
+        ))
+    } else {
+        None
+    }
+}
+
+/// mpv 的解碼器錯誤記錄 →（軌道種類, 編碼名稱）。種類看記錄的來源：`vd` 影像、`ad` 聲音；
+/// 其他來源（現在的 mpv 沒有）是 None，由呼叫的一方查軌道清單。不是這兩種記錄時 None
+/// - `[vd] Failed to initialize a decoder for codec 'avs2'.`（filters/f_decoder_wrapper.c，0.37 起都一樣）
+/// - `[sub] Could not find subtitle decoder for format 'dvb_teletext'.`（sub/dec_sub.c）
+fn missing_decoder(prefix: &str, text: &str) -> Option<(Option<TrackKind>, String)> {
+    // 分離器認不出編碼時名稱是空的（FFmpeg 6.1 的 MP4 裡的 VVC 之類）：跟 `<?>` 一樣當成不知道
+    let quoted = |head: &str| {
+        let rest = text.trim_end().strip_prefix(head)?.strip_suffix("'.")?;
+        Some(if rest.is_empty() { UNKNOWN_CODEC } else { rest }.to_owned())
+    };
+    if let Some(codec) = quoted("Failed to initialize a decoder for codec '") {
+        let kind = match prefix {
+            "vd" => Some(TrackKind::Video),
+            "ad" => Some(TrackKind::Audio),
+            _ => None,
+        };
+        return Some((kind, codec));
+    }
+    quoted("Could not find subtitle decoder for format '").map(|codec| (Some(TrackKind::Sub), codec))
+}
+
+/// 自動選字幕時解得了的字幕軌：不是 FFmpeg 解不了的格式（[`KNOWN_UNDECODABLE_SUBS`]），
+/// 也不是這個播放器之前解不了的（`learned`）
+fn auto_sub_decodable(t: &Track, learned: &HashSet<String>) -> bool {
+    let codec = track_codec(t);
+    !KNOWN_UNDECODABLE_SUBS.contains(&codec) && !learned.contains(codec)
+}
+
+/// 開檔後自動選字幕要改選的那條（None = 照 mpv 的選擇）：
+/// - 有繁中就選繁中（其次中文、簡中），依語言碼、標題判斷；同語言時外掛優先，再來是軌道順序
+/// - 沒有中文字幕時尊重 mpv 的選擇；mpv 什麼都沒選時選第一條
+/// - 解不了的格式（[`auto_sub_decodable`]）不選；mpv 自己選了解不了的（標成預設的 Teletext 之類）當成沒選
+fn pick_auto_sub<'a>(subs: &[&'a Track], learned: &HashSet<String>) -> Option<&'a Track> {
+    let lang_of = |t: &Track| {
+        let label = format!(
+            "{} {}",
+            t.lang.as_deref().unwrap_or(""),
+            t.title.as_deref().unwrap_or("")
+        );
+        subs::classify_label(&label).unwrap_or(SubLang::Unknown)
+    };
+    let decodable = |t: &Track| auto_sub_decodable(t, learned);
+    // 語言最優先；同語言時外掛優先（字幕組另外附的通常比內嵌的好）；再來是軌道順序
+    let best = subs
+        .iter()
+        .filter(|t| !t.forced && decodable(t))
+        .max_by_key(|t| (lang_of(t), t.external, std::cmp::Reverse(t.id)))
+        .or_else(|| subs.iter().find(|t| decodable(t)))
+        .copied();
+    let current = subs.iter().find(|t| t.selected && decodable(t));
+    match (current, best) {
+        (None, Some(b)) => Some(b),
+        (Some(c), Some(b)) if lang_of(b).is_chinese() && lang_of(b) > lang_of(c) => Some(b),
+        _ => None,
+    }
+}
+
+/// 編碼名稱 → 給人看的名稱（「H.264」「AVS2」「Teletext（圖文電視）」）；不在表上的照 mpv 的名稱轉大寫
+pub fn codec_display_name(codec: &str) -> String {
+    match codec {
+        "h264" => "H.264",
+        "hevc" => "HEVC",
+        "vvc" => "H.266 / VVC",
+        "av1" => "AV1",
+        "vp9" => "VP9",
+        "avs2" => "AVS2",
+        "avs3" => "AVS3",
+        "cavs" => "AVS",
+        "evc" => "MPEG-5 EVC",
+        "apv" => "APV",
+        "ac4" => "AC-4",
+        "mpegh_3d_audio" => "MPEG-H 3D Audio",
+        "codec2" => "Codec 2",
+        "lc3" => "LC3",
+        "ttml" => "TTML",
+        "dvb_teletext" => crate::tr!("Teletext（圖文電視）", "Teletext"),
+        "arib_caption" => crate::tr!("ARIB 字幕", "ARIB captions"),
+        "hdmv_text_subtitle" => crate::tr!("藍光文字字幕", "Blu-ray text subtitles"),
+        "" | "null" | UNKNOWN_CODEC => crate::tr!("未知的編碼", "unknown codec"),
+        other => return other.to_uppercase(),
+    }
+    .to_owned()
+}
+
 /// `chapter-list` 裡的一個章節。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Chapter {
@@ -259,9 +462,19 @@ pub struct State {
     /// 純音訊檔（沒有影像，可以有專輯封面）正在顯示的字幕文字（LRC 歌詞之類），介面畫在歌名下面；
     /// 沒有字幕、兩句之間、有影像的檔案都是 None（只在純音訊檔時才向 mpv 要，見 `SUB_TEXT_ID`）
     pub sub_text: Option<String>,
+    /// 這個檔案解不了的編碼（mpv 關掉了那條軌道，其他的照常播；見 [`MissingDecoder`]）。開新檔時清掉
+    pub missing_decoders: Vec<MissingDecoder>,
 }
 
 impl State {
+    /// 這條軌道解得了：這個檔案還沒有因為解不了而被 mpv 關掉
+    pub fn decodable(&self, t: &Track) -> bool {
+        !self
+            .missing_decoders
+            .iter()
+            .any(|m| m.kind == t.kind && m.codec == track_codec(t))
+    }
+
     pub fn tracks_of(&self, kind: TrackKind) -> impl Iterator<Item = &Track> {
         self.tracks.iter().filter(move |t| t.kind == kind)
     }
@@ -277,9 +490,15 @@ impl State {
             .find(|t| t.selected && (kind != TrackKind::Sub || Some(t.id) != self.secondary_sid))
     }
 
-    /// 有實際影像（不是只有專輯封面）
+    /// 有實際影像（不是只有專輯封面）。影像解不了（mpv 關掉了影片軌，只播聲音）的不算：介面當成純音訊檔
     pub fn has_video(&self) -> bool {
-        self.tracks_of(TrackKind::Video).any(|t| !t.albumart)
+        self.tracks_of(TrackKind::Video)
+            .any(|t| !t.albumart && self.decodable(t))
+    }
+
+    /// 有畫面可畫（影片或專輯封面，而且解得了）
+    pub fn has_picture(&self) -> bool {
+        self.tracks_of(TrackKind::Video).any(|t| self.decodable(t))
     }
 
     /// 歌詞（目前的字幕）由介面畫在歌名下面、mpv 自己的那份藏起來（見 `Player::watch_lyrics`）。
@@ -294,7 +513,10 @@ impl State {
         let Some(codec) = self.selected(TrackKind::Sub).and_then(|t| t.codec.as_deref()) else {
             return false;
         };
-        let has_cover = self.tracks_of(TrackKind::Video).any(|t| t.albumart);
+        // 解不了的封面不算（mpv 沒有畫面可畫，ASS 歌詞也要由介面畫）
+        let has_cover = self
+            .tracks_of(TrackKind::Video)
+            .any(|t| t.albumart && self.decodable(t));
         is_plain_text_sub(codec) || (!has_cover && matches!(codec, "ass" | "ssa"))
     }
 
@@ -345,6 +567,9 @@ pub enum PlayerEvent {
         /// yt-dlp 只讀了前 [`ytdl::PLAYLIST_MAX`] 個（清單可能更長）
         capped: bool,
     },
+    /// 這個檔案有一條軌道解不了（同一個檔案、同一種軌道的同一個編碼只送一次；`state.missing_decoders` 也記著）。
+    /// mpv 的記錄比一般事件晚到，可能在 FileLoaded 之前或之後，也可能在整個檔案開不起來的 EndFile 之後
+    DecoderMissing(MissingDecoder),
     Shutdown,
 }
 
@@ -572,6 +797,25 @@ const RENDER_ERRORS_CAP: usize = 16;
 fn is_harmless_error(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     (t.contains("bwdif_cuda") && t.contains("failed")) || t.contains("creating deinterlacer failed")
+}
+
+/// 錯誤記錄最多留幾筆
+const RECENT_ERRORS_CAP: usize = 8;
+
+/// 記下一筆錯誤（最多 [`RECENT_ERRORS_CAP`] 筆，留最新的）。FFmpeg 的記錄（`[ffmpeg…]`）跟 mpv 自己的分開算：
+/// FFmpeg 的記錄一律送到行程裡第一個建立的 mpv（見設計 §1.9），匯出、其他播放器解碼的錯誤也會進來，
+/// 一大串的話會把這個檔案 mpv 自己的錯誤（音訊輸出、解碼器開不起來…）擠掉。滿了的時候，
+/// 同一類已經佔了一半就丟掉同一類最舊的那筆，不然丟掉另一類最舊的（每一類至少留得住一半）
+fn push_recent_error(list: &mut Vec<String>, entry: String) {
+    if list.len() >= RECENT_ERRORS_CAP {
+        let is_ffmpeg = |e: &str| e.starts_with("[ffmpeg");
+        let class = is_ffmpeg(&entry);
+        let same = list.iter().filter(|e| is_ffmpeg(e) == class).count();
+        let drop_class = if same >= RECENT_ERRORS_CAP / 2 { class } else { !class };
+        let drop = list.iter().position(|e| is_ffmpeg(e) == drop_class).unwrap_or(0);
+        list.remove(drop);
+    }
+    list.push(entry);
 }
 
 /// 畫面輸出（render API、vo）的記錄：著色器編譯失敗之類的錯誤從這裡來
@@ -953,6 +1197,31 @@ pub struct Player {
     site: Site,
     /// 播放引擎讀得了 `memory://` 的 Cookie 檔（mpv 0.38 起；系統的 libmpv 0.37 只讀本機檔案，改用 Cookie 標頭）
     memory_cookies: bool,
+    /// 播放引擎有解碼器的編碼（`decoder-list` 的 codec，只有影像、聲音）：第一次有軌道解不了時才讀（之後不會變）
+    decoders: Option<HashSet<String>>,
+    /// 這個播放器開過的檔案裡解不了的字幕格式（引擎沒有解碼器，換檔也一樣）：自動選字幕時跳過
+    undecodable_subs: HashSet<String>,
+    /// 這個檔案開檔時自動選的字幕（軌道編號, 編碼）：它解不了的話（記錄晚到）改選別條
+    auto_sub: Option<(i64, String)>,
+    /// 這個檔案開始播了（PlaybackRestart）
+    played: bool,
+    /// 影像解不了、mpv 0.37 卻整個停下（見 `audio_only_retry`）：重開的檔案, 要帶過去的「解不了」記錄。
+    /// 只給同一個檔案用（重開之前介面又開了別的，就丟掉）
+    audio_only_carry: Option<(String, Vec<MissingDecoder>)>,
+    /// 這個檔案是只播聲音重開的（不再重開第二次）
+    audio_only_retried: bool,
+    /// loadfile 有「插入位置」參數（mpv 0.38 起；選項是第四個參數，0.37 是第三個）
+    loadfile_index: bool,
+    /// 載入完成、還沒開始播就失敗的結束：等事件取完才決定要只播聲音重開，還是通知介面（見 `events_drained`）
+    held_end: Option<PlayerEvent>,
+    /// 先通知留著的結束，晚一步才處理的 mpv 事件（下一個檔案的 StartFile；見 `next_event`）
+    replay: Option<Event>,
+    /// 載入中、mpv 讀不到軌道時收到的「解不了」記錄（種類, 編碼）：可能是上一個檔案晚到的，也可能是這個檔案
+    /// 整個開不起來（mpv 已經關掉分離器；mpv 0.37 影像解不了時，在載入完成之後才停下）。載入時因為沒有東西可播而失敗、
+    /// 或載入完成之後還沒開始播就失敗，才算這個檔案的（見 `EndFile`、`decoder_failed`）
+    pending_missing: Vec<(TrackKind, String)>,
+    /// 這個檔案使用者自己選過的字幕編碼（`select_track`、`set_secondary_sub`）：只有這些解不了才提示（見 `MissingDecoder::quiet`）
+    user_subs: std::sync::Mutex<Vec<String>>,
 }
 
 /// 跳轉不準的格式（`approx_seek::approximate_seeks`）在這個檔案的狀態；換檔時清掉
@@ -1120,6 +1389,17 @@ impl Player {
             debug_print: debug.as_deref().map(|v| log_rank(debug_log_level(Some(v)))),
             net_hooks: opts.net_hooks,
             memory_cookies: memory_cookies(&mpv_text),
+            decoders: None,
+            undecodable_subs: HashSet::new(),
+            auto_sub: None,
+            played: false,
+            audio_only_carry: None,
+            audio_only_retried: false,
+            loadfile_index: mpv_version(&mpv_text).is_none_or(|v| v >= (0, 38)),
+            held_end: None,
+            replay: None,
+            pending_missing: Vec::new(),
+            user_subs: std::sync::Mutex::new(Vec::new()),
             site: Site {
                 resolver: opts.net_resolver,
                 extra_sites: opts.net_sites,
@@ -1691,6 +1971,8 @@ impl Player {
             self.load_started = Some(Instant::now());
             // on_load 要等處理事件時才收到，現在記下來還來得及；之前沒用到的要求（那個檔案還沒開就換掉了）丟掉
             self.site.mode = mode.map(|m| (path.to_owned(), m));
+            // 還沒開始的只播聲音重開（mpv 0.37）被這次換掉了：記錄不帶給新的檔案
+            self.audio_only_carry = None;
             // 舊的檔案還停在 hook 等 yt-dlp：mpv 已經收到換檔（loadfile 在前），現在放行，舊的就直接結束、不會再去讀網頁
             self.site_abandon();
         }
@@ -1730,6 +2012,7 @@ impl Player {
         // 不清掉的話會一直算「載入中」
         self.load_started = None;
         self.state.loading = false;
+        self.audio_only_carry = None;
         Ok(())
     }
 
@@ -2262,6 +2545,7 @@ impl Player {
 
     /// 第二字幕（跟主字幕同時顯示，在畫面上方）；`None` = 關閉
     pub fn set_secondary_sub(&self, id: Option<i64>) -> mpv::Result<()> {
+        self.note_user_sub(id);
         match id {
             Some(id) => self.mpv.set_property("secondary-sid", id),
             None => self.mpv.set_property("secondary-sid", "no"),
@@ -2336,8 +2620,30 @@ impl Player {
         Ok(())
     }
 
-    /// 選擇軌道；`None` = 關閉這類軌道（例如關字幕）
+    /// 選擇軌道；`None` = 關閉這類軌道（例如關字幕）。使用者（介面）選的；影戲自己自動選的用 `set_track`
     pub fn select_track(&self, kind: TrackKind, id: Option<i64>) -> mpv::Result<()> {
+        if kind == TrackKind::Sub {
+            self.note_user_sub(id);
+        }
+        self.set_track(kind, id)
+    }
+
+    /// 記下使用者自己選的字幕的編碼：這條解不了的話要提示（見 `MissingDecoder::quiet`）
+    fn note_user_sub(&self, id: Option<i64>) {
+        let Some(id) = id else { return };
+        let codec = self
+            .current_tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Sub && t.id == id)
+            .map(|t| track_codec(t).to_owned());
+        if let (Some(codec), Ok(mut list)) = (codec, self.user_subs.lock())
+            && !list.contains(&codec)
+        {
+            list.push(codec);
+        }
+    }
+
+    fn set_track(&self, kind: TrackKind, id: Option<i64>) -> mpv::Result<()> {
         let Some(prop) = kind.property() else { return Ok(()) };
         // 把目前的第二字幕選成主字幕：兩條對調（mpv 不讓同一條同時當主字幕和第二字幕，直接設定會沒有反應）
         if kind == TrackKind::Sub
@@ -2505,14 +2811,23 @@ impl Player {
     /// 處理所有待處理的事件（介面每一幀呼叫），回傳介面需要反應的事件。
     pub fn poll(&mut self) -> Vec<PlayerEvent> {
         let mut out = Vec::new();
-        while let Some(ev) = self.mpv.wait_event(0.0) {
+        while let Some(ev) = self.next_event(0.0) {
             if let Some(pe) = self.handle(ev) {
                 out.push(pe);
             }
         }
-        // 事件（含比較晚送到的錯誤記錄）都處理完了：網站影片的背景工作
+        // 事件（含比較晚送到的錯誤記錄）都處理完了：留著的結束、網站影片的背景工作
+        out.extend(self.events_drained());
         out.extend(self.net_tick());
         out
+    }
+
+    /// 下一個要處理的 mpv 事件：晚一步處理的（`replay`）優先，再來才問 mpv（最多等 `timeout` 秒）
+    fn next_event(&mut self, timeout: f64) -> Option<Event> {
+        if let Some(ev) = self.replay.take() {
+            return Some(ev);
+        }
+        self.mpv.wait_event(timeout)
     }
 
     /// 等待下一個播放事件，最多 `timeout`（自動測試用）。
@@ -2523,7 +2838,13 @@ impl Player {
             if remaining.is_zero() {
                 return None;
             }
-            match self.mpv.wait_event(self.net_wait(remaining).as_secs_f64()) {
+            // 留著的結束：佇列一空就要決定，不等
+            let wait = if self.held_end.is_some() {
+                0.0
+            } else {
+                self.net_wait(remaining).as_secs_f64()
+            };
+            match self.next_event(wait) {
                 Some(ev) => {
                     if let Some(pe) = self.handle(ev) {
                         return Some(pe);
@@ -2531,7 +2852,7 @@ impl Player {
                 }
                 // 佇列空了（或背景的解析做完、叫醒了這裡）
                 None => {
-                    if let Some(pe) = self.net_tick() {
+                    if let Some(pe) = self.events_drained().or_else(|| self.net_tick()) {
                         return Some(pe);
                     }
                 }
@@ -2568,9 +2889,9 @@ impl Player {
             if remaining.is_zero() {
                 return Err(format!("等待狀態逾時（{:.1} 秒）", timeout.as_secs_f64()));
             }
-            let ev = match self.mpv.wait_event(self.net_wait(remaining).as_secs_f64().min(0.1)) {
+            let ev = match self.next_event(self.net_wait(remaining).as_secs_f64().min(0.1)) {
                 Some(ev) => self.handle(ev),
-                None => self.net_tick(),
+                None => self.events_drained().or_else(|| self.net_tick()),
             };
             if let Some(PlayerEvent::EndFile { error: Some(e), .. }) = ev {
                 return Err(e);
@@ -3103,6 +3424,12 @@ impl Player {
                         .iter()
                         .any(|parts| parts.iter().all(|p| text.contains(p.as_str())));
                 let error = matches!(level.as_str(), "error" | "fatal") && !noise;
+                // 解不了的編碼（mpv 的 MP_ERR）：先記下，下面重新整理開檔失敗的說明時才用得到
+                let missing = if error {
+                    self.decoder_failed(&prefix, &text)
+                } else {
+                    None
+                };
                 if error && is_render_log(&prefix) {
                     if self.render_errors.len() >= RENDER_ERRORS_CAP {
                         self.render_errors.pop_front();
@@ -3116,17 +3443,20 @@ impl Player {
                 }
                 // 警告只收網路的（HTTP 404 之類），其他照舊不收
                 if error || (level == "warn" && is_net_warning(&prefix, &text)) {
-                    if self.recent_errors.len() >= 8 {
-                        self.recent_errors.remove(0);
-                    }
-                    self.recent_errors.push(format!("[{prefix}] {}", text.trim_end()));
+                    push_recent_error(&mut self.recent_errors, format!("[{prefix}] {}", text.trim_end()));
                     if let Some(base) = &self.failure {
                         self.state.last_error = Some(self.compose_failure(base));
                     }
                 }
-                None
+                missing.map(PlayerEvent::DecoderMissing)
             }
             Event::StartFile => {
+                // 留著的上一個檔案的結束（載入完成、還沒開始播就失敗）：mpv 已經開始下一個（mpv 自己的播放清單往下播、
+                // 介面開了別的），不會再只播聲音重開了。照順序先通知那個結束，這個開始下一次才處理（`next_event`）
+                if let Some(end) = self.held_end.take() {
+                    self.replay = Some(Event::StartFile);
+                    return Some(end);
+                }
                 // 上一個檔案的跳轉目標、核對結果不算這個檔案的
                 self.note_seek(None);
                 self.approx_reset();
@@ -3144,6 +3474,12 @@ impl Player {
                 self.failure = None;
                 self.recent_errors.clear();
                 self.loaded_subs.clear();
+                self.auto_sub = None;
+                self.played = false;
+                self.pending_missing.clear();
+                if let Ok(mut list) = self.user_subs.lock() {
+                    list.clear();
+                }
                 // 網站影片的資料、原因是每個檔案各自的（on_load 時才設定）
                 self.state.net = None;
                 self.state.net_need_ytdl = false;
@@ -3157,6 +3493,15 @@ impl Player {
                 if let Ok(path) = self.mpv.get_string("path") {
                     self.opening = Some(path);
                 }
+                // 解不了的編碼是每個檔案各自的（之前的檔案晚到的記錄見 `decoder_failed`）；
+                // 只播聲音重開的（`audio_only_retry`）帶著上一次的記錄：這次沒選影片軌，mpv 不會再說。
+                // 只給重開的那個檔案（重開之前又開了別的：mpv 不會開重開的那個）
+                let carry = self
+                    .audio_only_carry
+                    .take()
+                    .filter(|(path, _)| self.opening.as_deref() == Some(path.as_str()));
+                self.audio_only_retried = carry.is_some();
+                self.state.missing_decoders = carry.map(|(_, m)| m).unwrap_or_default();
                 // 從 `open` 算（比 mpv 真的開始早一點點，不會比較晚）；前一個檔案結束時清掉了的才從現在算
                 self.load_started.get_or_insert_with(Instant::now);
                 // 翻轉是每個檔案各自的（通常 `open` 已經拿掉了）；清單跟該有的不一樣、或不確定
@@ -3200,6 +3545,29 @@ impl Player {
                 }
                 self.failed_after = self.load_started.take().map(|t| t.elapsed());
                 self.site_file_ended();
+                // 載入中讀不到軌道時收到的「解不了」記錄（mpv 關掉分離器才讀不到軌道）是這個檔案的：
+                // - 載入時因為沒有東西可播而失敗（其他原因的載入失敗不算）
+                // - 載入完成、還沒開始播就失敗（mpv 0.37 影像解不了時在載入完成之後才停下，錯誤碼不一定）
+                let pending = std::mem::take(&mut self.pending_missing);
+                let nothing_to_play = error
+                    .as_ref()
+                    .is_some_and(|e| e.code == libmpv2_sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY);
+                let stopped_after_load = error.is_some() && self.failed_after.is_none() && !self.played;
+                let mut notices = Vec::new();
+                if (self.failed_after.is_some() && nothing_to_play) || stopped_after_load {
+                    for (kind, codec) in pending {
+                        notices.extend(self.record_missing(kind, codec, false));
+                    }
+                }
+                // mpv 0.37：影像解不了就整個停下（聲音還沒開始）。不當成失敗，只播聲音重開一次（見 `audio_only_retry`）。
+                // 載入完成、還沒開始播就失敗的：解碼器的記錄可能還沒收到（記錄排在一般事件後面），先留著這個結束，
+                // 事件取完（記錄一定已經收到了）再決定（`events_drained`）
+                let early =
+                    error.is_some() && reason == EndReason::Error && self.failed_after.is_none() && !self.played;
+                if early && self.audio_only_retry() {
+                    // 這次的結束不通知；剛記下的「解不了」照樣通知（整個檔案開不起來時錯誤說明就夠了）
+                    return notices.into_iter().next().map(PlayerEvent::DecoderMissing);
+                }
                 let error = error.map(|e| {
                     let base = failure_reason(e.code);
                     let full = self.compose_failure(base);
@@ -3210,9 +3578,18 @@ impl Player {
                     self.state.last_error = error.clone();
                     self.state.net_failure = self.site.file.failure.clone();
                 }
-                Some(PlayerEvent::EndFile { reason, error })
+                let ev = PlayerEvent::EndFile { reason, error };
+                if early && !self.audio_only_retried {
+                    self.held_end = Some(ev);
+                    return None;
+                }
+                Some(ev)
             }
             Event::PlaybackRestart => {
+                // 已經結束的檔案晚到的不算（只播聲音重開看的是「結束前開始播了沒」）
+                if self.state.loaded {
+                    self.played = true;
+                }
                 self.refresh_tracks();
                 Some(PlayerEvent::PlaybackRestart)
             }
@@ -3339,7 +3716,8 @@ impl Player {
     /// 開檔後選字幕：
     /// - 有繁中就選繁中（其次中文、簡中），依語言碼、標題和外掛字幕的內容判斷
     /// - 沒有中文字幕時尊重 mpv 的選擇；mpv 什麼都沒選時（很多 MKV 的字幕軌沒有語言標籤）選第一條，比照 PotPlayer
-    fn choose_subtitle(&self) {
+    /// - 解不了的字幕格式（Teletext、ARIB、這個播放器之前解不了的…）不選：選了也只會失敗、每次開檔都提示一次
+    fn choose_subtitle(&mut self) {
         let Ok(json) = self.mpv.get_string("track-list") else {
             return;
         };
@@ -3348,33 +3726,186 @@ impl Player {
         if subs.is_empty() {
             return;
         }
-        let lang_of = |t: &Track| {
-            let label = format!(
-                "{} {}",
-                t.lang.as_deref().unwrap_or(""),
-                t.title.as_deref().unwrap_or("")
-            );
-            subs::classify_label(&label).unwrap_or(SubLang::Unknown)
-        };
-        // 語言最優先；同語言時外掛優先（字幕組另外附的通常比內嵌的好）；再來是軌道順序
-        let best = subs
-            .iter()
-            .filter(|t| !t.forced)
-            .max_by_key(|t| (lang_of(t), t.external, std::cmp::Reverse(t.id)))
-            .or(subs.first());
-        let current = subs.iter().find(|t| t.selected);
-        let pick = match (current, best) {
-            (None, Some(b)) => Some(b),
-            (Some(c), Some(b)) if lang_of(b).is_chinese() && lang_of(b) > lang_of(c) => Some(b),
-            _ => None,
-        };
-        if let Some(t) = pick {
-            let _ = self.select_track(TrackKind::Sub, Some(t.id));
+        let pick = pick_auto_sub(&subs, &self.undecodable_subs);
+        let pick = pick.map(|t| (t.id, track_codec(t).to_owned()));
+        if let Some((id, _)) = &pick {
+            let _ = self.set_track(TrackKind::Sub, Some(*id));
         }
+        self.auto_sub = pick;
+    }
+
+    /// 影像解不了時 mpv 0.37（Linux tar.gz 用的系統 libmpv）整個停下：它先開影像、才開聲音，影像失敗的當下還沒有
+    /// 音訊輸出，就當成沒有東西可播（新版看的是選了哪些軌道，聲音照常播）。載入完成、還沒開始播就失敗、
+    /// 而且這個檔案有影像解不了（不是封面）時，同一個檔案關掉影片軌（只對這個檔案）重開一次，「解不了」的記錄帶過去。
+    /// 重開了回傳 true（這次的結束不算失敗、不通知介面）
+    fn audio_only_retry(&mut self) -> bool {
+        let video_failed = self
+            .state
+            .missing_decoders
+            .iter()
+            .any(|m| m.kind == TrackKind::Video && !m.cover);
+        // 載入完成過（`failed_after` 是 None）、還沒開始播
+        if !video_failed || self.failed_after.is_some() || self.played || self.audio_only_retried {
+            return false;
+        }
+        let Some(path) = self.state.path.clone().or_else(|| self.opening.clone()) else {
+            return false;
+        };
+        // mpv 自己的播放清單（交給 mpv 讀的本機 .pls 之類）：mpv 已經往下播了，重開（replace）會把清單整個換掉。
+        // 照舊當成開檔失敗
+        if self.mpv.get_property::<i64>("playlist-count").is_ok_and(|n| n > 1) {
+            return false;
+        }
+        let mut args = vec!["loadfile", path.as_str(), "replace"];
+        if self.loadfile_index {
+            args.push("-1");
+        }
+        args.push("vid=no");
+        if let Err(e) = self.mpv.command(&args) {
+            eprintln!("[vitascope] 無法只播聲音重開：{e}");
+            return false;
+        }
+        self.audio_only_carry = Some((path.clone(), self.state.missing_decoders.clone()));
+        self.load_started = Some(Instant::now());
+        // 只對這次開檔有效的要求（網站影片換畫質）：第一次開的 on_load 已經用掉了，重開的再用一次
+        if self.site.file.url == path && self.site.file.mode != Mode::default() {
+            self.site.mode = Some((path, self.site.file.mode.clone()));
+        }
+        true
+    }
+
+    /// mpv 的事件、記錄都取完了：留著的結束（載入完成、還沒開始播就失敗）現在決定。記錄一定已經收到了
+    ///（mpv 寫記錄在送出結束的事件之前，取事件時記錄排在一般事件後面、同一次取完）：
+    /// 影像解不了的話只播聲音重開，不然照常通知介面開檔失敗
+    fn events_drained(&mut self) -> Option<PlayerEvent> {
+        let ev = self.held_end.take()?;
+        if self.audio_only_retry() {
+            self.state.last_error = None;
+            self.failure = None;
+            return None;
+        }
+        Some(ev)
+    }
+
+    /// 播放引擎有沒有這個編碼的解碼器（影像、聲音；`decoder-list`）。讀不到清單時當成有（只說「無法解碼」，
+    /// 不說引擎不支援）
+    fn engine_decodes(&mut self, codec: &str) -> bool {
+        let mpv = &self.mpv;
+        let decoders = self.decoders.get_or_insert_with(|| {
+            mpv.get_string("decoder-list")
+                .ok()
+                .and_then(|j| serde_json::from_str::<Vec<serde_json::Value>>(&j).ok())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|d| d["codec"].as_str().map(str::to_owned))
+                .collect()
+        });
+        decoders.is_empty() || decoders.contains(codec)
+    }
+
+    /// 目前檔案的軌道：測試用的假清單，或直接問 mpv（介面記下的可能還沒更新）；讀不到時是空的
+    fn current_tracks(&self) -> Vec<Track> {
+        if let Some(fake) = &self.fake_tracks {
+            return fake.clone();
+        }
+        self.mpv
+            .get_string("track-list")
+            .ok()
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
+    /// mpv 的錯誤記錄是解不了某條軌道的話：記進 `state.missing_decoders`，回傳要通知介面的（見 `record_missing`）。
+    /// 記錄比一般事件晚到，可能是上一個檔案的：
+    /// - mpv 現在的檔案有軌道、但沒有這個編碼的，不算這個檔案的
+    /// - 讀不到軌道、檔案已經結束了（整個檔案開不起來）：照樣記下，開檔失敗的說明才寫得出原因
+    /// - 讀不到軌道、下一個檔案還在載入：先留著（`pending_missing`），這個檔案開不起來才算它的
+    fn decoder_failed(&mut self, prefix: &str, text: &str) -> Option<MissingDecoder> {
+        let (kind, codec) = missing_decoder(prefix, text)?;
+        let tracks = self.current_tracks();
+        let has = |k: TrackKind| tracks.iter().find(|t| t.kind == k && track_codec(t) == codec);
+        let kind = kind.or_else(|| {
+            [TrackKind::Video, TrackKind::Audio]
+                .into_iter()
+                .find(|k| has(*k).is_some())
+        })?;
+        let track = has(kind);
+        if track.is_none() && !tracks.is_empty() {
+            return None;
+        }
+        if track.is_none() && self.state.loading {
+            self.pending_missing.push((kind, codec));
+            return None;
+        }
+        let cover = track.is_some_and(|t| t.albumart);
+        self.record_missing(kind, codec, cover)
+    }
+
+    /// 記下這個檔案有一條軌道解不了，回傳要通知介面的（同一個檔案同一條只通知一次；自動選的字幕不通知）。
+    /// - 影像解不了（只播聲音）：歌詞、字幕改由介面畫（跟純音訊檔一樣，mpv 沒有畫面可畫）
+    /// - 開檔時自動選的字幕解不了：改選別條
+    fn record_missing(&mut self, kind: TrackKind, codec: String, cover: bool) -> Option<MissingDecoder> {
+        let auto_sub_failed = kind == TrackKind::Sub && self.auto_sub.as_ref().is_some_and(|(_, c)| *c == codec);
+        if kind == TrackKind::Sub {
+            self.undecodable_subs.insert(codec.clone());
+        }
+        // 字幕：使用者自己選的才提示（mpv 選了標成預設的、影戲開檔時選的都不提示）
+        let quiet = kind == TrackKind::Sub && !self.user_subs.lock().is_ok_and(|list| list.contains(&codec));
+        if let Some(m) = self
+            .state
+            .missing_decoders
+            .iter_mut()
+            .find(|m| m.kind == kind && m.codec == codec)
+        {
+            // 開檔時自動選的解不了（沒提示），現在使用者自己選了這條：提示
+            if m.quiet && !quiet {
+                m.quiet = false;
+                return Some(m.clone());
+            }
+            return None;
+        }
+        let unsupported = kind == TrackKind::Sub || !self.engine_decodes(&codec);
+        let missing = MissingDecoder {
+            kind,
+            codec,
+            unsupported,
+            cover,
+            quiet,
+        };
+        self.state.missing_decoders.push(missing.clone());
+        if self.state.loaded {
+            if kind == TrackKind::Video {
+                self.watch_lyrics();
+                self.sync_lyrics_visibility();
+            }
+            if auto_sub_failed && self.auto_select_subs {
+                self.choose_subtitle();
+            }
+        }
+        (!quiet).then_some(missing)
+    }
+
+    /// 這個檔案開始播了（載入完成之後的第一個 PlaybackRestart）：介面等到這時才提示解不了的編碼
+    ///（mpv 0.37 影像解不了時，載入完成之後還會整個停下、只播聲音重開，見 `audio_only_retry`）
+    pub fn playback_started(&self) -> bool {
+        self.played
+    }
+
+    /// 現在這個檔案是影像解不了、只播聲音重開的（mpv 0.37；見 `audio_only_retry`）：
+    /// 對介面來說還是同一個檔案（解不了的已經提示過、一起拖進來的字幕要再載入一次）
+    pub fn reopened_audio_only(&self) -> bool {
+        self.audio_only_retried
     }
 
     /// 基本原因加上 mpv 記錄裡的細節，整理成給使用者看的說明。
     fn compose_failure(&self, base: &str) -> String {
+        // 載入時影像、聲音都解不了：說是哪個編碼（記錄裡同時有「No video or audio streams」，不能說成檔案裡沒有影像或聲音）。
+        // 播了一陣子才失敗的（只播聲音的檔案網路斷了之類）照下面的原因說明
+        if self.failed_after.is_some()
+            && let Some(msg) = decoder_failure(&self.state.missing_decoders)
+        {
+            return msg;
+        }
         // 網站影片：yt-dlp 說的原因（記錄裡只有「讀不到 memory://」之類）
         if let Some(f) = &self.site.file.failure {
             return f.error.message();
@@ -4086,5 +4617,545 @@ mod tests {
         // 沒有影像
         assert_eq!(display_size("null"), None);
         assert_eq!(display_size(r#"{"dw":0,"dh":0}"#), None);
+    }
+
+    /// 別的播放器、匯出的 FFmpeg 錯誤一大串（都送到第一個建立的 mpv）：這個檔案 mpv 自己的錯誤不會被擠掉
+    #[test]
+    fn ffmpeg_floods_do_not_push_out_mpv_errors() {
+        use super::push_recent_error;
+        let mut list = Vec::new();
+        for i in 0..3 {
+            push_recent_error(&mut list, format!("[ffmpeg] early {i}"));
+        }
+        push_recent_error(&mut list, "[ao/wasapi] cannot open device".into());
+        push_recent_error(
+            &mut list,
+            "[vd] Failed to initialize a decoder for codec 'avs2'.".into(),
+        );
+        for i in 0..20 {
+            push_recent_error(&mut list, format!("[ffmpeg/demuxer] partial file {i}"));
+        }
+        assert_eq!(list.len(), 8);
+        assert_eq!(list[0], "[ao/wasapi] cannot open device", "{list:?}");
+        assert_eq!(list[1], "[vd] Failed to initialize a decoder for codec 'avs2'.");
+        assert_eq!(list[7], "[ffmpeg/demuxer] partial file 19", "最新的在最後面：{list:?}");
+        // mpv 自己的錯誤一大串也一樣：FFmpeg 的留一半
+        for i in 0..20 {
+            push_recent_error(&mut list, format!("[cplayer] e{i}"));
+        }
+        assert_eq!(list.iter().filter(|e| e.starts_with("[ffmpeg")).count(), 4, "{list:?}");
+        assert_eq!(
+            list[4..],
+            ["[cplayer] e16", "[cplayer] e17", "[cplayer] e18", "[cplayer] e19"].map(String::from)
+        );
+        // 一開始 mpv 的只有兩筆：先丟 FFmpeg 的，mpv 的兩筆留到 mpv 的佔滿一半才輪到
+        let mut few = Vec::new();
+        push_recent_error(&mut few, "[ao] a".into());
+        for i in 0..7 {
+            push_recent_error(&mut few, format!("[ffmpeg] {i}"));
+        }
+        push_recent_error(&mut few, "[cplayer] b".into());
+        assert_eq!(few[0], "[ao] a", "{few:?}");
+        assert_eq!(few.iter().filter(|e| e.starts_with("[ffmpeg")).count(), 6, "{few:?}");
+        // 只有一類時跟以前一樣：留最新的 8 筆
+        let mut only = Vec::new();
+        for i in 0..20 {
+            push_recent_error(&mut only, format!("[ffmpeg] {i}"));
+        }
+        assert_eq!(only.first().map(String::as_str), Some("[ffmpeg] 12"));
+    }
+
+    #[test]
+    fn decoder_log_lines_are_parsed() {
+        use super::missing_decoder;
+        assert_eq!(
+            missing_decoder("vd", "Failed to initialize a decoder for codec 'avs2'.\n"),
+            Some((Some(TrackKind::Video), "avs2".to_owned()))
+        );
+        assert_eq!(
+            missing_decoder("ad", "Failed to initialize a decoder for codec 'ac4'.\n"),
+            Some((Some(TrackKind::Audio), "ac4".to_owned()))
+        );
+        // 沒有編碼名稱時 mpv 寫 <?>
+        assert_eq!(
+            missing_decoder("vd", "Failed to initialize a decoder for codec '<?>'.\n"),
+            Some((Some(TrackKind::Video), "<?>".to_owned()))
+        );
+        assert_eq!(
+            missing_decoder(
+                "vd",
+                "Failed to initialize a decoder for codec ''.
+"
+            ),
+            Some((Some(TrackKind::Video), "<?>".to_owned()))
+        );
+        // 其他來源：種類由呼叫的一方查軌道清單
+        assert_eq!(
+            missing_decoder("lavfi", "Failed to initialize a decoder for codec 'aac'.\n"),
+            Some((None, "aac".to_owned()))
+        );
+        assert_eq!(
+            missing_decoder("sub", "Could not find subtitle decoder for format 'dvb_teletext'.\n"),
+            Some((Some(TrackKind::Sub), "dvb_teletext".to_owned()))
+        );
+        // 其他的錯誤、單一解碼器失敗的警告都不是
+        assert_eq!(missing_decoder("vd", "Decoder init failed for libdav1d\n"), None);
+        assert_eq!(
+            missing_decoder("sub/ass", "Could not open libavcodec subtitle converter\n"),
+            None
+        );
+        assert_eq!(
+            missing_decoder("cplayer", "No video or audio streams selected.\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn codec_names_for_people() {
+        use super::codec_display_name as name;
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(name("h264"), "H.264");
+        assert_eq!(name("hevc"), "HEVC");
+        assert_eq!(name("avs2"), "AVS2");
+        assert_eq!(name("avs3"), "AVS3");
+        assert_eq!(name("cavs"), "AVS");
+        assert_eq!(name("evc"), "MPEG-5 EVC");
+        assert_eq!(name("vvc"), "H.266 / VVC");
+        assert_eq!(name("apv"), "APV");
+        assert_eq!(name("ac4"), "AC-4");
+        assert_eq!(name("ttml"), "TTML");
+        assert_eq!(name("dvb_teletext"), "Teletext（圖文電視）");
+        assert_eq!(name("arib_caption"), "ARIB 字幕");
+        assert_eq!(name("<?>"), "未知的編碼");
+        assert_eq!(name("null"), "未知的編碼");
+        // 不在表上的：mpv 的名稱轉大寫
+        assert_eq!(name("wmv3"), "WMV3");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(name("dvb_teletext"), "Teletext");
+        assert_eq!(name("arib_caption"), "ARIB captions");
+        assert_eq!(name("<?>"), "unknown codec");
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+    }
+
+    #[test]
+    fn decoder_messages_say_what_is_unsupported() {
+        use super::{MissingDecoder, decoder_failure};
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let m = |kind, codec: &str, unsupported| MissingDecoder {
+            kind,
+            codec: codec.into(),
+            unsupported,
+            cover: false,
+            quiet: false,
+        };
+        // 引擎沒有的編碼：不支援；有解碼器、開不起來：無法解碼（不能說成不支援）
+        assert_eq!(
+            m(TrackKind::Video, "avs2", true).notice(true),
+            "這個影片的影像編碼（AVS2）影戲不支援，只播放聲音"
+        );
+        assert_eq!(
+            m(TrackKind::Video, "h264", false).notice(true),
+            "無法解碼 H.264 影像（檔案可能損壞，或用了引擎不支援的設定），只播放聲音"
+        );
+        assert_eq!(
+            m(TrackKind::Audio, "ac4", true).notice(true),
+            "這個檔案的音訊編碼（AC-4）影戲不支援，只播放影像"
+        );
+        assert_eq!(
+            m(TrackKind::Audio, "aac", false).notice(true),
+            "無法解碼 AAC 聲音（檔案可能損壞，或用了引擎不支援的設定），只播放影像"
+        );
+        assert_eq!(
+            m(TrackKind::Audio, "ac4", true).notice(false),
+            "這個檔案的音訊編碼（AC-4）影戲不支援"
+        );
+        assert_eq!(
+            m(TrackKind::Sub, "dvb_teletext", true).notice(true),
+            "這條字幕的格式（Teletext（圖文電視））影戲不支援"
+        );
+        assert_eq!(m(TrackKind::Video, "avs2", true).label(), "AVS2（不支援）");
+        assert_eq!(m(TrackKind::Video, "h264", false).label(), "H.264（無法解碼）");
+        // 整個檔案開不起來的說明：引擎沒有的優先；字幕不算
+        assert_eq!(decoder_failure(&[]), None);
+        assert_eq!(decoder_failure(&[m(TrackKind::Sub, "ttml", true)]), None);
+        assert_eq!(
+            decoder_failure(&[m(TrackKind::Video, "avs2", true)]).as_deref(),
+            Some("不支援的編碼：AVS2")
+        );
+        assert_eq!(
+            decoder_failure(&[m(TrackKind::Video, "avs2", true), m(TrackKind::Audio, "ac4", true)]).as_deref(),
+            Some("不支援的編碼：AVS2、AC-4")
+        );
+        assert_eq!(
+            decoder_failure(&[m(TrackKind::Audio, "aac", false), m(TrackKind::Video, "avs2", true)]).as_deref(),
+            Some("不支援的編碼：AVS2")
+        );
+        assert_eq!(
+            decoder_failure(&[m(TrackKind::Video, "h264", false)]).as_deref(),
+            Some("無法解碼 H.264（檔案可能損壞，或用了引擎不支援的設定）")
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(
+            m(TrackKind::Video, "avs2", true).notice(true),
+            "This video's codec (AVS2) isn't supported; playing the audio only"
+        );
+        assert_eq!(
+            m(TrackKind::Sub, "ttml", true).notice(true),
+            "This subtitle format (TTML) isn't supported"
+        );
+        assert_eq!(m(TrackKind::Audio, "aac", false).label(), "AAC (can't decode)");
+        assert_eq!(
+            decoder_failure(&[m(TrackKind::Video, "avs2", true)]).as_deref(),
+            Some("Unsupported codec: AVS2")
+        );
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+    }
+
+    #[test]
+    fn undecodable_video_does_not_count_as_video() {
+        use super::MissingDecoder;
+        let track = |json: &str| serde_json::from_str::<Track>(json).unwrap();
+        let mut state = State {
+            tracks: vec![
+                track(r#"{"id":1,"type":"video","codec":"avs2"}"#),
+                track(r#"{"id":1,"type":"audio","codec":"aac","selected":true}"#),
+            ],
+            ..Default::default()
+        };
+        assert!(state.has_video() && state.has_picture());
+        state.missing_decoders.push(MissingDecoder {
+            kind: TrackKind::Video,
+            codec: "avs2".into(),
+            unsupported: true,
+            cover: false,
+            quiet: false,
+        });
+        // 只播聲音：介面當成純音訊檔（不畫上一個檔案留下的畫面）
+        assert!(!state.has_video() && !state.has_picture());
+        assert!(state.decodable(&state.tracks[1]));
+        // 同一個編碼名稱、別種軌道不受影響
+        state.missing_decoders[0].kind = TrackKind::Audio;
+        assert!(state.has_video());
+    }
+
+    /// mpv 的解碼器錯誤記錄 → `state.missing_decoders`、`PlayerEvent::DecoderMissing`、開檔失敗的說明。
+    /// 用假的軌道清單（沒有真的檔案），記錄照各種順序送
+    #[test]
+    fn decoder_failures_are_recorded_once_and_explain_the_failure() {
+        use super::MissingDecoder;
+        use crate::mpv::{EndReason, Error, Event};
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let log = |prefix: &str, level: &str, text: &str| Event::Log {
+            prefix: prefix.into(),
+            level: level.into(),
+            text: text.into(),
+        };
+        let failed = |code| Event::EndFile {
+            reason: EndReason::Error,
+            error: Some(Error {
+                code,
+                context: String::new(),
+            }),
+        };
+        let track = |json: &str| serde_json::from_str::<Track>(json).unwrap();
+        let missing = |kind, codec: &str, unsupported, cover| {
+            Some(super::PlayerEvent::DecoderMissing(MissingDecoder {
+                kind,
+                codec: codec.into(),
+                unsupported,
+                cover,
+                quiet: false,
+            }))
+        };
+        // 播放引擎有的解碼器（每個版本的 FFmpeg 都有）、沒有的（AVS2 要 GPL 的 libdavs2）
+        assert!(p.engine_decodes("aac") && p.engine_decodes("h264") && p.engine_decodes("mjpeg"));
+        assert!(!p.engine_decodes("avs2"));
+        p.set_fake_tracks(Some(vec![
+            track(r#"{"id":1,"type":"video","codec":"avs2","selected":true}"#),
+            track(r#"{"id":2,"type":"video","codec":"mjpeg","albumart":true}"#),
+            track(r#"{"id":1,"type":"audio","codec":"aac","selected":true}"#),
+            track(r#"{"id":1,"type":"sub","codec":"dvb_teletext"}"#),
+        ]));
+        p.handle(Event::StartFile);
+        let avs2 = "Failed to initialize a decoder for codec 'avs2'.\n";
+        // 引擎沒有 AVS2 的解碼器（decoder-list 裡沒有）：不支援
+        assert_eq!(
+            p.handle(log("vd", "error", avs2)),
+            missing(TrackKind::Video, "avs2", true, false)
+        );
+        // 同一條再失敗一次（又選了這條軌道）：不再通知
+        assert_eq!(p.handle(log("vd", "error", avs2)), None);
+        // 這個檔案沒有 HEVC 的軌道：上一個檔案晚到的記錄，不算
+        assert_eq!(
+            p.handle(log("vd", "error", "Failed to initialize a decoder for codec 'hevc'.\n")),
+            None
+        );
+        // 不是錯誤等級的不看
+        assert_eq!(
+            p.handle(log("ad", "warn", "Failed to initialize a decoder for codec 'aac'.\n")),
+            None
+        );
+        // 引擎有 AAC 的解碼器：無法解碼（不是不支援）；來源不是 vd / ad 的查軌道清單
+        assert_eq!(
+            p.handle(log(
+                "lavfi",
+                "error",
+                "Failed to initialize a decoder for codec 'aac'.\n"
+            )),
+            missing(TrackKind::Audio, "aac", false, false)
+        );
+        // 字幕一律是不支援。mpv 自動選的（使用者沒選過）：記下、不通知（每次開檔都提示的話很煩）
+        let teletext = "Could not find subtitle decoder for format 'dvb_teletext'.\n";
+        assert_eq!(p.handle(log("sub", "error", teletext)), None);
+        assert!(
+            p.state
+                .missing_decoders
+                .iter()
+                .any(|m| m.codec == "dvb_teletext" && m.quiet),
+            "{:?}",
+            p.state.missing_decoders
+        );
+        // 使用者自己選了這條、又解不了：通知（只一次）
+        p.select_track(TrackKind::Sub, Some(1)).unwrap();
+        assert_eq!(
+            p.handle(log("sub", "error", teletext)),
+            missing(TrackKind::Sub, "dvb_teletext", true, false)
+        );
+        assert_eq!(p.handle(log("sub", "error", teletext)), None);
+        // 專輯封面記下是封面
+        assert_eq!(
+            p.handle(log(
+                "vd",
+                "error",
+                "Failed to initialize a decoder for codec 'mjpeg'.\n"
+            )),
+            missing(TrackKind::Video, "mjpeg", false, true)
+        );
+        assert_eq!(p.state.missing_decoders.len(), 4);
+        assert!(p.undecodable_subs.contains("dvb_teletext"));
+        // 影像、聲音都解不了，mpv 說「No video or audio streams」：說明是哪個編碼（引擎沒有的優先）
+        p.handle(log("cplayer", "fatal", "No video or audio streams selected.\n"));
+        p.handle(failed(libmpv2_sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY));
+        assert_eq!(p.state.last_error.as_deref(), Some("不支援的編碼：AVS2"));
+        // 開新檔：清掉；字幕格式解不了這件事留著（引擎沒有的解碼器換檔也一樣）
+        p.handle(Event::StartFile);
+        assert!(p.state.missing_decoders.is_empty());
+        assert!(p.undecodable_subs.contains("dvb_teletext"));
+
+        // 記錄比 EndFile 晚到：收到時再補進說明
+        p.set_fake_tracks(Some(vec![track(r#"{"id":1,"type":"video","codec":"h264"}"#)]));
+        p.handle(log("cplayer", "fatal", "No video or audio streams selected.\n"));
+        p.handle(failed(libmpv2_sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY));
+        assert!(
+            p.state
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("檔案裡沒有可播放的影像或聲音")),
+            "{:?}",
+            p.state.last_error
+        );
+        assert_eq!(
+            p.handle(log("vd", "error", "Failed to initialize a decoder for codec 'h264'.\n")),
+            missing(TrackKind::Video, "h264", false, false)
+        );
+        assert_eq!(
+            p.state.last_error.as_deref(),
+            Some("無法解碼 H.264（檔案可能損壞，或用了引擎不支援的設定）")
+        );
+
+        // 整個檔案結束了才收到（mpv 讀不到軌道）：照樣算這個檔案的
+        p.set_fake_tracks(None);
+        p.handle(Event::StartFile);
+        p.handle(failed(libmpv2_sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY));
+        assert!(p.handle(log("vd", "error", avs2)).is_some());
+        assert_eq!(p.state.last_error.as_deref(), Some("不支援的編碼：AVS2"));
+
+        // 播了一陣子（載入完成過）才失敗：原因不是解不了的編碼
+        p.set_fake_tracks(Some(vec![
+            track(r#"{"id":1,"type":"video","codec":"avs2"}"#),
+            track(r#"{"id":1,"type":"audio","codec":"aac","selected":true}"#),
+        ]));
+        p.handle(Event::StartFile);
+        p.handle(log("vd", "error", avs2));
+        p.handle(Event::FileLoaded);
+        p.handle(log("stream", "error", "Failed to open C:\\影片\\a.mkv.\n"));
+        p.handle(failed(libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED));
+        let err = p.state.last_error.clone().unwrap_or_default();
+        assert!(err.starts_with("無法載入檔案") && !err.contains("AVS2"), "{err}");
+    }
+
+    fn decoder_log(prefix: &str, codec: &str) -> crate::mpv::Event {
+        crate::mpv::Event::Log {
+            prefix: prefix.into(),
+            level: "error".into(),
+            text: format!("Failed to initialize a decoder for codec '{codec}'.\n"),
+        }
+    }
+
+    fn ended_with(code: i32) -> crate::mpv::Event {
+        crate::mpv::Event::EndFile {
+            reason: crate::mpv::EndReason::Error,
+            error: Some(crate::mpv::Error {
+                code,
+                context: String::new(),
+            }),
+        }
+    }
+
+    /// 換檔時上一個檔案晚到的記錄：下一個檔案還在載入、mpv 讀不到軌道時先留著，
+    /// 下一個檔案載入完成就丟掉；它因為沒有東西可播而開不起來，才算它的
+    #[test]
+    fn decoder_log_while_the_next_file_loads_waits_for_its_outcome() {
+        use crate::mpv::Event;
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        // mpv 還沒開分離器：讀不到軌道
+        p.set_fake_tracks(Some(Vec::new()));
+        p.handle(Event::StartFile);
+        assert!(p.state.loading);
+        assert_eq!(p.handle(decoder_log("vd", "h264")), None);
+        assert!(p.state.missing_decoders.is_empty(), "不算載入中的這個檔案的");
+        // 開始播了：是上一個檔案的（之後結束也不算）
+        p.handle(Event::FileLoaded);
+        p.handle(Event::PlaybackRestart);
+        p.handle(ended_with(libmpv2_sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY));
+        assert!(p.state.missing_decoders.is_empty(), "{:?}", p.state.missing_decoders);
+
+        // mpv 0.37：影像解不了時載入完成之後才停下，記錄可能在載入完成之前、讀不到軌道時收到：是這個檔案的
+        p.handle(Event::StartFile);
+        assert_eq!(p.handle(decoder_log("vd", "h264")), None);
+        p.handle(Event::FileLoaded);
+        // 0.37 的錯誤碼不是「沒有東西可播」
+        p.handle(ended_with(libmpv2_sys::mpv_error_MPV_ERROR_GENERIC));
+        assert_eq!(p.state.missing_decoders.len(), 1, "{:?}", p.state.missing_decoders);
+        // 留著的結束（沒有檔案可以重開）：事件取完時通知
+        assert!(
+            p.poll()
+                .iter()
+                .any(|e| matches!(e, super::PlayerEvent::EndFile { error: Some(_), .. }))
+        );
+
+        // 沒有東西可播、開不起來（mpv 已經關掉分離器才讀不到軌道）：是這個檔案的
+        p.handle(Event::StartFile);
+        assert_eq!(p.handle(decoder_log("vd", "h264")), None);
+        p.handle(ended_with(libmpv2_sys::mpv_error_MPV_ERROR_NOTHING_TO_PLAY));
+        assert_eq!(p.state.missing_decoders.len(), 1);
+        assert_eq!(
+            p.state.last_error.as_deref(),
+            Some("無法解碼 H.264（檔案可能損壞，或用了引擎不支援的設定）")
+        );
+
+        // 其他原因開不起來（讀不到檔案）：不是解不了
+        p.handle(Event::StartFile);
+        assert_eq!(p.handle(decoder_log("vd", "h264")), None);
+        p.handle(ended_with(libmpv2_sys::mpv_error_MPV_ERROR_LOADING_FAILED));
+        assert!(p.state.missing_decoders.is_empty(), "{:?}", p.state.missing_decoders);
+        let err = p.state.last_error.clone().unwrap_or_default();
+        assert!(err.starts_with("無法載入檔案"), "{err}");
+    }
+
+    /// 載入完成、還沒開始播就失敗（留著的結束），接著 mpv 自己開始了下一個項目（mpv 的播放清單）：
+    /// 先通知那個結束、再通知下一個開始（不能吞掉）
+    #[test]
+    fn held_end_is_reported_before_the_next_file_starts() {
+        use crate::mpv::Event;
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        p.handle(Event::StartFile);
+        p.handle(Event::FileLoaded);
+        assert_eq!(p.handle(ended_with(-1)), None, "結束先留著");
+        let ev = p.handle(Event::StartFile);
+        assert!(
+            matches!(ev, Some(super::PlayerEvent::EndFile { error: Some(_), .. })),
+            "{ev:?}"
+        );
+        assert_eq!(p.poll().first(), Some(&super::PlayerEvent::StartFile));
+        assert!(p.state.loading, "下一個檔案照常開始");
+        assert_eq!(p.poll(), Vec::new(), "只通知一次");
+    }
+
+    /// 只播聲音重開（mpv 0.37）帶過去的記錄只給重開的那個檔案
+    #[test]
+    fn audio_only_carry_goes_only_to_the_reopened_file() {
+        use super::MissingDecoder;
+        use crate::mpv::Event;
+        let mut p = super::Player::new(super::Options::headless()).unwrap();
+        let carried = vec![MissingDecoder {
+            kind: TrackKind::Video,
+            codec: "h264".into(),
+            unsupported: false,
+            cover: false,
+            quiet: false,
+        }];
+        let a = "C:/影片/a.mp4".to_owned();
+        // mpv 開始的是別的檔案（重開之前又開了別的）：不帶過去
+        p.audio_only_carry = Some((a.clone(), carried.clone()));
+        p.opening = Some("C:/影片/b.mp4".into());
+        p.handle(Event::StartFile);
+        assert!(p.state.missing_decoders.is_empty());
+        assert!(!p.reopened_audio_only());
+        // 重開的那個：帶過去
+        p.audio_only_carry = Some((a.clone(), carried.clone()));
+        p.opening = Some(a.clone());
+        p.handle(Event::StartFile);
+        assert_eq!(p.state.missing_decoders, carried);
+        assert!(p.reopened_audio_only());
+        // 介面開了別的檔案：丟掉
+        p.audio_only_carry = Some((a, carried));
+        let _ = p.open("C:/不存在/c.mp4");
+        assert!(p.audio_only_carry.is_none());
+    }
+
+    /// 開檔自動選字幕：FFmpeg 解不了的格式（Teletext、ARIB、MP4 裡的 TTML、藍光文字字幕）和這個播放器
+    /// 之前解不了的都不選；mpv 自己選了解不了的當成沒選
+    #[test]
+    fn auto_subtitle_choice_skips_undecodable_formats() {
+        use super::pick_auto_sub;
+        use std::collections::HashSet;
+        let t = |json: &str| serde_json::from_str::<Track>(json).unwrap();
+        let none = HashSet::new();
+        let srt = t(r#"{"id":9,"type":"sub","codec":"subrip","lang":"eng"}"#);
+        let pick = |subs: &[&Track], learned: &HashSet<String>| pick_auto_sub(subs, learned).map(|t| t.id);
+        // mpv 選了標成預設的 Teletext：當成沒選，改選解得了的
+        let teletext = t(r#"{"id":1,"type":"sub","codec":"dvb_teletext","lang":"ger","default":true,"selected":true}"#);
+        assert_eq!(pick(&[&teletext, &srt], &none), Some(9));
+        // 只有 ARIB 字幕：不選
+        let arib = t(r#"{"id":1,"type":"sub","codec":"arib_caption","lang":"jpn"}"#);
+        assert_eq!(pick(&[&arib], &none), None);
+        // 標成繁中、但解不了的：不選（不然繁中優先會選它）
+        for codec in ["ttml", "hdmv_text_subtitle", "dvb_teletext", "arib_caption"] {
+            let zh = t(&format!(r#"{{"id":1,"type":"sub","codec":"{codec}","lang":"zh-TW"}}"#));
+            assert_eq!(pick(&[&zh, &srt], &none), Some(9), "{codec}");
+        }
+        // 這個播放器之前解不了的格式
+        let ass = t(r#"{"id":1,"type":"sub","codec":"ass","lang":"zh-TW"}"#);
+        assert_eq!(pick(&[&ass, &srt], &none), Some(1));
+        let learned = HashSet::from(["ass".to_owned()]);
+        assert_eq!(pick(&[&ass, &srt], &learned), Some(9));
+    }
+
+    /// 解不了的專輯封面不算封面：沒有畫面，ASS 歌詞由介面畫
+    #[test]
+    fn undecodable_cover_does_not_hide_ass_lyrics() {
+        use super::MissingDecoder;
+        let track = |json: &str| serde_json::from_str::<Track>(json).unwrap();
+        let mut state = State {
+            tracks: vec![
+                track(r#"{"id":1,"type":"video","codec":"jpegxl","albumart":true,"selected":true}"#),
+                track(r#"{"id":1,"type":"audio","codec":"flac","selected":true}"#),
+                track(r#"{"id":1,"type":"sub","codec":"ass","selected":true}"#),
+            ],
+            ..Default::default()
+        };
+        assert!(!state.lyrics_in_app(), "有封面：ASS 歌詞由 mpv 畫在封面上");
+        state.missing_decoders.push(MissingDecoder {
+            kind: TrackKind::Video,
+            codec: "jpegxl".into(),
+            unsupported: true,
+            cover: true,
+            quiet: false,
+        });
+        assert!(state.lyrics_in_app());
+        assert!(!state.has_picture());
     }
 }

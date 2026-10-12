@@ -8,7 +8,7 @@
 //! `decoder`（0.39 起）；零複製硬體解碼時 `pixelformat` 是硬體表面的名稱（`cuda`、`d3d11`），
 //! 真正的格式在 `hw-pixelformat`；非有限的浮點數 mpv 會寫成字串（例如 `"-nan(ind)"`）。
 
-use crate::player::Player;
+use crate::player::{MissingDecoder, Player, TrackKind};
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 
@@ -100,6 +100,8 @@ pub struct MediaInfo {
     pub audio_device: Option<String>,
     /// 網路串流：「來源」取代「檔案」那一段（標題、網址、串流的種類）；本機檔案是 None
     pub source: Option<Source>,
+    /// 解不了的軌道（mpv 關掉了，不在 current-tracks 裡）：各段另外列一行「AVS2（不支援）」
+    pub missing: Vec<MissingDecoder>,
 }
 
 /// 網路串流的來源
@@ -185,6 +187,7 @@ pub fn read(player: &Player, audio_device: Option<String>) -> MediaInfo {
         ao: player.get_string("current-ao").ok(),
         audio_device,
         source: None,
+        missing: st.missing_decoders.clone(),
     }
 }
 
@@ -571,6 +574,15 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
         out.push((crate::tr!("檔案", "File"), file));
     }
 
+    // 解不了的軌道（專輯封面不算）：「AVS2（不支援）」
+    let missing = |kind: TrackKind| -> Vec<String> {
+        info.missing
+            .iter()
+            .filter(|m| m.kind == kind && !m.cover)
+            .map(MissingDecoder::label)
+            .collect()
+    };
+
     // 影像（專輯封面不算）
     if let Some(v) = info.video.as_ref().filter(|v| !v.albumart && !v.image) {
         let mut lines = vec![format!("{} · {}", codec_line(v), hwdec_label(info.hwdec.as_deref()))];
@@ -638,7 +650,10 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
             })
             .unwrap_or_else(|| crate::tr!("計算中…", "measuring…").to_owned());
         lines.push(crate::tf!("位元率 {bitrate}", "Bitrate {bitrate}"));
+        lines.extend(missing(TrackKind::Video));
         out.push((crate::tr!("影像", "Video"), lines));
+    } else if !missing(TrackKind::Video).is_empty() {
+        out.push((crate::tr!("影像", "Video"), missing(TrackKind::Video)));
     }
 
     // 音訊
@@ -676,7 +691,10 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
         if !output.is_empty() {
             lines.push(crate::tf!("輸出 {}", "Output {}", output.join(" · ")));
         }
+        lines.extend(missing(TrackKind::Audio));
         out.push((crate::tr!("音訊", "Audio"), lines));
+    } else if !missing(TrackKind::Audio).is_empty() {
+        out.push((crate::tr!("音訊", "Audio"), missing(TrackKind::Audio)));
     }
 
     // 字幕
@@ -707,6 +725,7 @@ pub fn sections(info: &MediaInfo, live: &LiveStats) -> Vec<Section> {
     if let Some(s) = &info.sub2 {
         subs.push(crate::tf!("第二字幕 {}", "Secondary {}", sub_line(s)));
     }
+    subs.extend(missing(TrackKind::Sub));
     if !subs.is_empty() {
         out.push((crate::tr!("字幕", "Subtitles"), subs));
     }
@@ -1012,5 +1031,66 @@ mod tests {
         assert!(text.contains("位元率 計算中…"), "{text}");
         assert!(text.contains("影音差 +1 ms"), "{text}");
         assert!(!text.contains("音訊"), "沒有音軌就不列：{text}");
+    }
+
+    /// 解不了的軌道（mpv 關掉了，不在 current-tracks）：各段另外列一行；專輯封面不列
+    #[test]
+    fn undecodable_tracks_are_listed_with_a_mark() {
+        use crate::player::{MissingDecoder, TrackKind};
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        let m = |kind, codec: &str, unsupported, cover| MissingDecoder {
+            kind,
+            codec: codec.into(),
+            unsupported,
+            cover,
+            quiet: false,
+        };
+        let info = MediaInfo {
+            file_name: "a.mkv".into(),
+            audio: Some(TrackInfo {
+                codec: Some("aac".into()),
+                ..Default::default()
+            }),
+            sub: Some(TrackInfo {
+                codec: Some("subrip".into()),
+                ..Default::default()
+            }),
+            missing: vec![
+                m(TrackKind::Video, "avs2", true, false),
+                m(TrackKind::Video, "mjpeg", false, true),
+                m(TrackKind::Audio, "aac", false, false),
+                m(TrackKind::Sub, "dvb_teletext", true, false),
+            ],
+            ..Default::default()
+        };
+        let s = sections(&info, &LiveStats::default());
+        let section = |name: &str| {
+            s.iter()
+                .find(|(t, _)| *t == name)
+                .map(|(_, l)| l.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(section("影像"), ["AVS2（不支援）"], "{s:?}");
+        assert_eq!(
+            section("音訊").last().map(String::as_str),
+            Some("AAC（無法解碼）"),
+            "{s:?}"
+        );
+        assert_eq!(
+            section("字幕").last().map(String::as_str),
+            Some("Teletext（圖文電視）（不支援）"),
+            "{s:?}"
+        );
+        assert!(!to_text(&s).contains("MJPEG"), "專輯封面不列：{s:?}");
+        // 沒有解不了的：跟以前一樣，沒有影像就沒有「影像」這段
+        let plain = MediaInfo {
+            missing: Vec::new(),
+            ..info
+        };
+        assert!(
+            sections(&plain, &LiveStats::default())
+                .iter()
+                .all(|(t, _)| *t != "影像")
+        );
     }
 }

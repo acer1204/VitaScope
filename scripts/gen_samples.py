@@ -8,11 +8,13 @@
   samples/generated/net/…                本機 HTTP 伺服器播放用的 HLS、DASH、分開的影像與聲音（不在 manifest.json；tests/net.rs 用）
   samples/generated/pacing/pan_23976.mkv  流暢播放的實機測試（tests/pacing_window.rs）；只有 --tier pacing 才產生
   samples/generated/pacing/pan_4k10.mkv   同上，4K 10-bit（軟體解碼、GPU 畫一格比較久）
+  samples/generated/unsupported/…        播放引擎解不了的編碼（不在 manifest.json；tests/decoders.rs 用）
 
 用法：
   python scripts/gen_samples.py                 # 產生全部等級
   python scripts/gen_samples.py --tier common   # 只產生「常見」
   python scripts/gen_samples.py --tier net      # 只產生網路測試用的串流（HLS、DASH）
+  python scripts/gen_samples.py --tier unsupported  # 只產生播放引擎解不了的編碼（AVS2、MP4 裡的 TTML 字幕）
   python scripts/gen_samples.py --force         # 已存在也重新產生
   python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p、4K 平移影片（約 20 MB + 50 MB，CI 不需要）
 
@@ -680,6 +682,56 @@ def generate_net(force: bool) -> list[str]:
     return errors
 
 
+# ───────────── 播放引擎解不了的編碼（tests/decoders.rs；不在 manifest.json）─────────────
+# 影戲要說明是哪個編碼解不了、其他的照常播。格式矩陣（tests/formats.rs）預期每個樣本都播得了，所以不放進 manifest。
+# - mp4_h264_aac_ttml：MP4 裡的 TTML 字幕（stpp，FFmpeg 只有編碼器、沒有解碼器，每個平台都解不了；FFmpeg 內建的編碼器，
+#   每個平台都產生得了）＋ 一條 mov_text。TTML 那條標成預設：mpv 會先選它（解不了），影戲改選 mov_text
+# - mkv_avs2_aac / mkv_avs2：AVS2 影像（libdavs2 是 GPL，播放引擎沒有，系統的 FFmpeg 通常也沒有）；要有 libxavs2 的 FFmpeg
+#   （Windows 的 full build）才產生得了，沒有的平台測試會略過
+UNSUPPORTED_DIR = OUT / "unsupported"
+
+
+def generate_unsupported(force: bool) -> None:
+    """產生 unsupported/ 底下的樣本；這個 FFmpeg 沒有的編碼器略過（不算失敗）"""
+    UNSUPPORTED_DIR.mkdir(parents=True, exist_ok=True)
+    video = ["-f", "lavfi", "-i", f"testsrc2=size=320x240:rate=24:duration={DUR}"]
+    audio = ["-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={DUR}"]
+    with tempfile.TemporaryDirectory() as td:
+        srt = Path(td) / "src.srt"
+        srt.write_text(srt_text(), encoding="utf-8")
+        jobs = [
+            ("mp4_h264_aac_ttml.mp4", None,
+             [*video, *audio, "-i", str(srt), "-i", str(srt),
+              "-map", "0:v", "-map", "1:a", "-map", "2:s", "-map", "3:s", *X264, *AAC,
+              "-c:s:0", "ttml", "-c:s:1", "mov_text",
+              "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=eng",
+              "-disposition:s:0", "default", "-disposition:s:1", "0"]),
+            ("mkv_avs2_aac.mkv", "libxavs2",
+             [*video, *audio, "-map", "0:v", "-map", "1:a", "-c:v", "libxavs2", "-pix_fmt", "yuv420p", *AAC]),
+            ("mkv_avs2.mkv", "libxavs2", [*video, "-c:v", "libxavs2", "-pix_fmt", "yuv420p"]),
+        ]
+        for name, encoder, args in jobs:
+            out = UNSUPPORTED_DIR / name
+            if out.exists() and not force:
+                print(f"  略過  unsupported {name}（已存在）")
+                continue
+            if encoder and not has_encoder(encoder):
+                print(f"  略過  unsupported {name}（這個 ffmpeg 沒有 {encoder}）")
+                continue
+            err = _ffmpeg([*args, str(out)], UNSUPPORTED_DIR)
+            if err:
+                out.unlink(missing_ok=True)
+                print(f"  失敗  unsupported {name}: {err}")
+            else:
+                print(f"  完成  unsupported {name}")
+
+
+def has_encoder(name: str) -> bool:
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-h", f"encoder={name}"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return r.returncode == 0 and f"Encoder {name}" in r.stdout
+
+
 # ───────────── 流暢播放（實機測試用，不在 manifest.json）─────────────
 # 1920×1080、23.976 fps、20 秒：每格往左平移 16 像素，左上角是影格編號。
 # 卡頓（某一格多停一次更新）在平移的畫面上最明顯；tests/pacing_window.rs 用 mpv 的記錄算每格顯示幾次更新
@@ -748,7 +800,7 @@ def main() -> int:
         stream.reconfigure(encoding="utf-8", errors="replace")
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=(*TIERS, "all", "pacing", "net"), default="all")
+    ap.add_argument("--tier", choices=(*TIERS, "all", "pacing", "net", "unsupported"), default="all")
     ap.add_argument("--force", action="store_true", help="已存在的樣本也重新產生")
     args = ap.parse_args()
 
@@ -763,6 +815,9 @@ def main() -> int:
         return 0
     if args.tier == "net":
         return 2 if generate_net(args.force) else 0
+    if args.tier == "unsupported":
+        generate_unsupported(args.force)
+        return 0
 
     all_samples = samples()
     todo = [s for s in all_samples if args.tier in ("all", s.tier)]
@@ -794,6 +849,9 @@ def main() -> int:
             print(f"::warning::這個平台的 FFmpeg 產生不了 DASH 樣本：{dash_error}")
     # 網路測試用的串流：產生不了的測試會略過（看得到警告），不擋其他樣本
     net_errors = generate_net(args.force) if args.tier == "all" else []
+    # 播放引擎解不了的編碼：產生不了的（沒有那個編碼器）測試會略過
+    if args.tier == "all":
+        generate_unsupported(args.force)
     if net_errors and os.environ.get("GITHUB_ACTIONS"):
         print(f"::warning::這個平台的 FFmpeg 產生不了網路測試的樣本：{'; '.join(net_errors)}")
 

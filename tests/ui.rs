@@ -21349,3 +21349,290 @@ fn pip_native_settings_are_restored_before_fullscreen() {
     assert!(!n.spaces && n.aspect.is_none(), "系統最大化：{n:?}");
     assert!(fake.is_normal(), "系統最大化：{:?}", fake.0.lock().unwrap());
 }
+
+// ───────────── 解不了的編碼 ─────────────
+
+/// 用 `vd=-`（mpv 不用任何影像解碼器；引擎有 H.264 的解碼器，只是開不起來）開 `rel`
+fn harness_without_video_decoders(rel: &str) -> Harness<'static, VitascopeApp> {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![("vd".into(), "-".into())],
+            ..Options::headless()
+        },
+        Launch {
+            files: vec![sample(rel)],
+            ..Default::default()
+        },
+        settings,
+    )
+}
+
+/// 影像解不了：提示一次是哪個編碼、只播放聲音；畫面跟純音訊檔一樣（檔名），媒體資訊標「無法解碼」。
+/// 同一個檔案再失敗一次（又選了影片軌）不再提示
+#[test]
+fn undecodable_video_notice_once_and_plays_the_audio() {
+    let mut h = harness_without_video_decoders("common/mp4_h264_aac.mp4");
+    step_until_app(&mut h, "提示影像解不了", |app| {
+        app.osd_text()
+            .is_some_and(|t| t.contains("H.264") && t.contains("只播放聲音"))
+    });
+    assert_eq!(
+        h.state().osd_text(),
+        Some("無法解碼 H.264 影像（檔案可能損壞，或用了引擎不支援的設定），只播放聲音")
+    );
+    step_until(&mut h, "聲音在播", |s| s.time_pos > 0.3 && !s.paused);
+    assert_eq!(h.state().player().state.last_error, None);
+    // 跟純音訊檔一樣顯示檔名（不畫影片畫面：不然會留著上一個檔案的最後一格）
+    assert!(!h.state().paints_video());
+    h.run_steps(2);
+    h.get_by_label_contains("mp4_h264_aac.mp4");
+    // 媒體資訊：影像那段寫無法解碼
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("H.264（無法解碼）");
+    // 別的提示蓋過去之後，再選一次影片軌（mpv 又失敗、又記錄一次）：不再提示
+    h.key_press(egui::Key::M);
+    step_until(&mut h, "靜音", |s| s.muted);
+    // mpv 0.37 是只播聲音重開的，之前的記錄已經清掉：等到比現在多一筆
+    let failures = |app: &VitascopeApp| {
+        app.player()
+            .recent_errors()
+            .iter()
+            .filter(|e| e.contains("Failed to initialize a decoder"))
+            .count()
+    };
+    let before = failures(h.state());
+    h.state().player().select_track(TrackKind::Video, Some(1)).unwrap();
+    step_until_app(&mut h, "又失敗一次的記錄", |app| failures(app) > before);
+    h.run_steps(3);
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.contains("只播放聲音")),
+        "同一個檔案只提示一次：{:?}",
+        h.state().osd_text()
+    );
+    assert_eq!(h.state().player().state.missing_decoders.len(), 1);
+}
+
+/// 只有影像、又解不了：錯誤畫面說明是哪個編碼，不另外提示「只播放聲音」
+#[test]
+fn undecodable_video_only_file_shows_the_reason_without_a_notice() {
+    let mut h = harness_without_video_decoders("common/mp4_h264_noaudio.mp4");
+    step_until(&mut h, "開檔失敗、說明是 H.264", |s| {
+        s.last_error.as_deref().is_some_and(|e| e.contains("H.264"))
+    });
+    h.run_steps(3);
+    h.get_by_label_contains("無法解碼 H.264（檔案可能損壞，或用了引擎不支援的設定）");
+    assert!(
+        h.state().osd_text().is_none_or(|t| !t.contains("H.264")),
+        "{:?}",
+        h.state().osd_text()
+    );
+}
+
+/// 引擎沒有解碼器的編碼（用假的軌道清單與記錄：每個平台都一樣，不用樣本）：提示寫「不支援」與編碼的名稱，
+/// 媒體資訊標「（不支援）」
+#[test]
+fn unsupported_subtitle_and_video_codecs_are_named() {
+    let mut h = playing_multitrack();
+    let mut tracks = h.state().player().state.tracks.clone();
+    tracks.push(serde_json::from_str(r#"{"id":3,"type":"sub","codec":"dvb_teletext","lang":"ger"}"#).unwrap());
+    h.state_mut().player_mut().set_fake_tracks(Some(tracks.clone()));
+    let log = |prefix: &str, text: &str| Event::Log {
+        prefix: prefix.into(),
+        level: "error".into(),
+        text: text.into(),
+    };
+    let teletext = || log("sub", "Could not find subtitle decoder for format 'dvb_teletext'.\n");
+    // mpv 自己選的（標成預設的 Teletext 之類；使用者沒選過）：不提示，媒體資訊照樣標
+    let ev = h.state_mut().player_mut().inject_event(teletext());
+    assert_eq!(ev, None);
+    // 介面收到下一個事件時才檢查要不要提示（播放中 mpv 的屬性更新不是事件）：送一個無害的事件，確定檢查跑過了
+    assert!(h.state().player().playback_started());
+    h.state_mut().deliver_player_event(PlayerEvent::Seek);
+    h.run_steps(2);
+    assert!(
+        !h.state().osd_text().is_some_and(|t| t.contains("Teletext")),
+        "{:?}",
+        h.state().osd_text()
+    );
+    // 使用者自己選了這條：提示
+    let _ = h.state().player().select_track(TrackKind::Sub, Some(3));
+    let ev = h.state_mut().player_mut().inject_event(teletext());
+    assert!(matches!(ev, Some(PlayerEvent::DecoderMissing(_))), "{ev:?}");
+    h.state_mut().deliver_player_event(ev.unwrap());
+    h.step();
+    assert_eq!(
+        h.state().osd_text(),
+        Some("這條字幕的格式（Teletext（圖文電視））影戲不支援")
+    );
+    // 原本選的字幕不受影響
+    assert!(h.state().player().state.selected(TrackKind::Sub).is_some());
+    // 影片軌是 AVS2（引擎沒有）：只播放聲音，畫面跟純音訊檔一樣（不畫影片畫面）
+    assert!(h.state().paints_video());
+    for t in tracks.iter_mut().filter(|t| t.kind == TrackKind::Video) {
+        t.codec = Some("avs2".into());
+    }
+    h.state_mut().player_mut().set_fake_tracks(Some(tracks));
+    let ev = h
+        .state_mut()
+        .player_mut()
+        .inject_event(log("vd", "Failed to initialize a decoder for codec 'avs2'.\n"));
+    h.state_mut().deliver_player_event(ev.unwrap());
+    h.step();
+    assert_eq!(
+        h.state().osd_text(),
+        Some("這個影片的影像編碼（AVS2）影戲不支援，只播放聲音")
+    );
+    h.run_steps(2);
+    assert!(!h.state().paints_video());
+    h.get_by_label_contains("mkv_multitrack.mkv");
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("AVS2（不支援）");
+    h.get_by_label_contains("Teletext（圖文電視）（不支援）");
+}
+
+/// 英文介面
+#[test]
+fn unsupported_codec_notice_in_english() {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = playing_multitrack_with(settings);
+    let mut tracks = h.state().player().state.tracks.clone();
+    for t in tracks.iter_mut().filter(|t| t.kind == TrackKind::Audio) {
+        t.codec = Some("ac4".into());
+    }
+    h.state_mut().player_mut().set_fake_tracks(Some(tracks));
+    let ev = h.state_mut().player_mut().inject_event(Event::Log {
+        prefix: "ad".into(),
+        level: "error".into(),
+        text: "Failed to initialize a decoder for codec 'ac4'.\n".into(),
+    });
+    h.state_mut().deliver_player_event(ev.unwrap());
+    h.step();
+    assert_eq!(
+        h.state().osd_text(),
+        Some("This file's audio codec (AC-4) isn't supported; playing the video only")
+    );
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::I);
+    h.run_steps(2);
+    h.get_by_label_contains("AC-4 (unsupported)");
+}
+
+/// 用 `vd=-` 開 `files`（影片和一起拖進來的字幕）
+fn harness_without_video_decoders_launching(files: Vec<PathBuf>) -> Harness<'static, VitascopeApp> {
+    let mut settings = Settings::default();
+    settings.auto_next = false;
+    harness_launch_with(
+        Options {
+            keep_open: true,
+            extra: vec![("vd".into(), "-".into())],
+            ..Options::headless()
+        },
+        Launch {
+            files,
+            ..Default::default()
+        },
+        settings,
+    )
+}
+
+/// 跟影片一起拖進來的字幕：影像解不了也照樣載入、選上。mpv 0.37（Linux tar.gz）會只播聲音重開同一個檔案，
+/// 字幕在第一次載入完成時已經用掉了，重開之後要再載入一次（真的重開由 Linux 的系統 libmpv 檢查跑）
+#[test]
+fn subtitle_dropped_with_an_undecodable_video_is_loaded() {
+    let mut h = harness_without_video_decoders_launching(vec![
+        sample("common/mp4_h264_aac.mp4"),
+        sample("common/extsub_srt_utf8.srt"),
+    ]);
+    step_until(&mut h, "聲音在播、選了拖進來的字幕", |s| {
+        s.loaded
+            && s.time_pos > 0.3
+            && !s.missing_decoders.is_empty()
+            && s.selected(TrackKind::Sub).is_some_and(|t| t.external)
+    });
+    assert_eq!(h.state().player().state.last_error, None);
+}
+
+/// 解不了的編碼等開始播了才提示：mpv 0.37 影像解不了時，載入完成之後還會整個停下、只播聲音重開同一個檔案。
+/// 照 0.37 的順序送（載入完成、解碼器的記錄、還沒開始播就結束）：重開之前不提示，重開之後只提示一次，
+/// 一起拖進來的字幕重開之後照樣載入。播放器的事件由測試一個一個交給介面（載入完成之後、開始播之前停得下來）
+#[test]
+fn decoder_notice_waits_for_playback_through_the_audio_only_reopen() {
+    // 建立介面時會跑好幾幀（開檔的話事件都處理掉了）：先不開檔，用拖放開（只跑一幀）
+    let mut h = harness_without_video_decoders_launching(Vec::new());
+    let version = h.state().player().get_string("mpv-version").unwrap();
+    if version.starts_with("mpv 0.3") {
+        eprintln!("略過：{version} 自己就會只播聲音重開，由 subtitle_dropped_with_an_undecodable_video_is_loaded 檢查");
+        return;
+    }
+    h.step();
+    for f in [sample("common/mp4_h264_aac.mp4"), sample("common/extsub_srt_utf8.srt")] {
+        h.input_mut().dropped_files.push(Arc::new(Dropped(f)));
+    }
+    h.step();
+    let notice = "無法解碼 H.264 影像（檔案可能損壞，或用了引擎不支援的設定），只播放聲音";
+    let start = Instant::now();
+    while !h.state().player().state.loaded {
+        assert!(start.elapsed() < TIMEOUT, "等不到載入完成");
+        if let Some(ev) = h.state_mut().player_mut().wait(Duration::from_millis(100)) {
+            h.state_mut().deliver_player_event(ev);
+        }
+    }
+    // FileLoaded 一處理完就停下：PlaybackRestart 排在後面，還沒處理
+    assert!(!h.state().player().playback_started());
+    if let Some(ev) = h.state_mut().player_mut().inject_event(Event::Log {
+        prefix: "vd".into(),
+        level: "error".into(),
+        text: "Failed to initialize a decoder for codec 'h264'.\n".into(),
+    }) {
+        h.state_mut().deliver_player_event(ev);
+    }
+    assert_eq!(h.state().player().state.missing_decoders.len(), 1);
+    assert_ne!(h.state().osd_text(), Some(notice), "還沒開始播：不提示");
+    let stopped = Event::EndFile {
+        reason: vitascope::mpv::EndReason::Error,
+        error: Some(vitascope::mpv::Error {
+            code: -1,
+            context: String::new(),
+        }),
+    };
+    assert_eq!(
+        h.state_mut().player_mut().inject_event(stopped),
+        None,
+        "只播聲音重開，不通知開檔失敗"
+    );
+    let (mut shown, mut showing, mut reopened) = (0, false, false);
+    let start = Instant::now();
+    loop {
+        if let Some(ev) = h.state_mut().player_mut().wait(Duration::from_millis(50)) {
+            if ev == PlayerEvent::StartFile {
+                reopened = true;
+                assert_ne!(h.state().osd_text(), Some(notice), "重開之前不提示");
+            }
+            assert!(!matches!(ev, PlayerEvent::EndFile { error: Some(_), .. }), "{ev:?}");
+            h.state_mut().deliver_player_event(ev);
+        }
+        let now = h.state().osd_text() == Some(notice);
+        if now && !showing {
+            shown += 1;
+        }
+        showing = now;
+        let s = &h.state().player().state;
+        if shown > 0 && s.loaded && s.time_pos > 0.5 && s.selected(TrackKind::Sub).is_some_and(|t| t.external) {
+            break;
+        }
+        assert!(
+            start.elapsed() < TIMEOUT,
+            "等不到重開後的提示與字幕：提示 {shown} 次，重開 {reopened}，{s:#?}"
+        );
+    }
+    assert!(reopened && h.state().player().reopened_audio_only());
+    assert_eq!(shown, 1, "只提示一次");
+    assert_eq!(h.state().player().state.missing_decoders.len(), 1);
+    assert_eq!(h.state().player().state.last_error, None);
+}
