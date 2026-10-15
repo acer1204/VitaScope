@@ -852,13 +852,19 @@ def build_cmd(s: Sample, out: Path, sub_src: dict[str, Path], font: Path | None)
     return cmd
 
 
+def remove_old(s: Sample) -> None:
+    """清掉這個樣本以前產生的檔案（包括外掛字幕）：舊的字幕檔會被當成多出來的軌道，
+    舊的樣本檔會留在 manifest.json 裡。"""
+    if s.path.parent.is_dir():
+        for old in s.path.parent.glob(f"{s.id}.*"):
+            old.unlink()
+
+
 def generate(s: Sample, sub_src: dict[str, Path], font: Path | None, tmp: Path) -> str | None:
     """產生一個樣本；成功回傳 None，失敗回傳錯誤訊息。"""
     out = s.path
     out.parent.mkdir(parents=True, exist_ok=True)
-    # 清掉這個樣本以前產生的檔案（包括外掛字幕），舊的字幕檔會被當成多出來的軌道
-    for old in out.parent.glob(f"{s.id}.*"):
-        old.unlink()
+    remove_old(s)
     if s.writer:
         out.write_bytes(WRITERS[s.writer]())
         return None
@@ -1174,7 +1180,9 @@ def main() -> int:
                 print(f"  略過  {s.tier:<7} {s.id}（已存在）")
                 continue
             if s.needs and not has_encoder(s.needs):
-                # 各平台套件版的 FFmpeg 不一定有外部函式庫的編碼器：略過（測試就沒有這個樣本），不算失敗
+                # 各平台套件版的 FFmpeg 不一定有外部函式庫的編碼器：略過（測試就沒有這個樣本），不算失敗。
+                # --force 時刪掉別的 FFmpeg 以前產生的舊檔，manifest 才會跟這個 FFmpeg 做得出來的一致
+                remove_old(s)
                 print(f"  略過  {s.tier:<7} {s.id}（這個 ffmpeg 沒有 {s.needs}）")
                 continue
             err = generate(s, sub_src, font, tmp)
