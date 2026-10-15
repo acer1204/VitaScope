@@ -155,7 +155,7 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | SAMI（`.smi`） | 韓國、舊台灣下載常見 |
 | 罕見 | MicroDVD（影格制 `.sub`）、SubViewer、MPL2、JACOsub、RealText、PJS、AQTitle、VPlayer、LRC | 轉成 UTF-8（不加 BOM）再載入；LRC 在音樂檔顯示在歌名下面 |
 | 罕見 | TTML / DFXP（`.ttml` `.dfxp`、內容是 TTML 的 `.xml`） | FFmpeg 讀不了，影戲轉成 SRT 再載入（MP4 裡的 TTML 字幕軌不支援，開檔時跳過） |
-| 罕見 | DVB 字幕、Teletext、ARIB、EIA-608 / 708 隱藏字幕（含 SCC 檔、MOV 的 608 軌） | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含；ARIB 要 libaribcaption、708 FFmpeg 沒有解碼器，都不支援，選到時提示） |
+| 罕見 | DVB 字幕、Teletext、ARIB、EIA-608 / 708 隱藏字幕（含 SCC 檔、MOV 的 608 軌） | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含；ARIB 要 libaribcaption，這兩種都不支援，選到時提示；708 FFmpeg 沒有解碼器，mpv 不會列出這種軌道，只顯示同一份資料裡的 608） |
 
 ### 2.5 畫面特性
 
@@ -710,7 +710,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - 不支援的編碼（G3）：從 mpv 的記錄認出開不起來的解碼器，照播放引擎的 `decoder-list` 分成「不支援的編碼」與「無法解碼」，提示一次、媒體資訊標出那條軌道，
     其他的照常播；整個檔案都解不了時錯誤畫面寫是哪個編碼；自動選字幕時跳過解不了的
   - 樣本（G4，`scripts/gen_samples.py`）：FFmpeg 內建的編碼器做得出的（CineForm、MagicYUV、MS-MPEG4 v2、WMV 7、RealVideo 1 + RealAudio 14.4 的 `.rmvb` 與 `.ra`、
-    AMV、WTV、MXF 的 JPEG 2000、ZMBV、RPZA、AC-3 / DTS 原始串流、MS ADPCM）三個平台的 CI 都產生；要外部函式庫的（libvvenc、liboapv、libxavs2、
+    AMV、WTV、MXF 的 JPEG 2000、ZMBV、RPZA、AC-3 / DTS 原始串流、MS ADPCM）三個平台的 CI 都產生得出；要外部函式庫的（libvvenc、liboapv、libxavs2、
     libvo_amrwbenc、libopencore_amrnb、libspeex、Hap 的 libsnappy）標在 `needs`，那個平台的 FFmpeg 沒有時略過並說明（不算失敗）。
     FFmpeg 沒有編碼器的 DSD（DSF / DFF）、藍光 PGS（`.sup`）、SCC、TTML / DFXP 與罕見的文字字幕由產生程式自己寫；PGS 再由 FFmpeg 放進 MKV、
     轉成 DVD（VobSub）與 DVB 字幕（`-fix_sub_duration`：FFmpeg 解 PGS 時每句的長度是「不知道」）。PGS 的兩個樣本先放「罕見」，
@@ -720,7 +720,8 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
     `missing`（AVS2：播放器要記下解不了的編碼，聲音照常播到結尾）
   - FFmpeg 做不出樣本的（Bink、Smacker、RealVideo 4、Cook、APE、Musepack、TAK、VP6、Indeo、Lagarith、ATRAC）：確認播放引擎與系統的 libmpv 都有解碼器、分離器；
     真實檔案靠影片庫普查。還播不了的與 Linux tar.gz 的差異見 2.6
-  （自動：格式矩陣三個平台的 CI（各平台的 FFmpeg 編碼器不同，產生的樣本數不同；罕見失敗只列在報告裡）；Linux 的系統 libmpv 0.37 在 Docker 跑過
+  （自動：格式矩陣在本機 Windows（144 個）與 Linux 的 Docker（本專案的播放引擎）全數通過；三個平台的 CI 常見、通用全數通過
+  （Windows 143、macOS 132、Linux 139 個樣本，CI 執行 38670739113；各平台的 FFmpeg 編碼器不同，產生的樣本數不同；罕見失敗只列在報告裡）；Linux 的系統 libmpv 0.37 在 Docker 跑過
   （SubViewer 只有第一句、MKV 的旋轉方向相反，其他都通過）；`tests/subs_formats.rs`（每種文字字幕在 2 秒的那一句、暫存檔沒有 BOM、TTML / DFXP 與 `.xml`、
   轉不了的說明原因、音樂檔的 LRC 歌詞、影片旁邊的 `.sup` 照原路徑交給 mpv、每一句的時間、截圖裡真的有那個白色的長方形）；
   `tests/decoders.rs`（`vd=-` 的「無法解碼」、AVS2 的「不支援」、MP4 裡的 TTML 跳過）；`ttml`、`formats` 與播放器的解碼器記錄單元測試；
@@ -792,9 +793,12 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 
 1. **產生樣本**：`python scripts/gen_samples.py` 用本機 FFmpeg 產生每個等級的測試檔（3 秒彩條 + 測試音，每種容器 × 編碼的組合各一個）。
    已確認本機 FFmpeg 8.1 具備 x264、x265、VP8/9、AV1、MPEG-1/2/4、WMV2、ProRes、MJPEG、Theora、FLV、RV20、FFV1、DNxHD、
-   AAC、MP3、Opus、AC-3、E-AC-3、DTS、Vorbis、FLAC、ALAC、WMA、TrueHD、Speex，以及 SRT / ASS / WebVTT / VobSub / mov_text 編碼器。
+   AAC、MP3、Opus、AC-3、E-AC-3、DTS、Vorbis、FLAC、ALAC、WMA、TrueHD、Speex，以及 SRT / ASS / WebVTT / VobSub / mov_text 編碼器；
+   罕見的樣本另外用到 FFmpeg 內建的 CineForm、MagicYUV、MS-MPEG4 v2、WMV 7 / WMA 1、RealVideo 1 + RealAudio 14.4、AMV（含 AMV 的 IMA ADPCM）、
+   JPEG 2000、ZMBV、RPZA、MS ADPCM 與 DVB 字幕編碼器。
    FFmpeg 沒有編碼器的 DSD（DSF / DFF）、PGS 圖形字幕（`.sup`）、SCC、TTML / DFXP 與罕見的文字字幕由產生程式自己寫；
-   要外部函式庫的編碼器（libvvenc、liboapv、libxavs2…）各平台的 FFmpeg 不一定有，沒有時略過那個樣本並說明。
+   要外部函式庫的編碼器（libvvenc、liboapv、libxavs2、libvo_amrwbenc、libopencore_amrnb、libspeex、Hap 用的 libsnappy）本機都有，
+   但各平台的 FFmpeg 不一定有，沒有時略過那個樣本並說明（不算失敗）。
    無法產生的（VC-1、RV40、Bink、Smacker、Dolby Vision、Atmos 等）改用公開樣本，放在 `samples/external/`（不進版控）。
 2. **自動測試**：`cargo test --test formats` 以 headless 模式執行 libmpv（`vo=null`、`ao=null`），每個樣本檢查：
    - 能開啟，偵測到的編碼與預期一致
