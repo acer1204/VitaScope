@@ -525,11 +525,14 @@ impl VitascopeApp {
                     if !ui.memory(|m| m.has_focus(id)) {
                         self.export.range_text[i] = shown.clone();
                     }
+                    // 欄位在表格中間那一欄：表格第一次排版時還不知道各欄多寬，只給 40 點，之後一直照那個寬度
+                    //（00:03:24.300 只看得到「00:03」）。min_size 不受表格給的寬度限制
                     let r = ui
                         .add(
                             egui::TextEdit::singleline(&mut self.export.range_text[i])
                                 .id(id)
-                                .desired_width(120.0),
+                                .desired_width(120.0)
+                                .min_size(egui::vec2(120.0, 0.0)),
                         )
                         .labelled_by(label.id);
                     if r.changed() {

@@ -16719,6 +16719,90 @@ fn export_gif_end_to_end_and_choices_are_remembered() {
     h.get_by_label("大小（長邊）");
 }
 
+/// 起點、終點欄位要寬到整個時間都看得到（不是只剩「00:03」）。
+/// 欄位在表格中間那一欄：表格第一次畫的時候還不知道各欄多寬，egui 只給 40 點，之後一直照那個寬度，
+/// 時間 00:03:24.300 只看得到開頭。用主人的顯示縮放（225%）開視窗；GIF、片段兩個分頁都看
+#[test]
+fn export_range_fields_show_the_whole_time() {
+    // 兩個分頁共用同一個表格的欄寬紀錄：各自從第一次打開開始看（先開 GIF 分頁時，片段分頁沿用 GIF 存下的寬度，看不出片段分頁自己壞掉）
+    export_range_width_case(false);
+    export_range_width_case(true);
+}
+
+/// `gif_first`：先打開 GIF 分頁（主人的做法）；否則先打開片段分頁
+fn export_range_width_case(gif_first: bool) {
+    let dir = TempDir::new(if gif_first {
+        "export-range-width-gif"
+    } else {
+        "export-range-width-clip"
+    });
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.auto_next = false;
+    settings.export.clip_dir = Some(dir.0.join("clips"));
+    settings.export.image_dir = Some(dir.0.join("gifs"));
+    let launch = Launch {
+        files: vec![sample("common/mp4_long.mp4")],
+        ..Default::default()
+    };
+    let player = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    let mut h = Harness::builder()
+        .with_size([960.0, 600.0])
+        .with_pixels_per_point(2.25)
+        .build_eframe(move |cc| VitascopeApp::new(cc, player, settings, launch));
+    settle(&mut h, "mp4_long.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    // 欄位的寬度扣掉左右的留白，要放得下整個時間
+    let fits = |h: &Harness<'_, VitascopeApp>, tab: &str| {
+        for label in ["起點", "終點"] {
+            let field = export_field(h, label);
+            let text = field.accesskit_node().value().unwrap_or_default();
+            assert!(!text.is_empty(), "{tab}：{label} 沒有顯示時間");
+            let font = egui::TextStyle::Body.resolve(&h.ctx.global_style());
+            let need = h
+                .ctx
+                .fonts_mut(|f| f.layout_no_wrap(text.clone(), font, egui::Color32::WHITE))
+                .size()
+                .x;
+            let margin = egui::Margin::symmetric(4, 2).sum().x;
+            let width = field.rect().width();
+            assert!(
+                width - margin >= need,
+                "{tab}：{label}「{text}」要 {need:.1} 點寬，欄位只有 {width:.1} 點（扣掉留白 {:.1}）",
+                width - margin
+            );
+        }
+    };
+    // 停在 1:04.3、1:06.5 各按一次「目前位置」
+    let first = if gif_first {
+        if !gif_engine(&h, "export_range_fields_show_the_whole_time 的 GIF 分頁") {
+            return;
+        }
+        open_gif_window(&mut h);
+        "GIF"
+    } else {
+        open_export_window(&mut h);
+        "片段"
+    };
+    for (i, t) in [(0, 64.3), (1, 66.5)] {
+        seek_exact(&mut h, t);
+        h.query_all_by_label("目前位置").nth(i).unwrap().click();
+        step_until_app(&mut h, "「目前位置」寫進 A-B", |app| {
+            app.player().ab_loop_points()[i].is_some_and(|p| (p - t).abs() < 0.001)
+        });
+    }
+    wait_ab(&mut h, "範圍 1:04.3–1:06.5", [Some(64.3), Some(66.5)]);
+    h.run_steps(3);
+    assert_eq!(field_value(&h, "起點"), "00:01:04.300");
+    assert_eq!(field_value(&h, "終點"), "00:01:06.500");
+    h.get_by_label_contains("長度 2.2 秒");
+    fits(&h, first);
+}
+
 #[test]
 fn export_gif_length_cap_and_disabled_reasons() {
     let (_dir, _gifs, _path, mut h) = gif_harness("export-gif-cap", "common/mp4_long.mp4");
