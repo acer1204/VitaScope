@@ -1,6 +1,8 @@
 //! 測試用的本機 HTTP 伺服器（只用標準函式庫，只聽 127.0.0.1，不會碰到外面的網路）。
 //!
 //! - `/f/<路徑>`：`samples/generated` 底下的檔案；支援 `Range`（206）、HEAD，Content-Type 依副檔名
+//! - `/signed/<簽名>/f/<路徑>`：跟 `/f/<路徑>` 一樣。像網站影片每次解析給的「有簽名的網址」：簽名不同就是不同的路徑，
+//!   測試可以只讓某一次解析的網址失效（`put` 那個路徑回應 403）
 //! - `/status/<代碼>`：回應這個狀態碼
 //! - `/slow`：收下請求、永遠不回應（測連線逾時）
 //! - `/hold/<路徑>`：收下請求、等測試呼叫 `release()` 才跟 `/f/` 一樣送出（檔案一直「載入中」，直到測試放行）
@@ -279,6 +281,13 @@ fn serve(conn: TcpStream, s: &Shared) -> std::io::Result<()> {
         return send_canned(&mut out, &c, head, s);
     }
     if let Some(rel) = route.strip_prefix("/f/") {
+        return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
+    }
+    if let Some(rel) = route
+        .strip_prefix("/signed/")
+        .and_then(|r| r.split_once('/'))
+        .and_then(|(_, r)| r.strip_prefix("f/"))
+    {
         return send_file(&mut out, &s.root, rel, Some(req.header("Range")), head, None);
     }
     if let Some(rel) = route.strip_prefix("/hold/") {

@@ -5,6 +5,8 @@
 //! - 播放網址：HTTP 的檔案（能跳轉）、HLS、DASH（多畫質），網路設定（User-Agent、標頭、憑證、逾時…）真的送到 mpv、送到伺服器。
 //!
 //! 開網址失敗的說明要看 FFmpeg 的記錄，在 tests/net_errors.rs（那些測試一次只能有一個播放器）。
+//! 讓伺服器回應錯誤（例如網站影片快取的網址失效、回應 403）的測試也放在那裡：FFmpeg 的錯誤記錄會送到
+//! 這個測試程式裡第一個建立的播放器，別的測試看到的說明就不對了。
 
 mod support;
 
@@ -13,14 +15,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use support::fake_ytdl::{
-    FakeResolver, SITE_COOKIE, SITE_REFERER, SITE_TITLE_TEXT, SITE_UA, site_playlist_json, site_video_json,
+    FakeResolver, SITE_COOKIE, SITE_REFERER, SITE_TITLE_TEXT, SITE_UA, page_never_fetched, site_player,
+    site_playlist_json, site_video_json,
 };
 use support::http::Server;
 use vitascope::mpv::{EndReason, Event, Mpv, Node};
 use vitascope::net::{self, HlsBitrate, NetSettings};
 use vitascope::player::{Options, Player, PlayerEvent, TrackKind};
 use vitascope::ytdl::plan::{Choice, Mode};
-use vitascope::ytdl::{Failure, Hint, Resolve, SitePrefs, YtdlError};
+use vitascope::ytdl::{Failure, Hint, YtdlError};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const LAVFI: &str = "av://lavfi:testsrc2=size=160x90:rate=10:duration=10";
@@ -779,26 +782,6 @@ fn cancel_loading_stops_cleanly() {
 
 // ───────────── 網站影片（假的 yt-dlp；不執行程式、不連網） ─────────────
 
-/// 有網路 hook、用假的 yt-dlp 的播放器（跟介面一樣）。`sites` = 本機的測試伺服器（127.0.0.1）當成影片網站（先問 yt-dlp）；
-/// 不當成的話是「其他網頁」：先照原樣開，認不出內容才問
-fn site_player(fake: &Arc<FakeResolver>, sites: bool, s: &NetSettings, extra: &[(&str, &str)]) -> Player {
-    let resolver: Arc<dyn Resolve> = fake.clone();
-    let mut p = Player::new(Options {
-        net_hooks: true,
-        net_resolver: Some(resolver),
-        net_sites: if sites { vec!["127.0.0.1".into()] } else { Vec::new() },
-        extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-        ..Options::headless()
-    })
-    .expect("建立 mpv 失敗");
-    let opts = net::mpv_options(s, &p.net_defaults());
-    for (name, _, r) in p.apply_net(&opts, true) {
-        r.unwrap_or_else(|e| panic!("無法設定 {name}：{e}"));
-    }
-    p.set_net_config(s, &SitePrefs::default());
-    p
-}
-
 /// 等到開檔失敗，回傳最後的說明（詳細原因的記錄可能比失敗晚到：等到說明裡有 `want`，等不到就回傳最後看到的）
 fn failure_text(p: &mut Player, url: &str, want: &str) -> String {
     p.open(url).unwrap();
@@ -821,16 +804,6 @@ fn until_resolving(p: &mut Player) {
         assert!(Instant::now() < deadline, "沒有開始問 yt-dlp");
         p.wait(Duration::from_millis(50));
     }
-}
-
-/// 網頁本身（`/watch`、`/playlist`）一次都沒被讀：網站影片只讀 yt-dlp 給的網址
-fn page_never_fetched(server: &Server) {
-    let pages: Vec<_> = server
-        .requests()
-        .into_iter()
-        .filter(|r| r.path.starts_with("/watch") || r.path.starts_with("/playlist"))
-        .collect();
-    assert!(pages.is_empty(), "播放器自己去讀了網頁：{pages:#?}");
 }
 
 /// 網站影片：yt-dlp 給的影像、聲音合成一部（EDL），用網站要的 User-Agent、Referer、Cookie（memory:// 的 Cookie 檔）去讀；

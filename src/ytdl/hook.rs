@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 /// 記住幾個解析結果（換畫質、重開同一部影片時不用再執行 yt-dlp）
 pub const CACHE_SIZE: usize = 8;
-/// 解析結果多久之內能直接用（YouTube 的影片網址大約 6 小時後失效）
+/// 解析結果多久之內能直接用（YouTube 的影片網址大約 6 小時後失效，但網站可能提早撤銷：
+/// 用快取的結果開不起來時丟掉、重新問一次，見 `Player` 的 `site_retry`）
 pub const CACHE_AGE: Duration = Duration::from_secs(20 * 60);
 /// 看門狗：yt-dlp 自己的時間限制之後再等多久
 pub const WATCHDOG_GRACE: Duration = Duration::from_secs(10);
@@ -261,6 +262,11 @@ impl Cache {
             .map(|(_, _, v)| v.clone())
     }
 
+    /// 丟掉這個網頁（`Request::url`）的所有結果（不管畫質、播放清單…）：裡面的網址開不起來，可能已經失效
+    pub fn forget(&mut self, url: &str) {
+        self.entries.retain(|(r, _, _)| r.url != url);
+    }
+
     pub fn insert(&mut self, req: Request, resolved: Arc<Resolved>) {
         self.entries.retain(|(r, _, _)| *r != req);
         self.entries.push((req, Instant::now(), resolved));
@@ -418,6 +424,21 @@ mod tests {
         c.insert(changed.clone(), newer);
         let hit = c.get_any_format(&old).unwrap();
         assert_eq!(hit.info.id.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn forgetting_a_page_drops_all_its_results() {
+        let mut c = Cache::default();
+        let page = req("https://h.test/v/1");
+        c.insert(page.clone(), resolved());
+        let mut q = page.clone();
+        q.quality = crate::ytdl::SiteQuality::P720;
+        c.insert(q.clone(), resolved());
+        c.insert(req("https://h.test/v/2"), resolved());
+        c.forget(&page.url);
+        assert!(c.get(&page).is_none() && c.get(&q).is_none() && c.get_any_format(&page).is_none());
+        assert!(c.get(&req("https://h.test/v/2")).is_some(), "別的網頁不受影響");
+        assert_eq!(c.len(), 1);
     }
 
     #[test]

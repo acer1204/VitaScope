@@ -5,12 +5,16 @@
 //! - 看門狗可以改短（`with_watchdog`），測試不用等真正的 70 秒。
 //!
 //! JSON 裡的網址指向本機的測試伺服器（`site_video_json`），播放器真的去讀，測試確認伺服器收到什麼。
+//!
+//! 用假的 yt-dlp 的播放器（`site_player`）、網頁本身沒被讀（`page_never_fetched`）：tests/net.rs、tests/net_errors.rs 共用。
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use vitascope::net::{self, NetSettings};
+use vitascope::player::{Options, Player};
 use vitascope::ytdl::json;
-use vitascope::ytdl::{Failure, Hint, Request, Resolve, Resolved, YtdlError};
+use vitascope::ytdl::{Failure, Hint, Request, Resolve, Resolved, SitePrefs, YtdlError};
 
 type Handler = dyn Fn(&Request, &AtomicBool) -> Result<Resolved, Failure> + Send + Sync;
 
@@ -184,5 +188,92 @@ pub fn site_playlist_json(page: &str, urls: &[(String, &str)]) -> String {
     format!(
         r#"{{"_type": "playlist", "id": "PL1", "title": "清單", "webpage_url": "{page}", "entries": [{}]}}"#,
         entries.join(",")
+    )
+}
+
+/// 像真的網站一樣每次解析都給新的、有簽名的網址：第 n 次解析（從 1 開始）回應 [`site_video_json`]，
+/// 影像、聲音、字幕都在本機伺服器的 `/signed/<n>/f/…`（跟 `/f/…` 一樣的檔案）。
+/// 測試讓某一次給的網址失效：[`expire_signed`]
+pub fn signed_site(base: &str, page: &str, id: &str) -> FakeResolver {
+    let (base, page, id) = (base.to_owned(), page.to_owned(), id.to_owned());
+    let n = AtomicUsize::new(0);
+    FakeResolver::new(move |_, _| {
+        let i = n.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(resolved(
+            &site_video_json(&format!("{base}/signed/{i}"), &page, &id),
+            Vec::new(),
+        ))
+    })
+}
+
+/// 第 n 次解析給的網址（[`signed_site`]）失效了：伺服器之後都回應 403（像過期、被網站撤銷的網址）
+pub fn expire_signed(server: &super::http::Server, n: usize) {
+    for rel in ["net/video_only.mp4", "net/audio_only.m4a", "net/sub.vtt"] {
+        server.put(&format!("/signed/{n}/f/{rel}"), super::http::Canned::status(403));
+    }
+}
+
+/// 有網路 hook、用假的 yt-dlp 的播放器選項（跟介面一樣）。`sites` = 本機的測試伺服器（127.0.0.1）當成影片網站（先問 yt-dlp）；
+/// 不當成的話是「其他網頁」：先照原樣開，認不出內容才問。`extra` 是額外的 mpv 選項
+pub fn site_options(fake: &Arc<FakeResolver>, sites: bool, extra: &[(&str, &str)]) -> Options {
+    let resolver: Arc<dyn Resolve> = fake.clone();
+    Options {
+        net_hooks: true,
+        net_resolver: Some(resolver),
+        net_sites: if sites { vec!["127.0.0.1".into()] } else { Vec::new() },
+        extra: extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        ..Options::headless()
+    }
+}
+
+/// 用 `opts` 建立播放器，網路設定照 `s` 同步套用（跟介面啟動時一樣）
+pub fn site_player_with(opts: Options, s: &NetSettings) -> Player {
+    let mut p = Player::new(opts).expect("建立 mpv 失敗");
+    let net_opts = net::mpv_options(s, &p.net_defaults());
+    for (name, _, r) in p.apply_net(&net_opts, true) {
+        r.unwrap_or_else(|e| panic!("無法設定 {name}：{e}"));
+    }
+    p.set_net_config(s, &SitePrefs::default());
+    p
+}
+
+/// [`site_options`] 的 headless 播放器，網路設定照 `s` 同步套用
+pub fn site_player(fake: &Arc<FakeResolver>, sites: bool, s: &NetSettings, extra: &[(&str, &str)]) -> Player {
+    site_player_with(site_options(fake, sites, extra), s)
+}
+
+/// 網頁本身（`/watch`、`/playlist`）一次都沒被讀：網站影片只讀 yt-dlp 給的網址
+pub fn page_never_fetched(server: &super::http::Server) {
+    let pages: Vec<_> = server
+        .requests()
+        .into_iter()
+        .filter(|r| r.path.starts_with("/watch") || r.path.starts_with("/playlist"))
+        .collect();
+    assert!(pages.is_empty(), "播放器自己去讀了網頁：{pages:#?}");
+}
+
+/// 兩種畫質的網站影片（都是影音合在一起的 90 秒 `common/mp4_long.mp4`，網址不同：`?q=hi` 720p、`?q=lo` 360p），
+/// 一個只有聲音的格式（`net/audio_only.m4a`），三個網站字幕（en、ja、zh-TW：開檔時照一般的規則會選繁中）。
+/// yt-dlp 自己挑的是 720p
+pub fn two_quality_json(base: &str) -> String {
+    let muxed = |id: &str, file: &str, height: u32, tbr: u32| {
+        format!(
+            r#"{{"format_id": "{id}", "url": "{base}/f/common/{file}?q={id}", "protocol": "http",
+                "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "height": {height}, "fps": 24, "tbr": {tbr}}}"#
+        )
+    };
+    format!(
+        r#"{{"id": "two", "title": "兩種畫質", "extractor_key": "FakeSite", "duration": 90,
+            "format_id": "hi", "url": "{base}/f/common/mp4_long.mp4?q=hi", "protocol": "http",
+            "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "height": 720, "fps": 24, "tbr": 2000,
+            "formats": [{}, {},
+              {{"format_id": "a", "url": "{base}/f/net/audio_only.m4a", "protocol": "http", "vcodec": "none",
+                "acodec": "mp4a.40.2", "abr": 128}}],
+            "requested_subtitles": {{
+              "en": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?en", "name": "English"}},
+              "ja": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?ja", "name": "Japanese"}},
+              "zh-TW": {{"ext": "vtt", "url": "{base}/f/net/sub.vtt?zh", "name": "中文（台灣）"}}}}}}"#,
+        muxed("hi", "mp4_long.mp4", 720, 2000),
+        muxed("lo", "mp4_long.mp4", 360, 500)
     )
 }

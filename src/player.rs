@@ -994,6 +994,12 @@ struct Site {
     /// 下一次開檔只對那次有效的要求（網址, 要求）：`open_with_mode`
     mode: Option<(String, Mode)>,
     cache: hook::Cache,
+    /// 用快取的結果開不起來、重新問 yt-dlp 重開的那個 mpv 播放清單項目（`site_retry`）：它的開始（StartFile）不通知介面
+    retrying: Option<i64>,
+    /// 這次開檔已經重新問過 yt-dlp 一次了（`site_retry` 每次開檔最多一次；只播聲音重開也算同一次開檔）
+    retried: bool,
+    /// 決定要重開、等事件與記錄都取完才重開的（`site_retry`、`site_reopen`）：開不起來的那次結束（從什麼時候開始載入、原因、錯誤）
+    reopen: Option<(Option<Instant>, EndReason, Option<mpv::Error>)>,
     /// 目前（或剛結束）這個檔案的狀態
     file: SiteFile,
     /// mpv 拿掉的 hook（事件佇列滿了送不出去時）：下一次 `net_tick` 重新註冊（hook 的編號, 名稱）
@@ -1028,6 +1034,10 @@ struct SiteFile {
     chapters: Vec<ChapterMark>,
     /// 網站影片：mpv 實際開的（解析出來的網址或 EDL）與連線用的 file-local 選項（`net_stream`）
     stream: Option<(String, Vec<(String, Node)>)>,
+    /// 解析的網頁（快取用的 `Request::url`）：開不起來時丟掉它的快取（`site_forget`）
+    resolved_url: Option<String>,
+    /// 用的是快取的結果：開不起來時重新問 yt-dlp 重開一次（`site_retry`）
+    from_cache: bool,
 }
 
 /// 另一個 mpv（匯出片段、GIF）開同一個網路串流要的東西（`Player::net_stream`）
@@ -1971,6 +1981,10 @@ impl Player {
             self.load_started = Some(Instant::now());
             // on_load 要等處理事件時才收到，現在記下來還來得及；之前沒用到的要求（那個檔案還沒開就換掉了）丟掉
             self.site.mode = mode.map(|m| (path.to_owned(), m));
+            // 換掉了正在重開的網站影片（`site_retry`）：這次的開始照常通知介面，這次開檔可以再重新問一次
+            self.site.retrying = None;
+            self.site.retried = false;
+            self.site.reopen = None;
             // 還沒開始的只播聲音重開（mpv 0.37）被這次換掉了：記錄不帶給新的檔案
             self.audio_only_carry = None;
             // 舊的檔案還停在 hook 等 yt-dlp：mpv 已經收到換檔（loadfile 在前），現在放行，舊的就直接結束、不會再去讀網頁
@@ -2008,6 +2022,9 @@ impl Player {
     pub fn cancel_loading(&mut self) -> mpv::Result<()> {
         self.stop()?;
         self.site_abandon();
+        self.site.retrying = None;
+        self.site.retried = false;
+        self.site.reopen = None;
         // 馬上不算載入中（連線中的畫面馬上消失）。mpv 還沒開始的檔案（loadfile 之後馬上停止）不會再有 EndFile，
         // 不清掉的話會一直算「載入中」
         self.load_started = None;
@@ -2839,7 +2856,7 @@ impl Player {
                 return None;
             }
             // 留著的結束：佇列一空就要決定，不等
-            let wait = if self.held_end.is_some() {
+            let wait = if self.held_end.is_some() || self.site.reopen.is_some() {
                 0.0
             } else {
                 self.net_wait(remaining).as_secs_f64()
@@ -3124,6 +3141,7 @@ impl Player {
             return None;
         };
         self.site.file.tried = true;
+        self.site.file.resolved_url = Some(request.url.clone());
         // 選單選的畫質、只播聲音：只用之前的格式清單，畫質、編碼的偏好改了也不用再問 yt-dlp
         let hit = if self.site.file.mode.choice == Choice::Default {
             self.site.cache.get(&request)
@@ -3131,6 +3149,7 @@ impl Player {
             self.site.cache.get_any_format(&request)
         };
         if let Some(hit) = hit {
+            self.site.file.from_cache = true;
             return self.site_apply(id, after_failure, &hit);
         }
         let playlist = request.playlist;
@@ -3272,6 +3291,60 @@ impl Player {
             self.continue_hook(id, "on_load_fail");
         }
         self.state.net_busy = None;
+    }
+
+    /// 網站影片用快取的結果開不起來（還沒載入完成）：網站可能提早讓那些網址失效了（YouTube 的 HTTP 403）。
+    /// 丟掉這部影片的快取，同一個網頁、同樣的要求（換畫質的位置與格式…；沒有的照一般的開法，其他網頁先照原樣開）重開，
+    /// 重新問 yt-dlp。每次開檔最多一次（`retried`）；新的也開不起來就照常說明原因。
+    /// 不在 `on_load_fail` 做：影像、聲音分開的 EDL 有一條開不起來時，mpv 不算開檔失敗（不跑 on_load_fail），
+    /// 而是開成沒有影像、聲音的檔案再結束（載入完成之前）。載入完成之後才失敗的不算：網址那時候還能用
+    ///（影像解不了之類；mpv 0.37 可能只播聲音重開，見 `audio_only_retry`）。
+    /// 對介面來說還是同一次開檔（這次的結束、重開的開始都不通知）。要重開的話回傳 true（記下這次的結束）：
+    /// 等事件與記錄都取完才真的重開（`site_reopen`）。開不起來的那次的錯誤記錄（失效的網址「Failed to open」）比結束晚到，
+    /// 先重開的話會算到重開的那次（其他網頁就以為連不上、不問 yt-dlp；說明也會用到舊的原因）
+    fn site_retry(&mut self, started: Option<Instant>, reason: EndReason, error: &Option<mpv::Error>) -> bool {
+        let f = &self.site.file;
+        let before_load = self.failed_after.is_some();
+        if error.is_none() || !f.from_cache || f.stream.is_none() || self.played || !before_load || self.site.retried {
+            return false;
+        }
+        // mpv 自己的播放清單（交給 mpv 讀的本機 .pls 之類）：重開（replace）會把清單整個換掉
+        if self.mpv.get_property::<i64>("playlist-count").is_ok_and(|n| n > 1) {
+            return false;
+        }
+        self.site.retried = true;
+        self.site.reopen = Some((started, reason, error.clone()));
+        true
+    }
+
+    /// 事件與記錄都取完了：`site_retry` 決定的重開。重開不了的話照常通知那次的結束（不再重開）
+    fn site_reopen(&mut self) -> Option<PlayerEvent> {
+        let (started, reason, error) = self.site.reopen.take()?;
+        let (url, mode) = (self.site.file.url.clone(), self.site.file.mode.clone());
+        self.site_forget();
+        if let Err(e) = self.mpv.command(&["loadfile", &url, "replace"]) {
+            eprintln!("[vitascope] 網站影片：無法重開：{e}");
+            self.load_started = started;
+            return self.handle(Event::EndFile { reason, error });
+        }
+        eprintln!("[vitascope] 網站影片：之前解析的網址開不起來（可能已經失效），重新問 yt-dlp");
+        // 只對這次開檔有效的要求再用一次（第一次開的 on_load 已經用掉了）；跟 `audio_only_retry` 一樣，
+        // 沒有要求的不給：給了就一定先問 yt-dlp，其他網頁（先照原樣開、認不出來才問）會換成別的開法
+        self.site.mode = (mode != Mode::default()).then_some((url, mode));
+        // 重開的項目（replace 之後加在清單最後）：用項目認，不用網址（之後使用者自己開同一個網址的開始照常通知）
+        let count = self.mpv.get_property::<i64>("playlist-count").unwrap_or(0);
+        self.site.retrying = self.mpv.get_property::<i64>(&format!("playlist/{}/id", count - 1)).ok();
+        // 跟 `open` 一樣：音訊輸出的判斷沿用開檔時的；連線中的時間從第一次開算
+        self.open_pending = true;
+        self.load_started = Some(started.unwrap_or_else(Instant::now));
+        None
+    }
+
+    /// 這個檔案解析的網頁的快取丟掉（裡面的網址開不起來，可能已經失效）：之後開、換畫質重新問 yt-dlp
+    fn site_forget(&mut self) {
+        if let Some(url) = self.site.file.resolved_url.take() {
+            self.site.cache.forget(&url);
+        }
     }
 
     /// 處理事件的執行緒最多等多久就要回來做網站影片的事（`wait` 系列）：等 yt-dlp 的時候至少每 0.1 秒看一次
@@ -3510,6 +3583,16 @@ impl Player {
                 if let Err(e) = self.push_shaders(false) {
                     eprintln!("[vitascope] 無法設定 glsl-shaders：{e}");
                 }
+                // 用快取的結果開不起來、重開的網站影片（`site_retry`）：對介面來說還是同一次開檔。
+                // 比較晚才處理到（mpv 已經換成使用者開的下一個檔案）的照常通知
+                if self
+                    .site
+                    .retrying
+                    .take()
+                    .is_some_and(|id| self.playing_entry() == Some(id))
+                {
+                    return None;
+                }
                 Some(PlayerEvent::StartFile)
             }
             Event::FileLoaded => {
@@ -3543,7 +3626,8 @@ impl Player {
                         self.remote_playlist = Some(list);
                     }
                 }
-                self.failed_after = self.load_started.take().map(|t| t.elapsed());
+                let started = self.load_started.take();
+                self.failed_after = started.map(|t| t.elapsed());
                 self.site_file_ended();
                 // 載入中讀不到軌道時收到的「解不了」記錄（mpv 關掉分離器才讀不到軌道）是這個檔案的：
                 // - 載入時因為沒有東西可播而失敗（其他原因的載入失敗不算）
@@ -3568,6 +3652,10 @@ impl Player {
                     // 這次的結束不通知；剛記下的「解不了」照樣通知（整個檔案開不起來時錯誤說明就夠了）
                     return notices.into_iter().next().map(PlayerEvent::DecoderMissing);
                 }
+                // 網站影片用快取的結果開不起來：重新問 yt-dlp 重開一次（見 `site_retry`），這次的結束不通知
+                if self.site_retry(started, reason, &error) {
+                    return notices.into_iter().next().map(PlayerEvent::DecoderMissing);
+                }
                 let error = error.map(|e| {
                     let base = failure_reason(e.code);
                     let full = self.compose_failure(base);
@@ -3577,6 +3665,11 @@ impl Player {
                 if error.is_some() {
                     self.state.last_error = error.clone();
                     self.state.net_failure = self.site.file.failure.clone();
+                }
+                // 網站影片開不起來、播到一半失敗：解析的網址可能已經失效（重開過的也一樣），之後開、換畫質重新問 yt-dlp。
+                // 載入完成、還沒開始播就失敗的不算（網址那時候還能用；mpv 0.37 可能只播聲音重開）
+                if error.is_some() && !early {
+                    self.site_forget();
                 }
                 let ev = PlayerEvent::EndFile { reason, error };
                 if early && !self.audio_only_retried {
@@ -3778,6 +3871,9 @@ impl Player {
     ///（mpv 寫記錄在送出結束的事件之前，取事件時記錄排在一般事件後面、同一次取完）：
     /// 影像解不了的話只播聲音重開，不然照常通知介面開檔失敗
     fn events_drained(&mut self) -> Option<PlayerEvent> {
+        if self.site.reopen.is_some() {
+            return self.site_reopen();
+        }
         let ev = self.held_end.take()?;
         if self.audio_only_retry() {
             self.state.last_error = None;
