@@ -7,7 +7,10 @@
 //! - 純音訊檔旁邊的 LRC 歌詞：播放器把目前的那一句放在 `state.sub_text`（介面畫在歌名下面），
 //!   mpv 畫在封面上的那份藏起來；影片不觀察 sub-text。封面上的 ASS 歌詞（樣式、卡拉 OK 效果）照舊由 mpv 畫
 //!
-//! 字幕檔都由測試自己寫到暫存資料夾（不需要產生的樣本）；歌詞用 `general/audio_flac.flac`
+//! - 影片旁邊的藍光 PGS 字幕（`.sup`）：照原路徑交給 mpv，播放中顯示的那一句跟著時間換
+//!
+//! 文字字幕檔都由測試自己寫到暫存資料夾（不需要產生的樣本）；歌詞用 `general/audio_flac.flac`，
+//! PGS 用 `general/extsub_pgs.mp4`（scripts/gen_samples.py 自己寫的 .sup）
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -417,6 +420,119 @@ fn broken_ttml_says_why() {
     // 直接讀 mpv 的軌道清單（sub-add 是同步指令：加了的話已經在清單裡）
     let tracks: Vec<serde_json::Value> = serde_json::from_str(&p.get_string("track-list").unwrap()).unwrap();
     assert!(!tracks.iter().any(|t| t["type"] == "sub"), "沒有加進字幕軌：{tracks:?}");
+}
+
+// ───────────── 圖形字幕 ─────────────
+
+/// 目前這一格的截圖（`subtitles` = 含字幕）：RGB 或 RGBA 的像素、寬、每個像素幾個位元組
+fn snapshot(p: &mut Player, path: &Path, subtitles: bool) -> (Vec<u8>, usize, usize) {
+    static SEQ: AtomicUsize = AtomicUsize::new(1);
+    let id = 900 + SEQ.fetch_add(1, Ordering::Relaxed) as u64;
+    p.screenshot_to_file(id, &path.to_string_lossy(), subtitles).unwrap();
+    let mut reply = None;
+    p.wait_for(TIMEOUT, |e| match e {
+        PlayerEvent::CommandReply { id: got, error } if *got == id => {
+            reply = Some(error.clone());
+            true
+        }
+        _ => false,
+    })
+    .unwrap();
+    assert_eq!(reply, Some(None), "截圖失敗");
+    let file = std::fs::File::open(path).unwrap();
+    let mut reader = png::Decoder::new(std::io::BufReader::new(file)).read_info().unwrap();
+    let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+    let info = reader.next_frame(&mut buf).unwrap();
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    buf.truncate(info.buffer_size());
+    let bpp = info.color_type.samples();
+    (buf, info.width as usize, bpp)
+}
+
+/// PGS 的那一句（gen_samples.py 的 pgs_bytes：320×240 的畫面上 (100, 180) 起 120×30 的白色長方形）真的畫出來了：
+/// 含字幕的截圖裡長方形裡面都是白的；不含字幕的同一格不是（白色是字幕畫的，不是影片本來就有）
+fn assert_pgs_box_drawn(p: &mut Player, dir: &TempDir) {
+    let (subs, width, bpp) = snapshot(p, &dir.0.join("subs.png"), true);
+    let (video, _, _) = snapshot(p, &dir.0.join("video.png"), false);
+    let points: Vec<(usize, usize)> = (0..5)
+        .flat_map(|i| (0..3).map(move |j| (110 + i * 25, 185 + j * 10)))
+        .collect();
+    let white = |img: &[u8], (x, y): (usize, usize)| {
+        let at = (y * width + x) * bpp;
+        img[at..at + 3].iter().all(|&c| c >= 230)
+    };
+    let not_white: Vec<_> = points.iter().filter(|pt| !white(&subs, **pt)).collect();
+    assert!(not_white.is_empty(), "字幕的長方形裡不是白色：{not_white:?}");
+    assert!(
+        points.iter().any(|pt| !white(&video, *pt)),
+        "不含字幕的截圖在那裡也是白的，看不出字幕有沒有畫"
+    );
+}
+
+#[test]
+fn pgs_next_to_the_video_follows_the_cues() {
+    // 影片旁邊的藍光 PGS 字幕（.sup，scripts/gen_samples.py 自己寫的：0.2、1.5、2.7 秒各一句）：
+    // 圖形字幕照原路徑交給 mpv（不轉碼），播放中 mpv 顯示的那一句跟著時間換（sub-start 是那一句的開始時間）。
+    // 暫停中（vo=null）跳轉後 sub-start 不會更新，所以邊播邊看；放慢到 0.5 倍，慢的機器也看得到每一句
+    let dir = TempDir::new("pgs");
+    let video = sample("general/extsub_pgs.mp4");
+    let sup = video.with_extension("sup");
+    let mut p = Player::new(Options {
+        keep_open: true,
+        ..Options::headless()
+    })
+    .unwrap();
+    p.set_pause(true).unwrap();
+    p.open(&video.to_string_lossy()).unwrap();
+    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::FileLoaded).unwrap();
+    p.wait_state(TIMEOUT, |s| {
+        s.selected(TrackKind::Sub)
+            .is_some_and(|t| t.external && t.codec.as_deref() == Some("hdmv_pgs_subtitle"))
+    })
+    .expect("自動載入、選上同名的 .sup");
+    let track = p.state.selected(TrackKind::Sub).cloned().unwrap();
+    assert_eq!(
+        track.external_filename.as_deref().map(Path::new),
+        Some(sup.as_path()),
+        "圖形字幕照原路徑交給 mpv：{track:?}"
+    );
+
+    p.set_speed(0.5).unwrap();
+    p.set_pause(false).unwrap();
+    let start = Instant::now();
+    let mut seen: Vec<f64> = Vec::new();
+    let mut checked_drawing = false;
+    loop {
+        if let Ok(t) = p.get_f64("sub-start")
+            && seen.last().is_none_or(|last| (last - t).abs() > 0.01)
+        {
+            seen.push(t);
+            // 第二句（1.5 秒，播放中有 2 秒多）出現時暫停一下，看截圖裡真的畫了那個白色的長方形
+            if !checked_drawing && (t - 1.5).abs() < 0.05 {
+                checked_drawing = true;
+                p.set_pause(true).unwrap();
+                assert_pgs_box_drawn(&mut p, &dir);
+                p.set_pause(false).unwrap();
+            }
+        }
+        if p.state.eof || start.elapsed() > Duration::from_secs(30) {
+            break;
+        }
+        let _ = p.wait(Duration::from_millis(20));
+    }
+    eprintln!("sub-start：{seen:?}");
+    // 第三句只有 0.25 秒，慢的機器可能剛好錯過；前兩句一定要看到，而且照順序
+    let near = |want: f64| seen.iter().position(|t| (t - want).abs() < 0.05);
+    let (Some(first), Some(second)) = (near(0.2), near(1.5)) else {
+        panic!("沒有看到前兩句字幕（0.2、1.5 秒）：{seen:?}");
+    };
+    assert!(first < second, "{seen:?}");
+    assert!(checked_drawing);
+    assert!(
+        seen.iter()
+            .all(|t| [0.2, 1.5, 2.7].iter().any(|c| (t - c).abs() < 0.05)),
+        "每次顯示的都是其中一句的開始時間：{seen:?}"
+    );
 }
 
 // ───────────── 歌詞 ─────────────

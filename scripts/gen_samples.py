@@ -18,16 +18,20 @@
   python scripts/gen_samples.py --force         # 已存在也重新產生
   python scripts/gen_samples.py --tier pacing   # 流暢播放實機測試用的 1080p、4K 平移影片（約 20 MB + 50 MB，CI 不需要）
 
-需要 FFmpeg 7.1 以上的 full build（VVC 樣本需要 libvvenc）。
-FFmpeg 無法編碼的格式（VC-1、RV40、PGS、Dolby Vision…）請把公開樣本放到 samples/external/。
+需要 FFmpeg 7.1 以上的 full build（VVC 樣本需要 libvvenc）。各平台套件版的 FFmpeg 沒有的外部函式庫編碼器
+（libvvenc、liboapv、libxavs2、libvo_amrwbenc…）會略過那個樣本並說明。
+FFmpeg 沒有編碼器的 DSD（DSF / DFF）、PGS 圖形字幕、SCC、TTML 與罕見的文字字幕由這個程式自己寫。
+FFmpeg 無法編碼的其他格式（VC-1、RV40、Bink、Smacker、Dolby Vision…）請把公開樣本放到 samples/external/。
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -56,6 +60,13 @@ SUB_CUES_SIMP = [
 ]
 SUB_PROBE_TIME = 2.0
 SUB_PROBE_TEXT = "影戲播放器測試"
+# CEA-608 隱藏字幕（SCC）只有 ASCII：同樣的時間、英文的內容
+CC_CUES = [
+    (0.2, 1.4, "FIRST LINE"),
+    (1.5, 2.6, "VITASCOPE TEST"),
+    (2.7, 2.95, "THIRD"),
+]
+CC_PROBE_TEXT = "VITASCOPE TEST"
 
 # 一般對白（自己寫的句子），放在 3 秒之後（影片結束後不會顯示），讓字幕檔長度和用字接近真實字幕。
 # 實際影片庫裡「繁體字用 GBK 編碼」的長字幕，mpv 會誤判成 BIG5，整份變亂碼；短字幕反而猜得對。
@@ -92,6 +103,9 @@ X265 = ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-x265
 X265_10 = ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error"]
 SVTAV1 = ["-c:v", "libsvtav1", "-preset", "12", "-pix_fmt", "yuv420p"]
 VP9 = ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "500k", "-pix_fmt", "yuv420p"]
+# 自訂（custom）樣本常用的輸入：跟一般樣本一樣的彩條（320×240、24 fps）+ 測試音
+TEST_AV = ["-f", "lavfi", "-i", f"testsrc2=size=320x240:rate=24:duration={DUR}",
+           "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={DUR}"]
 
 HDR10_PARAMS = (
     "log-level=error:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
@@ -114,7 +128,9 @@ class Sample:
     rate: str = "24"
     vf: str | None = None
     sub_embed: str | None = None  # 內嵌字幕編碼：srt / ass / mov_text / webvtt
-    sub_ext: str | None = None  # 外掛字幕：srt_utf8 / srt_big5 / srt_utf16 / ass / vtt / smi / microdvd
+    # 外掛字幕：srt_utf8 / srt_big5 / srt_utf16 / ass / vtt / smi / microdvd / sup / mpl2 / subviewer / lrc /
+    # jacosub / realtext / pjs / aqtitle / vplayer / ttml / dfxp / scc
+    sub_ext: str | None = None
     # 自訂外掛字幕：(檔名後綴, 格式 srt/ass/ssa, 編碼, 繁簡 trad/simp)
     extra_subs: list[tuple[str, str, str, str]] = field(default_factory=list)
     subs: list[str] = field(default_factory=list)  # 預期的字幕編碼（內嵌 + 外掛）
@@ -124,7 +140,15 @@ class Sample:
     note: str = ""
     dur: int = DUR
     # 完整的 ffmpeg 參數（輸入、對應、編碼），給多軌之類的特殊樣本用；{srt} 會換成字幕來源檔
+    # （{ass}、{chapters}、{scc}、{sup} 也是）
     custom: list[str] | None = None
+    # 不用 FFmpeg、由這個程式自己寫的媒體檔：dsf / dff（DSD，FFmpeg 沒有編碼器，每個平台都產生得了）
+    writer: str | None = None
+    # 需要的 FFmpeg 外部函式庫編碼器（各平台套件版的 FFmpeg 不一定有）：沒有時略過並說明，不算失敗
+    needs: str | None = None
+    # False = 檔頭寫不出正確的長度（AMV、FFmpeg 寫的 .ra）：manifest 的 duration 是 null，
+    # 格式矩陣不檢查長度、不跳轉，直接播到結尾
+    known_dur: bool = True
 
     @property
     def path(self) -> Path:
@@ -315,10 +339,20 @@ def samples() -> list[Sample]:
         S("audio_opus", "general", "opus", None, OPUS, None, "opus"),
         S("audio_vorbis", "general", "ogg", None, ["-c:a", "libvorbis", "-ac", "2"], None, "vorbis"),
         S("audio_wav", "general", "wav", None, PCM, None, "pcm_s16le"),
+        # 藍光的 PGS 圖形字幕（.sup）：FFmpeg 沒有 PGS 編碼器，由這個程式自己寫（pgs_bytes），每個平台都產生得了。
+        # 外掛的 .sup 走影戲自己的外掛字幕流程（圖形字幕照原路徑交給 mpv）；MKV 內嵌的直接複製進去。
+        # 先放在「罕見」，播放引擎與 Linux tar.gz 用的系統 libmpv 0.37（FFmpeg 6.1）都通過之後才改成「通用」（失敗會擋下）
+        S("extsub_pgs", "general", "mp4", X264, AAC, "h264", "aac", sub_ext="sup", subs=["hdmv_pgs_subtitle"],
+          expect={"sub_bitmap": True}, note="外掛的藍光 PGS 字幕（.sup）"),
+        S("mkv_h264_pgs", "general", "mkv", X264, AAC, "h264", "aac", subs=["hdmv_pgs_subtitle"],
+          expect={"sub_bitmap": True}, note="MKV 內嵌的藍光 PGS 字幕", custom=[
+              *TEST_AV, "-i", "{sup}", "-map", "0:v", "-map", "1:a", "-map", "2:s", *X264, *AAC, "-c:s", "copy",
+          ]),
 
         # ───────────── 罕見 ─────────────
         # 手機直拍轉存成 MKV：旋轉放在 Matroska 的容器層（mpv 自己的 MKV 解析器讀，不在影格上）。
-        # 舊版 ffmpeg（6.1）寫不出 MKV 的旋轉，所以放在「罕見」（失敗只列在報告裡）
+        # FFmpeg 6.1 做出來的也正確（ProjectionPoseRoll = -90），但 Linux tar.gz 用的系統 mpv 0.37 沒有把 Matroska 的
+        # 角度反過來、讀成 270 度（本專案的引擎會反），所以放在「罕見」（失敗只列在報告裡；ROADMAP 第 2.6 節）
         S("mkv_hevc_aac_rot90", "rare", "mkv", X265, AAC, "hevc", "aac",
           post="rotate", expect={"rotate": 90}, note="直拍影片轉存的 MKV（容器層的旋轉）"),
         S("rm_rv20_ac3", "rare", "rm", ["-c:v", "rv20", "-b:v", "500k"], AC3, "rv20", "ac3", note="RealMedia"),
@@ -343,7 +377,7 @@ def samples() -> list[Sample]:
           "flv1", "mp3", note="Sorenson Spark"),
         S("mov_svq1_pcm", "rare", "mov", ["-c:v", "svq1"], PCM, "svq1", "pcm_s16le", note="Sorenson Video 1"),
         S("mp4_vvc_aac", "rare", "mp4", ["-c:v", "libvvenc", "-preset", "faster", "-pix_fmt", "yuv420p10le"], AAC,
-          "vvc", "aac", note="H.266 / VVC"),
+          "vvc", "aac", needs="libvvenc", note="H.266 / VVC"),
         S("mkv_dirac_flac", "rare", "mkv", ["-c:v", "vc2", "-b:v", "5M"], FLAC, "dirac", "flac"),
         S("mkv_hevc444_12bit", "rare", "mkv", ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv444p12le",
                                                "-x265-params", "log-level=error"], AAC, "hevc", "aac", note="12-bit 4:4:4"),
@@ -351,17 +385,103 @@ def samples() -> list[Sample]:
         S("audio_wavpack", "rare", "wv", None, ["-c:a", "wavpack", "-ac", "2"], None, "wavpack"),
         S("audio_tta", "rare", "tta", None, ["-c:a", "tta", "-ac", "2"], None, "tta"),
         S("audio_amr", "rare", "amr", None, ["-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "12.2k"],
-          None, "amr_nb"),
+          None, "amr_nb", needs="libopencore_amrnb"),
         S("audio_speex", "rare", "spx", None, ["-c:a", "libspeex", "-ar", "16000", "-ac", "1"], None, "speex",
-          fmt=["-f", "ogg"]),
+          fmt=["-f", "ogg"], needs="libspeex"),
         # 罕見的純音訊副檔名（formats::AUDIO_RARE：能播，但不加入檔案關聯）。都是 FFmpeg 內建的編碼器，每個平台都產生得了。
-        # .ra（RealAudio）不放：rm 封裝寫不出長度，格式矩陣的長度檢查會失敗
+        # .ra（RealAudio）在下面（audio_ra144）：rm 封裝寫不出長度，只檢查能播到結尾
         S("audio_aiff", "rare", "aiff", None, ["-c:a", "pcm_s16be", "-ac", "2"], None, "pcm_s16be", note="AIFF"),
         S("audio_aifc_sowt", "rare", "aifc", None, ["-c:a", "pcm_s16le", "-ac", "2"], None, "pcm_s16le",
           fmt=["-f", "aiff"], note="AIFF-C（sowt）"),
         S("audio_caf_alac", "rare", "caf", None, ["-c:a", "alac", "-ac", "2"], None, "alac", note="Apple Lossless 的 CAF"),
         S("extsub_microdvd", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="microdvd", subs=["microdvd"],
           note="影格制字幕"),
+
+        # ── 罕見的影像編碼、容器（L3「罕見格式盡力支援」）。都是 FFmpeg 內建的編碼器，除非標了 needs ──
+        S("mov_cfhd_pcm", "rare", "mov", ["-c:v", "cfhd", "-pix_fmt", "yuv422p10le"], PCM, "cfhd", "pcm_s16le",
+          note="CineForm"),
+        S("avi_magicyuv_pcm", "rare", "avi", ["-c:v", "magicyuv"], PCM, "magicyuv", "pcm_s16le", note="MagicYUV（無損）"),
+        S("avi_msmpeg4v2_mp3", "rare", "avi", ["-c:v", "msmpeg4v2", "-b:v", "800k"], MP3, "msmpeg4v2", "mp3",
+          note="MS-MPEG4 v2（影片庫普查遇過）"),
+        S("wmv_wmv1_wmav1", "rare", "wmv", ["-c:v", "wmv1", "-b:v", "800k"], ["-c:a", "wmav1", "-b:a", "128k", "-ac", "2"],
+          "wmv1", "wmav1", fmt=["-f", "asf"], note="WMV 7 + WMA 1"),
+        S("rmvb_rv10_ra144", "rare", "rmvb", ["-c:v", "rv10", "-b:v", "500k"],
+          ["-c:a", "real_144", "-ar", "8000", "-ac", "1"], "rv10", "ra_144", fmt=["-f", "rm"],
+          note=".rmvb + RealAudio 14.4"),
+        # AMV（MP3 隨身聽）：FFmpeg 的 AMV 封裝不寫真正的長度（檔頭說 1 秒左右），只檢查能播到結尾
+        S("amv_amv_adpcm", "rare", "amv", ["-c:v", "amv", "-pix_fmt", "yuvj420p"],
+          ["-c:a", "adpcm_ima_amv", "-ar", "22050", "-ac", "1", "-block_size", "882", "-strict", "-1"],
+          "amv", "adpcm_ima_amv", size="160x120", rate="25", known_dur=False, note="AMV（檔頭沒有正確的長度）"),
+        S("wtv_mpeg2_ac3", "rare", "wtv", ["-c:v", "mpeg2video", "-b:v", "4M"], AC3, "mpeg2video", "ac3",
+          size="720x480", rate="30000/1001", fmt=["-f", "wtv"], note="Windows Media Center 錄影"),
+        S("mxf_jpeg2000_pcm", "rare", "mxf", ["-c:v", "jpeg2000", "-pix_fmt", "yuv422p"], ["-c:a", "pcm_s16le", "-ac", "1"],
+          "jpeg2000", "pcm_s16le", rate="25", note="JPEG 2000（廣播、DCP）"),
+        S("avi_zmbv_pcm", "rare", "avi", ["-c:v", "zmbv", "-pix_fmt", "bgr0"], PCM, "zmbv", "pcm_s16le",
+          note="DOSBox 錄影"),
+        S("mov_rpza_pcm", "rare", "mov", ["-c:v", "rpza", "-pix_fmt", "rgb555be"], PCM, "rpza", "pcm_s16le",
+          note="舊 QuickTime（Apple Video）"),
+        S("mov_hap_pcm", "rare", "mov", ["-c:v", "hap"], PCM, "hap", "pcm_s16le", needs="hap",
+          note="Hap（要有 libsnappy 的 FFmpeg）"),
+        S("mp4_apv_aac", "rare", "mp4", ["-c:v", "liboapv", "-pix_fmt", "yuv422p10le"], AAC, "apv", "aac",
+          needs="liboapv", note="APV（Samsung 的專業錄影編碼）"),
+        # 播放引擎解不了的 AVS2（libdavs2 是 GPL）：影戲說明不支援，聲音照常播到結尾
+        S("mkv_avs2_aac", "rare", "mkv", ["-c:v", "libxavs2", "-pix_fmt", "yuv420p"], AAC, None, "aac",
+          needs="libxavs2", expect={"missing": ["avs2"]}, note="AVS2（不支援，只播放聲音）"),
+
+        # ── 罕見的音訊 ──
+        S("audio_dsf", "rare", "dsf", None, None, None, "dsd_lsbf_planar", writer="dsf", note="DSD（DSF）"),
+        S("audio_dff", "rare", "dff", None, None, None, "dsd_msbf", writer="dff", note="DSD（DSDIFF）"),
+        S("audio_ac3", "rare", "ac3", None, AC3, None, "ac3", note="AC-3 原始串流"),
+        S("audio_dts", "rare", "dts", None, ["-c:a", "dca", "-strict", "-2", "-ac", "2"], None, "dts",
+          note="DTS 原始串流"),
+        S("wav_adpcm_ms", "rare", "wav", None, ["-c:a", "adpcm_ms", "-ac", "2"], None, "adpcm_ms", note="MS ADPCM 的 WAV"),
+        S("audio_amrwb", "rare", "amr", None, ["-c:a", "libvo_amrwbenc", "-ar", "16000", "-ac", "1", "-b:a", "23.85k"],
+          None, "amr_wb", needs="libvo_amrwbenc", note="AMR-WB"),
+        # FFmpeg 的 rm 封裝寫的 .ra 沒有長度、時間也不對（播放位置一直在 0 附近），只檢查能播到結尾
+        S("audio_ra144", "rare", "ra", None, ["-c:a", "real_144", "-ar", "8000", "-ac", "1"], None, "ra_144",
+          fmt=["-f", "rm"], known_dur=False, note="RealAudio 14.4（.ra，FFmpeg 寫不出長度）"),
+
+        # ── 罕見的文字字幕（這個程式自己寫；影戲自己的外掛字幕流程，轉成 UTF-8、不加 BOM）──
+        S("extsub_mpl2", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="mpl2", subs=["mpl2"], note="MPL2（.txt）"),
+        S("extsub_subviewer", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="subviewer", subs=["subviewer"],
+          note="SubViewer 2（mpv 0.37 只顯示第一句）"),
+        S("extsub_lrc", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="lrc", subs=["text"], note="LRC 歌詞"),
+        S("extsub_jacosub", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="jacosub", subs=["jacosub"],
+          note="JACOsub"),
+        S("extsub_realtext", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="realtext", subs=["realtext"],
+          note="RealText"),
+        S("extsub_pjs", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="pjs", subs=["pjs"], note="PJS"),
+        S("extsub_aqtitle", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="aqtitle", subs=["text"], note="AQTitle"),
+        S("extsub_vplayer", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="vplayer", subs=["vplayer"],
+          note="VPlayer（.txt）"),
+        # TTML / DFXP：FFmpeg 讀不了，影戲轉成 SRT 再交給 mpv
+        S("extsub_ttml", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="ttml", subs=["subrip"],
+          note="TTML（影戲轉成 SRT）"),
+        S("extsub_dfxp", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="dfxp", subs=["subrip"],
+          note="DFXP（舊版 TTML，影戲轉成 SRT）"),
+        # CEA-608 隱藏字幕只有 ASCII
+        S("extsub_scc", "rare", "mp4", X264, AAC, "h264", "aac", sub_ext="scc", subs=["eia_608"],
+          expect={"sub_text": CC_PROBE_TEXT}, note="SCC（CEA-608 隱藏字幕）"),
+        S("mov_h264_cc608", "rare", "mov", X264, AAC, "h264", "aac", subs=["eia_608"],
+          expect={"sub_text": CC_PROBE_TEXT}, note="MOV 裡的 CEA-608 字幕軌", custom=[
+              "-f", "lavfi", "-i", f"testsrc2=size=320x240:rate=30000/1001:duration={DUR}",
+              "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={DUR}",
+              "-i", "{scc}", "-map", "0:v", "-map", "1:a", "-map", "2:s", *X264, *AAC, "-c:s", "copy",
+          ]),
+
+        # ── 罕見的圖形字幕：從 PGS 轉成 DVD、DVB 字幕 ──
+        # FFmpeg 解 PGS 時每句的長度是「不知道」（2^32 毫秒），直接轉出去的 MKV 長度變成 49 天；
+        # -fix_sub_duration 用下一句的時間補上長度
+        S("mkv_h264_dvdsub", "rare", "mkv", X264, AAC, "h264", "aac", subs=["dvd_subtitle"],
+          expect={"sub_bitmap": True}, note="DVD 圖形字幕（VobSub）", custom=[
+              *TEST_AV, "-fix_sub_duration", "-i", "{sup}", "-map", "0:v", "-map", "1:a", "-map", "2:s", *X264, *AAC,
+              "-c:s", "dvdsub",
+          ]),
+        S("ts_mpeg2_dvbsub", "rare", "ts", ["-c:v", "mpeg2video", "-b:v", "2M"], AC3, "mpeg2video", "ac3",
+          subs=["dvb_subtitle"], expect={"sub_bitmap": True}, note="數位電視的 DVB 圖形字幕", custom=[
+              *TEST_AV, "-fix_sub_duration", "-i", "{sup}", "-map", "0:v", "-map", "1:a", "-map", "2:s",
+              "-c:v", "mpeg2video", "-b:v", "2M", *AC3, "-c:s", "dvbsub", "-f", "mpegts",
+          ]),
     ]
 
 
@@ -443,8 +563,158 @@ def microdvd_text(fps: float = 24.0) -> str:
     return header + "".join(f"{{{round(a * fps)}}}{{{round(b * fps)}}}{t}\n" for a, b, t in SUB_CUES)
 
 
+# ── 罕見的文字字幕（tests/subs_formats.rs 用同樣的寫法、英文的內容測過每一種）──
+
+def _centis(t: float) -> str:
+    """`HH:MM:SS.cc`（百分之一秒）"""
+    return _ts(t, ".")[:-1]
+
+
+def mpl2_text(cues=SUB_CUES) -> str:
+    """MPL2：[開始][結束]，單位 0.1 秒"""
+    return "".join(f"[{round(a * 10)}][{round(b * 10)}]{t}\n" for a, b, t in cues)
+
+
+def subviewer_text(cues=SUB_CUES) -> str:
+    """SubViewer 2.0"""
+    head = ("[INFORMATION]\n[TITLE]test\n[AUTHOR]\n[SOURCE]\n[PRG]\n[FILEPATH]\n[DELAY]0\n[CD TRACK]0\n[COMMENT]\n"
+            "[END INFORMATION]\n[SUBTITLE]\n[COLF]&HFFFFFF,[STYLE]bd,[SIZE]18,[FONT]Arial\n")
+    return head + "".join(f"{_centis(a)},{_centis(b)}\n{t}\n\n" for a, b, t in cues)
+
+
+def _lrc_time(t: float) -> str:
+    cs = int(round(t * 100))
+    return f"[{cs // 6000:02}:{cs // 100 % 60:02}.{cs % 100:02}]"
+
+
+def lrc_text(cues=SUB_CUES) -> str:
+    """LRC 歌詞：每句的開始，結束時放一行空的"""
+    return "[ar:影戲]\n[ti:測試]\n" + "".join(f"{_lrc_time(a)}{t}\n{_lrc_time(b)}\n" for a, b, t in cues)
+
+
+def jacosub_text(cues=SUB_CUES) -> str:
+    def jts(t: float) -> str:
+        cs = int(round(t * 100))
+        return f"{cs // 360000}:{cs // 6000 % 60:02}:{cs // 100 % 60:02}.{cs % 100:02}"
+    return "#TITLE test\n#TIMERES 100\n" + "".join(f"{jts(a)} {jts(b)} D {t}\n" for a, b, t in cues)
+
+
+def realtext_text(cues=SUB_CUES) -> str:
+    body = "".join(f'<time begin="{_centis(a)}" end="{_centis(b)}"/><clear/>{t}\n' for a, b, t in cues)
+    return f'<window type="generic" duration="00:00:{DUR:02}.00" >\n{body}</window>\n'
+
+
+def pjs_text(cues=SUB_CUES) -> str:
+    """PJS：開始,結束,"文字"，單位 0.1 秒"""
+    return "".join(f'{round(a * 10)},{round(b * 10)},"{t}"\n' for a, b, t in cues)
+
+
+def aqtitle_text(cues=SUB_CUES) -> str:
+    """AQTitle：影格編號（25 fps），結束時放一段空的"""
+    return "".join(f"-->> {round(a * 25)}\n{t}\n\n-->> {round(b * 25)}\n\n" for a, b, t in cues)
+
+
+def vplayer_text(cues=SUB_CUES) -> str:
+    """VPlayer：時間:文字，結束時放一行空的"""
+    return "".join(f"{_centis(a)}:{t}\n{_centis(b)}:\n" for a, b, t in cues)
+
+
+def ttml_text(cues=SUB_CUES) -> str:
+    """TTML（現行的命名空間、時鐘時間）。第二句是斜體、在畫面上方的區域（轉成 SRT 的 `<i>`、`{\\an8}`）"""
+    body = ""
+    for i, (a, b, t) in enumerate(cues):
+        attrs = ' style="it" region="top"' if i == 1 else ""
+        body += f'<p begin="{_ts(a, ".")}" end="{_ts(b, ".")}"{attrs}>{t}</p>\n'
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="zh-TW">\n'
+        '<head><styling><style xml:id="it" tts:fontStyle="italic"/></styling>\n'
+        '<layout><region xml:id="top" tts:origin="10% 5%" tts:extent="80% 20%"/></layout></head>\n'
+        f"<body><div>\n{body}</div></body></tt>\n"
+    )
+
+
+def dfxp_text(cues=SUB_CUES) -> str:
+    """DFXP（舊版的命名空間、`ttp:tickRate`、`t` 偏移時間、`<br/>`、斜體的 span）"""
+    body = ""
+    for i, (a, b, t) in enumerate(cues):
+        if i == 0:
+            t = t.replace(" ", "<br/>", 1)
+        elif i == 1:
+            t = f'<span tts:fontStyle="italic">{t[:2]}</span>{t[2:]}'
+        body += f'<p begin="{round(a * 10_000_000)}t" end="{round(b * 10_000_000)}t">{t}</p>\n'
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<tt xmlns="http://www.w3.org/2006/10/ttaf1" xmlns:tts="http://www.w3.org/2006/10/ttaf1#styling" '
+        'xmlns:ttp="http://www.w3.org/2006/10/ttaf1#parameter" ttp:tickRate="10000000" xml:lang="zh-TW">\n'
+        f"<body><div>\n{body}</div></body></tt>\n"
+    )
+
+
+def scc_text(cues=CC_CUES) -> str:
+    """SCC（CEA-608 pop-on 字幕，30 fps 不丟格的時間碼）。時間碼一定要遞增，不然時間會亂掉"""
+    def parity(b: int) -> int:  # 奇同位
+        return b | 0x80 if bin(b).count("1") % 2 == 0 else b
+
+    def pairs(text: str) -> str:
+        bs = [parity(ord(c)) for c in text]
+        if len(bs) % 2:
+            bs.append(0x80)
+        return " ".join(f"{bs[i]:02x}{bs[i + 1]:02x}" for i in range(0, len(bs), 2))
+
+    def tc(t: float) -> str:
+        s, fr = divmod(int(round(t * 30)), 30)
+        return f"{s // 3600:02}:{s // 60 % 60:02}:{s % 60:02}:{fr:02}"
+
+    lines = ["Scenarist_SCC V1.0", ""]
+    for a, b, t in cues:
+        # 載入 pop-on、清掉暫存、移到第 15 列、文字、顯示；結束時清掉畫面
+        lines += [f"{tc(a)}\t9420 9420 94ae 94ae 9470 9470 {pairs(t)} 942f 942f", "", f"{tc(b)}\t942c 942c", ""]
+    return "\n".join(lines)
+
+
+# ── 藍光的 PGS 圖形字幕（.sup）：FFmpeg 沒有 PGS 編碼器，自己寫最小的檔案。每句是一個白色的長方形 ──
+
+def pgs_bytes(cues=SUB_CUES, size=(320, 240)) -> bytes:
+    width, height = size
+    x, y, w, h = 100, 180, 120, 30
+
+    def seg(pts: float, typ: int, payload: bytes) -> bytes:
+        t = int(round(pts * 90000))
+        return b"PG" + struct.pack(">IIBH", t, t, typ, len(payload)) + payload
+
+    def rle_rows() -> bytes:
+        # 每列：一段 w 個像素的顏色 1，再接列尾 00 00
+        run = bytes([0x00, 0xC0 | (w >> 8), w & 0xFF, 1]) if w >= 64 else bytes([0x00, 0x80 | w, 1])
+        return (run + b"\x00\x00") * h
+
+    def pcs(comp: int, state: int, objects: int) -> bytes:
+        body = struct.pack(">HHBHBBBB", width, height, 0x10, comp, state, 0, 0, objects)
+        if objects:
+            body += struct.pack(">HBBHH", 0, 0, 0, x, y)
+        return body
+
+    wds = struct.pack(">BBHHHH", 1, 0, x, y, w, h)
+    # 調色盤：顏色 1 是白色（Y=235、Cr=Cb=128、不透明）
+    pds = struct.pack(">BB", 0, 0) + struct.pack(">BBBBB", 1, 235, 128, 128, 255)
+    data = rle_rows()
+    ods = struct.pack(">HBB", 0, 0, 0xC0) + (len(data) + 4).to_bytes(3, "big") + struct.pack(">HH", w, h) + data
+    out = bytearray()
+    comp = 0
+    for a, b, _ in cues:
+        # 出現：PCS（新的 epoch）、WDS、PDS、ODS、END；消失：沒有物件的 PCS、WDS、END
+        out += seg(a, 0x16, pcs(comp, 0x80, 1)) + seg(a, 0x17, wds) + seg(a, 0x14, pds) + seg(a, 0x15, ods)
+        out += seg(a, 0x80, b"")
+        out += seg(b, 0x16, pcs(comp + 1, 0x00, 0)) + seg(b, 0x17, wds) + seg(b, 0x80, b"")
+        comp += 2
+    return bytes(out)
+
+
 def write_ext_sub(kind: str, video: Path) -> None:
     stem = video.with_suffix("")
+    if kind == "sup":
+        Path(f"{stem}.sup").write_bytes(pgs_bytes())
+        return
     table = {
         "srt_utf8": (".srt", srt_text, "utf-8"),
         "srt_big5": (".srt", srt_text, "cp950"),
@@ -453,6 +723,17 @@ def write_ext_sub(kind: str, video: Path) -> None:
         "vtt": (".vtt", vtt_text, "utf-8"),
         "smi": (".smi", smi_text, "utf-8"),
         "microdvd": (".sub", microdvd_text, "utf-8"),
+        "mpl2": (".txt", mpl2_text, "utf-8"),
+        "subviewer": (".sub", subviewer_text, "utf-8"),
+        "lrc": (".lrc", lrc_text, "utf-8"),
+        "jacosub": (".jss", jacosub_text, "utf-8"),
+        "realtext": (".rt", realtext_text, "utf-8"),
+        "pjs": (".pjs", pjs_text, "utf-8"),
+        "aqtitle": (".aqt", aqtitle_text, "utf-8"),
+        "vplayer": (".txt", vplayer_text, "utf-8"),
+        "ttml": (".ttml", ttml_text, "utf-8"),
+        "dfxp": (".dfxp", dfxp_text, "utf-8"),
+        "scc": (".scc", scc_text, "ascii"),
     }
     ext, make, enc = table[kind]
     Path(f"{stem}{ext}").write_text(make(), encoding=enc, newline="\r\n" if ext in (".srt", ".smi") else "\n")
@@ -486,6 +767,52 @@ def find_font() -> Path | None:
         if Path(p).exists():
             return Path(p)
     return None
+
+
+# ───────────── 這個程式自己寫的媒體檔（FFmpeg 沒有編碼器）─────────────
+# DSD 64（2.8224 MHz）、立體聲，內容是 DSD 的靜音樣式 0x69
+
+DSD_RATE = 2_822_400
+DSD_CHANNELS = 2
+
+
+def _dsd_silence(secs: int) -> bytes:
+    return bytes([0x69]) * (DSD_RATE * secs // 8)
+
+
+def dsf_bytes(secs: int = DUR) -> bytes:
+    """DSF（Sony）：每個聲道 4096 位元組一塊、輪流放，最後一塊補零；位元順序是低位先（LSB first）"""
+    block = 4096
+    silence = _dsd_silence(secs)
+    data = bytearray()
+    for i in range(0, len(silence), block):
+        chunk = silence[i:i + block].ljust(block, b"\0")
+        data += chunk * DSD_CHANNELS
+    # fmt：版本 1、DSD raw、聲道型態 2（立體聲）、聲道數、取樣率、1 位元、每聲道的取樣數、每塊大小、保留
+    fmt = b"fmt " + struct.pack("<QIIIIIIQII", 52, 1, 0, 2, DSD_CHANNELS, DSD_RATE, 1, len(silence) * 8, block, 0)
+    dat = b"data" + struct.pack("<Q", 12 + len(data)) + bytes(data)
+    total = 28 + len(fmt) + len(dat)
+    return b"DSD " + struct.pack("<QQQ", 28, total, 0) + fmt + dat
+
+
+def dff_bytes(secs: int = DUR) -> bytes:
+    """DSDIFF（Philips）：大端序的 chunk，聲道逐位元組交錯，位元順序是高位先（MSB first）"""
+    def chunk(cid: bytes, body: bytes) -> bytes:
+        return cid + struct.pack(">Q", len(body)) + body + (b"\0" if len(body) % 2 else b"")
+
+    silence = _dsd_silence(secs)
+    name = b"not compressed"
+    cmpr = chunk(b"CMPR", b"DSD " + bytes([len(name)]) + name + (b"\0" if (len(name) + 1) % 2 else b""))
+    prop = chunk(b"PROP", b"SND " + chunk(b"FS  ", struct.pack(">I", DSD_RATE))
+                 + chunk(b"CHNL", struct.pack(">H", DSD_CHANNELS) + b"SLFTSRGT") + cmpr)
+    inter = bytearray(len(silence) * DSD_CHANNELS)
+    for c in range(DSD_CHANNELS):
+        inter[c::DSD_CHANNELS] = silence
+    body = b"DSD " + chunk(b"FVER", struct.pack(">I", 0x01050000)) + prop + chunk(b"DSD ", bytes(inter))
+    return b"FRM8" + struct.pack(">Q", len(body)) + body
+
+
+WRITERS = {"dsf": dsf_bytes, "dff": dff_bytes}
 
 
 # ───────────── 產生 ─────────────
@@ -532,6 +859,9 @@ def generate(s: Sample, sub_src: dict[str, Path], font: Path | None, tmp: Path) 
     # 清掉這個樣本以前產生的檔案（包括外掛字幕），舊的字幕檔會被當成多出來的軌道
     for old in out.parent.glob(f"{s.id}.*"):
         old.unlink()
+    if s.writer:
+        out.write_bytes(WRITERS[s.writer]())
+        return None
     target = tmp / f"{s.id}.{s.ext}" if s.post else out
     r = subprocess.run(build_cmd(s, target, sub_src, font), capture_output=True, text=True, encoding="utf-8",
                        errors="replace")
@@ -683,7 +1013,9 @@ def generate_net(force: bool) -> list[str]:
 
 
 # ───────────── 播放引擎解不了的編碼（tests/decoders.rs；不在 manifest.json）─────────────
-# 影戲要說明是哪個編碼解不了、其他的照常播。格式矩陣（tests/formats.rs）預期每個樣本都播得了，所以不放進 manifest。
+# 影戲要說明是哪個編碼解不了、其他的照常播。這些是 tests/decoders.rs 檢查提示與重開的樣本，不放進 manifest：
+# 格式矩陣只看得出「解不了的那條軌道之外照常播」（罕見的 mkv_avs2_aac 用 missing 標出），整個檔案都解不了的、
+# mpv 先選到解不了的字幕之類的情況要另外測。
 # - mp4_h264_aac_ttml：MP4 裡的 TTML 字幕（stpp，FFmpeg 只有編碼器、沒有解碼器，每個平台都解不了；FFmpeg 內建的編碼器，
 #   每個平台都產生得了）＋ 一條 mov_text。TTML 那條標成預設：mpv 會先選它（解不了），影戲改選 mov_text
 # - mkv_avs2_aac / mkv_avs2：AVS2 影像（libdavs2 是 GPL，播放引擎沒有，系統的 FFmpeg 通常也沒有）；要有 libxavs2 的 FFmpeg
@@ -726,6 +1058,7 @@ def generate_unsupported(force: bool) -> None:
                 print(f"  完成  unsupported {name}")
 
 
+@functools.cache
 def has_encoder(name: str) -> bool:
     r = subprocess.run(["ffmpeg", "-hide_banner", "-h", f"encoder={name}"], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
@@ -783,11 +1116,13 @@ def manifest_entry(s: Sample) -> dict:
         "video": s.video,
         "audio": s.audio,
         "subs": s.subs,
-        "duration": s.dur,
+        # null：檔頭沒有正確的長度，格式矩陣不檢查長度、直接播到結尾
+        "duration": s.dur if s.known_dur else None,
         "note": s.note,
     }
     expect = dict(s.expect)
-    if s.subs:
+    # sub_bitmap：圖形字幕，播放中檢查有沒有出現（沒有文字可以比對）；missing：預期播放引擎解不了的編碼
+    if s.subs and not expect.get("sub_bitmap"):
         # 預設預期繁體字幕；只有簡體字幕的樣本用 expect={"sub_text": ...} 指定
         e["sub_probe"] = {"time": SUB_PROBE_TIME, "text": expect.pop("sub_text", SUB_PROBE_TEXT)}
     e.update(expect)
@@ -826,14 +1161,21 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        sub_src = {"srt": tmp / "src.srt", "ass": tmp / "src.ass", "chapters": tmp / "chapters.txt"}
+        sub_src = {"srt": tmp / "src.srt", "ass": tmp / "src.ass", "chapters": tmp / "chapters.txt",
+                   "scc": tmp / "src.scc", "sup": tmp / "src.sup"}
         sub_src["srt"].write_text(srt_text(), encoding="utf-8")
         sub_src["ass"].write_text(ass_text(), encoding="utf-8")
         sub_src["chapters"].write_text(chapters_text(), encoding="utf-8")
+        sub_src["scc"].write_text(scc_text(), encoding="ascii")
+        sub_src["sup"].write_bytes(pgs_bytes())
 
         for s in todo:
             if s.path.exists() and not args.force:
                 print(f"  略過  {s.tier:<7} {s.id}（已存在）")
+                continue
+            if s.needs and not has_encoder(s.needs):
+                # 各平台套件版的 FFmpeg 不一定有外部函式庫的編碼器：略過（測試就沒有這個樣本），不算失敗
+                print(f"  略過  {s.tier:<7} {s.id}（這個 ffmpeg 沒有 {s.needs}）")
                 continue
             err = generate(s, sub_src, font, tmp)
             if err:

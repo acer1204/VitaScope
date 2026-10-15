@@ -201,7 +201,12 @@ yt-dlp、deno 只在你按「下載」時才下載（見下面的「網站影片
   「設定 → 一般 → 外觀」選深色、淺色或跟隨系統（預設深色），影片畫面一律是黑的；跟隨系統時 Linux 讀桌面的設定
   （GNOME、KDE 等的 XDG portal），改了系統設定也跟著換。迷你播放器 Ctrl（⌘）+ Shift + M，子母畫面 Ctrl（⌘）+ Shift + P；
   Wayland 不能置頂、不能指定位置
-- [ ] 「罕見」格式盡力支援（Windows / macOS 的自動測試全數通過；Linux CI 的 FFmpeg 6.1 做不出 MKV 旋轉樣本，只列在報告裡）
+- [x] 「罕見」格式盡力支援：DSD 音樂（DSF / DFF）、AIFF、CAF、RealAudio、AMV、WTV、CineForm、MagicYUV、JPEG 2000 之類的罕見格式能播，
+  藍光 PGS、DVD、DVB 圖形字幕與 MPL2、SubViewer、JACOsub、RealText、PJS、AQTitle、VPlayer、SCC（CEA-608）字幕、LRC 歌詞都能載入，
+  TTML / DFXP 字幕由影戲轉成 SRT 再載入；AVS2 之類播放引擎解不了的編碼會說明是哪一個，其他的照常播。
+  有樣本的都在自動測試裡（本機 144 個樣本全數通過；Bink、Smacker 之類 FFmpeg 做不出樣本的只確認播放引擎有解碼器）。
+  Linux tar.gz 用的系統 libmpv 較舊時（例如 Ubuntu 24.04 的 0.37）：SubViewer 字幕只顯示第一句，
+  MKV 容器裡的旋轉方向相反（直拍轉存的 MKV 上下顛倒；MP4、MOV 正常），H.266 / VVC、APV 解不了
 
 ### L4 擴充與專業（未開始）
 
@@ -302,12 +307,13 @@ yt-dlp 的位置、下載、更新、移除、預設畫質、編碼、字幕、�
 ## 支援格式
 
 格式分為「常見 / 通用 / 罕見」三級，詳見 [ROADMAP.md 第 2 節](ROADMAP.md#2-格式支援分級)。
-目前自動測試涵蓋 **98 個樣本**（常見、通用全數通過；罕見只在 Linux 有一項因 FFmpeg 版本舊做不出樣本）；另外用一個約 1.4 萬部動畫的影片庫抽樣 626 個檔案實測，
+目前自動測試涵蓋 **144 個樣本**（本機全數通過；CI 上各平台的 FFmpeg 少幾個編碼器，產生的樣本比較少，常見、通用全數通過）；另外用一個約 1.4 萬部動畫的影片庫抽樣 626 個檔案實測，
 **全部能播放**（含 RMVB、VC-1、Hi10P、PGS 字幕等）。例如：
 
 - **常見**：MP4、MKV、WebM、MOV、AVI；H.264（含 Hi10P）、HEVC（含 10-bit、4K）、AV1、VP9；AAC、MP3、Opus、AC-3、FLAC；SRT、ASS、mov_text
-- **通用**：TS / M2TS、MPG / VOB、WMV、FLV、3GP、OGV；MPEG-2、Xvid、VC-1、ProRes、MJPEG；E-AC-3、DTS；WebVTT、SAMI；HDR10、HLG、隔行掃描
-- **罕見**：RealMedia、MXF、DV、VVC (H.266)、FFV1、DNxHR、TrueHD、WavPack、MicroDVD…
+- **通用**：TS / M2TS、MPG / VOB、WMV、FLV、3GP、OGV；MPEG-2、Xvid、VC-1、ProRes、MJPEG；E-AC-3、DTS；WebVTT、SAMI、藍光 PGS；HDR10、HLG、隔行掃描
+- **罕見**：RealMedia、MXF、DV、AMV、WTV；VVC (H.266)、FFV1、DNxHR、CineForm、MagicYUV、JPEG 2000、Hap、APV；TrueHD、WavPack、DSD（DSF / DFF）、AIFF、CAF；
+  MicroDVD、SubViewer、MPL2、LRC、SCC（CEA-608）、TTML / DFXP、DVD 與 DVB 圖形字幕…（AVS2、AVS3、Teletext 不支援：影戲會說明是哪個編碼，其他的軌道照常播）
 
 ## 建置
 
@@ -353,7 +359,9 @@ cargo test --test hwdec -- --ignored       # 硬體解碼測試（需要 GPU）
 
 | 測試 | 內容 |
 |---|---|
-| `tests/formats.rs` | 格式測試矩陣：每個樣本檢查編碼、解碼、字幕文字、旋轉 / HDR 中繼資料、跳轉、播到結尾 |
+| `tests/formats.rs` | 格式測試矩陣：每個樣本檢查編碼、解碼、字幕文字、圖形字幕真的畫出來、旋轉 / HDR 中繼資料、解不了的編碼有記下來、跳轉、播到結尾 |
+| `tests/subs_formats.rs` | 罕見的文字字幕（MPL2、SubViewer、LRC、JACOsub、RealText、PJS、AQTitle、VPlayer、SCC、TTML / DFXP）在 2 秒的那一句、轉成的暫存檔不加 BOM、轉不了的說明原因；音樂檔的 LRC 歌詞；影片旁邊的 PGS（`.sup`）照原路徑交給 mpv、每一句跟著時間換、真的畫出來 |
+| `tests/decoders.rs` | 解不了的編碼：記下是哪個編碼、其他的軌道照常播（「無法解碼」與「不支援」分開），整個檔案都解不了時說明是哪個，自動選字幕時跳過解不了的 |
 | `tests/smoke.rs` | libmpv 載入、開檔、錯誤訊息 |
 | `tests/ui.rs` | 介面測試（egui_kittest）：快捷鍵、按鈕、選單、拖放、貼上、「開啟網址」對話框與網路播放（本機的 HTTP 伺服器：連線中與取消、緩衝中、直播、續播、網路上的播放清單、「設定 → 網路」）、播放清單面板、截圖、匯出視窗（範圍就是 A-B 重播、軌道與格式、存好的片段、取消與寫入中不能取消、關閉時不留暫存檔；GIF 的大小、格率、字幕會記住、最長 30 秒、沒有影像時停用、GIF 資料夾；縮圖總覽圖的格線與實際大小、太大時列數變少、只取 A-B、選擇會記住、一次只做一個與取消、快捷鍵、英文介面）、設定視窗、「關於」與檢查更新 |
 | `tests/instance.rs` | 單一執行個體：同時啟動好幾個程式，檔案都送到同一個視窗；第一個關掉後由下一個接手 |

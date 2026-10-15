@@ -6,7 +6,9 @@
 //! 2. 第一格能解出來
 //! 3. 字幕會自動選上，跳到指定時間後畫面上的字幕文字正確（含 Big5 / UTF-16 編碼偵測）
 //! 4. 中繼資料：旋轉、HDR 傳輸特性、畫面比例
-//! 5. 跳到中間、播到結尾，過程中沒有錯誤
+//! 5. 圖形字幕（PGS、DVD、DVB）：播放中字幕會畫出來（`sub_bitmap`；比較含字幕與不含字幕的截圖）
+//! 6. 播放引擎解不了的編碼（`missing`，例如 AVS2）：播放器記下是哪個，其他的照常播到結尾
+//! 7. 跳到中間、播到結尾，過程中沒有錯誤。檔頭沒有正確長度的（`duration: null`，例如 AMV）不跳轉、直接播到結尾
 //!
 //! 「常見」「通用」有任何失敗 → 測試失敗；「罕見」失敗只列在報告裡。
 //!
@@ -18,7 +20,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vitascope::mpv::EndReason;
 use vitascope::player::{Options, Player, PlayerEvent, TrackKind};
 
@@ -34,7 +36,8 @@ struct Sample {
     audio: Option<String>,
     #[serde(default)]
     subs: Vec<String>,
-    duration: f64,
+    /// null：檔頭沒有正確的長度（AMV、FFmpeg 寫的 .ra），不檢查長度、不跳轉
+    duration: Option<f64>,
     #[serde(default)]
     note: String,
     sub_probe: Option<SubProbe>,
@@ -42,6 +45,12 @@ struct Sample {
     gamma: Option<String>,
     primaries: Option<String>,
     aspect: Option<f64>,
+    /// 圖形字幕：沒有文字可以比對，播放中每換一句（`sub-start` 有新的值）就比較含字幕與不含字幕的截圖
+    #[serde(default)]
+    sub_bitmap: bool,
+    /// 預期播放引擎解不了的編碼（mpv 的編碼名稱）：播放器要記下（`missing_decoders`），其他的照常播
+    #[serde(default)]
+    missing: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -108,8 +117,22 @@ fn run_checks(s: &Sample, problems: &mut Vec<String>) -> Result<String, String> 
         .map_err(|e| format!("開檔：{e}"))?;
     p.wait_for(TIMEOUT, |e| *e == PlayerEvent::PlaybackRestart)
         .map_err(|e| format!("解出第一格：{e}"))?;
-    p.wait_state(TIMEOUT, |st| !st.tracks.is_empty() && st.duration.is_some())
-        .map_err(|e| format!("讀取軌道：{e}"))?;
+    p.wait_state(TIMEOUT, |st| {
+        !st.tracks.is_empty() && (s.duration.is_none() || st.duration.is_some())
+    })
+    .map_err(|e| format!("讀取軌道：{e}"))?;
+    // 解不了的編碼：mpv 的記錄比開檔的事件晚到
+    if !s.missing.is_empty() {
+        let recorded = |st: &vitascope::player::State| {
+            s.missing
+                .iter()
+                .all(|c| st.missing_decoders.iter().any(|m| &m.codec == c))
+        };
+        if p.wait_state(TIMEOUT, recorded).is_err() {
+            let got: Vec<&str> = p.state.missing_decoders.iter().map(|m| m.codec.as_str()).collect();
+            problems.push(format!("解不了的編碼 {got:?}，預期 {:?}", s.missing));
+        }
+    }
     if s.video.is_some() {
         p.wait_state(TIMEOUT, |st| st.video_size.is_some())
             .map_err(|e| format!("影像尺寸：{e}"))?;
@@ -133,8 +156,10 @@ fn run_checks(s: &Sample, problems: &mut Vec<String>) -> Result<String, String> 
         }
     }
     let duration = st.duration.unwrap_or(0.0);
-    if (duration - s.duration).abs() > 0.5 {
-        problems.push(format!("長度 {duration:.2} 秒，預期約 {} 秒", s.duration));
+    if let Some(want) = s.duration
+        && (duration - want).abs() > 0.5
+    {
+        problems.push(format!("長度 {duration:.2} 秒，預期約 {want} 秒"));
     }
 
     let mut info = [video.as_deref(), audio.as_deref()]
@@ -147,6 +172,13 @@ fn run_checks(s: &Sample, problems: &mut Vec<String>) -> Result<String, String> 
     }
     if let Some([w, h]) = st.video_size {
         info += &format!(" {w}×{h}");
+    }
+    if !st.missing_decoders.is_empty() {
+        let codecs: Vec<&str> = st.missing_decoders.iter().map(|m| m.codec.as_str()).collect();
+        info += &format!(" 解不了:{}", codecs.join(","));
+    }
+    if s.duration.is_none() {
+        info += " 長度未知";
     }
 
     // 2. 字幕：要自動選上，而且文字正確
@@ -193,13 +225,58 @@ fn run_checks(s: &Sample, problems: &mut Vec<String>) -> Result<String, String> 
         }
     }
 
-    // 4. 跳到中間，再播到結尾
-    p.seek_to(duration * 0.5, true).map_err(|e| e.to_string())?;
-    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::PlaybackRestart)
-        .map_err(|e| format!("跳到中間：{e}"))?;
-    p.seek_to((duration - 0.4).max(0.0), true).map_err(|e| e.to_string())?;
-    p.wait_for(TIMEOUT, |e| *e == PlayerEvent::PlaybackRestart)
-        .map_err(|e| format!("跳到結尾前：{e}"))?;
+    // 4. 圖形字幕：暫停中（vo=null）跳轉後 sub-start 不會更新，要播放中檢查。
+    // 從頭用 0.5 倍速播，mpv 每換一句（sub-start 有新的值）就暫停，比較含字幕與不含字幕的截圖：
+    // 有畫出東西才算（只看 sub-start 不夠：沒有圖的字幕事件也有開始時間）
+    if s.sub_bitmap {
+        if p.state.selected(TrackKind::Sub).is_none() {
+            problems.push("字幕沒有自動選上".into());
+            let first = p.state.tracks_of(TrackKind::Sub).next().map(|t| t.id);
+            p.select_track(TrackKind::Sub, first).map_err(|e| e.to_string())?;
+        }
+        p.seek_to(0.0, true).map_err(|e| e.to_string())?;
+        p.wait_for(TIMEOUT, |e| *e == PlayerEvent::PlaybackRestart)
+            .map_err(|e| format!("圖形字幕跳到開頭：{e}"))?;
+        p.set_speed(0.5).map_err(|e| e.to_string())?;
+        p.set_pause(false).map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        let mut last_cue = None;
+        let shown = loop {
+            if let Ok(cue) = p.get_f64("sub-start")
+                && last_cue != Some(cue)
+            {
+                last_cue = Some(cue);
+                p.set_pause(true).map_err(|e| e.to_string())?;
+                if bitmap_sub_drawn(&mut p, &s.id)? {
+                    break true;
+                }
+                p.set_pause(false).map_err(|e| e.to_string())?;
+            }
+            // 0.5 倍速播完 3 秒要 6 秒，每句還要截兩張圖：慢的機器上給兩倍的時間
+            if start.elapsed() > 2 * TIMEOUT {
+                break false;
+            }
+            if let Some(PlayerEvent::EndFile { .. }) = p.wait(Duration::from_millis(20)) {
+                problems.push(format!("圖形字幕沒有畫出來（已經播到結尾；最後一句 {last_cue:?}）"));
+                return Ok(info);
+            }
+        };
+        p.set_pause(true).map_err(|e| e.to_string())?;
+        p.set_speed(1.0).map_err(|e| e.to_string())?;
+        if !shown {
+            problems.push(format!("圖形字幕沒有畫出來（最後一句 {last_cue:?}）"));
+        }
+    }
+
+    // 5. 跳到中間，再播到結尾（長度不明的直接從現在的位置播到結尾）
+    if s.duration.is_some() {
+        p.seek_to(duration * 0.5, true).map_err(|e| e.to_string())?;
+        p.wait_for(TIMEOUT, |e| *e == PlayerEvent::PlaybackRestart)
+            .map_err(|e| format!("跳到中間：{e}"))?;
+        p.seek_to((duration - 0.4).max(0.0), true).map_err(|e| e.to_string())?;
+        p.wait_for(TIMEOUT, |e| *e == PlayerEvent::PlaybackRestart)
+            .map_err(|e| format!("跳到結尾前：{e}"))?;
+    }
     p.set_pause(false).map_err(|e| e.to_string())?;
     match p.wait_for(TIMEOUT, |e| matches!(e, PlayerEvent::EndFile { .. })) {
         Ok(PlayerEvent::EndFile {
@@ -210,6 +287,51 @@ fn run_checks(s: &Sample, problems: &mut Vec<String>) -> Result<String, String> 
     }
 
     Ok(info)
+}
+
+/// 目前這一格的截圖（`subtitles` = 含字幕），解成像素
+fn snapshot(p: &mut Player, id: &str, subtitles: bool) -> Result<Vec<u8>, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("vitascope-formats-{}-{seq}-{id}.png", std::process::id()));
+    p.screenshot_to_file(seq, &path.to_string_lossy(), subtitles)
+        .map_err(|e| e.to_string())?;
+    let mut reply = None;
+    p.wait_for(TIMEOUT, |e| match e {
+        PlayerEvent::CommandReply { id, error } if *id == seq => {
+            reply = Some(error.clone());
+            true
+        }
+        _ => false,
+    })
+    .map_err(|e| format!("截圖：{e}"))?;
+    if let Some(Some(e)) = reply {
+        return Err(format!("截圖失敗：{e}"));
+    }
+    let read = || -> Result<Vec<u8>, String> {
+        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let mut reader = png::Decoder::new(std::io::BufReader::new(file))
+            .read_info()
+            .map_err(|e| e.to_string())?;
+        let mut buf = vec![0; reader.output_buffer_size().ok_or("PNG 太大")?];
+        let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+        buf.truncate(info.buffer_size());
+        Ok(buf)
+    };
+    let pixels = read();
+    let _ = std::fs::remove_file(&path);
+    pixels
+}
+
+/// 圖形字幕真的畫出來了：同一格含字幕的截圖跟不含字幕的有明顯不同（至少幾百個位元組差超過 64）
+fn bitmap_sub_drawn(p: &mut Player, id: &str) -> Result<bool, String> {
+    let video = snapshot(p, id, false)?;
+    let subs = snapshot(p, id, true)?;
+    if video.len() != subs.len() {
+        return Err(format!("兩張截圖大小不同：{} / {}", video.len(), subs.len()));
+    }
+    let changed = video.iter().zip(&subs).filter(|(a, b)| a.abs_diff(**b) > 64).count();
+    Ok(changed >= 300)
 }
 
 #[test]

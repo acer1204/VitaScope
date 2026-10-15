@@ -179,6 +179,11 @@
   不再停在錯誤畫面；整份清單都打不開才停。自己開的檔案（雙擊、PgUp / PgDn、開啟檔案）打不開時照樣顯示原因。
 - Linux tar.gz 用系統的 libmpv 播 DASH（`.mpd`）只能盡力而為：載入中停止、換檔時可能會卡住（系統的 FFmpeg 沒有這個修正；
   AppImage 與 Windows、macOS 版不受影響）。
+- 格式的自動測試多了 36 個樣本（罕見 34、通用 2）：DSD（DSF / DFF）、CineForm、MagicYUV、JPEG 2000、Hap、APV、AMV、WTV、RMVB 與 `.ra` 的 RealAudio 14.4、
+  AC-3 / DTS 原始串流、MS ADPCM、AVS2（確認說明不支援、聲音照常播）；藍光 PGS（外掛的 `.sup` 與 MKV 內嵌，跟 WebVTT、SAMI 一樣是「通用」，失敗會擋下發佈）、
+  DVD、DVB 圖形字幕；SCC 與 MOV 裡的 CEA-608 隱藏字幕、TTML / DFXP 與其他罕見的文字字幕。
+- Linux tar.gz 用的系統 libmpv 較舊時（例如 Ubuntu 24.04 的 0.37）的已知差異：SubViewer 字幕只顯示第一句；MKV 容器裡的旋轉方向相反
+  （直拍轉存的 MKV 上下顛倒，MP4、MOV 正常）；H.266 / VVC、APV 解不了。AppImage 與 Windows、macOS 版不受影響。
 
 ### 修正
 

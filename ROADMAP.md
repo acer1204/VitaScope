@@ -98,10 +98,10 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | Flash Video | `.flv` `.f4v` | 早期網路影片、直播錄影 |
 | 通用 | 3GPP | `.3gp` `.3g2` | 舊手機 |
 | 通用 | Ogg | `.ogv` `.ogg` | 開源專案 |
-| 罕見 | RealMedia | `.rm` `.rmvb` | 2000 年代下載 |
+| 罕見 | RealMedia | `.rm` `.rmvb` `.ra` | 2000 年代下載 |
 | 罕見 | MXF | `.mxf` | 廣播、專業攝影機 |
 | 罕見 | DV | `.dv` | MiniDV 攝影機 |
-| 罕見 | 其他 | `.ogm` `.nut` `.ivf` `.y4m` `.bik` `.smk` `.amv` `.wtv` `.dvr-ms` | 特殊工具、遊戲、錄影系統 |
+| 罕見 | 其他 | `.ogm` `.nut` `.ivf` `.y4m` `.bik` `.smk` `.amv` `.wtv` `.dvr-ms` | 特殊工具、遊戲、錄影系統（AMV、WTV 有樣本；AMV 的檔頭沒有正確的長度，只測播到結尾。Bink、Smacker、DVR-MS 做不出樣本） |
 
 ### 2.2 影像編碼
 
@@ -120,10 +120,10 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | H.263 / Theora | 舊手機、Ogg |
 | 罕見 | H.266 / VVC | 新標準，目前很少見 |
 | 罕見 | RealVideo（RV30 / RV40） | `.rmvb` |
-| 罕見 | DNxHD / DNxHR、CineForm | 專業剪輯中介檔 |
-| 罕見 | 無損編碼：FFV1、HuffYUV、Lagarith、UtVideo | 錄影、保存 |
-| 罕見 | 舊式：Sorenson、VP6、Cinepak、Indeo、MS Video 1 | 1990–2000 年代 |
-| 罕見 | AVS2 / AVS3、Bink | 中國標準、遊戲影片（AVS2 / AVS3 目前不支援：要 davs2 / uavs3d，自建的 libmpv 不含） |
+| 罕見 | DNxHD / DNxHR、CineForm、Hap、APV、JPEG 2000（MXF） | 專業剪輯中介檔、即時影像、廣播與數位電影（APV 要 FFmpeg 8：Linux tar.gz 的系統 libmpv 較舊時解不了） |
+| 罕見 | 無損編碼：FFV1、HuffYUV、Lagarith、UtVideo、MagicYUV | 錄影、保存 |
+| 罕見 | 舊式：Sorenson、VP6、Cinepak、Indeo、MS Video 1、MS-MPEG4 v2 / v3、WMV 7、RealVideo 1 / 2、Apple Video（RPZA）、ZMBV | 1990–2000 年代、DOSBox 錄影 |
+| 罕見 | AVS2 / AVS3、MPEG-5 EVC、Bink、Smacker | 中國標準、遊戲影片（AVS2 / AVS3 / EVC 不支援，開檔時提示：要 davs2 / uavs3d / xevd，自建的 libmpv 不含；聲音照常播） |
 
 ### 2.3 音訊編碼
 
@@ -138,8 +138,8 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | DTS（核心） | 電影重製 |
 | 通用 | Vorbis、ALAC、PCM / WAV、WMA、MP2 | |
 | 罕見 | TrueHD / Dolby Atmos、DTS-HD MA / DTS:X | 會解成 PCM 播放；直通到擴大機屬於 L3 功能 |
-| 罕見 | APE、WavPack、TTA、Musepack、DSD（DSF / DFF） | 發燒友音樂格式 |
-| 罕見 | RealAudio（cook）、AMR、Speex、ATRAC | |
+| 罕見 | APE、WavPack、TTA、Musepack、DSD（DSF / DFF）、AIFF / AIFF-C、Apple Lossless 的 CAF | 發燒友音樂格式（DSD 的樣本由產生程式自己寫） |
+| 罕見 | RealAudio（cook、14.4）、AMR-NB / WB、Speex、ATRAC、MS ADPCM、AC-3 / DTS 原始串流 | FFmpeg 寫的 `.ra` 沒有長度，只測播到結尾 |
 
 ### 2.4 字幕
 
@@ -153,8 +153,9 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | VobSub（`.idx` + `.sub`） | DVD 圖形字幕 |
 | 通用 | WebVTT（`.vtt`） | 網頁、串流 |
 | 通用 | SAMI（`.smi`） | 韓國、舊台灣下載常見 |
-| 罕見 | MicroDVD（影格制 `.sub`）、SubViewer、MPL2、TTML / DFXP、LRC | |
-| 罕見 | DVB 字幕、Teletext、EIA-608 / 708 隱藏字幕 | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含） |
+| 罕見 | MicroDVD（影格制 `.sub`）、SubViewer、MPL2、JACOsub、RealText、PJS、AQTitle、VPlayer、LRC | 轉成 UTF-8（不加 BOM）再載入；LRC 在音樂檔顯示在歌名下面 |
+| 罕見 | TTML / DFXP（`.ttml` `.dfxp`、內容是 TTML 的 `.xml`） | FFmpeg 讀不了，影戲轉成 SRT 再載入（MP4 裡的 TTML 字幕軌不支援，開檔時跳過） |
+| 罕見 | DVB 字幕、Teletext、ARIB、EIA-608 / 708 隱藏字幕（含 SCC 檔、MOV 的 608 軌） | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含；ARIB 要 libaribcaption、708 FFmpeg 沒有解碼器，都不支援，選到時提示） |
 
 ### 2.5 畫面特性
 
@@ -171,6 +172,31 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 罕見 | HDR 直通到 HDR 螢幕 | ⚠ 見風險 R3 |
 | 罕見 | 8K、12-bit、4:4:4 | |
 | 罕見 | 3D（左右 / 上下）、360° 全景 | |
+
+### 2.6 已知的缺口
+
+罕見的格式「有樣本就測」：樣本由 `scripts/gen_samples.py` 產生（見 4.1），FFmpeg 做不出的靠影片庫普查與播放引擎的解碼器清單（`tests/engine_build.rs`）。
+下面這些目前播不了或只能部分支援：
+
+| 項目 | 原因 | 之後 |
+|---|---|---|
+| AVS2 | 解碼器 libdavs2 是 GPL，播放引擎只用 LGPL 的元件 | 不做；開檔時說明「不支援的編碼：AVS2」，聲音照常播 |
+| AVS3、MPEG-5 EVC | 自建的 libmpv 沒有 libuavs3d、libxevd（BSD-3-Clause） | 下次重建播放引擎時可以加；本機的 FFmpeg 也做不出樣本 |
+| Teletext | libzvbi 含 GPL-2.0-only 的程式碼 | 不做；選到時說明 |
+| ARIB 字幕（日本的電視錄影） | 自建的 libmpv 沒有 libaribcaption（MIT） | 下次重建播放引擎時可以加 |
+| CEA-708 | FFmpeg 沒有解碼器（608 可以） | 無 |
+| MP4 / MKV 裡的 TTML 字幕軌 | FFmpeg 只有 TTML 的封裝、沒有解碼器 | 只支援外掛的 `.ttml` / `.dfxp`（影戲轉成 SRT） |
+| VobSub（`.idx` + `.sub`）的樣本 | FFmpeg 沒有 VobSub 的封裝 | 同一個解碼器由 MKV 裡的 DVD 字幕樣本測；實際檔案靠普查 |
+| APE、Musepack、TAK、VP6、Indeo、RealVideo 4、Cook、Bink、Smacker、ATRAC、Lagarith 的樣本 | FFmpeg 沒有編碼器 | 只確認播放引擎有解碼器與分離器；真實檔案放 `samples/external/`（不進版控）、靠普查 |
+
+**Linux tar.gz 用的系統 libmpv**（例如 Ubuntu 24.04 的 mpv 0.37 / FFmpeg 6.1）比本專案建置的播放引擎舊，CI 的 ubuntu-latest 工作測的就是它：
+
+- SubViewer 2 字幕只顯示第一句：FFmpeg 的 SubViewer 分離器給每一句的檔案位置都是 0，mpv 0.37 只看位置判斷重複，把後面的都丟掉（新版也比對時間）。
+  之後可以像 TTML 一樣由影戲轉成 SRT 再載入。
+- MKV 容器裡的旋轉（Matroska 的 `ProjectionPoseRoll`，例如直拍影片轉存的 MKV）方向相反，畫面上下顛倒：mpv 0.37 沒有把角度反過來
+  （本專案建置的播放引擎、MP4 / MOV 的旋轉都正常）。格式矩陣的 `mkv_hevc_aac_rot90` 在這裡讀到 270 度。
+- H.266 / VVC、APV：FFmpeg 6.1 還沒有解碼器（開檔時說明不支援）。
+- 去交錯沒有「自動」（見 L3 的去交錯）。
 
 ---
 
@@ -674,7 +700,34 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
     大小對、沒有標題列；回到一般視窗後綠色按鈕照樣能全螢幕；子母畫面在別的桌面、別的程式的全螢幕上看不看得到（盡力而為，不保證）；
     選「跟隨系統」時系統改深淺色馬上跟著換；淺色啟動 → 選深色 → 系統改成深色 → 選「跟隨系統」，是深色
     （這裡沒有 Mac，目前只有 CI 的自動測試）
-- [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試
+- [x] ✅ 「罕見」格式盡力支援，有樣本的納入測試（格式矩陣在本機 144 個樣本：常見 35、通用 46、罕見 63，全數通過；發佈前的數字在 4.4 更新）
+  - 副檔名（G1）：開啟檔案、拖放、資料夾的播放清單認得 `.aif` `.aiff` `.aifc` `.caf` `.ra`（`formats::AUDIO_RARE`）與 `.amv` `.bik` `.smk`，
+    跟其他罕見格式一樣不加入檔案關聯；字幕多了 `.lrc` `.mpl` `.jss` `.rt` `.pjs` `.aqt` `.scc` `.ttml` `.dfxp`（不含 `.stl`：也可能是 FFmpeg 讀不了的 EBU STL）。
+    外掛文字字幕轉成 UTF-8 的暫存檔不再加 BOM（FFmpeg 認 AQTitle、PJS、VPlayer 時從第一個位元組比對，有 BOM 就載入失敗）。
+    音樂檔的 LRC 歌詞：只在純音訊時觀察 mpv 的 `sub-text`，影戲畫在歌名下面，mpv 畫的那份藏起來
+  - TTML / DFXP（G2，`ttml.rs`）：FFmpeg 只有 TTML 的封裝、沒有分離器，影戲用 quick-xml 轉成 SRT（斜體、粗體、顏色、上方的區域、tick 時間）再交給 mpv；
+    `.xml` 看開頭 2 KiB 像 TTML 才當字幕
+  - 不支援的編碼（G3）：從 mpv 的記錄認出開不起來的解碼器，照播放引擎的 `decoder-list` 分成「不支援的編碼」與「無法解碼」，提示一次、媒體資訊標出那條軌道，
+    其他的照常播；整個檔案都解不了時錯誤畫面寫是哪個編碼；自動選字幕時跳過解不了的
+  - 樣本（G4，`scripts/gen_samples.py`）：FFmpeg 內建的編碼器做得出的（CineForm、MagicYUV、MS-MPEG4 v2、WMV 7、RealVideo 1 + RealAudio 14.4 的 `.rmvb` 與 `.ra`、
+    AMV、WTV、MXF 的 JPEG 2000、ZMBV、RPZA、AC-3 / DTS 原始串流、MS ADPCM）三個平台的 CI 都產生；要外部函式庫的（libvvenc、liboapv、libxavs2、
+    libvo_amrwbenc、libopencore_amrnb、libspeex、Hap 的 libsnappy）標在 `needs`，那個平台的 FFmpeg 沒有時略過並說明（不算失敗）。
+    FFmpeg 沒有編碼器的 DSD（DSF / DFF）、藍光 PGS（`.sup`）、SCC、TTML / DFXP 與罕見的文字字幕由產生程式自己寫；PGS 再由 FFmpeg 放進 MKV、
+    轉成 DVD（VobSub）與 DVB 字幕（`-fix_sub_duration`：FFmpeg 解 PGS 時每句的長度是「不知道」）。PGS 的兩個樣本先放「罕見」，
+    在 Docker 裡用 Ubuntu 24.04 的系統 libmpv 0.37 通過之後才改成「通用」（失敗會擋下）
+  - 格式矩陣（`tests/formats.rs`）的新欄位：`duration: null`（AMV、FFmpeg 寫的 `.ra` 檔頭沒有正確的長度：不比長度、不跳轉，直接播到結尾）、
+    `sub_bitmap`（圖形字幕：0.5 倍速從頭播，每換一句就暫停、比較含字幕與不含字幕的截圖，有畫出東西才算）、
+    `missing`（AVS2：播放器要記下解不了的編碼，聲音照常播到結尾）
+  - FFmpeg 做不出樣本的（Bink、Smacker、RealVideo 4、Cook、APE、Musepack、TAK、VP6、Indeo、Lagarith、ATRAC）：確認播放引擎與系統的 libmpv 都有解碼器、分離器；
+    真實檔案靠影片庫普查。還播不了的與 Linux tar.gz 的差異見 2.6
+  （自動：格式矩陣三個平台的 CI（各平台的 FFmpeg 編碼器不同，產生的樣本數不同；罕見失敗只列在報告裡）；Linux 的系統 libmpv 0.37 在 Docker 跑過
+  （SubViewer 只有第一句、MKV 的旋轉方向相反，其他都通過）；`tests/subs_formats.rs`（每種文字字幕在 2 秒的那一句、暫存檔沒有 BOM、TTML / DFXP 與 `.xml`、
+  轉不了的說明原因、音樂檔的 LRC 歌詞、影片旁邊的 `.sup` 照原路徑交給 mpv、每一句的時間、截圖裡真的有那個白色的長方形）；
+  `tests/decoders.rs`（`vd=-` 的「無法解碼」、AVS2 的「不支援」、MP4 裡的 TTML 跳過）；`ttml`、`formats` 與播放器的解碼器記錄單元測試；
+  `tests/engine_build.rs` 的解碼器、分離器清單；kittest 的歌詞與不支援的提示；`tests/lyrics_shot.rs`（`#[ignore]`，真的視窗截圖：有封面、沒有封面的歌詞））
+  - [ ] 手動確認：真的 LRC 歌詞配音樂；串流網站下載的 TTML / DFXP
+  - [ ] 手動確認：真的藍光 PGS、DVD 的 VobSub（`.idx` + `.sub`）、電視錄影的 DVB 字幕與 CEA-608 隱藏字幕
+  - [ ] 手動確認：Bink（`.bik`）、Smacker（`.smk`）、DSD 音樂、RMVB（RealVideo 4 + Cook）、AMV 的真實檔案
 
 ### L4 擴充與專業
 
@@ -740,11 +793,15 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 1. **產生樣本**：`python scripts/gen_samples.py` 用本機 FFmpeg 產生每個等級的測試檔（3 秒彩條 + 測試音，每種容器 × 編碼的組合各一個）。
    已確認本機 FFmpeg 8.1 具備 x264、x265、VP8/9、AV1、MPEG-1/2/4、WMV2、ProRes、MJPEG、Theora、FLV、RV20、FFV1、DNxHD、
    AAC、MP3、Opus、AC-3、E-AC-3、DTS、Vorbis、FLAC、ALAC、WMA、TrueHD、Speex，以及 SRT / ASS / WebVTT / VobSub / mov_text 編碼器。
-   無法用 FFmpeg 產生的（VC-1、RV40、PGS、Dolby Vision、Atmos 等）改用公開樣本，放在 `samples/external/`（不進版控）。
+   FFmpeg 沒有編碼器的 DSD（DSF / DFF）、PGS 圖形字幕（`.sup`）、SCC、TTML / DFXP 與罕見的文字字幕由產生程式自己寫；
+   要外部函式庫的編碼器（libvvenc、liboapv、libxavs2…）各平台的 FFmpeg 不一定有，沒有時略過那個樣本並說明。
+   無法產生的（VC-1、RV40、Bink、Smacker、Dolby Vision、Atmos 等）改用公開樣本，放在 `samples/external/`（不進版控）。
 2. **自動測試**：`cargo test --test formats` 以 headless 模式執行 libmpv（`vo=null`、`ao=null`），每個樣本檢查：
    - 能開啟，偵測到的編碼與預期一致
    - 能播到 1 秒、跳到中間、播到結尾，過程中沒有錯誤事件
    - 字幕軌數量與內容正確（包含 Big5 編碼的 SRT）
+   - 圖形字幕（PGS、DVD、DVB）播放中真的畫出來；解不了的編碼（AVS2）有記下來、其他的照常播；
+     檔頭沒有正確長度的（`duration: null`，AMV、`.ra`）不比長度、直接播到結尾
 3. **硬體解碼**：用 `hwdec=auto-copy` 播放，讀取 `hwdec-current` 確認真的走了 GPU（CI 主機沒有 GPU，所以在本機測）。
 4. **依等級判定**：常見、通用失敗 → 測試失敗；罕見失敗 → 只列在報告中。
 
