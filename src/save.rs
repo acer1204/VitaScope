@@ -53,6 +53,22 @@ pub fn finish_new(temp: &Path, wanted: &Path) -> io::Result<PathBuf> {
     finish_with(temp, wanted, true, &mut |_| {})
 }
 
+/// 把寫好的暫存檔換成剛好是 `target` 這個名稱；`target` 已經存在時回傳 `AlreadyExists`（不覆蓋，暫存檔留著），
+/// 名稱由呼叫的人另外選（線上字幕的 `影片.zh-TW.2.srt` 這種編號）。成功時暫存檔刪掉
+pub fn finish_exact(temp: &Path, target: &Path) -> io::Result<()> {
+    finish_exact_with(temp, target, true)
+}
+
+fn finish_exact_with(temp: &Path, target: &Path, hard_links: bool) -> io::Result<()> {
+    let deadline = Instant::now() + BUSY_RETRY;
+    loop {
+        match place(temp, target, hard_links) {
+            Err(e) if busy(&e) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            other => return other,
+        }
+    }
+}
+
 /// `finish_new` 本體：`hard_links` = 先試硬連結（測試用 false 模擬 FAT）；
 /// `before` 在選好名稱、還沒換名稱之前呼叫（測試用來模擬別的程式剛好建立了同名的檔案）
 fn finish_with(temp: &Path, wanted: &Path, hard_links: bool, before: &mut dyn FnMut(&Path)) -> io::Result<PathBuf> {
@@ -274,6 +290,26 @@ mod tests {
             assert_eq!(std::fs::read(&wanted).unwrap(), b"theirs", "別人的檔案不能被蓋掉");
             assert_eq!(std::fs::read(&got).unwrap(), b"mine");
             assert!(parts_in(&dir).is_empty());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn finish_exact_uses_that_name_and_never_overwrites() {
+        for hard_links in [true, false] {
+            let dir = scratch(&format!("exact-{hard_links}"));
+            let target = dir.join("影片.zh-TW.srt");
+            std::fs::write(&target, b"old").unwrap();
+            let temp = temp_in(&dir, "影片", "part");
+            std::fs::write(&temp, b"new").unwrap();
+            let e = finish_exact_with(&temp, &target, hard_links).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&target).unwrap(), b"old", "已經有的檔案不能被蓋掉");
+            assert_eq!(std::fs::read(&temp).unwrap(), b"new", "換不成名稱時暫存檔留著");
+            let free = dir.join("影片.zh-TW.2.srt");
+            finish_exact_with(&temp, &free, hard_links).unwrap();
+            assert_eq!(std::fs::read(&free).unwrap(), b"new");
+            assert!(parts_in(&dir).is_empty(), "暫存檔要刪掉：{:?}", parts_in(&dir));
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }

@@ -94,6 +94,8 @@ fn parse_args() -> (Launch, bool) {
         launch.tools_dir = vitascope::paths::tools_dir();
         // 匯出的磁碟快取；啟動時清掉上次留下的暫存檔（自動截圖不清）
         launch.cache_root = Some(vitascope::paths::cache_root());
+        // 線上搜尋字幕：真的連線、正式版的 API 金鑰、登入狀態與字幕的快取（只在使用者用到時才連網；自動截圖不連）
+        launch.online = vitascope::online_subs::OnlineEnv::real(&vitascope::paths::cache_root());
         launch.persist_playlist = true;
         // 播完後的倒數：視窗還原、叫到前面、暫時置頂（自動截圖不動視窗）
         launch.countdown_raise = true;

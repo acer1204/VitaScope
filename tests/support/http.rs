@@ -14,7 +14,7 @@
 //!   像很多小型伺服器、NAS。播放器只能從頭讀（不能跳轉），但總長度照樣知道：不是直播
 //! - 測試指定的固定回應（`put`）：假的 GitHub 發佈（轉址、檢查碼、要下載的檔案），可以送到一半就停住
 //!
-//! 每個請求的方法、路徑、標頭都記下來（`requests()`），測試用來確認播放器送了什麼。
+//! 每個請求的方法、路徑、標頭、內容都記下來（`requests()`），測試用來確認播放器送了什麼。
 //! 一個連線一個執行緒；每個回應之後關閉連線（`Connection: close`）。
 
 use std::collections::HashMap;
@@ -33,6 +33,8 @@ pub struct Request {
     pub path: String,
     /// 標頭（名稱、值；名稱照收到的大小寫）
     pub headers: Vec<(String, String)>,
+    /// 內容（有 `Content-Length` 的請求，例如 POST；最多 1 MiB）
+    pub body: Vec<u8>,
 }
 
 impl Request {
@@ -242,7 +244,20 @@ fn serve(conn: TcpStream, s: &Shared) -> std::io::Result<()> {
             headers.push((n.to_owned(), v.trim_start().to_owned()));
         }
     }
-    let req = Request { method, path, headers };
+    let length = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("Content-Length"))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(1 << 20);
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body)?;
+    let req = Request {
+        method,
+        path,
+        headers,
+        body,
+    };
     s.log.lock().unwrap().push(req.clone());
     let mut out = conn;
     let head = req.method == "HEAD";
@@ -333,6 +348,7 @@ fn reason(code: u16) -> &'static str {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        406 => "Not Acceptable",
         410 => "Gone",
         416 => "Range Not Satisfiable",
         429 => "Too Many Requests",

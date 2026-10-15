@@ -9,6 +9,8 @@
 //!
 //! vendor/ 的 libmpv 都是本專案從原始碼建置的（.github/workflows/libmpv-*.yml）。用它們時，
 //! `VITASCOPE_LIBMPV_MANIFEST` 指向它的 components.json（tests/engine_build.rs 用來核對版本）。
+//!
+//! 另外產生 `OUT_DIR/opensubtitles_key.rs`：OpenSubtitles 的 API 金鑰（見 [`opensubtitles_key`]）。
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=VITASCOPE_LIBMPV");
+    opensubtitles_key();
     let choice = env::var("VITASCOPE_LIBMPV").unwrap_or_default();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -27,6 +30,39 @@ fn main() {
         "macos" => vendored("macos-arm64", "libmpv.2.dylib", "libmpv.dylib"),
         "linux" if choice == "vendor" => vendored("linux-x64", "lib/libmpv.so.2", "libmpv.so"),
         _ => {} // Linux：libmpv 在系統預設的函式庫路徑
+    }
+}
+
+/// 混淆金鑰用的位元組（跟金鑰逐位元組 XOR）。改了沒關係：產生的檔案裡一起寫出來
+const KEY_MASK: &[u8] = b"VitaScope:online-subtitles:mask!";
+
+/// OpenSubtitles 的 API 金鑰：建置時從環境變數 `VITASCOPE_OPENSUBTITLES_KEY` 讀（發佈流程從 GitHub 的 secret 填入），
+/// XOR 之後寫到 `OUT_DIR/opensubtitles_key.rs`（`src/online_subs/opensubtitles.rs` 引入）。
+///
+/// - 沒設定時也一定寫出檔案（金鑰是空的）：`cargo test`、自己編譯的版本照樣能編譯，只是不能用 OpenSubtitles。
+/// - XOR 只是讓 `strings` 之類的工具不能直接看到金鑰，**不是加密**：發佈的執行檔裡一定拿得到金鑰。
+/// - 不印出金鑰（建置記錄會公開在 CI 上）
+fn opensubtitles_key() {
+    println!("cargo:rerun-if-env-changed=VITASCOPE_OPENSUBTITLES_KEY");
+    let key = env::var("VITASCOPE_OPENSUBTITLES_KEY").unwrap_or_default();
+    let masked: Vec<String> = key
+        .trim()
+        .bytes()
+        .zip(KEY_MASK.iter().cycle())
+        .map(|(b, m)| (b ^ m).to_string())
+        .collect();
+    let mask: Vec<String> = KEY_MASK.iter().map(u8::to_string).collect();
+    let text = format!(
+        "// 由 build.rs 產生（VITASCOPE_OPENSUBTITLES_KEY 與 KEY_MASK 逐位元組 XOR；沒設定時是空的）\n\
+         pub(crate) const MASK: &[u8] = &[{}];\n\
+         pub(crate) const KEY: &[u8] = &[{}];\n",
+        mask.join(", "),
+        masked.join(", ")
+    );
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("opensubtitles_key.rs");
+    // 內容一樣就不寫（不讓引入它的程式每次都重新編譯）
+    if std::fs::read_to_string(&out).ok().as_deref() != Some(text.as_str()) {
+        std::fs::write(&out, text).unwrap_or_else(|e| panic!("無法寫入 {}: {e}", out.display()));
     }
 }
 

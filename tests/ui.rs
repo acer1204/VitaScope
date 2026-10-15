@@ -21636,3 +21636,22 @@ fn decoder_notice_waits_for_playback_through_the_audio_only_reopen() {
     assert_eq!(h.state().player().state.missing_decoders.len(), 1);
     assert_eq!(h.state().player().state.last_error, None);
 }
+
+/// 線上搜尋字幕的環境：介面測試（Launch 的預設）一律離線，沒有金鑰、不碰使用者的快取資料夾（R-B9、§1.10）
+#[test]
+fn online_subtitles_are_offline_by_default() {
+    let h = harness(None);
+    let env = h.state().online_env();
+    assert!(env.is_offline(), "{env:?}");
+    assert!(env.os_key.is_none() && env.cache_dir.is_none() && env.session_file.is_none());
+    let req = vitascope::online_subs::http::Request::new(
+        vitascope::online_subs::http::Method::Get,
+        "https://api.opensubtitles.com/api/v1/subtitles?query=x",
+        vitascope::online_subs::http::Kind::Api,
+        1024,
+    );
+    assert_eq!(
+        env.http.send(&req),
+        Err(vitascope::online_subs::http::Transport::Offline)
+    );
+}

@@ -116,22 +116,29 @@ fn net_error(e: ureq::Error) -> WebError {
     }
 }
 
+/// 影戲所有 ureq 連線共同的設定（這裡的下載、線上字幕 `online_subs::http`）：連線最多等 [`CONNECT_TIMEOUT`]、
+/// 狀態碼自己看（轉址的 3xx、錯誤的 4xx / 5xx 不當成錯誤）、`https_only`、proxy 照環境變數（`proxy_from_env`）。
+/// 之後要改連線的共同規則（憑證、proxy）改這裡，兩邊都會用到
+pub(crate) fn agent_base(
+    proxy_from_env: bool,
+    https_only: bool,
+) -> ureq::config::ConfigBuilder<ureq::typestate::AgentScope> {
+    let config = ureq::Agent::config_builder()
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .https_only(https_only)
+        .http_status_as_error(false);
+    if proxy_from_env { config } else { config.proxy(None) }
+}
+
 impl Web {
     /// `proxy_from_env`：照環境變數用 proxy（自動測試連本機的伺服器時不用）；
     /// `https_only`：連線與轉址都只能是 https（真的下載時；本機的測試伺服器是 http）
     pub fn new(proxy_from_env: bool, https_only: bool) -> Web {
-        let mut config = ureq::Agent::config_builder()
-            .timeout_connect(Some(CONNECT_TIMEOUT))
+        let config = agent_base(proxy_from_env, https_only)
             .timeout_recv_response(Some(RESPONSE_TIMEOUT))
             // 不限制讀內容的總時間（N-L2）：慢速網路上還在下載的不能被切斷，卡住的由 `download` 的「沒有進度」處理
             .timeout_recv_body(None)
-            .user_agent(concat!("VitaScope/", env!("CARGO_PKG_VERSION")))
-            .https_only(https_only)
-            // 狀態碼自己看（轉址的 3xx、錯誤的 4xx / 5xx）
-            .http_status_as_error(false);
-        if !proxy_from_env {
-            config = config.proxy(None);
-        }
+            .user_agent(concat!("VitaScope/", env!("CARGO_PKG_VERSION")));
         Web {
             agent: config.build().into(),
             stall: STALL,

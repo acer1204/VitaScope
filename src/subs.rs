@@ -259,23 +259,21 @@ pub fn cache_dir() -> PathBuf {
     crate::paths::cache_root().join("subs")
 }
 
-/// 清掉超過一天的暫存字幕
+/// 線上下載、影片資料夾寫不進去（或設定不存到影片旁邊）時放的地方：暫存資料夾的 `online`
+pub fn online_cache_dir() -> PathBuf {
+    cache_dir().join("online")
+}
+
+/// 清掉超過一天的暫存字幕，與超過 30 天的線上下載字幕（`online` 資料夾：下次開同一部影片時還用得到）
 pub fn clean_cache() {
-    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
-        return;
-    };
+    clean_cache_in(&cache_dir());
+}
+
+fn clean_cache_in(dir: &Path) {
     let day = std::time::Duration::from_secs(24 * 3600);
-    for e in entries.flatten() {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > day);
-        if old {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
+    // 只刪檔案（`online` 資料夾本身不刪）
+    crate::save::sweep_matching(dir, |_| true, day);
+    crate::save::sweep_matching(&dir.join("online"), |_| true, 30 * day);
 }
 
 /// 找出影片的外掛字幕：同資料夾（以及 Subs 之類的子資料夾）裡，檔名以影片名稱開頭的字幕檔
@@ -303,7 +301,10 @@ pub fn find_external(video: &Path) -> Vec<PathBuf> {
             .filter(|e| {
                 let name = e.file_name().to_string_lossy().to_lowercase();
                 let ext = name.rsplit('.').next().unwrap_or_default();
-                belongs_to(&name, &stem) && (TEXT_EXTS.contains(&ext) || BINARY_EXTS.contains(&ext) || ext == "sub")
+                // 影戲還在寫（或當掉時留下）的暫存檔不載入
+                belongs_to(&name, &stem)
+                    && !crate::save::is_part(&name)
+                    && (TEXT_EXTS.contains(&ext) || BINARY_EXTS.contains(&ext) || ext == "sub")
             })
             .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
             .map(|e| e.path())
@@ -699,6 +700,8 @@ mod tests {
             "[Group] Show - 02.tc.ass",
             "[Group] Show - 01.nfo",
             "Subs/[Group] Show - 01.eng.srt",
+            // 影戲下載字幕時還在寫的暫存檔（副檔名是真的）：不能載入
+            "[Group] Show - 01.123-4.vitascope-part.srt",
         ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
@@ -718,6 +721,39 @@ mod tests {
         );
         let sub = load(&dir.join("[Group] Show - 01.tc.ass"), &video).unwrap();
         assert_eq!(sub.title, "tc.ass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_cleanup_keeps_online_downloads_for_30_days() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("online")).unwrap();
+        let age = |p: &Path, days: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(days * 24 * 3600 + 60))
+                .unwrap();
+        };
+        let files = [
+            ("old.srt", 2, false),
+            ("new.srt", 0, true),
+            ("online/a.zh-TW.srt", 2, true),
+            ("online/b.zh-TW.srt", 31, false),
+        ];
+        for (name, days, _) in files {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            age(&p, days);
+        }
+        clean_cache_in(&dir);
+        for (name, _, kept) in files {
+            assert_eq!(dir.join(name).exists(), kept, "{name}");
+        }
+        assert!(dir.join("online").is_dir(), "線上字幕的資料夾本身不刪");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

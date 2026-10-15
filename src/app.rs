@@ -380,6 +380,8 @@ pub struct VitascopeApp {
     install: install::InstallUi,
     /// 快取的根資料夾（匯出的磁碟快取、清掉上次留下的暫存檔）；None = 不用（自動測試、`--shot`）
     cache_root: Option<PathBuf>,
+    /// 線上搜尋字幕的環境（連線、金鑰、存檔的地方）：預設離線，只有 main.rs 設成真的
+    online: crate::online_subs::OnlineEnv,
     /// 啟動時在背景清掉上次匯出留下的暫存檔（資料夾可能在網路磁碟上，不在介面執行緒做）
     leftover_sweep: Option<std::thread::JoinHandle<usize>>,
     /// 已經提示過「書籤只保留到關閉影戲」的檔案（書籤的代號）
@@ -726,6 +728,9 @@ pub struct Launch {
     /// None = 這個平台的（macOS 讀 NSApp，其他系統不用）
     #[doc(hidden)]
     pub os_appearance: Option<crate::theme::OsAppearance>,
+    /// 線上搜尋字幕的連線、API 金鑰、存檔的地方；預設離線（自動測試、`--shot`：絕不連網、不碰使用者的資料夾）。
+    /// 只有 main.rs 設成真的（`OnlineEnv::real`）
+    pub online: crate::online_subs::OnlineEnv,
 }
 
 impl VitascopeApp {
@@ -905,6 +910,7 @@ impl VitascopeApp {
             install: install::InstallUi::new(launch.installer),
             leftover_sweep,
             cache_root: launch.cache_root,
+            online: launch.online,
             private_marks_told: Default::default(),
             was_eof: false,
             wheel: 0.0,
@@ -1151,6 +1157,12 @@ impl VitascopeApp {
     /// 目前的畫面調整（介面測試用）
     pub fn geometry(&self) -> &Geometry {
         &self.geometry
+    }
+
+    /// 線上搜尋字幕的環境（介面測試用：預設是離線的）
+    #[doc(hidden)]
+    pub fn online_env(&self) -> &crate::online_subs::OnlineEnv {
+        &self.online
     }
 
     /// 播放引擎偵測到的功能（介面測試用）

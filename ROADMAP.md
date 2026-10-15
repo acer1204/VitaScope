@@ -554,6 +554,24 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：在影戲裡下載 yt-dlp 與 deno（Windows、macOS、Linux 各一次），Windows Defender 會不會擋下、執行時不閃黑色視窗（yt-dlp 與 deno）
   - [ ] 手動確認：「更新 yt-dlp 再試一次」「立即更新」「移除…」在真的 GitHub 上；`VITASCOPE_ONLINE_TESTS=1 cargo test --test install -- --ignored`
 - [ ] 線上搜尋字幕（OpenSubtitles API）
+  - 核心已完成（G5，介面在 G6）：`src/online_subs/`（OpenSubtitles.com 與射手網（偽）assrt.net 的搜尋、展開、下載、登入、登出）、
+    `src/filehash.rs`（OpenSubtitles 的 moviehash，128 KiB 以下不算）。OpenSubtitles 的金鑰在建置時從 `VITASCOPE_OPENSUBTITLES_KEY` 放進執行檔
+    （`build.rs`，XOR 混淆、沒設定時是空的：自己編譯的版本不能用 OpenSubtitles）；搜尋不用登入，伺服器要求登入時才請使用者登入，
+    登入憑證（24 小時，不是密碼）存在快取資料夾的 `online/opensubtitles-session.json`。下載的字幕先檢查內容（網頁、壓縮檔、VobSub 不收），
+    語言標記照內容判斷，存成 `影片名.zh-TW.srt`（同名時 `.2`、內容一樣直接用），寫不進去時放快取資料夾的 `subs/online`（30 天後清掉），
+    絕不覆蓋。連線的共同設定（連線逾時、https、proxy）跟下載 yt-dlp 共用 `web::agent_base`。
+    自動測試一律離線（`Launch.online` 的預設），只用假的連線與本機的測試伺服器
+    （自動：online_subs / filehash 單元測試（參數的寫法、結果的排序與每片一列、錯誤對照、登入過期就登出不改用未登入、下載次數、
+    之前的連結與存過的檔案不再花下載次數、410 的連結先重試同一個、晚到的過期不清掉剛重新登入的狀態、請求的間隔、取消（下載中、
+    暫存檔寫好之後）、存檔的編號與退回快取資料夾、影片旁邊用影片原本的檔名、日文不會被標成繁體、`.txt` 說明檔不收、
+    射手網（偽）的 Token 只放標頭與換網域、建置時的金鑰還原得出來）；
+    `tests/online_subs.rs` 真的 HTTP 連到本機：4xx 帶著內容、大小上限、同一台主機的轉址才保留登入憑證、轉址次數上限、User-Agent、
+    只能 https、兩種連線各自的逾時；
+    kittest 預設離線）
+  - [ ] SR0 實測（還沒做）：主人的金鑰只在 GitHub 的 secret，開發的電腦上沒有，所以連到真網站的測試還沒跑過。有金鑰時執行
+    `VITASCOPE_ONLINE_TESTS=1 cargo test --test online_subs -- --ignored --nocapture`（開發版另外設 `VITASCOPE_OPENSUBTITLES_KEY`），
+    確認未登入能不能下載、`ratelimit-*` 標頭、參數沒排好時會不會轉址，結果寫進第 7 節。次數用完（406）的內容只有次數真的用完時才看得到：
+    另外設 `VITASCOPE_SR0_EXHAUST=1` 再跑一次（會一直未登入下載到不是 200 為止，用完這個 IP 今天的免登入次數）
 - [x] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF。右鍵選單「匯出 ▸ 儲存片段… / 轉成 GIF…」打開不擋住播放的匯出視窗，
   範圍就是 A-B 重播；一次只做一個，關掉視窗不中斷，結束影戲時清掉暫存檔；從不覆蓋已經有的檔案（`save.rs`），
   換不成正式名稱的完整檔案登記在 `kept.json`，啟動時的清理不刪。
@@ -897,6 +915,12 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | R15 | 音訊直通在檔案一開始就被輸出拒絕時，這個引擎改回 PCM 之後會停住，跳轉一下才繼續播（第十批測試時發現，見第 7 節） | 測試用 `ao-null-format=float` 模擬並確認濾鏡鏈會設回；停住的部分要在引擎裡查，實機（擴大機、電視）確認時一起看 |
 
 ## 7. 開發中學到的事
+
+- **OpenSubtitles 的整合規定**（「Terms of use for integrators」，2026-10-13 版，G5 時讀的）：一個程式只能有一把金鑰，
+  不能要使用者自己申請金鑰，也不能把開發者的帳號密碼放進程式；免費金鑰每個 IP 每天 5 個免登入下載（金鑰的設定可以關掉），
+  之後要用使用者自己的帳號與額度；搜尋、選字幕的地方要顯示「Subtitles provided by OpenSubtitles.com」並連到網站；
+  下載的字幕可以存在使用者的電腦（例如影片旁邊），暫時的下載連結不能存。實際的 API 行為（SR0）還沒用真的金鑰測過，見第 3 節。
+- **ureq 的回應大小上限是「讀到這麼多就算超過」**：內容剛好等於上限時，讀到結尾的那一次也會失敗。要多給一個位元組再自己比。
 
 - **mpv 的記錄訊息比一般事件晚送達**：`mpv_wait_event` 會先把一般事件取完才送記錄訊息，
   所以開檔失敗時，詳細原因會比 `END_FILE` 晚到，要在收到後補進錯誤說明。

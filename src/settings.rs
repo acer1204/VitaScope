@@ -10,6 +10,7 @@ pub use crate::export::ExportSettings;
 pub use crate::keymap::KeySettings;
 pub use crate::media_keys::SystemMedia;
 pub use crate::net::NetSettings;
+pub use crate::online_subs::{OnlineSubSettings, Provider as OnlineSubProvider};
 pub use crate::pacing::SmoothMode;
 pub use crate::picture::VideoSettings;
 pub use crate::playlist::{PlayOrder, Repeat};
@@ -75,6 +76,8 @@ pub struct Settings {
     pub system_media: SystemMedia,
     /// 迷你播放器：置頂、上次的位置大小（視窗模式本身不存，下次啟動是一般視窗）
     pub compact: CompactWindows,
+    /// 線上字幕：來源、搜尋語言、存到影片旁邊、射手網（偽）的 Token…（OpenSubtitles 的登入憑證不在這裡，另外存在快取資料夾）
+    pub online_subs: OnlineSubSettings,
     /// 存檔位置；None = 只放在記憶體（自動測試用：`Settings::default()` 不會動到使用者的設定檔）
     #[serde(skip)]
     path: Option<PathBuf>,
@@ -211,6 +214,7 @@ impl Default for Settings {
             export: ExportSettings::default(),
             system_media: SystemMedia::default(),
             compact: CompactWindows::default(),
+            online_subs: OnlineSubSettings::default(),
             path: None,
             baseline: None,
         }
@@ -386,6 +390,7 @@ impl Settings {
         self.net = self.net.sanitized();
         self.export = self.export.sanitized();
         self.compact = self.compact.sanitized();
+        self.online_subs = self.online_subs.sanitized();
         self
     }
 
@@ -763,6 +768,17 @@ mod tests {
         );
         assert!(sheet.timestamps && sheet.header);
         assert_eq!(sheet.format, crate::export::ImageFormat::Jpeg);
+        assert_eq!(s.online_subs, OnlineSubSettings::default());
+        assert_eq!(
+            s.online_subs.provider,
+            OnlineSubProvider::Opensubtitles,
+            "線上字幕預設 OpenSubtitles"
+        );
+        assert!(s.online_subs.languages.is_empty(), "搜尋語言預設依介面語言");
+        assert!(s.online_subs.save_next_to_video, "下載的字幕預設存到影片旁邊（Q6）");
+        assert!(s.online_subs.hearing_impaired && !s.online_subs.machine_translated);
+        assert!(s.online_subs.auto_search, "打開視窗就搜尋");
+        assert!(s.online_subs.assrt_token.is_empty() && s.online_subs.opensubtitles_user.is_empty());
         assert_eq!(s.video.deinterlace, crate::picture::Deinterlace::Auto);
         assert_eq!(s.video.quality, crate::picture::Quality::Standard);
         assert!(s.video.tone.compute_peak);
@@ -823,6 +839,7 @@ mod tests {
         assert_eq!(s.play_order, PlayOrder::default(), "升級後照順序播、不重複");
         assert_eq!(s.system_media, SystemMedia::default(), "升級後系統媒體控制開著");
         assert_eq!(s.compact, CompactWindows::default(), "升級後迷你播放器置頂、位置照預設");
+        assert_eq!(s.online_subs, OnlineSubSettings::default(), "升級後線上字幕是預設值");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1045,6 +1062,69 @@ mod tests {
         assert!(!back.net.tls_verify, "A 關掉的憑證檢查不能被 B 蓋回去");
         assert_eq!(back.net.proxy, "http://127.0.0.1:3128");
         assert_eq!(back.net.hls_bitrate, HlsBitrate::Min);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn online_subs_settings_load_leniently_sanitize_and_merge() {
+        // 一項讀不懂（新版的來源）：只有那一項用預設值，同一組的其他項目、其他設定照樣讀進來
+        let s = lenient(
+            r#"{"volume": 31.0, "online_subs": {"provider": "subhd", "languages": ["en", "ja"],
+                "save_next_to_video": false, "assrt_token": " abc "}}"#,
+        );
+        assert_eq!(s.volume, 31.0);
+        assert_eq!(s.online_subs.provider, OnlineSubProvider::Opensubtitles);
+        assert_eq!(s.online_subs.languages, ["en", "ja"]);
+        assert!(!s.online_subs.save_next_to_video);
+        assert_eq!(s.online_subs.assrt_token, " abc ");
+        let s = lenient(r#"{"online_subs": {"provider": "assrt", "languages": "zh-tw"}, "seek_short": 7.0}"#);
+        assert_eq!(s.online_subs.provider, OnlineSubProvider::Assrt);
+        assert!(s.online_subs.languages.is_empty());
+        assert_eq!(s.seek_short, 7.0);
+        // 讀檔時整理語言碼；Token 照使用者輸入的保存（用的時候才檢查：R-C7）
+        let dir = temp_dir("online");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"online_subs": {"languages": [" ZH-TW", "zh-tw", "x", "pt-br"], "assrt_token": "short"}}"#,
+        )
+        .unwrap();
+        let mut a = Settings::load_from(path.clone());
+        assert_eq!(a.online_subs.languages, ["zh-tw", "pt-br"]);
+        assert_eq!(a.online_subs.assrt_token, "short");
+        // 兩個視窗各改了不同的項目：兩個都留下
+        let mut b = Settings::load_from(path.clone());
+        a.online_subs.provider = OnlineSubProvider::Assrt;
+        a.save().unwrap();
+        b.online_subs.machine_translated = true;
+        b.save().unwrap();
+        let back = Settings::load_from(path.clone());
+        assert_eq!(back.online_subs.provider, OnlineSubProvider::Assrt);
+        assert!(back.online_subs.machine_translated);
+        // OpenSubtitles 的登入憑證、密碼不在設定檔裡（另外存在快取資料夾：Q3）
+        let text = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut keys: Vec<&str> = v["online_subs"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "assrt_token",
+                "auto_search",
+                "hearing_impaired",
+                "languages",
+                "machine_translated",
+                "opensubtitles_user",
+                "provider",
+                "save_next_to_video"
+            ]
+        );
+        assert!(!text.contains("password") && !text.contains("jwt") && !text.contains("session"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
