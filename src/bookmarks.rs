@@ -8,8 +8,13 @@
 //!   讀回、寫入這一段先鎖住 `bookmarks.json.lock`：兩個視窗同時存檔時一個等另一個，後寫的不會蓋掉先寫的。
 //!   寫完把那個檔案在磁碟上的書籤送回來（[`Bookmarks::poll`]），別的視窗加的也看得到。
 //! - 檔案的代號（`key`）：本機檔案是完整路徑（Windows 不分大小寫，跟續播一樣），網址一字不差地比對。
+//! - 本機檔案另外記大小和特徵碼（moviehash）：搬家、改名之後開啟時，在背景找回原本的書籤（[`recover`]）。
+//!   使用者自己刪光書籤的本機檔案，書籤檔裡留一個沒有書籤的項目（[`Disk::note_emptied`]）：不再找回，刪掉的不會又回來。
+
+mod recover;
 
 use crate::instance::Wake;
+use recover::{Candidate, Done, Job, Same, Stats, Worker};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -30,6 +35,8 @@ pub const NEXT_AFTER: f64 = 0.5;
 /// 「上一個書籤」：比目前的時間早這麼多（秒）才算前面的。比「下一個」寬：播放中剛跳到的書籤已經過了一點，
 /// 連按時才會一個一個往前，不會一直跳回同一個（跟章節一樣）
 pub const PREV_BEFORE: f64 = 1.5;
+/// 最多記幾個「使用者自己刪光書籤的檔案」（不再找回書籤的；舊的擠掉）
+const MAX_EMPTIED: usize = 1000;
 
 /// 一個書籤
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,7 +62,8 @@ pub struct FileMarks {
     /// 檔案大小（本機檔案，新增書籤時在背景查；之後找回搬家、改名的檔案用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// 檔案內容的雜湊（找回搬家、改名的檔案用；之後的版本才填）
+    /// 檔案的特徵碼（OpenSubtitles 的 moviehash，16 個十六進位數字；新增書籤後在背景查）：找回搬家、改名的檔案用。
+    /// 小於 128 KiB 的檔案沒有
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
     /// 依時間排序
@@ -124,6 +132,22 @@ pub enum Change {
     Clear {
         key: String,
     },
+    /// 記下檔案的大小和特徵碼（背景查到的；只改已經有書籤的檔案，不算使用者的修改）
+    Identify {
+        key: String,
+        size: u64,
+        hash: Option<String>,
+    },
+    /// 找回搬家、改名的檔案：把 `from` 的書籤放到 `key`（`marks` 是介面上已經放好的，編號一樣）；
+    /// `moved` = 原檔不在了，`from` 的項目拿掉
+    Adopt {
+        key: String,
+        from: String,
+        marks: Vec<Mark>,
+        moved: bool,
+        size: u64,
+        hash: String,
+    },
 }
 
 impl Change {
@@ -132,9 +156,32 @@ impl Change {
             Change::Add { key, .. }
             | Change::Rename { key, .. }
             | Change::Remove { key, .. }
-            | Change::Clear { key } => key,
+            | Change::Clear { key }
+            | Change::Identify { key, .. }
+            | Change::Adopt { key, .. } => key,
         }
     }
+}
+
+/// 找回了搬家、改名的檔案的書籤（介面顯示提示用）
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recovered {
+    /// 開著的檔案
+    pub key: String,
+    /// 放進來幾個書籤
+    pub count: usize,
+    /// true = 原檔不在了，搬過來；false = 從同樣內容的檔案複製
+    pub moved: bool,
+}
+
+/// 兩個代號是不是同一個檔案（Windows 的本機路徑不分大小寫）
+pub fn same_key(a: &str, b: &str) -> bool {
+    norm(a) == norm(b)
+}
+
+/// 本機檔案（不是網址：`https://`、`ytdl://`、mpv 的 `av://` 之類都不算）
+fn is_local(key: &str) -> bool {
+    !key.is_empty() && !key.contains("://")
 }
 
 /// 比對用的代號：Windows 的本機路徑不分大小寫（跟 `playlist::same_file` 一樣）；網址一字不差
@@ -262,6 +309,66 @@ fn apply(files: &mut Vec<FileMarks>, change: &Change, size_of: &dyn Fn(&str) -> 
             files.remove(i);
             true
         }
+        (Change::Identify { size, hash, .. }, Some(i)) => {
+            let f = &mut files[i];
+            let changed = f.size != Some(*size) || f.hash != *hash;
+            f.size = Some(*size);
+            f.hash.clone_from(hash);
+            // 不是使用者的修改：順序不變
+            return changed;
+        }
+        (
+            Change::Adopt {
+                key,
+                from,
+                marks,
+                moved,
+                size,
+                hash,
+            },
+            pos,
+        ) => {
+            let from = norm(from);
+            let moving = *moved && from != norm(key);
+            // 搬家：磁碟上原檔的書籤全部搬過來，包括別的視窗加的、這個視窗還沒讀回的（不然拿掉原本的項目時一起丟了）
+            let theirs = files
+                .iter()
+                .find(|f| moving && norm(&f.path) == from)
+                .map(|f| f.marks.clone())
+                .unwrap_or_default();
+            let i = pos.unwrap_or_else(|| {
+                files.insert(0, FileMarks::new(key));
+                0
+            });
+            let entry = &mut files[i];
+            let mut changed = false;
+            for m in marks {
+                changed |= insert_mark(&mut entry.marks, m.clone()).is_ok();
+            }
+            // 介面已經放好的（上面那些）在同一個位置，不重複加；編號跟別的書籤撞了才換（由內容算出來，重試時一樣）
+            let seed = norm(key)
+                .bytes()
+                .fold(0, |h, b| crate::picture::splitmix64(h ^ u64::from(b)));
+            for mut m in theirs {
+                if entry.marks.iter().any(|e| e.id == m.id) {
+                    m.id = derived_id(seed ^ m.time.to_bits() ^ m.id.rotate_left(17), &entry.marks);
+                }
+                changed |= insert_mark(&mut entry.marks, m).is_ok();
+            }
+            if entry.marks.is_empty() {
+                files.remove(i);
+            } else {
+                changed |= entry.size != Some(*size) || entry.hash.as_ref() != Some(hash);
+                entry.size = Some(*size);
+                entry.hash = Some(hash.clone());
+            }
+            // 原本的項目拿掉（同一個檔案的話不拿）
+            if moving && let Some(j) = files.iter().position(|f| norm(&f.path) == from) {
+                files.remove(j);
+                changed = true;
+            }
+            changed
+        }
         (_, None) => false,
     };
     // 最近改的檔案放在最前面
@@ -332,6 +439,29 @@ impl Disk {
     fn find(&self, key: &str) -> Option<&FileMarks> {
         let key = norm(key);
         self.files.iter().find(|f| norm(&f.path) == key)
+    }
+
+    /// 使用者自己刪光了這個檔案的書籤（磁碟上留著沒有書籤的項目，見 [`Disk::note_emptied`]）
+    fn is_emptied(&self, key: &str) -> bool {
+        self.find(key).is_some_and(|f| f.marks.is_empty())
+    }
+
+    /// 套用修改之後：使用者自己刪光了本機檔案的書籤，就留一個沒有書籤的項目（最近的在前面，最多 [`MAX_EMPTIED`] 個）。
+    /// 之後開它時不再從同樣內容的檔案複製書籤過來（不然刪掉的書籤下次開又回來了）；再加書籤就是一般的項目。
+    /// 回傳有沒有改到
+    fn note_emptied(&mut self, change: &Change) -> bool {
+        let key = change.key();
+        if !matches!(change, Change::Clear { .. } | Change::Remove { .. }) || !is_local(key) || self.find(key).is_some()
+        {
+            return false;
+        }
+        self.files.insert(0, FileMarks::new(key));
+        let mut n = 0;
+        self.files.retain(|f| {
+            n += usize::from(f.marks.is_empty());
+            !f.marks.is_empty() || n <= MAX_EMPTIED
+        });
+        true
     }
 }
 
@@ -419,7 +549,7 @@ enum Msg {
 struct Reply {
     /// 處理到哪一個訊息
     seq: u64,
-    /// 改到、查到的檔案在磁碟上的書籤（`norm` 過的代號；None = 沒有書籤了）
+    /// 改到、查到的檔案在磁碟上的書籤（`norm` 過的代號；None = 沒有書籤了；沒有書籤的項目 = 使用者自己刪光的）
     synced: Vec<(String, Option<FileMarks>)>,
     /// 存檔失敗的原因：只在這一批有使用者的修改時才回報。開檔時的讀回順便重試之前沒存到的，
     /// 失敗也不提示（使用者這次沒有動書籤，不要蓋掉開檔的提示）
@@ -432,9 +562,10 @@ struct Writer {
     rx: Receiver<Reply>,
     /// 送出的最後一個訊息的順序
     sent: u64,
+    /// 全部處理完、換上磁碟版本的最後一個訊息的順序
+    synced: u64,
     /// 還有訊息沒處理完時收到的磁碟版本：全部處理完才換上去（不然會短暫蓋掉之後才加的書籤）
     pending: HashMap<String, Option<FileMarks>>,
-    wake: Arc<Mutex<Option<Wake>>>,
 }
 
 /// 所有檔案的書籤
@@ -446,6 +577,19 @@ pub struct Bookmarks {
     writer: Option<Writer>,
     /// 只放在記憶體、不存檔的檔案（`norm` 過的代號）：網址含登入資訊、token 的（[`Self::keep_in_memory`]）
     in_memory: HashSet<String>,
+    /// 叫醒介面（寫入執行緒、找回搬家的檔案的背景執行緒共用）
+    wake: Arc<Mutex<Option<Wake>>>,
+    /// 查特徵碼、找同樣內容的檔案的背景執行緒（第一次需要時才開）
+    lookup: Option<Worker>,
+    lookup_stats: Arc<Stats>,
+    /// 等開檔時的讀回做完才找（[`Self::recover`]）：代號、第幾次找、等到哪一個訊息
+    waiting: Option<(String, u64, u64)>,
+    /// 這次執行已經查過（或排隊在查）大小和特徵碼的檔案（`norm` 過的代號）
+    identifying: HashSet<String>,
+    /// 找回的書籤，還沒拿去提示的（[`Self::take_recovered`]）
+    recovered: Vec<Recovered>,
+    /// 使用者自己刪光書籤的本機檔案（`norm` 過的代號）：不再從同樣內容的檔案複製書籤過來
+    emptied: HashSet<String>,
 }
 
 impl Bookmarks {
@@ -467,10 +611,17 @@ impl Bookmarks {
             }
         };
         let mut files = HashMap::new();
+        let mut emptied = HashSet::new();
         for f in &disk.files {
+            // 沒有書籤的項目：使用者自己刪光的（[`Disk::note_emptied`]）
+            if f.marks.is_empty() {
+                emptied.insert(norm(&f.path));
+                continue;
+            }
             // 同一個檔案出現兩次（手動改過）：用前面的（最近改的）
             files.entry(norm(&f.path)).or_insert_with(|| f.clone());
         }
+
         let (tx, worker_rx) = mpsc::channel();
         let (worker_tx, rx) = mpsc::channel();
         let wake: Arc<Mutex<Option<Wake>>> = Arc::default();
@@ -483,8 +634,8 @@ impl Bookmarks {
                 tx,
                 rx,
                 sent: 0,
+                synced: 0,
                 pending: HashMap::new(),
-                wake,
             }),
             Err(e) => {
                 eprintln!("[vitascope] 書籤無法存檔（開不了背景執行緒）：{e}");
@@ -494,15 +645,15 @@ impl Bookmarks {
         Self {
             files,
             writer,
-            in_memory: HashSet::new(),
+            wake,
+            emptied,
+            ..Self::default()
         }
     }
 
-    /// 寫入執行緒有回覆時叫醒介面（存檔失敗要提示）
+    /// 背景執行緒有結果時叫醒介面（存檔失敗要提示、找回了搬家的檔案的書籤）
     pub fn set_wake(&mut self, wake: Wake) {
-        if let Some(w) = &self.writer
-            && let Ok(mut slot) = w.wake.lock()
-        {
+        if let Ok(mut slot) = self.wake.lock() {
             *slot = Some(wake);
         }
     }
@@ -554,10 +705,16 @@ impl Bookmarks {
             }
             return Err(e);
         }
+        let unidentified = needs_identity(entry);
+        self.emptied.remove(&norm_key);
         self.send(Change::Add {
             key: key.to_owned(),
             mark: mark.clone(),
         });
+        // 本機檔案在背景記下大小和特徵碼：之後搬家、改名才找得回來
+        if unidentified && !self.is_in_memory(key) {
+            self.identify(key);
+        }
         Ok(mark)
     }
 
@@ -595,6 +752,7 @@ impl Bookmarks {
         }
         if f.marks.is_empty() {
             self.files.remove(&norm_key);
+            self.note_emptied(key);
         }
         self.send(Change::Remove {
             key: key.to_owned(),
@@ -607,9 +765,17 @@ impl Bookmarks {
     pub fn clear(&mut self, key: &str) -> usize {
         let n = self.files.remove(&norm(key)).map_or(0, |f| f.marks.len());
         if n > 0 {
+            self.note_emptied(key);
             self.send(Change::Clear { key: key.to_owned() });
         }
         n
+    }
+
+    /// 使用者自己刪光了這個本機檔案的書籤：之後開它時不再從同樣內容的檔案複製回來
+    fn note_emptied(&mut self, key: &str) {
+        if is_local(key) && !self.is_in_memory(key) {
+            self.emptied.insert(norm(key));
+        }
     }
 
     /// 背景讀回磁碟上這個檔案的書籤（開檔時：同時開著的別的視窗加的書籤也看得到），結果在 [`Self::poll`] 換上
@@ -636,6 +802,15 @@ impl Bookmarks {
     /// 收寫入執行緒的回覆（每一幀）：送出的都處理完了，就換成磁碟上的版本（包括別的視窗加的）。
     /// 回傳存檔失敗的原因（記憶體裡照樣保留這次的修改）
     pub fn poll(&mut self) -> Vec<std::io::Error> {
+        let errors = self.poll_writer();
+        self.poll_lookups();
+        if self.waiting.is_some() {
+            self.start_waiting();
+        }
+        errors
+    }
+
+    fn poll_writer(&mut self) -> Vec<std::io::Error> {
         let Some(w) = &mut self.writer else {
             return Vec::new();
         };
@@ -644,12 +819,19 @@ impl Bookmarks {
             errors.extend(reply.error);
             w.pending.extend(reply.synced);
             if reply.seq == w.sent {
+                w.synced = reply.seq;
                 for (key, f) in w.pending.drain() {
                     // 只放在記憶體的：標記之前送出的讀回，不能蓋掉記憶體裡的書籤
                     if self.in_memory.contains(&key) {
                         continue;
                     }
-                    match f {
+                    // 沒有書籤的項目 = 使用者自己刪光的（這個或別的視窗）：記著，不再找回
+                    if f.as_ref().is_some_and(|f| f.marks.is_empty()) {
+                        self.emptied.insert(key.clone());
+                    } else {
+                        self.emptied.remove(&key);
+                    }
+                    match f.filter(|f| !f.marks.is_empty()) {
                         Some(f) => self.files.insert(key, f),
                         None => self.files.remove(&key),
                     };
@@ -665,6 +847,256 @@ impl Bookmarks {
         let (ack, done) = mpsc::channel();
         w.tx.send(Msg::Flush(ack)).is_ok() && done.recv_timeout(timeout).is_ok()
     }
+
+    /// 開了本機檔案（在 [`Self::refresh`] 之後叫）：這個檔案沒有書籤時，在背景找搬家、改名前的書籤
+    /// （同樣大小、同樣特徵碼的檔案）；有書籤但還沒記特徵碼的（之前的版本加的），順便查好記下來。
+    /// 等開檔時的讀回做完才找：同時開著的別的視窗加的書籤也算「有書籤」。結果在 [`Self::poll`] 套用，
+    /// 提示用 [`Self::take_recovered`] 拿。網址、只放在記憶體的不找，但每次開檔都要叫（網址也是）：
+    /// 之前的檔案還在找的就不找了，找到的也不套用。使用者自己刪光書籤的檔案也不找（不把刪掉的書籤複製回來）
+    pub fn recover(&mut self, key: &str) {
+        let generation = self.opened();
+        if !is_local(key) || self.is_in_memory(key) {
+            return;
+        }
+        let after = self.writer.as_ref().map_or(0, |w| w.sent);
+        self.waiting = Some((key.to_owned(), generation, after));
+        self.start_waiting();
+    }
+
+    /// 換了檔案（網址也算）：之前還在找的不找了，找到的也不套用。回傳這一次的編號
+    fn opened(&mut self) -> u64 {
+        if self.waiting.take().is_some() {
+            self.finish_lookup();
+        }
+        self.lookup_stats.latest.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// 開檔時的讀回做完了就開始找
+    fn start_waiting(&mut self) {
+        let Some((_, _, after)) = &self.waiting else {
+            return;
+        };
+        if self.writer.as_ref().is_some_and(|w| w.synced < *after) {
+            return;
+        }
+        let Some((key, generation, _)) = self.waiting.take() else {
+            return;
+        };
+        let norm_key = norm(&key);
+        if let Some(f) = self.files.get(&norm_key) {
+            // 已經有書籤：還沒記特徵碼的查好記下來
+            if needs_identity(f) {
+                self.identify(&key);
+            }
+            self.finish_lookup();
+            return;
+        }
+        // 使用者自己刪光了這個檔案的書籤：不再複製回來
+        if self.emptied.contains(&norm_key) {
+            self.finish_lookup();
+            return;
+        }
+        // 有候選（別的本機檔案、有書籤、記了大小）才查：沒有就完全不碰檔案。先只查大小（背景），
+        // 再挑出一樣大的項目：介面執行緒不用每次複製全部的書籤
+        if !self.files.iter().any(|(k, f)| self.is_candidate(k, f, &norm_key))
+            || !self.queue(Job::Size { key, generation })
+        {
+            self.finish_lookup();
+        }
+    }
+
+    /// 可以拿來比對的項目：別的本機檔案，有書籤、記了大小，不是只放在記憶體的
+    fn is_candidate(&self, norm_key: &str, f: &FileMarks, target: &str) -> bool {
+        f.size.is_some()
+            && !f.marks.is_empty()
+            && norm_key != target
+            && is_local(&f.path)
+            && !self.in_memory.contains(norm_key)
+    }
+
+    /// 背景查到開著的檔案的大小：挑出一樣大的項目（最近改過的排前面），交給背景比特徵碼
+    fn lookup_sized(&mut self, key: String, generation: u64, size: u64) {
+        let norm_key = norm(&key);
+        // 又開了別的檔案，或這段時間裡有了書籤（別的視窗加的、剛按了 P）：不找
+        if generation < self.lookup_stats.latest.load(Ordering::Relaxed)
+            || self.files.contains_key(&norm_key)
+            || self.emptied.contains(&norm_key)
+        {
+            self.finish_lookup();
+            return;
+        }
+        let mut candidates: Vec<(u64, Candidate)> = self
+            .files
+            .iter()
+            .filter(|(k, f)| f.size == Some(size) && self.is_candidate(k, f, &norm_key))
+            .map(|(_, f)| {
+                let latest = f.marks.iter().map(|m| m.added).max().unwrap_or(0);
+                let candidate = Candidate {
+                    path: f.path.clone(),
+                    size,
+                    hash: f.hash.clone(),
+                };
+                (latest, candidate)
+            })
+            .collect();
+        // 沒有一樣大的：不讀特徵碼
+        if candidates.is_empty() {
+            self.finish_lookup();
+            return;
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+        let job = Job::Lookup {
+            key,
+            generation,
+            candidates: candidates.into_iter().map(|c| c.1).collect(),
+        };
+        if !self.queue(job) {
+            self.finish_lookup();
+        }
+    }
+
+    /// 在背景查這個檔案的大小和特徵碼（這次執行每個檔案只查一次）
+    fn identify(&mut self, key: &str) {
+        if self.identifying.insert(norm(key)) {
+            self.queue(Job::Identify(key.to_owned()));
+        }
+    }
+
+    /// 交給背景執行緒（第一次才開）
+    fn queue(&mut self, job: Job) -> bool {
+        if self.lookup.is_none() {
+            self.lookup = Worker::spawn(self.lookup_stats.clone(), self.wake.clone());
+        }
+        self.lookup.as_ref().is_some_and(|w| w.tx.send(job).is_ok())
+    }
+
+    fn finish_lookup(&self) {
+        self.lookup_stats.finished.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 收背景執行緒的結果：記下大小、特徵碼，找到同樣內容的檔案就把書籤放過來
+    fn poll_lookups(&mut self) {
+        let results: Vec<Done> = match &self.lookup {
+            Some(w) => w.rx.try_iter().collect(),
+            None => return,
+        };
+        for done in results {
+            for (path, size, hash) in done.identified {
+                self.set_identity(&path, size, hash);
+            }
+            // 又開了別的檔案（網址也算）：找到的不套用
+            if let Some(same) = done.same
+                && done.generation == self.lookup_stats.latest.load(Ordering::Relaxed)
+            {
+                self.adopt(same);
+            }
+            if let Some((key, generation, size)) = done.sized {
+                self.lookup_sized(key, generation, size);
+            }
+            if done.lookup {
+                self.finish_lookup();
+            }
+        }
+    }
+
+    /// 記下檔案的大小、特徵碼（只改已經有書籤的檔案）
+    fn set_identity(&mut self, key: &str, size: u64, hash: Option<String>) {
+        let Some(f) = self.files.get_mut(&norm(key)) else {
+            return;
+        };
+        if f.size == Some(size) && f.hash == hash {
+            return;
+        }
+        f.size = Some(size);
+        f.hash.clone_from(&hash);
+        let key = f.path.clone();
+        self.send(Change::Identify { key, size, hash });
+    }
+
+    /// 把 `same.from` 的書籤放到 `same.key`：原檔不在了就搬過來（編號不變），還在就複製一份（新的編號）。
+    /// 這段時間裡使用者已經在新的檔案加了書籤的，合在一起（同一個位置的不重複加）
+    fn adopt(&mut self, same: Same) {
+        let Same {
+            key,
+            from,
+            moved,
+            size,
+            hash,
+        } = same;
+        let (norm_key, norm_from) = (norm(&key), norm(&from));
+        // 這段時間裡使用者把它的書籤刪光了（先加了又刪掉）：不複製回來
+        if norm_key == norm_from || self.is_in_memory(&key) || self.emptied.contains(&norm_key) {
+            return;
+        }
+        let Some(source) = self.files.get(&norm_from).map(|f| f.marks.clone()) else {
+            return;
+        };
+        let entry = self
+            .files
+            .entry(norm_key.clone())
+            .or_insert_with(|| FileMarks::new(&key));
+        let mut added = Vec::new();
+        for mut mark in source {
+            if !moved || entry.marks.iter().any(|m| m.id == mark.id) {
+                mark.id = new_id(&entry.marks);
+            }
+            if insert_mark(&mut entry.marks, mark.clone()).is_ok() {
+                added.push(mark);
+            }
+        }
+        if entry.marks.is_empty() {
+            self.files.remove(&norm_key);
+            return;
+        }
+        entry.size = Some(size);
+        entry.hash = Some(hash.clone());
+        let target = entry.path.clone();
+        self.emptied.remove(&norm_key);
+        if moved {
+            self.files.remove(&norm_from);
+        } else if added.is_empty() {
+            return;
+        }
+        let count = added.len();
+        self.send(Change::Adopt {
+            key: target,
+            from,
+            marks: added,
+            moved,
+            size,
+            hash,
+        });
+        if count > 0 {
+            self.recovered.push(Recovered { key, count, moved });
+        }
+    }
+
+    /// 找回的書籤（每一幀拿；介面在還開著那個檔案時提示）
+    pub fn take_recovered(&mut self) -> Vec<Recovered> {
+        std::mem::take(&mut self.recovered)
+    }
+
+    /// 處理完幾次「找搬家前的書籤」（[`Self::recover`]；介面測試等它）
+    #[doc(hidden)]
+    pub fn lookups_finished(&self) -> u64 {
+        self.lookup_stats.finished.load(Ordering::Relaxed)
+    }
+
+    /// 背景讀了幾次檔案的特徵碼（介面測試用：大小不同時不能讀）
+    #[doc(hidden)]
+    pub fn hash_reads(&self) -> u64 {
+        self.lookup_stats.hash_reads.load(Ordering::Relaxed)
+    }
+}
+
+/// 這個本機檔案還沒記特徵碼（小於 128 KiB 的沒有特徵碼，不用查）
+fn needs_identity(f: &FileMarks) -> bool {
+    is_local(&f.path) && f.hash.is_none() && f.size.is_none_or(|s| s >= crate::filehash::MIN_SIZE)
+}
+
+/// 寫入執行緒不套用的修改：從同樣內容的檔案複製書籤到使用者自己刪光的檔案（別的視窗剛刪光的）
+fn skipped(disk: &Disk, change: &Change) -> bool {
+    matches!(change, Change::Adopt { key, moved: false, .. } if disk.is_emptied(key))
 }
 
 /// 寫入執行緒：一次收完排隊中的訊息，讀回磁碟上的版本、全部套用、寫一次，再回覆。
@@ -687,7 +1119,11 @@ fn run_writer(path: &Path, mut cache: Disk, rx: &Receiver<Msg>, tx: &Sender<Repl
             .collect();
         let size_of = |key: &str| sizes.get(key).copied();
         let needs_disk = batch.iter().any(|m| !matches!(m, Msg::Flush(_)));
-        let user_change = batch.iter().any(|m| matches!(m, Msg::Change(..)));
+        // 背景做的（記下大小、特徵碼，找回搬家的檔案的書籤）存不了不提示：使用者這次沒有動書籤
+        // （找回的書籤照樣留在記憶體，下次存檔一起寫）
+        let user_change = batch
+            .iter()
+            .any(|m| matches!(m, Msg::Change(_, c) if !matches!(c, Change::Identify { .. } | Change::Adopt { .. })));
         let mut error = None;
         let mut repaired = false;
         // 鎖到寫完（這一輪結束時放開）
@@ -703,7 +1139,10 @@ fn run_writer(path: &Path, mut cache: Disk, rx: &Receiver<Msg>, tx: &Sender<Repl
                 Err(why) => eprintln!("[vitascope] 書籤檔讀不了，用記得的版本：{why}"),
             }
             for change in &unsaved {
-                apply(&mut cache.files, change, &|_| None);
+                if !skipped(&cache, change) {
+                    apply(&mut cache.files, change, &|_| None);
+                    cache.note_emptied(change);
+                }
             }
         }
         let (mut seq, mut touched, mut acks) = (None, Vec::new(), Vec::new());
@@ -712,8 +1151,15 @@ fn run_writer(path: &Path, mut cache: Disk, rx: &Receiver<Msg>, tx: &Sender<Repl
             match msg {
                 Msg::Change(s, change) => {
                     seq = Some(s);
-                    changed |= apply(&mut cache.files, &change, &size_of);
+                    if !skipped(&cache, &change) {
+                        changed |= apply(&mut cache.files, &change, &size_of);
+                        changed |= cache.note_emptied(&change);
+                    }
                     touched.push(norm(change.key()));
+                    // 搬家：原本的項目也拿掉了
+                    if let Change::Adopt { from, moved: true, .. } = &change {
+                        touched.push(norm(from));
+                    }
                     unsaved.push(change);
                 }
                 Msg::Refresh(s, key) => {
@@ -1014,8 +1460,8 @@ mod tests {
             tx,
             rx: reply_rx,
             sent: 0,
+            synced: 0,
             pending: HashMap::new(),
-            wake: Arc::default(),
         });
         b.add("movie.mkv", 10.0).unwrap();
         b.add("movie.mkv", 20.0).unwrap();
@@ -1348,5 +1794,787 @@ mod tests {
             4
         );
         cleanup(&path);
+    }
+
+    // ───────────── 找回搬家、改名的檔案（G7） ─────────────
+
+    /// 假的影片：`len` 個位元組，內容由 `seed` 決定（不同的 seed 特徵碼不同）
+    fn fake_video(path: &Path, len: usize, seed: u64) {
+        let mut x = seed;
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                x = crate::picture::splitmix64(x);
+                x as u8
+            })
+            .collect();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn key_of(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+
+    /// 等背景處理完第 `n` 次「找搬家前的書籤」，再等寫入執行緒寫完
+    fn wait_lookups(b: &mut Bookmarks, n: u64) {
+        let start = Instant::now();
+        while b.lookups_finished() < n {
+            b.poll();
+            assert!(start.elapsed() < WAIT, "找搬家前的書籤沒有做完");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        sync(b);
+    }
+
+    /// 等背景記下這個檔案的特徵碼
+    fn wait_hash(b: &mut Bookmarks, key: &str) -> String {
+        let start = Instant::now();
+        loop {
+            b.poll();
+            if let Some(h) = b.file(key).and_then(|f| f.hash.clone()) {
+                sync(b);
+                return h;
+            }
+            assert!(start.elapsed() < WAIT, "沒有記下特徵碼");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 書籤檔裡這個檔案的項目
+    fn on_disk(store: &Path, key: &str) -> Option<FileMarks> {
+        Bookmarks::load_from(store.to_path_buf()).file(key).cloned()
+    }
+
+    /// 開了一個有書籤的檔案、加一個書籤：背景記下大小和特徵碼（寫進書籤檔）
+    #[test]
+    fn adding_records_size_and_hash() {
+        let store = temp_file("identify");
+        let dir = store.parent().unwrap();
+        let video = dir.join("第1集.mkv");
+        fake_video(&video, 300_000, 1);
+        let small = dir.join("小.mkv");
+        fake_video(&small, 1000, 2);
+        let mut b = Bookmarks::load_from(store.clone());
+        b.add(&key_of(&video), 10.0).unwrap();
+        b.add(&key_of(&small), 1.0).unwrap();
+        b.add("https://example.com/v.mp4", 1.0).unwrap();
+        let hash = wait_hash(&mut b, &key_of(&video));
+        let expected = crate::filehash::moviehash(&video).unwrap().unwrap();
+        assert_eq!(hash, expected.hex());
+        let saved = on_disk(&store, &key_of(&video)).unwrap();
+        assert_eq!((saved.size, saved.hash), (Some(300_000), Some(expected.hex())));
+        // 小檔案只有大小；網址兩個都沒有
+        let start = Instant::now();
+        while b.file(&key_of(&small)).unwrap().size.is_none() {
+            b.poll();
+            assert!(start.elapsed() < WAIT);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(b.file(&key_of(&small)).unwrap().hash, None);
+        let url = b.file("https://example.com/v.mp4").unwrap();
+        assert_eq!((url.size, url.hash.as_deref()), (None, None));
+        // 同一個檔案再加書籤：不再讀一次
+        let reads = b.hash_reads();
+        b.add(&key_of(&video), 20.0).unwrap();
+        sync(&mut b);
+        // 背景一次做一件事：排在後面的工作做完，前面排的（如果有）也做完了
+        b.recover(&key_of(&dir.join("沒有這個檔案.mkv")));
+        wait_lookups(&mut b, 1);
+        assert_eq!(b.hash_reads(), reads);
+        cleanup(&store);
+    }
+
+    /// 原檔還在（複製了一份）：書籤複製過來（新的編號），兩個檔案都有
+    #[test]
+    fn a_copy_gets_a_copy_of_the_marks() {
+        let store = temp_file("copy");
+        let dir = store.parent().unwrap();
+        let original = dir.join("原本.mkv");
+        fake_video(&original, 300_000, 3);
+        let mut b = Bookmarks::load_from(store.clone());
+        let first = b.add(&key_of(&original), 10.0).unwrap();
+        b.rename(&key_of(&original), first.id, "OP 結束");
+        b.add(&key_of(&original), 20.0).unwrap();
+        wait_hash(&mut b, &key_of(&original));
+        let copy = dir.join("備份").join("複製的.mkv");
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        std::fs::copy(&original, &copy).unwrap();
+        b.refresh(&key_of(&copy));
+        b.recover(&key_of(&copy));
+        wait_lookups(&mut b, 1);
+        assert_eq!(
+            b.take_recovered(),
+            [Recovered {
+                key: key_of(&copy),
+                count: 2,
+                moved: false
+            }]
+        );
+        let ours = b.marks(&key_of(&copy)).to_vec();
+        assert_eq!(times(&ours), [10.0, 20.0]);
+        assert_eq!(ours[0].name, "OP 結束");
+        let theirs = b.marks(&key_of(&original)).to_vec();
+        assert_eq!(times(&theirs), [10.0, 20.0], "原檔的書籤還在");
+        assert!(
+            ours.iter().all(|m| theirs.iter().all(|t| t.id != m.id)),
+            "複製的書籤用新的編號"
+        );
+        // 書籤檔裡兩個都有；複製的也記了大小和特徵碼
+        let saved = on_disk(&store, &key_of(&copy)).unwrap();
+        assert_eq!(saved.marks, ours);
+        assert_eq!(saved.hash, b.file(&key_of(&original)).unwrap().hash);
+        assert_eq!(saved.size, Some(300_000));
+        assert_eq!(on_disk(&store, &key_of(&original)).unwrap().marks, theirs);
+        // 複製的書籤自己改名、刪除，不影響原檔
+        assert!(b.remove(&key_of(&copy), ours[0].id));
+        sync(&mut b);
+        assert_eq!(times(b.marks(&key_of(&original))), [10.0, 20.0]);
+        cleanup(&store);
+    }
+
+    /// 原檔不在了（搬家、改名）：書籤搬過來，原本的項目拿掉
+    #[test]
+    fn a_moved_file_takes_its_marks_along() {
+        let store = temp_file("move");
+        let dir = store.parent().unwrap();
+        let before = dir.join("下載").join("第2集.mkv");
+        std::fs::create_dir_all(before.parent().unwrap()).unwrap();
+        fake_video(&before, 400_000, 4);
+        let mut b = Bookmarks::load_from(store.clone());
+        b.add(&key_of(&before), 30.0).unwrap();
+        b.add(&key_of(&before), 60.0).unwrap();
+        wait_hash(&mut b, &key_of(&before));
+        let ids: Vec<u64> = b.marks(&key_of(&before)).iter().map(|m| m.id).collect();
+        let after = dir.join("動畫").join("第 2 集（改名）.mkv");
+        std::fs::create_dir_all(after.parent().unwrap()).unwrap();
+        std::fs::rename(&before, &after).unwrap();
+        b.refresh(&key_of(&after));
+        b.recover(&key_of(&after));
+        wait_lookups(&mut b, 1);
+        assert_eq!(
+            b.take_recovered(),
+            [Recovered {
+                key: key_of(&after),
+                count: 2,
+                moved: true
+            }]
+        );
+        assert_eq!(times(b.marks(&key_of(&after))), [30.0, 60.0]);
+        let moved_ids: Vec<u64> = b.marks(&key_of(&after)).iter().map(|m| m.id).collect();
+        assert_eq!(moved_ids, ids, "搬家的書籤編號不變");
+        assert!(b.marks(&key_of(&before)).is_empty(), "原本的項目拿掉");
+        assert!(on_disk(&store, &key_of(&before)).is_none());
+        assert_eq!(times(&on_disk(&store, &key_of(&after)).unwrap().marks), [30.0, 60.0]);
+        assert_eq!(b.file_count(), 1);
+        // 再開一次（已經有書籤）：不再找
+        let reads = b.hash_reads();
+        b.recover(&key_of(&after));
+        wait_lookups(&mut b, 2);
+        assert!(b.take_recovered().is_empty());
+        assert_eq!(b.hash_reads(), reads);
+        cleanup(&store);
+    }
+
+    /// 大小不同：只看檔案資訊，不讀任何特徵碼（目標、候選的都不讀）
+    #[test]
+    fn a_size_mismatch_never_reads_the_hash() {
+        let store = temp_file("size-mismatch");
+        let dir = store.parent().unwrap();
+        let other = dir.join("別的.mkv");
+        fake_video(&other, 300_000, 5);
+        let opened = dir.join("開的.mkv");
+        fake_video(&opened, 300_001, 5);
+        // 書籤檔裡已經有別的檔案的書籤（大小、特徵碼都記了；這次執行沒有新增，不會查特徵碼）
+        let hash = crate::filehash::moviehash(&other).unwrap().unwrap().hex();
+        std::fs::write(
+            &store,
+            serde_json::json!({ "files": [
+                { "path": key_of(&other), "size": 300_000, "hash": hash,
+                  "marks": [ { "id": 5, "time": 12.0, "name": "", "added": 1 } ] }
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+        let mut b = Bookmarks::load_from(store.clone());
+        b.refresh(&key_of(&opened));
+        b.recover(&key_of(&opened));
+        wait_lookups(&mut b, 1);
+        assert_eq!(b.hash_reads(), 0, "大小不同就不讀特徵碼");
+        assert!(b.marks(&key_of(&opened)).is_empty());
+        assert!(b.take_recovered().is_empty());
+        // 一樣大、內容不同：讀了開的檔案的特徵碼，對不上，不找回
+        let same_size = dir.join("一樣大.mkv");
+        fake_video(&same_size, 300_000, 6);
+        b.recover(&key_of(&same_size));
+        wait_lookups(&mut b, 2);
+        assert_eq!(b.hash_reads(), 1, "只讀開的檔案（別的檔案的記在書籤檔裡）");
+        assert!(b.marks(&key_of(&same_size)).is_empty());
+        assert_eq!(times(b.marks(&key_of(&other))), [12.0]);
+        cleanup(&store);
+    }
+
+    /// 之前的版本加的書籤沒有記特徵碼：原檔還在就讀它的（記下來），不在了就找不回（只有大小不夠確定）
+    #[test]
+    fn old_entries_without_a_hash() {
+        let store = temp_file("old-entries");
+        let dir = store.parent().unwrap();
+        let kept = dir.join("還在.mkv");
+        fake_video(&kept, 300_000, 7);
+        let vanished = dir.join("不見了.mkv");
+        let entry = |path: &Path, size: u64, time: f64| {
+            serde_json::json!({ "path": key_of(path), "size": size,
+                "marks": [ { "id": 9, "time": time, "name": "", "added": 1 } ] })
+        };
+        std::fs::write(
+            &store,
+            serde_json::json!({ "files": [ entry(&kept, 300_000, 5.0), entry(&vanished, 500_000, 7.0) ] }).to_string(),
+        )
+        .unwrap();
+        let mut b = Bookmarks::load_from(store.clone());
+        let copy = dir.join("複製.mkv");
+        std::fs::copy(&kept, &copy).unwrap();
+        b.recover(&key_of(&copy));
+        wait_lookups(&mut b, 1);
+        assert_eq!(times(b.marks(&key_of(&copy))), [5.0]);
+        let hash = crate::filehash::moviehash(&kept).unwrap().unwrap().hex();
+        assert_eq!(
+            on_disk(&store, &key_of(&kept)).unwrap().hash.as_deref(),
+            Some(hash.as_str()),
+            "讀到的特徵碼記下來"
+        );
+        // 只知道大小、原檔已經不在：找不回
+        let moved = dir.join("搬過來的.mkv");
+        fake_video(&moved, 500_000, 8);
+        b.recover(&key_of(&moved));
+        wait_lookups(&mut b, 2);
+        assert!(b.marks(&key_of(&moved)).is_empty());
+        assert_eq!(times(b.marks(&key_of(&vanished))), [7.0]);
+        // 開了沒記特徵碼、但有書籤的檔案：順便記下來
+        let reopened = Bookmarks::load_from(store.clone());
+        let mut b = reopened;
+        std::fs::write(&vanished, std::fs::read(&moved).unwrap()).unwrap();
+        b.refresh(&key_of(&vanished));
+        b.recover(&key_of(&vanished));
+        wait_lookups(&mut b, 1);
+        let hash = wait_hash(&mut b, &key_of(&vanished));
+        assert_eq!(hash, crate::filehash::moviehash(&vanished).unwrap().unwrap().hex());
+        assert_eq!(on_disk(&store, &key_of(&vanished)).unwrap().hash, Some(hash));
+        cleanup(&store);
+    }
+
+    /// 開檔時先讀回磁碟上的書籤：別的視窗已經在這個檔案加了書籤，就不找（不會再複製一份過來）
+    #[test]
+    fn marks_from_another_window_count_as_having_marks() {
+        let store = temp_file("other-window-first");
+        let dir = store.parent().unwrap();
+        let original = dir.join("原本.mkv");
+        fake_video(&original, 300_000, 9);
+        let mut ours = Bookmarks::load_from(store.clone());
+        ours.add(&key_of(&original), 10.0).unwrap();
+        wait_hash(&mut ours, &key_of(&original));
+        let copy = dir.join("複製.mkv");
+        std::fs::copy(&original, &copy).unwrap();
+        // 另一個視窗在複製的檔案加了書籤（這邊還不知道）
+        let mut other = Bookmarks::load_from(store.clone());
+        other.add(&key_of(&copy), 50.0).unwrap();
+        assert!(other.flush(WAIT));
+        ours.refresh(&key_of(&copy));
+        ours.recover(&key_of(&copy));
+        wait_lookups(&mut ours, 1);
+        assert!(ours.take_recovered().is_empty());
+        assert_eq!(times(ours.marks(&key_of(&copy))), [50.0], "讀回的書籤，沒有複製");
+        assert_eq!(times(&on_disk(&store, &key_of(&copy)).unwrap().marks), [50.0]);
+        cleanup(&store);
+    }
+
+    /// 網址、只放在記憶體的不找，也不當作候選
+    #[test]
+    fn urls_are_never_looked_up() {
+        let mut b = Bookmarks::default();
+        b.add("https://example.com/a.mp4", 1.0).unwrap();
+        b.recover("https://example.com/b.mp4");
+        b.recover("ytdl://youtube/abc");
+        b.recover("av://lavfi:testsrc");
+        assert_eq!(b.lookups_finished(), 0, "網址不找");
+        assert!(b.lookup.is_none(), "沒有開背景執行緒");
+        // 本機檔案：只有網址的書籤時沒有候選，不碰檔案
+        b.recover("/not/there.mkv");
+        assert_eq!(b.lookups_finished(), 1);
+        assert!(b.lookup.is_none(), "沒有候選：不讀檔案");
+        assert_eq!(b.hash_reads(), 0);
+    }
+
+    /// 搬家：寫入執行緒在磁碟上的版本套用（另一個視窗的書籤檔照樣更新），原本的項目拿掉
+    #[test]
+    fn apply_adopt_and_identify() {
+        let mut files = Vec::new();
+        let add = |key: &str, t: f64| Change::Add {
+            key: key.into(),
+            mark: mark_at(t),
+        };
+        apply(&mut files, &add("a.mkv", 1.0), &|_| Some(300_000));
+        apply(&mut files, &add("c.mkv", 1.0), &|_| None);
+        // 記下大小、特徵碼：不算使用者的修改，順序不變；沒有書籤的檔案不建立項目
+        let identify = |key: &str, hash: &str| Change::Identify {
+            key: key.into(),
+            size: 300_000,
+            hash: Some(hash.into()),
+        };
+        assert!(apply(&mut files, &identify("a.mkv", "00ff"), &|_| None));
+        assert!(!apply(&mut files, &identify("a.mkv", "00ff"), &|_| None), "沒變");
+        assert!(!apply(&mut files, &identify("x.mkv", "00ff"), &|_| None));
+        assert_eq!(files[1].path, "a.mkv", "順序不變");
+        assert_eq!(files[1].hash.as_deref(), Some("00ff"));
+        let marks = files[1].marks.clone();
+        let adopt = |moved| Change::Adopt {
+            key: "b.mkv".into(),
+            from: "a.mkv".into(),
+            marks: marks.clone(),
+            moved,
+            size: 300_000,
+            hash: "00ff".into(),
+        };
+        // 複製：兩個都有
+        assert!(apply(&mut files, &adopt(false), &|_| None));
+        assert_eq!(files[0].path, "b.mkv");
+        assert_eq!((files[0].size, files[0].hash.as_deref()), (Some(300_000), Some("00ff")));
+        assert_eq!(files.len(), 3);
+        assert!(!apply(&mut files, &adopt(false), &|_| None), "已經有了");
+        // 搬家：原本的拿掉
+        assert!(apply(&mut files, &adopt(true), &|_| None));
+        let order: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(order, ["b.mkv", "c.mkv"]);
+        assert_eq!(files[0].marks, marks);
+    }
+
+    /// 背景找回的書籤存不了：不提示（使用者這次沒有動書籤），記憶體裡照樣有，之後可以存時一起寫
+    #[test]
+    fn recovered_marks_that_cannot_be_saved_are_kept_quietly() {
+        let path = temp_file("recover-unsaved");
+        let dir = path.parent().unwrap().to_path_buf();
+        let blocked = dir.join("sub");
+        std::fs::write(&blocked, "不是資料夾").unwrap();
+        let store = blocked.join("bookmarks.json");
+        let original = dir.join("原本.mkv");
+        fake_video(&original, 300_000, 10);
+        let mut b = Bookmarks::load_from(store.clone());
+        b.add(&key_of(&original), 10.0).unwrap();
+        assert_eq!(sync(&mut b).len(), 1, "使用者的修改存不了要回報");
+        let start = Instant::now();
+        while b.file(&key_of(&original)).and_then(|f| f.hash.as_ref()).is_none() {
+            assert!(b.poll().is_empty(), "記下特徵碼存不了：不提示");
+            assert!(start.elapsed() < WAIT, "沒有記下特徵碼");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let copy = dir.join("複製.mkv");
+        std::fs::copy(&original, &copy).unwrap();
+        b.refresh(&key_of(&copy));
+        b.recover(&key_of(&copy));
+        let start = Instant::now();
+        while b.lookups_finished() < 1 {
+            assert!(b.poll().is_empty(), "背景的工作存不了：不提示");
+            assert!(start.elapsed() < WAIT);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(sync(&mut b).is_empty(), "找回的書籤存不了：不提示");
+        assert_eq!(times(b.marks(&key_of(&copy))), [10.0]);
+        assert_eq!(b.take_recovered().len(), 1);
+        // 可以存了：下一次修改連同找回的一起寫
+        std::fs::remove_file(&blocked).unwrap();
+        b.add(&key_of(&original), 20.0).unwrap();
+        assert!(sync(&mut b).is_empty());
+        assert_eq!(times(&on_disk(&store, &key_of(&copy)).unwrap().marks), [10.0]);
+        cleanup(&path);
+    }
+
+    /// 開了沒有書籤的檔案時，介面執行緒的成本（取候選的快照、交給背景）：5,000 個檔案也不到 2 毫秒；讀檔案都在背景
+    #[test]
+    fn looking_up_costs_the_ui_thread_under_2_ms() {
+        // 不存在的資料夾（背景只查得到「沒有這個檔案」）
+        let dir = std::env::temp_dir().join(format!("vitascope-lookup-cost-{}", std::process::id()));
+        let mut b = Bookmarks::default();
+        for i in 0..5000u64 {
+            let mut f = FileMarks::new(&dir.join(format!("第{i}集.mkv")).to_string_lossy());
+            f.size = Some(700_000_000 + i);
+            f.hash = Some(format!("{i:016x}"));
+            f.marks = vec![mark_at(100.0), mark_at(200.0), mark_at(300.0)];
+            b.files.insert(norm(&f.path), f);
+        }
+        let mut costs = Vec::new();
+        for i in 0..7 {
+            let key = dir.join(format!("沒有書籤的{i}.mkv")).to_string_lossy().into_owned();
+            let start = Instant::now();
+            b.recover(&key);
+            costs.push(start.elapsed());
+        }
+        costs.sort();
+        let median = costs[costs.len() / 2];
+        assert!(
+            median < Duration::from_millis(2),
+            "找搬家前的書籤花了 {median:?}（{costs:?}）"
+        );
+        wait_lookups(&mut b, 7);
+        assert_eq!(b.hash_reads(), 0, "目標不存在：不讀特徵碼");
+        // 背景查到大小之後，挑出一樣大的項目：也不到 2 毫秒
+        let mut costs = Vec::new();
+        for i in 0..7u64 {
+            let key = dir.join(format!("沒有書籤的{i}.mkv")).to_string_lossy().into_owned();
+            let generation = b.lookup_stats.latest.load(Ordering::Relaxed);
+            let start = Instant::now();
+            b.lookup_sized(key, generation, 700_000_000 + i * 700);
+            costs.push(start.elapsed());
+        }
+        costs.sort();
+        let median = costs[costs.len() / 2];
+        assert!(median < Duration::from_millis(2), "挑候選花了 {median:?}（{costs:?}）");
+        wait_lookups(&mut b, 14);
+    }
+
+    /// 使用者自己刪光的書籤不會從同樣內容的檔案複製回來：這次執行、下次執行、別的視窗刪的都一樣；再加書籤之後恢復正常
+    #[test]
+    fn emptied_files_are_not_refilled() {
+        let store = temp_file("emptied");
+        let dir = store.parent().unwrap();
+        let original = dir.join("原本.mkv");
+        fake_video(&original, 300_000, 11);
+        let mut b = Bookmarks::load_from(store.clone());
+        b.add(&key_of(&original), 10.0).unwrap();
+        b.add(&key_of(&original), 20.0).unwrap();
+        wait_hash(&mut b, &key_of(&original));
+        let copy = dir.join("複製.mkv");
+        std::fs::copy(&original, &copy).unwrap();
+        let mut n = 0;
+        let mut reopen = |b: &mut Bookmarks, key: &Path| {
+            n += 1;
+            b.refresh(&key_of(key));
+            b.recover(&key_of(key));
+            wait_lookups(b, n);
+        };
+        reopen(&mut b, &copy);
+        assert_eq!(times(b.marks(&key_of(&copy))), [10.0, 20.0], "第一次開：複製過來");
+        // 全部刪除，再開：不再複製回來
+        assert_eq!(b.clear(&key_of(&copy)), 2);
+        sync(&mut b);
+        b.take_recovered();
+        reopen(&mut b, &copy);
+        assert!(b.marks(&key_of(&copy)).is_empty(), "刪掉的書籤又回來了");
+        assert!(b.take_recovered().is_empty());
+        // 原檔也一樣（反過來：複製的那份還有書籤）
+        let first = b.add(&key_of(&copy), 30.0).unwrap();
+        sync(&mut b);
+        for m in b.marks(&key_of(&original)).to_vec() {
+            assert!(b.remove(&key_of(&original), m.id));
+        }
+        sync(&mut b);
+        reopen(&mut b, &original);
+        assert!(b.marks(&key_of(&original)).is_empty(), "一個一個刪光的也不複製回來");
+        // 下次執行也記得（存在書籤檔裡）
+        let mut later = Bookmarks::load_from(store.clone());
+        let mut m = 0;
+        for key in [&original, &copy] {
+            m += 1;
+            later.refresh(&key_of(key));
+            later.recover(&key_of(key));
+            wait_lookups(&mut later, m);
+        }
+        assert!(later.marks(&key_of(&original)).is_empty());
+        assert_eq!(
+            later.marks(&key_of(&copy)),
+            std::slice::from_ref(&first),
+            "再加了書籤：照常讀回"
+        );
+        assert!(later.emptied.contains(&norm(&key_of(&original))), "書籤檔裡記著");
+        assert_eq!(later.file_count(), 1, "沒有書籤的項目不算有書籤的檔案");
+        // 再加書籤：不再算刪光的
+        later.add(&key_of(&original), 5.0).unwrap();
+        sync(&mut later);
+        let reloaded = Bookmarks::load_from(store.clone());
+        assert!(reloaded.emptied.is_empty());
+        assert_eq!(times(reloaded.marks(&key_of(&original))), [5.0]);
+        // 別的視窗刪光的：開檔時讀回就知道，不複製
+        let mut other = Bookmarks::load_from(store.clone());
+        let backup = dir.join("備份.mkv");
+        std::fs::copy(&original, &backup).unwrap();
+        b.add(&key_of(&backup), 1.0).unwrap();
+        sync(&mut b);
+        other.refresh(&key_of(&backup));
+        assert!(other.flush(WAIT));
+        other.poll();
+        assert_eq!(other.clear(&key_of(&backup)), 1);
+        assert!(other.flush(WAIT));
+        reopen(&mut b, &backup);
+        assert!(b.marks(&key_of(&backup)).is_empty(), "別的視窗刪光的");
+        cleanup(&store);
+    }
+
+    /// 刪光書籤之後才收到找到的結果：寫入執行緒還沒回覆（介面自己記著），或是別的視窗刪光的、這個視窗還不知道
+    /// （寫入執行緒看磁碟上的版本不複製），都不把刪掉的書籤複製回來
+    #[test]
+    fn found_marks_never_refill_a_file_emptied_before_the_reply() {
+        let store = temp_file("emptied-race");
+        let dir = store.parent().unwrap();
+        let original = dir.join("原本.mkv");
+        fake_video(&original, 300_000, 21);
+        let (copy, backup) = (dir.join("複製.mkv"), dir.join("備份.mkv"));
+        std::fs::copy(&original, &copy).unwrap();
+        std::fs::copy(&original, &backup).unwrap();
+        let mut a = Bookmarks::load_from(store.clone());
+        a.add(&key_of(&original), 10.0).unwrap();
+        let hash = wait_hash(&mut a, &key_of(&original));
+        let found = |key: &Path| Same {
+            key: key_of(key),
+            from: key_of(&original),
+            moved: false,
+            size: 300_000,
+            hash: hash.clone(),
+        };
+        // 這個視窗：加了又全部刪除，沒等寫入執行緒回覆就收到結果
+        a.add(&key_of(&copy), 5.0).unwrap();
+        assert_eq!(a.clear(&key_of(&copy)), 1);
+        a.adopt(found(&copy));
+        assert!(a.marks(&key_of(&copy)).is_empty(), "刪掉的書籤又回來了");
+        // 一個一個刪光的也一樣
+        let third = dir.join("第三份.mkv");
+        std::fs::copy(&original, &third).unwrap();
+        let mark = a.add(&key_of(&third), 6.0).unwrap();
+        assert!(a.remove(&key_of(&third), mark.id));
+        a.adopt(found(&third));
+        assert!(a.marks(&key_of(&third)).is_empty(), "一個一個刪光的又回來了");
+        assert!(a.take_recovered().is_empty());
+        sync(&mut a);
+        assert!(a.marks(&key_of(&copy)).is_empty());
+        // 別的視窗加了又刪光（磁碟上留著沒有書籤的項目），這個視窗沒讀回過那個檔案
+        let mut b = Bookmarks::load_from(store.clone());
+        b.add(&key_of(&backup), 7.0).unwrap();
+        sync(&mut b);
+        assert_eq!(b.clear(&key_of(&backup)), 1);
+        sync(&mut b);
+        assert!(!a.emptied.contains(&norm(&key_of(&backup))), "這個視窗還不知道");
+        a.adopt(found(&backup));
+        sync(&mut a);
+        assert!(
+            Bookmarks::load_from(store.clone()).marks(&key_of(&backup)).is_empty(),
+            "寫入執行緒把書籤複製進別的視窗刪光的檔案"
+        );
+        assert!(a.marks(&key_of(&backup)).is_empty(), "讀回磁碟上的版本");
+        assert!(a.emptied.contains(&norm(&key_of(&backup))));
+        assert_eq!(times(a.marks(&key_of(&original))), [10.0], "原檔不動");
+        cleanup(&store);
+    }
+
+    /// 搬家時，別的視窗在原檔加的書籤（這個視窗還沒讀回）一起搬過來，不會隨著原本的項目被拿掉
+    #[test]
+    fn a_move_keeps_marks_another_window_added() {
+        let store = temp_file("move-two-windows");
+        let dir = store.parent().unwrap();
+        let before = dir.join("搬家前.mkv");
+        fake_video(&before, 300_000, 12);
+        let mut ours = Bookmarks::load_from(store.clone());
+        let mine = ours.add(&key_of(&before), 10.0).unwrap();
+        wait_hash(&mut ours, &key_of(&before));
+        // 另一個視窗在原檔加了一個書籤（這個視窗不知道）
+        let mut other = Bookmarks::load_from(store.clone());
+        other.add(&key_of(&before), 50.0).unwrap();
+        assert!(other.flush(WAIT));
+        let after = dir.join("搬家後.mkv");
+        std::fs::rename(&before, &after).unwrap();
+        ours.refresh(&key_of(&after));
+        ours.recover(&key_of(&after));
+        wait_lookups(&mut ours, 1);
+        assert_eq!(
+            ours.take_recovered(),
+            [Recovered {
+                key: key_of(&after),
+                count: 1,
+                moved: true
+            }]
+        );
+        let saved = on_disk(&store, &key_of(&after)).unwrap();
+        assert_eq!(times(&saved.marks), [10.0, 50.0], "兩個視窗的書籤都搬過來");
+        assert_eq!(saved.marks[0].id, mine.id);
+        assert!(on_disk(&store, &key_of(&before)).is_none());
+        assert_eq!(times(ours.marks(&key_of(&after))), [10.0, 50.0], "存檔後讀回");
+        // 寫入執行緒那一層：磁碟上的原檔多一個書籤、編號撞到目標的，換一個編號一起搬
+        let mut files = vec![FileMarks::new("a.mkv")];
+        files[0].marks = vec![mark_at(1.0), mark_at(2.0)];
+        let ui = vec![files[0].marks[0].clone()];
+        let mut clash = files[0].marks[1].clone();
+        clash.id = ui[0].id;
+        files[0].marks[1] = clash;
+        assert!(apply(
+            &mut files,
+            &Change::Adopt {
+                key: "b.mkv".into(),
+                from: "a.mkv".into(),
+                marks: ui.clone(),
+                moved: true,
+                size: 300_000,
+                hash: "00ff".into(),
+            },
+            &|_| None
+        ));
+        assert_eq!(files.len(), 1);
+        assert_eq!(times(&files[0].marks), [1.0, 2.0]);
+        assert_eq!(files[0].marks[0].id, ui[0].id);
+        assert_ne!(files[0].marks[1].id, ui[0].id, "撞號的換一個");
+        cleanup(&store);
+    }
+
+    /// 換了檔案（網址也算）之後才找到的結果不套用：書籤不會放到已經沒在播的檔案
+    #[test]
+    fn results_for_a_file_no_longer_open_are_dropped() {
+        let mut b = Bookmarks::default();
+        let mut source = FileMarks::new("/影片/原本.mkv");
+        source.size = Some(300_000);
+        source.hash = Some("00ff".into());
+        source.marks = vec![mark_at(10.0)];
+        b.files.insert(norm(&source.path), source);
+        // 假的背景執行緒：結果由測試送
+        let (jobs, _job_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        b.lookup = Some(Worker { tx: jobs, rx: done_rx });
+        let found = |generation| Done {
+            lookup: true,
+            same: Some(Same {
+                key: "/影片/複製.mkv".into(),
+                from: "/影片/原本.mkv".into(),
+                moved: false,
+                size: 300_000,
+                hash: "00ff".into(),
+            }),
+            generation,
+            ..Done::default()
+        };
+        for next in ["https://example.com/v.mp4", "/影片/別的.mkv"] {
+            b.recover("/影片/複製.mkv");
+            let generation = b.lookup_stats.latest.load(Ordering::Relaxed);
+            b.recover(next);
+            done_tx.send(found(generation)).unwrap();
+            b.poll();
+            assert!(b.marks("/影片/複製.mkv").is_empty(), "換成 {next} 之後套用了");
+            assert!(b.take_recovered().is_empty());
+        }
+        // 還開著：套用
+        b.recover("/影片/複製.mkv");
+        done_tx
+            .send(found(b.lookup_stats.latest.load(Ordering::Relaxed)))
+            .unwrap();
+        b.poll();
+        assert_eq!(times(b.marks("/影片/複製.mkv")), [10.0]);
+    }
+
+    /// 原檔都還在、有好幾個同樣內容的：從最近加過書籤的那個複製
+    #[test]
+    fn the_most_recently_bookmarked_twin_is_copied() {
+        let store = temp_file("newest-twin");
+        let dir = store.parent().unwrap();
+        let first = dir.join("第1份.mkv");
+        fake_video(&first, 300_000, 13);
+        let hash = crate::filehash::moviehash(&first).unwrap().unwrap().hex();
+        // 五份一樣的，第 3 份最近加過書籤（書籤檔、HashMap 裡的順序都跟這個無關）
+        let entries: Vec<_> = (1..=5u64)
+            .map(|i| {
+                let path = dir.join(format!("第{i}份.mkv"));
+                if i > 1 {
+                    std::fs::copy(&first, &path).unwrap();
+                }
+                let added = if i == 3 { 900 } else { 100 + i };
+                serde_json::json!({ "path": key_of(&path), "size": 300_000, "hash": hash,
+                    "marks": [ { "id": 1, "time": 5.0, "name": format!("第{i}份"), "added": added } ] })
+            })
+            .collect();
+        std::fs::write(&store, serde_json::json!({ "files": entries }).to_string()).unwrap();
+        let mut b = Bookmarks::load_from(store.clone());
+        let copy = dir.join("再一份.mkv");
+        std::fs::copy(&first, &copy).unwrap();
+        b.recover(&key_of(&copy));
+        wait_lookups(&mut b, 1);
+        assert_eq!(b.marks(&key_of(&copy))[0].name, "第3份");
+        cleanup(&store);
+    }
+
+    /// 找到之前使用者已經在開著的檔案加了書籤：合在一起，同一個位置的不重複，編號不重複
+    #[test]
+    fn found_marks_merge_with_marks_added_meanwhile() {
+        for moved in [false, true] {
+            let mut b = Bookmarks::default();
+            let mut source = FileMarks::new("/影片/原本.mkv");
+            source.marks = vec![mark_at(10.0), mark_at(20.0)];
+            let source_ids: Vec<u64> = source.marks.iter().map(|m| m.id).collect();
+            b.files.insert(norm(&source.path), source);
+            // 剛按了 P：一個在 10.2 秒（跟原檔的 10 秒是同一個位置），一個在 15 秒、編號跟原檔的 20 秒撞了
+            let target = "/影片/搬家後.mkv";
+            b.add(target, 10.2).unwrap();
+            b.add(target, 15.0).unwrap();
+            b.files.get_mut(&norm(target)).unwrap().marks[1].id = source_ids[1];
+            b.adopt(Same {
+                key: target.into(),
+                from: "/影片/原本.mkv".into(),
+                moved,
+                size: 300_000,
+                hash: "00ff".into(),
+            });
+            let marks = b.marks(target);
+            assert_eq!(times(marks), [10.2, 15.0, 20.0], "moved = {moved}");
+            let mut ids: Vec<u64> = marks.iter().map(|m| m.id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), 3, "編號不重複");
+            assert_eq!(
+                b.take_recovered(),
+                [Recovered {
+                    key: target.into(),
+                    count: 1,
+                    moved
+                }]
+            );
+            assert_eq!(b.marks("/影片/原本.mkv").is_empty(), moved);
+        }
+    }
+
+    /// 只放在記憶體的（網址含登入資訊的那種）：不找，也不當作候選
+    #[test]
+    fn in_memory_keys_are_neither_looked_up_nor_candidates() {
+        let mut b = Bookmarks::default();
+        let secret = "/影片/只放在記憶體.mkv";
+        assert!(b.keep_in_memory(secret));
+        b.add(secret, 1.0).unwrap();
+        let f = b.files.get_mut(&norm(secret)).unwrap();
+        f.size = Some(300_000);
+        f.hash = Some("00ff".into());
+        b.recover(secret);
+        b.recover("/影片/別的.mkv");
+        assert!(b.lookup.is_none(), "沒有候選：不開背景執行緒、不讀檔案");
+        assert_eq!(b.lookups_finished(), 1, "只有別的那一個找了（沒有候選，馬上做完）");
+        // 直接交給它一個結果：也不放進只放在記憶體的檔案
+        b.adopt(Same {
+            key: secret.into(),
+            from: "/影片/別的.mkv".into(),
+            moved: false,
+            size: 300_000,
+            hash: "00ff".into(),
+        });
+        assert_eq!(times(b.marks(secret)), [1.0]);
+    }
+
+    /// 用別的寫法開了同一個檔案（這裡是硬連結）：不複製一份各改各的
+    #[test]
+    fn the_same_file_under_another_name_is_not_a_copy() {
+        let store = temp_file("same-file");
+        let dir = store.parent().unwrap();
+        let original = dir.join("原本.mkv");
+        fake_video(&original, 300_000, 14);
+        let mut b = Bookmarks::load_from(store.clone());
+        b.add(&key_of(&original), 10.0).unwrap();
+        wait_hash(&mut b, &key_of(&original));
+        let link = dir.join("連結.mkv");
+        std::fs::hard_link(&original, &link).unwrap();
+        let reads = b.hash_reads();
+        b.refresh(&key_of(&link));
+        b.recover(&key_of(&link));
+        wait_lookups(&mut b, 1);
+        assert_eq!(b.hash_reads(), reads + 1, "比對過了（讀了開的檔案）");
+        assert!(b.marks(&key_of(&link)).is_empty());
+        assert!(b.take_recovered().is_empty());
+        cleanup(&store);
     }
 }

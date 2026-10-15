@@ -22787,3 +22787,196 @@ fn a_search_that_ends_after_the_video_changed_is_greyed() {
     h.get_by_label("影片已經換了，請重新搜尋");
     assert!(online_button(&h, "下載並載入", 0).accesskit_node().is_disabled());
 }
+
+// ───────────── 書籤：影片搬家或改名後找回（G7） ─────────────
+
+/// 放一份 90 秒的樣本（大於 128 KiB，有特徵碼）到 `path`
+fn long_clip(path: &std::path::Path) -> PathBuf {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::copy(sample("common/mp4_long.mp4"), path).unwrap();
+    assert!(
+        std::fs::metadata(path).unwrap().len() >= vitascope::filehash::MIN_SIZE,
+        "樣本要大於 128 KiB"
+    );
+    path.to_path_buf()
+}
+
+/// 用 `store` 的書籤檔開 `file`（不等開始播放：找回書籤可能在開檔後幾幀就做完，提示要邊等邊看）
+fn bookmarks_store_launch(
+    store: &std::path::Path,
+    file: PathBuf,
+    settings: Settings,
+) -> Harness<'static, VitascopeApp> {
+    let launch = Launch {
+        files: vec![file],
+        bookmarks: vitascope::bookmarks::Bookmarks::load_from(store.to_path_buf()),
+        ..Default::default()
+    };
+    harness_launch(launch, settings)
+}
+
+fn current_key(h: &Harness<'_, VitascopeApp>) -> String {
+    h.state().player().state.path.clone().unwrap_or_default()
+}
+
+/// 等開始播放 `name`（知道影片尺寸、視窗調整完）而且它有 `marks` 個書籤，每一幀記下提示
+/// （提示 1.5 秒就消失：CI 比較慢時，等完視窗調整再看可能已經不見了）
+fn settle_with_marks(h: &mut Harness<'_, VitascopeApp>, seen: &mut Seen, name: &str, marks: usize) {
+    step_until_seen(h, seen, "開始播放、找回書籤", |app| {
+        let s = &app.player().state;
+        playing(s, name)
+            && s.video_size.is_some()
+            && !app.window_fit_pending()
+            && s.path
+                .as_deref()
+                .is_some_and(|p| app.bookmarks().marks(p).len() == marks)
+    });
+    run_steps_seen(h, seen, 5);
+}
+
+/// 複製了一份再開：從原檔複製書籤（兩個檔案都有）；原檔搬走、改名之後再開：書籤搬過去（原本的項目拿掉，複製的那份不動）
+#[test]
+fn copied_and_moved_files_find_their_bookmarks() {
+    let dir = TempDir::new("bookmarks-recover");
+    let store = dir.0.join("bookmarks.json");
+    let original = long_clip(&dir.0.join("下載").join("第1集.mp4"));
+    let mut h = bookmarks_store_launch(&store, original.clone(), no_auto_next());
+    settle(&mut h, "第1集.mp4");
+    h.key_press(egui::Key::Space);
+    step_until(&mut h, "暫停", |s| s.paused);
+    paused_at(&mut h, 5.0);
+    h.key_press(egui::Key::P);
+    h.run_steps(2);
+    let original_key = current_key(&h);
+    // 加了書籤：背景記下大小和特徵碼
+    step_until_app(&mut h, "記下特徵碼", |app| {
+        app.bookmarks().file(&original_key).is_some_and(|f| f.hash.is_some())
+    });
+    let original_id = h.state().bookmarks().marks(&original_key)[0].id;
+    // 複製一份到別的資料夾再開
+    let copy = dir.0.join("備份").join("第一集（複製）.mp4");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::copy(&original, &copy).unwrap();
+    let mut seen = Seen::default();
+    drop_file(&mut h, copy.clone());
+    settle_with_marks(&mut h, &mut seen, "第一集（複製）.mp4", 1);
+    let copy_key = current_key(&h);
+    assert!(
+        seen.osd.iter().any(|t| t == "從同樣內容的檔案複製了 1 個書籤"),
+        "{:?}",
+        seen.osd
+    );
+    let copied = h.state().bookmarks().marks(&copy_key).to_vec();
+    assert_eq!(copied.len(), 1);
+    assert!((copied[0].time - 5.0).abs() < 0.05);
+    assert_ne!(copied[0].id, original_id, "複製的書籤用新的編號");
+    assert_eq!(h.state().bookmarks().marks(&original_key).len(), 1, "原檔的書籤還在");
+    // 書籤分頁、進度條用的就是這個檔案的書籤
+    assert_eq!(mark_times(&h).len(), 1);
+    // 原檔搬到別的資料夾、改名
+    let moved = dir.0.join("動畫").join("第 1 集.mp4");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    // Windows 上播放器還開著複製的那一個，原檔沒有被開著：可以搬
+    std::fs::rename(&original, &moved).unwrap();
+    let mut seen = Seen::default();
+    drop_file(&mut h, moved.clone());
+    settle_with_marks(&mut h, &mut seen, "第 1 集.mp4", 1);
+    let moved_key = current_key(&h);
+    assert!(
+        seen.osd.iter().any(|t| t == "找到這個檔案搬家前的 1 個書籤"),
+        "{:?}",
+        seen.osd
+    );
+    let b = h.state().bookmarks();
+    assert_eq!(
+        b.marks(&moved_key)[0].id,
+        original_id,
+        "原檔不在了：搬過來（編號不變），不是從複製的那份複製"
+    );
+    assert!(b.marks(&original_key).is_empty(), "原本的項目拿掉");
+    assert_eq!(b.marks(&copy_key).len(), 1, "複製的那份不動");
+    assert!(b.flush(TIMEOUT), "背景存檔");
+    let saved = vitascope::bookmarks::Bookmarks::load_from(store.clone());
+    assert!(saved.file(&original_key).is_none());
+    assert_eq!(saved.marks(&moved_key), b.marks(&moved_key));
+    assert_eq!(saved.marks(&copy_key), b.marks(&copy_key));
+    assert_eq!(
+        saved.file(&moved_key).unwrap().hash,
+        saved.file(&copy_key).unwrap().hash
+    );
+}
+
+/// 上次執行時加的書籤（書籤檔裡記了大小、特徵碼），原檔已經搬走：開新的位置時找回；英文介面的提示
+#[test]
+fn moved_file_bookmarks_in_english() {
+    let dir = TempDir::new("bookmarks-recover-en");
+    let store = dir.0.join("bookmarks.json");
+    let video = long_clip(&dir.0.join("new place").join("episode.mp4"));
+    let hash = vitascope::filehash::moviehash(&video).unwrap().unwrap();
+    let old = dir.0.join("old place").join("episode.mp4");
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    let entry = serde_json::json!({ "files": [ {
+        "path": old.to_string_lossy(), "size": hash.size, "hash": hash.hex(),
+        "marks": [
+            { "id": 11, "time": 2.0, "name": "OP", "added": 1_760_000_000u64 },
+            { "id": 12, "time": 40.0, "name": "", "added": 1_760_000_100u64 }
+        ] } ] });
+    std::fs::write(&store, entry.to_string()).unwrap();
+    let mut settings = no_auto_next();
+    settings.language = vitascope::i18n::Lang::En;
+    let mut h = bookmarks_store_launch(&store, video.clone(), settings);
+    let mut seen = Seen::default();
+    settle_with_marks(&mut h, &mut seen, "episode.mp4", 2);
+    assert!(
+        seen.osd
+            .iter()
+            .any(|t| t == "Found 2 bookmarks from before this file was moved"),
+        "{:?}",
+        seen.osd
+    );
+    assert_eq!(mark_times(&h), [2.0, 40.0]);
+    assert!(h.state().bookmarks().marks(&old.to_string_lossy()).is_empty());
+    // 再複製一份開：英文的「複製」提示
+    let copy = dir.0.join("backup").join("episode copy.mp4");
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::copy(&video, &copy).unwrap();
+    let mut seen = Seen::default();
+    drop_file(&mut h, copy);
+    settle_with_marks(&mut h, &mut seen, "episode copy.mp4", 2);
+    assert!(
+        seen.osd
+            .iter()
+            .any(|t| t == "Copied 2 bookmarks from a file with the same content"),
+        "{:?}",
+        seen.osd
+    );
+}
+
+/// 大小不同：只看檔案資訊，不讀特徵碼；書籤不會跑到不相干的檔案。網址不找
+#[test]
+fn bookmark_lookup_skips_other_sizes_and_urls() {
+    let server = Server::start();
+    let dir = TempDir::new("bookmarks-recover-size");
+    let store = dir.0.join("bookmarks.json");
+    let video = long_clip(&dir.0.join("影片.mp4"));
+    let size = std::fs::metadata(&video).unwrap().len();
+    let other = dir.0.join("別的.mp4");
+    let entry = serde_json::json!({ "files": [ {
+        "path": other.to_string_lossy(), "size": size + 1, "hash": "0123456789abcdef",
+        "marks": [ { "id": 3, "time": 1.0, "name": "", "added": 1u64 } ] } ] });
+    std::fs::write(&store, entry.to_string()).unwrap();
+    let mut h = bookmarks_store_launch(&store, video, no_auto_next());
+    settle(&mut h, "影片.mp4");
+    step_until_app(&mut h, "找完", |app| app.bookmarks().lookups_finished() >= 1);
+    h.run_steps(2);
+    let b = h.state().bookmarks();
+    assert_eq!(b.hash_reads(), 0, "大小不同就不讀特徵碼");
+    assert!(b.marks(&current_key(&h)).is_empty());
+    assert_eq!(b.marks(&other.to_string_lossy()).len(), 1);
+    // 網址：不找
+    let url = server.file_url("common/mp4_h264_aac.mp4");
+    h.event(egui::Event::Paste(url.clone()));
+    step_until_net(&mut h, "播網址", |app| playing_url(&app.player().state, &url));
+    h.run_steps(5);
+    assert_eq!(h.state().bookmarks().lookups_finished(), 1, "網址不找");
+}

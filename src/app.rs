@@ -2626,6 +2626,8 @@ impl VitascopeApp {
         } else {
             self.bookmarks.refresh(&key);
         }
+        // 本機檔案沒有書籤時，在背景找搬家、改名前的書籤。網址不找，但也要叫：之前的檔案還在找的就不套用了
+        self.bookmarks.recover(&key);
         // 書籤分頁上選取的是上一個檔案的書籤
         self.bookmark_selected = None;
         if let Some((video, subs)) = self.pending_subs.take()

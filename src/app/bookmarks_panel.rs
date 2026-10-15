@@ -30,6 +30,23 @@ pub(super) fn marks_in_memory_only(path: &str, key: &str) -> bool {
     crate::net::is_network(path) && !crate::net::storable(key)
 }
 
+/// 找回書籤的提示
+fn recovered_osd(r: &bookmarks::Recovered) -> String {
+    let n = r.count;
+    let s = if n == 1 { "" } else { "s" };
+    if r.moved {
+        tf!(
+            "找到這個檔案搬家前的 {n} 個書籤",
+            "Found {n} bookmark{s} from before this file was moved"
+        )
+    } else {
+        tf!(
+            "從同樣內容的檔案複製了 {n} 個書籤",
+            "Copied {n} bookmark{s} from a file with the same content"
+        )
+    }
+}
+
 /// 書籤分頁上正在改名的書籤（Enter、點別的地方 = 改好；Esc = 不改）
 pub(super) struct RenameEdit {
     /// 哪個檔案的書籤（換了檔案就不改了）
@@ -82,6 +99,12 @@ impl VitascopeApp {
     pub(super) fn poll_bookmarks(&mut self) {
         for e in self.bookmarks.poll() {
             self.osd(crate::tf!("無法儲存書籤：{e}", "Couldn't save bookmarks: {e}"));
+        }
+        // 找回了搬家、改名的檔案的書籤：還開著那個檔案才提示（已經換了檔案就不打擾）
+        for r in self.bookmarks.take_recovered() {
+            if self.media_key().is_some_and(|k| bookmarks::same_key(&k, &r.key)) {
+                self.osd(recovered_osd(&r));
+            }
         }
     }
 
@@ -791,6 +814,37 @@ mod tests {
         assert_eq!(clear_question(2), "Delete all 2 bookmarks of this file?");
         assert_eq!(cleared_osd(1), "Deleted 1 bookmark");
         assert_eq!(cleared_osd(4), "Deleted 4 bookmarks");
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+    }
+
+    /// 找回書籤的提示：兩種語言，英文分單複數
+    #[test]
+    fn recovered_osd_texts() {
+        let r = |count, moved| bookmarks::Recovered {
+            key: "a.mkv".into(),
+            count,
+            moved,
+        };
+        crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
+        assert_eq!(recovered_osd(&r(3, true)), "找到這個檔案搬家前的 3 個書籤");
+        assert_eq!(recovered_osd(&r(1, false)), "從同樣內容的檔案複製了 1 個書籤");
+        crate::i18n::set_lang(crate::i18n::Lang::En);
+        assert_eq!(
+            recovered_osd(&r(1, true)),
+            "Found 1 bookmark from before this file was moved"
+        );
+        assert_eq!(
+            recovered_osd(&r(2, true)),
+            "Found 2 bookmarks from before this file was moved"
+        );
+        assert_eq!(
+            recovered_osd(&r(1, false)),
+            "Copied 1 bookmark from a file with the same content"
+        );
+        assert_eq!(
+            recovered_osd(&r(5, false)),
+            "Copied 5 bookmarks from a file with the same content"
+        );
         crate::i18n::set_lang(crate::i18n::Lang::ZhTw);
     }
 }
