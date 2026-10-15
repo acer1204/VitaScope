@@ -1419,14 +1419,20 @@ fn clip_audio_only() {
 
 #[test]
 fn clip_keeps_rotation() {
-    // 手機直拍（檔案標示旋轉 90°）：寫出來的片段也標示一樣的旋轉。MKV 的樣本舊版 ffmpeg 做不出來，沒有就略過
+    // 手機直拍（檔案標示旋轉 90°）：寫出來的片段也標示一樣的旋轉。MKV 的樣本放在「罕見」（系統的 mpv 0.37 沒有把
+    // Matroska 的 ProjectionPoseRoll 反過來，格式矩陣在那裡讀到 270 度；不是 ffmpeg 做不出來）。樣本沒有就略過
     let dirs = clip_dirs("rotation");
     for rel in ["common/mov_hevc_aac_rot90.mov", "rare/mkv_hevc_aac_rot90.mkv"] {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("samples/generated")
             .join(rel);
         if !path.exists() {
-            eprintln!("略過 {rel}：沒有這個樣本（舊版 ffmpeg 寫不出 MKV 的旋轉）");
+            let tier = if rel.starts_with("rare/") {
+                "；MKV 的放在「罕見」是因為系統的 mpv 0.37 沒有把 ProjectionPoseRoll 反過來，不是產生不出來"
+            } else {
+                ""
+            };
+            eprintln!("略過 {rel}：沒有這個樣本（用 python scripts/gen_samples.py 產生{tier}）");
             continue;
         }
         let (mut p, caps) = main_player(&path.to_string_lossy());
