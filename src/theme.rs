@@ -328,7 +328,7 @@ impl Palette {
 ///   ← → ↑ ↓ 在快捷鍵說明裡是按鍵名稱（文字），不算圖示。
 pub const ICONS: &[&str] = &[
     "⏮", "⏸", "▶", "⏭", "⏹", "⛶", "🗁", "ℹ", "☰", "🔇", "🔊", "↺", "◀", "⚠", "♪", "×", "•", "🔀", "🔁", "🔂", "⏳", "🗗",
-    "🗖", "▣",
+    "🗖", "▣", "✔",
 ];
 
 /// Linux：桌面的設定 portal（`org.freedesktop.portal.Settings`）的深淺色（`org.freedesktop.appearance` 的 `color-scheme`）。

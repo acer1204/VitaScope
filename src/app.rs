@@ -11,6 +11,7 @@ mod info_panel;
 mod install;
 mod media;
 mod network;
+mod online_subs;
 mod pacing;
 mod play_order;
 mod playlist_panel;
@@ -245,6 +246,8 @@ enum Action {
     SetMiniOnTop(bool),
     /// 子母畫面開 / 關（Ctrl（⌘）+ Shift + P、右鍵選單、迷你控制列的 ▣）
     TogglePip,
+    /// 線上搜尋字幕的視窗（字幕選單、快捷鍵）
+    SearchSubtitles,
 }
 
 /// 起始畫面上按的
@@ -265,14 +268,16 @@ enum EscWindow {
     SubtitleStyle,
     ControlPanel,
     Export,
+    OnlineSubs,
     Settings,
     MediaInfo,
 }
 
-const ESC_WINDOWS: [EscWindow; 5] = [
+const ESC_WINDOWS: [EscWindow; 6] = [
     EscWindow::SubtitleStyle,
     EscWindow::ControlPanel,
     EscWindow::Export,
+    EscWindow::OnlineSubs,
     EscWindow::Settings,
     EscWindow::MediaInfo,
 ];
@@ -382,6 +387,8 @@ pub struct VitascopeApp {
     cache_root: Option<PathBuf>,
     /// 線上搜尋字幕的環境（連線、金鑰、存檔的地方）：預設離線，只有 main.rs 設成真的
     online: crate::online_subs::OnlineEnv,
+    /// 線上搜尋字幕的視窗、登入、這次下載過的
+    online_subs: online_subs::OnlineSubsUi,
     /// 啟動時在背景清掉上次匯出留下的暫存檔（資料夾可能在網路磁碟上，不在介面執行緒做）
     leftover_sweep: Option<std::thread::JoinHandle<usize>>,
     /// 已經提示過「書籤只保留到關閉影戲」的檔案（書籤的代號）
@@ -862,6 +869,8 @@ impl VitascopeApp {
         });
         // 系統的媒體控制：第一次有檔案載入時才建立（快取資料夾裡一天以上的舊封面在背景清掉）
         let media = media::MediaUi::new(launch.media, launch.cache_root.as_deref());
+        // OpenSubtitles 的登入狀態檔（自動測試沒有：只放在記憶體）
+        let online_subs = online_subs::OnlineSubsUi::new(launch.online.session_file.clone());
         let mut app = Self {
             player,
             video,
@@ -911,6 +920,7 @@ impl VitascopeApp {
             leftover_sweep,
             cache_root: launch.cache_root,
             online: launch.online,
+            online_subs,
             private_marks_told: Default::default(),
             was_eof: false,
             wheel: 0.0,
@@ -1653,6 +1663,13 @@ impl VitascopeApp {
             Action::ToggleBookmarks if self.compact() || self.modes.restoring() => {
                 self.side_after_leaving(ctx, SideTab::Bookmarks)
             }
+            // 線上搜尋字幕：迷你播放器裡已經開著（藏起來）的再打開一次，直接回到一般視窗；
+            // 關著的照常打開，`compact_window_check` 看到多開了大視窗就回到一般視窗
+            Action::SearchSubtitles if self.compact() && self.online_subs.open => {
+                self.show_online_subs();
+                self.leave_compact(ctx, window_modes::Then::Nothing);
+            }
+            Action::SearchSubtitles => self.show_online_subs(),
             Action::Settings | Action::ToggleControlPanel | Action::About | Action::SubtitleStyle if self.compact() => {
                 match action {
                     Action::Settings => self.settings_open = true,
@@ -3043,6 +3060,7 @@ impl VitascopeApp {
             Command::ToggleSmooth => Action::ToggleSmooth,
             Command::ScreenshotAs => Action::ScreenshotAs,
             Command::LoadSubtitle => Action::LoadSubtitle,
+            Command::SearchSubtitles => Action::SearchSubtitles,
             Command::BookmarkAdd => Action::BookmarkAdd,
             Command::BookmarkPrev => Action::BookmarkStep(-1),
             Command::BookmarkNext => Action::BookmarkStep(1),
@@ -3070,6 +3088,7 @@ impl VitascopeApp {
             EscWindow::SubtitleStyle => self.sub_style_open,
             EscWindow::ControlPanel => self.panel_open,
             EscWindow::Export => self.export.open,
+            EscWindow::OnlineSubs => self.online_subs.open,
             EscWindow::Settings => self.settings_open,
             EscWindow::MediaInfo => self.info_open,
         }
@@ -3083,6 +3102,8 @@ impl VitascopeApp {
             }
             EscWindow::ControlPanel => self.panel_open = false,
             EscWindow::Export => self.export.open = false,
+            // 正在下載的一起取消（R-B10）
+            EscWindow::OnlineSubs => self.close_online_subs(),
             EscWindow::Settings => self.settings_open = false,
             EscWindow::MediaInfo => self.info_open = false,
         }
@@ -4642,6 +4663,7 @@ impl VitascopeApp {
         } else {
             String::new()
         };
+        let search_hint = self.keymap.hint(Command::SearchSubtitles);
         // 選中的是外掛文字字幕：可以換編碼重新載入
         let encoding = st
             .selected(kind)
@@ -4763,6 +4785,17 @@ impl VitascopeApp {
                     } else {
                         Action::LoadAudio
                     });
+                }
+                // 線上搜尋字幕（G6）：跟「載入字幕檔…」放在一起
+                if is_sub
+                    && menu_item(
+                        ui,
+                        true,
+                        crate::tr!("線上搜尋字幕…", "Search subtitles online…"),
+                        &search_hint,
+                    )
+                {
+                    action = Some(Action::SearchSubtitles);
                 }
                 if is_sub && ui.button(crate::tr!("字幕外觀…", "Subtitle style…")).clicked() {
                     action = Some(Action::SubtitleStyle);
@@ -5018,6 +5051,8 @@ impl eframe::App for VitascopeApp {
         self.poll_screenshots(ctx);
         // 匯出的進度、結果（換了檔案時，匯出視窗的軌道、檔名跟著新的檔案）
         self.poll_export();
+        // 線上搜尋字幕：換了影片、背景工作的結果（視窗關著也收）
+        self.online_subs_tick();
         self.poll_previews(ctx);
         self.poll_folder_add();
         self.poll_dialog();
@@ -5200,6 +5235,10 @@ impl eframe::App for VitascopeApp {
             self.settings_window(&ctx);
             self.control_panel(&ctx);
             self.export_window(&ctx);
+            self.online_subs_window(&ctx);
+            // OpenSubtitles 的登入（視窗、設定頁都能打開）：蓋在它們上面。那兩個視窗在迷你播放器、子母畫面裡
+            // 藏起來，登入對話框也一樣（下載在那裡要登入時先等著，回到一般視窗才出現）
+            self.online_login_modal(&ctx);
         }
         // 同意下載、確認移除：在設定視窗之後畫（從設定頁按的，對話框要蓋在設定視窗上面）
         self.install_modals(&ctx);
@@ -5236,6 +5275,8 @@ impl eframe::App for VitascopeApp {
         self.cancel_install();
         // 匯出到一半：取消、最多等一下、刪掉暫存檔（`Job` 被丟掉時做；寫檔中停不下來的，寫完由背景執行緒刪掉）
         self.export.abandon();
+        // 線上字幕下載到一半：取消（不登出 OpenSubtitles：登入狀態只在按「登出」時清掉，R-C2）
+        self.online_subs.abandon();
         // 剛加的書籤還在背景存檔：等它寫完（最多兩秒），結束程式時背景執行緒會直接被停掉
         if !self.bookmarks.flush(Duration::from_secs(2)) {
             eprintln!("[vitascope] 書籤還沒存完就結束了");

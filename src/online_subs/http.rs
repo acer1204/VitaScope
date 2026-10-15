@@ -3,9 +3,15 @@
 //!
 //! - 4xx / 5xx 不當成錯誤：兩個 API 的錯誤原因都在回應內容裡（`http_status_as_error(false)`），由各來源自己解讀。
 //! - 兩種連線（R-B7）：
-//!   - API（[`Kind::Api`]）：同一台主機的轉址保留 `Authorization`（OpenSubtitles 的 vip-api 一定要 JWT；
-//!     射手網（偽）的 Token 也在這個標頭），換主機就拿掉；最多轉址 [`MAX_API_REDIRECTS`] 次；整個請求 20 秒。
-//!   - 暫時的下載連結（[`Kind::Download`]）：轉址一律拿掉 `Authorization`（本來也不送），整個請求 30 秒。
+//!   - API（[`Kind::Api`]）：最多轉址 [`MAX_API_REDIRECTS`] 次；整個請求（含轉址）20 秒。
+//!   - 暫時的下載連結（[`Kind::Download`]）：最多轉址 [`MAX_DOWNLOAD_REDIRECTS`] 次；整個請求 30 秒。
+//! - **轉址自己跟**（ureq 不跟：它換主機時只拿掉 `Authorization`，影戲的 `Api-Key` 會跟著送到別的主機）：
+//!   - API 的轉址目的地跟原本的請求是同一個來源（https、主機、埠都一樣）時，標頭照舊（OpenSubtitles 的 vip-api
+//!     一定要 JWT；射手網（偽）的 Token 也在 `Authorization`）；
+//!   - 換了來源（API），或下載連結的任何轉址：只留 [`SAFE_ON_REDIRECT`] 的標頭（`Accept`），金鑰、登入憑證、
+//!     Token 一律不送，之後再轉回原本的主機也不再加回來。新加的秘密標頭不用另外登記，預設就不會跟著轉址；
+//!   - 303、以及 301 / 302 的 POST、DELETE 改成不帶內容的 GET（跟瀏覽器、curl 一樣）；307 / 308 照原本的方法與內容，
+//!     但只在同一個來源裡跟：POST 的內容（登入的帳號密碼）、DELETE 不送到別的來源，3xx 直接交回去（ureq 也不跟）。
 //!   - 兩種都只能用 https（射手網（偽）的 `http://` 下載網址先改成 https，不退回 http：R-C5）；連線最多等 10 秒；
 //!     User-Agent 是 OpenSubtitles 規定的 `VitaScope vX.Y.Z`；proxy 照環境變數。這些共同的設定來自
 //!     `crate::web::agent_base`（跟下載 yt-dlp 的連線同一份）。
@@ -14,7 +20,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 連線（含 TLS 交握）最多等多久（跟下載 yt-dlp 的連線一樣：`crate::web::agent_base`）
 pub const CONNECT_TIMEOUT: Duration = crate::web::CONNECT_TIMEOUT;
@@ -26,6 +32,8 @@ pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_API_REDIRECTS: u32 = 3;
 /// 下載連結最多轉址幾次
 pub const MAX_DOWNLOAD_REDIRECTS: u32 = 5;
+/// 轉址到別的來源（或下載連結的轉址）時還帶著的標頭（名稱小寫）：都不是秘密
+pub const SAFE_ON_REDIRECT: [&str; 1] = ["accept"];
 /// OpenSubtitles 規定的 User-Agent 寫法（`App vX.Y.Z`；跟檢查更新的 `VitaScope/x.y.z` 不同）
 pub const USER_AGENT: &str = concat!("VitaScope v", env!("CARGO_PKG_VERSION"));
 
@@ -50,9 +58,9 @@ impl Method {
 /// 用哪一種連線
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// API：同一台主機的轉址保留 `Authorization`
+    /// API：轉址到同一個來源（https、主機、埠）時標頭照舊，換了來源就只留 [`SAFE_ON_REDIRECT`]
     Api,
-    /// 暫時的下載連結：轉址一律拿掉 `Authorization`
+    /// 暫時的下載連結：任何轉址都只留 [`SAFE_ON_REDIRECT`]
     Download,
 }
 
@@ -188,6 +196,9 @@ impl Http for OfflineHttp {
 pub struct UreqHttp {
     api: ureq::Agent,
     download: ureq::Agent,
+    /// 整個請求（含轉址、讀內容）最多多久
+    api_timeout: Duration,
+    download_timeout: Duration,
     debug: bool,
 }
 
@@ -227,65 +238,108 @@ impl UreqHttp {
     /// 測試用：自己指定選項
     #[doc(hidden)]
     pub fn with_options(o: UreqOptions) -> UreqHttp {
-        let agent = |kind: Kind| -> ureq::Agent {
-            let (timeout, redirects, auth) = match kind {
-                Kind::Api => (
-                    o.api_timeout,
-                    MAX_API_REDIRECTS,
-                    ureq::config::RedirectAuthHeaders::SameHost,
-                ),
-                Kind::Download => (
-                    o.download_timeout,
-                    MAX_DOWNLOAD_REDIRECTS,
-                    ureq::config::RedirectAuthHeaders::Never,
-                ),
-            };
-            // 共同的部分（連線逾時、https、proxy、狀態碼）跟 web.rs 一樣；這裡加上整個請求的時間限制
-            // （API 的回應很小，不像 web.rs 的大檔案下載要用「沒有進度」判斷）、轉址規則與 OpenSubtitles 規定的 User-Agent
+        // 共同的部分（連線逾時、https、proxy、狀態碼）跟 web.rs 一樣；這裡加上 OpenSubtitles 規定的 User-Agent。
+        // ureq 不跟轉址（`max_redirects(0)`：3xx 直接回來），由 `call` 自己跟，才管得到每一站送哪些標頭；
+        // 整個請求的時間限制也在 `call` 每一站設剩下的時間（含讀內容）
+        let agent = || -> ureq::Agent {
             crate::web::agent_base(o.proxy_from_env, o.https_only)
-                .timeout_global(Some(timeout))
                 .user_agent(USER_AGENT)
-                .max_redirects(redirects)
-                .redirect_auth_headers(auth)
+                .max_redirects(0)
                 .build()
                 .into()
         };
         UreqHttp {
-            api: agent(Kind::Api),
-            download: agent(Kind::Download),
+            api: agent(),
+            download: agent(),
+            api_timeout: o.api_timeout,
+            download_timeout: o.download_timeout,
             debug: std::env::var_os("VITASCOPE_DEBUG_ONLINE").is_some(),
         }
     }
 
-    fn call(&self, req: &Request) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-        let agent = match req.kind {
-            Kind::Api => &self.api,
-            Kind::Download => &self.download,
-        };
-        match req.method {
-            Method::Get => {
-                let mut b = agent.get(&req.url);
-                for (n, v) in &req.headers {
+    /// 送出一站（不跟轉址）：`timeout` = 這一站（含讀內容）最多多久
+    fn hop(
+        agent: &ureq::Agent,
+        method: Method,
+        url: &str,
+        headers: &[(String, String)],
+        body: Option<&str>,
+        timeout: Duration,
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        macro_rules! go {
+            ($b:expr, $send:ident $(, $arg:expr)?) => {{
+                let mut b = $b;
+                for (n, v) in headers {
                     b = b.header(n.as_str(), v.as_str());
                 }
-                b.call()
-            }
-            Method::Delete => {
-                let mut b = agent.delete(&req.url);
-                for (n, v) in &req.headers {
-                    b = b.header(n.as_str(), v.as_str());
-                }
-                b.call()
-            }
-            Method::Post => {
-                let mut b = agent.post(&req.url);
-                for (n, v) in &req.headers {
-                    b = b.header(n.as_str(), v.as_str());
-                }
-                b.send(req.body.as_deref().unwrap_or_default().as_bytes())
-            }
+                b.config().timeout_global(Some(timeout)).build().$send($($arg)?)
+            }};
+        }
+        match method {
+            Method::Get => go!(agent.get(url), call),
+            Method::Delete => go!(agent.delete(url), call),
+            Method::Post => go!(agent.post(url), send, body.unwrap_or_default().as_bytes()),
         }
     }
+
+    /// 送出請求、自己跟轉址（見模組說明）：每一站決定還帶哪些標頭，次數、總時間有上限
+    fn call(&self, req: &Request) -> Result<ureq::http::Response<ureq::Body>, Transport> {
+        let (agent, max_redirects, budget) = match req.kind {
+            Kind::Api => (&self.api, MAX_API_REDIRECTS, self.api_timeout),
+            Kind::Download => (&self.download, MAX_DOWNLOAD_REDIRECTS, self.download_timeout),
+        };
+        let deadline = Instant::now() + budget;
+        let first = url::Url::parse(&req.url).map_err(|e| Transport::Connect(e.to_string()))?;
+        let mut url = first.clone();
+        let mut method = req.method;
+        let mut body = req.body.clone();
+        let mut headers = req.headers.clone();
+        let mut hops = 0;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(Transport::Timeout);
+            }
+            let resp =
+                Self::hop(agent, method, url.as_str(), &headers, body.as_deref(), left).map_err(transport_error)?;
+            let status = resp.status().as_u16();
+            let location = matches!(status, 301 | 302 | 303 | 307 | 308)
+                .then(|| resp.headers().get("location").and_then(|v| v.to_str().ok()))
+                .flatten();
+            let Some(location) = location else {
+                return Ok(resp);
+            };
+            if hops >= max_redirects {
+                return Err(Transport::Connect(format!("too many redirects (> {max_redirects})")));
+            }
+            let next = url.join(location).map_err(|e| Transport::Connect(e.to_string()))?;
+            let leaves_home = req.kind == Kind::Download || !same_origin(&first, &next);
+            // 307 / 308 要照原本的方法與內容再送一次：POST 的內容（登入的帳號密碼）、DELETE 只送到原本的來源。
+            // 換了來源就不跟，把 3xx 交回去（跟 ureq 一樣：它從不跟著轉送有內容的請求）
+            if matches!(status, 307 | 308) && method != Method::Get && leaves_home {
+                return Ok(resp);
+            }
+            hops += 1;
+            // 303、301 / 302 的 POST、DELETE：改成不帶內容的 GET
+            if status == 303 || (matches!(status, 301 | 302) && method != Method::Get) {
+                method = Method::Get;
+                body = None;
+                headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-type"));
+            }
+            // 金鑰、登入憑證、Token 只送到原本的來源（API）；下載連結的轉址一律不送。拿掉之後不再加回來
+            if leaves_home {
+                headers.retain(|(n, _)| SAFE_ON_REDIRECT.contains(&n.to_ascii_lowercase().as_str()));
+            }
+            url = next;
+        }
+    }
+}
+
+/// 同一個來源：協定、主機（不分大小寫）、埠（沒寫的照協定的預設）都一樣
+pub fn same_origin(a: &url::Url, b: &url::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str().map(str::to_ascii_lowercase) == b.host_str().map(str::to_ascii_lowercase)
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 fn transport_error(e: ureq::Error) -> Transport {
@@ -300,7 +354,7 @@ fn transport_error(e: ureq::Error) -> Transport {
 
 impl Http for UreqHttp {
     fn send(&self, req: &Request) -> Result<Reply, Transport> {
-        let result = self.call(req).map_err(transport_error).and_then(|mut resp| {
+        let result = self.call(req).and_then(|mut resp| {
             let status = resp.status().as_u16();
             let headers = resp
                 .headers()
@@ -502,6 +556,26 @@ mod tests {
         assert!(!t.is_finished(), "放行之前要一直等");
         fake.release("/slow");
         assert_eq!(t.join().unwrap().unwrap().text(), "done");
+    }
+
+    #[test]
+    fn same_origin_compares_scheme_host_and_port() {
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        let api = u("https://api.opensubtitles.com/api/v1/subtitles");
+        assert!(same_origin(&api, &u("https://API.OpenSubtitles.com:443/api/v1/x")));
+        for other in [
+            "https://vip-api.opensubtitles.com/api/v1/x",
+            "http://api.opensubtitles.com/api/v1/x",
+            "https://api.opensubtitles.com:8443/api/v1/x",
+            "https://api.opensubtitles.com.evil.example/api/v1/x",
+            "https://evil.example/?api.opensubtitles.com",
+        ] {
+            assert!(!same_origin(&api, &u(other)), "{other}");
+        }
+        assert!(!same_origin(
+            &u("http://127.0.0.1:1000/a"),
+            &u("http://127.0.0.1:1001/a")
+        ));
     }
 
     #[test]

@@ -58,6 +58,8 @@ pub struct Canned {
     pub stall_after: Option<usize>,
     /// 不送 `Content-Length`（內容到連線關閉為止）：下載的那一邊事先不知道大小
     pub no_length: bool,
+    /// 收到請求後先等這麼久才回應（轉址一站一站花掉的時間）
+    pub delay: Duration,
 }
 
 impl Canned {
@@ -69,6 +71,7 @@ impl Canned {
             body: body.into(),
             stall_after: None,
             no_length: false,
+            delay: Duration::ZERO,
         }
     }
 
@@ -80,6 +83,7 @@ impl Canned {
             body: Vec::new(),
             stall_after: None,
             no_length: false,
+            delay: Duration::ZERO,
         }
     }
 
@@ -91,6 +95,7 @@ impl Canned {
             body: format!("status {code}\n").into_bytes(),
             stall_after: None,
             no_length: false,
+            delay: Duration::ZERO,
         }
     }
 
@@ -103,6 +108,12 @@ impl Canned {
     /// 不說大小（沒有 `Content-Length`，送完就關閉連線）
     pub fn without_length(mut self) -> Canned {
         self.no_length = true;
+        self
+    }
+
+    /// 先等 `d` 才回應
+    pub fn after(mut self, d: Duration) -> Canned {
+        self.delay = d;
         self
     }
 }
@@ -394,6 +405,10 @@ fn send(out: &mut TcpStream, code: u16, ctype: &str, body: &[u8], head: bool) ->
 
 /// 測試指定的固定回應；`stall_after` 的位置之後不再送，連線開著到伺服器關掉
 fn send_canned(out: &mut TcpStream, c: &Canned, head: bool, s: &Shared) -> std::io::Result<()> {
+    let begin = Instant::now();
+    while begin.elapsed() < c.delay && !s.stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut text = format!("HTTP/1.1 {} {}\r\nConnection: close\r\n", c.status, reason(c.status));
     if !c.no_length {
         text += &format!("Content-Length: {}\r\n", c.body.len());

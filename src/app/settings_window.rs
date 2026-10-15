@@ -105,7 +105,7 @@ impl VitascopeApp {
                                 Page::Playback => changed |= self.playback_page(ui, &mut action),
                                 Page::Picture => self.picture_page(ui, &mut action),
                                 Page::Sound => self.sound_page(ui, &mut action),
-                                Page::Subtitles => self.subtitles_page(ui, &mut action),
+                                Page::Subtitles => changed |= self.subtitles_page(ui, &mut action),
                                 Page::Network => self.network_page(ui),
                                 Page::Screenshot => changed |= self.screenshot_page(ui, &mut action),
                                 Page::System => changed |= self.system_page(ui),
@@ -876,7 +876,7 @@ impl VitascopeApp {
         }
     }
 
-    fn subtitles_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) {
+    fn subtitles_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) -> bool {
         let style = &self.settings.subtitle;
         ui.label(tf!(
             "字型：{}　字級：{:.0}",
@@ -894,6 +894,9 @@ impl VitascopeApp {
             "External subtitles are loaded automatically with their encoding detected; Traditional Chinese comes first. \
              Subtitle delay and the secondary subtitle are in the Subtitles menu on the control bar."
         ));
+        ui.add_space(12.0);
+        // 線上字幕（G6）：改了就存檔
+        self.online_settings_section(ui)
     }
 
     fn screenshot_page(&mut self, ui: &mut egui::Ui, action: &mut Option<Action>) -> bool {

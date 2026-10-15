@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use support::http::{Canned, Server};
 use vitascope::online_subs::http::{
-    API_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT, Http, Kind, MAX_API_REDIRECTS, Method, Request, Transport,
-    USER_AGENT, UreqHttp, UreqOptions,
+    API_TIMEOUT, CONNECT_TIMEOUT, DOWNLOAD_TIMEOUT, Http, Kind, MAX_API_REDIRECTS, MAX_DOWNLOAD_REDIRECTS, Method,
+    Request, Transport, USER_AGENT, UreqHttp, UreqOptions,
 };
 use vitascope::online_subs::{
     Account, DownloadJob, Job, JobResult, OnlineEnv, OnlineSubSettings, Provider, SearchJob, VideoRef, run,
@@ -106,6 +106,264 @@ fn redirects_keep_authorization_only_on_the_same_host_for_the_api() {
     );
     assert_eq!(auth("/target-other"), None, "換主機：拿掉登入憑證");
     assert_eq!(auth("/target-dl"), None, "下載連結：轉址一律拿掉");
+}
+
+/// 轉址到別的來源（這裡是同一台電腦的另一個埠）：影戲的 API 金鑰（`Api-Key`）與登入憑證（`Authorization`）
+/// 一律不跟著送過去（ureq 自己跟轉址時只拿掉 `Authorization`，`Api-Key` 會送到別的主機）；之後再轉回原本的主機也不加回來。
+/// 同一個來源的轉址照舊帶著（vip-api 一定要 JWT）；POST 經過 302 變成不帶內容的 GET，307 照原本的方法與內容
+#[test]
+fn secrets_never_follow_a_redirect_to_another_origin() {
+    let a = Server::start();
+    let b = Server::start();
+    assert_ne!(a.url(""), b.url(""), "兩個伺服器要在不同的埠");
+    a.put("/api/v1/subtitles", Canned::redirect(&b.url("/landing")));
+    b.put("/landing", Canned::ok("landed"));
+    a.put("/api/v1/download", Canned::redirect(&b.url("/dl")));
+    b.put("/dl", Canned::ok("dl"));
+    // A → B → A：回到原本的主機也不再帶
+    a.put("/bounce", Canned::redirect(&b.url("/back")));
+    b.put("/back", Canned::redirect(&a.url("/final")));
+    a.put("/final", Canned::ok("final"));
+    // 同一個來源：照舊帶著；307 照原本的方法與內容
+    a.put("/same", Canned::redirect(&a.url("/same-target")));
+    a.put("/same-target", Canned::ok("same"));
+    let temporary = |to: &str| Canned {
+        status: 307,
+        headers: vec![("Location".into(), to.into())],
+        ..Canned::ok("")
+    };
+    a.put("/post307", temporary(&a.url("/post307-target")));
+    a.put("/post307-target", Canned::ok("posted"));
+    // 下載連結：同一個來源的轉址也不帶
+    a.put("/files/x", Canned::redirect(&a.url("/files/y")));
+    a.put("/files/y", Canned::ok("file"));
+    let http = local();
+    let secret = |r: Request| {
+        r.header("Api-Key", "the-app-key")
+            .header("Authorization", "Bearer jwt")
+            .header("Accept", "*/*")
+    };
+    let text = |r: Request| http.send(&r).unwrap().text();
+    assert_eq!(
+        text(secret(get(a.url("/api/v1/subtitles?query=x"), Kind::Api))),
+        "landed"
+    );
+    let post =
+        |url: String| secret(Request::new(Method::Post, url, Kind::Api, 1 << 20)).json(r#"{"file_id":7}"#.into());
+    assert_eq!(text(post(a.url("/api/v1/download"))), "dl");
+    assert_eq!(text(secret(get(a.url("/bounce"), Kind::Api))), "final");
+    assert_eq!(text(secret(get(a.url("/same"), Kind::Api))), "same");
+    assert_eq!(text(post(a.url("/post307"))), "posted");
+    assert_eq!(text(secret(get(a.url("/files/x"), Kind::Download))), "file");
+
+    let only = |s: &Server, path: &str| {
+        let got = s.requests_to(path);
+        assert_eq!(got.len(), 1, "{path}：{got:?}");
+        got.into_iter().next().unwrap()
+    };
+    let no_secrets = |r: &support::http::Request, what: &str| {
+        assert_eq!(r.header("Api-Key"), None, "{what}：金鑰送到別的地方了");
+        assert_eq!(r.header("Authorization"), None, "{what}：登入憑證送到別的地方了");
+        assert_eq!(r.header("Accept"), Some("*/*"), "{what}：不是秘密的標頭照舊");
+        assert_eq!(r.header("User-Agent"), Some(USER_AGENT), "{what}");
+    };
+    no_secrets(&only(&b, "/landing"), "API 轉到別的埠");
+    let dl = only(&b, "/dl");
+    no_secrets(&dl, "POST 轉到別的埠");
+    assert_eq!(dl.method, "GET", "302 的 POST 變成 GET");
+    assert!(dl.body.is_empty() && dl.header("Content-Type").is_none(), "{dl:?}");
+    no_secrets(&only(&b, "/back"), "A → B");
+    no_secrets(&only(&a, "/final"), "A → B → A：回到原本的主機也不加回來");
+    let files_y = only(&a, "/files/y");
+    no_secrets(&files_y, "下載連結的轉址");
+    // 同一個來源的 API 轉址：照舊帶著
+    let same = only(&a, "/same-target");
+    assert_eq!(same.header("Api-Key"), Some("the-app-key"));
+    assert_eq!(same.header("Authorization"), Some("Bearer jwt"));
+    let p307 = only(&a, "/post307-target");
+    assert_eq!(
+        (p307.method.as_str(), p307.body.as_slice()),
+        ("POST", br#"{"file_id":7}"#.as_slice())
+    );
+    assert_eq!(p307.header("Api-Key"), Some("the-app-key"));
+    assert_eq!(p307.header("Content-Type"), Some("application/json"));
+}
+
+/// 307 / 308 會照原本的方法與內容再送一次：有內容的請求（登入的帳號密碼）、DELETE 只在同一個來源裡跟，
+/// 要轉到別的來源時不跟，把 3xx 交回去（別的來源什麼都收不到）。303 與 301 / 302 的 POST、DELETE 變成不帶內容的 GET
+#[test]
+fn bodies_never_follow_a_redirect_to_another_origin() {
+    let a = Server::start();
+    let b = Server::start();
+    let redirect = |status: u16, to: &str| Canned {
+        status,
+        headers: vec![("Location".into(), to.into())],
+        ..Canned::ok("")
+    };
+    a.put("/login307", redirect(307, &b.url("/stolen")));
+    a.put("/login308", redirect(308, &b.url("/stolen")));
+    a.put("/logout307", redirect(307, &b.url("/stolen")));
+    b.put("/stolen", Canned::ok("stolen"));
+    // 下載連結：同一個來源的 307 POST 也不跟（下載連結的轉址一律當成離開原本的地方）
+    a.put("/files/post", redirect(307, &a.url("/files/post-target")));
+    a.put("/files/post-target", Canned::ok("file"));
+    // 同一個來源：303 的 POST、302 的 DELETE 變成不帶內容的 GET，秘密的標頭照舊
+    a.put("/see", redirect(303, &a.url("/seen")));
+    a.put("/seen", Canned::ok("seen"));
+    a.put("/del302", redirect(302, &a.url("/deleted")));
+    a.put("/deleted", Canned::ok("deleted"));
+    let http = local();
+    let login = |url: String, kind: Kind| {
+        Request::new(Method::Post, url, kind, 1 << 20)
+            .header("Api-Key", "the-app-key")
+            .json(r#"{"username":"me","password":"secret"}"#.into())
+    };
+    for (path, status) in [("/login307", 307), ("/login308", 308)] {
+        let reply = http.send(&login(a.url(path), Kind::Api)).unwrap();
+        assert_eq!(reply.status, status, "{path}：3xx 交回去");
+    }
+    let logout =
+        Request::new(Method::Delete, a.url("/logout307"), Kind::Api, 1 << 20).header("Authorization", "Bearer jwt");
+    assert_eq!(http.send(&logout).unwrap().status, 307);
+    assert_eq!(
+        http.send(&login(a.url("/files/post"), Kind::Download)).unwrap().status,
+        307
+    );
+    assert!(b.requests().is_empty(), "別的來源收到了：{:?}", b.requests());
+    assert!(a.requests_to("/files/post-target").is_empty());
+
+    assert_eq!(http.send(&login(a.url("/see"), Kind::Api)).unwrap().text(), "seen");
+    let del = Request::new(Method::Delete, a.url("/del302"), Kind::Api, 1 << 20).header("Api-Key", "the-app-key");
+    assert_eq!(http.send(&del).unwrap().text(), "deleted");
+    for path in ["/seen", "/deleted"] {
+        let got = a.requests_to(path);
+        assert_eq!(got.len(), 1, "{path}：{got:?}");
+        let r = &got[0];
+        assert_eq!(r.method, "GET", "{path}");
+        assert!(r.body.is_empty() && r.header("Content-Type").is_none(), "{path}：{r:?}");
+        assert_eq!(r.header("Api-Key"), Some("the-app-key"), "{path}：同一個來源照舊帶著");
+    }
+}
+
+/// 轉址的每一站共用一個時間限制（不是每一站重新算）：兩站各慢 1.2 秒，限制 2 秒就逾時
+#[test]
+fn a_redirect_chain_shares_one_deadline() {
+    let server = Server::start();
+    let slow = Duration::from_millis(1200);
+    server.put("/d1", Canned::redirect(&server.url("/d2")).after(slow));
+    server.put("/d2", Canned::redirect(&server.url("/d3")).after(slow));
+    server.put("/d3", Canned::ok("end"));
+    for kind in [Kind::Api, Kind::Download] {
+        let http = UreqHttp::with_options(UreqOptions {
+            https_only: false,
+            proxy_from_env: false,
+            api_timeout: Duration::from_secs(2),
+            download_timeout: Duration::from_secs(2),
+        });
+        assert_eq!(
+            http.send(&get(server.url("/d1"), kind)),
+            Err(Transport::Timeout),
+            "{kind:?}"
+        );
+    }
+    // 一站很慢：下一站只剩下的時間（不是重新給一整段）。3 秒 + 4 秒 = 7 秒才逾時就是每一站重新算（只比上限、留 2 秒餘裕）
+    server.put(
+        "/e1",
+        Canned::redirect(&server.url("/slow")).after(Duration::from_secs(3)),
+    );
+    let http = UreqHttp::with_options(UreqOptions {
+        https_only: false,
+        proxy_from_env: false,
+        api_timeout: Duration::from_secs(4),
+        download_timeout: Duration::from_secs(4),
+    });
+    let start = Instant::now();
+    assert_eq!(http.send(&get(server.url("/e1"), Kind::Api)), Err(Transport::Timeout));
+    assert!(start.elapsed() < Duration::from_secs(6), "{:?}", start.elapsed());
+    // 時間夠就跟到底
+    let roomy = UreqHttp::with_options(UreqOptions {
+        https_only: false,
+        proxy_from_env: false,
+        api_timeout: Duration::from_secs(60),
+        download_timeout: Duration::from_secs(60),
+    });
+    assert_eq!(roomy.send(&get(server.url("/d1"), Kind::Api)).unwrap().text(), "end");
+}
+
+/// 下載連結最多轉址 [`MAX_DOWNLOAD_REDIRECTS`] 次（比 API 多）
+#[test]
+fn download_redirects_are_capped() {
+    let server = Server::start();
+    let hops = MAX_DOWNLOAD_REDIRECTS + 1;
+    for i in 0..hops {
+        let next = if i + 1 == hops {
+            "/end".to_owned()
+        } else {
+            format!("/r{}", i + 1)
+        };
+        server.put(&format!("/r{i}"), Canned::redirect(&server.url(&next)));
+    }
+    server.put("/end", Canned::ok("end"));
+    const { assert!(MAX_DOWNLOAD_REDIRECTS > MAX_API_REDIRECTS) };
+    let http = local();
+    assert_eq!(
+        http.send(&get(server.url("/r1"), Kind::Download)).unwrap().text(),
+        "end"
+    );
+    let too_many = http.send(&get(server.url("/r0"), Kind::Download));
+    assert!(matches!(too_many, Err(Transport::Connect(_))), "{too_many:?}");
+    // 同一串轉址，API 跟不完
+    let api = http.send(&get(server.url("/r1"), Kind::Api));
+    assert!(matches!(api, Err(Transport::Connect(_))), "{api:?}");
+}
+
+/// 整個流程：OpenSubtitles 的搜尋被轉到別的主機（例如被竄改的回應、公共網路的登入頁）時，金鑰與登入憑證不會送過去
+#[test]
+fn opensubtitles_search_redirected_elsewhere_keeps_the_key_home() {
+    let api = Server::start();
+    let elsewhere = Server::start();
+    let dir = scratch("redirect-key");
+    api.put(
+        "/api/v1/login",
+        Canned::ok(r#"{"user":{"allowed_downloads":20},"base_url":"api.opensubtitles.com","token":"jwt-y"}"#),
+    );
+    api.put("/api/v1/subtitles", Canned::redirect(&elsewhere.url("/subtitles")));
+    elsewhere.put(
+        "/subtitles",
+        Canned::ok(r#"{"total_pages":1,"total_count":0,"page":1,"data":[]}"#),
+    );
+    let mut env = OnlineEnv::testing(Arc::new(local()), Some(dir.join("cache")));
+    env.os_root = api.url("/api/v1");
+    let account = Account::new(None);
+    let JobResult::Login(info) = run(
+        Job::Login {
+            user: "me".into(),
+            password: "pw".into(),
+        },
+        &env,
+        &account,
+    ) else {
+        panic!()
+    };
+    info.unwrap();
+    let job = SearchJob::new(
+        Provider::Opensubtitles,
+        VideoRef::new("https://example.com/a.mp4"),
+        "a movie",
+        &OnlineSubSettings::default(),
+        vitascope::i18n::Lang::En,
+    );
+    let JobResult::Search { result, .. } = run(Job::Search(job), &env, &account) else {
+        panic!()
+    };
+    assert!(result.unwrap().results.is_empty());
+    let sent = &api.requests_to("/api/v1/subtitles")[0];
+    assert_eq!(sent.header("Api-Key"), Some("test-key"));
+    assert_eq!(sent.header("Authorization"), Some("Bearer jwt-y"));
+    let got = &elsewhere.requests_to("/subtitles")[0];
+    assert_eq!(got.header("Api-Key"), None, "金鑰送到別的主機了");
+    assert_eq!(got.header("Authorization"), None, "登入憑證送到別的主機了");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

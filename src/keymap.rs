@@ -460,6 +460,8 @@ commands! {
     CopyFrame => "copy-frame", Files, once, ("擷取畫面（剪貼簿）", "Copy frame");
     ScreenshotAs => "screenshot-as", Files, once, ("另存截圖…", "Save screenshot as…");
     LoadSubtitle => "load-subtitle", Files, once, ("載入字幕檔…", "Load subtitle file…");
+    /// 線上搜尋字幕的視窗（預設沒有按鍵）
+    SearchSubtitles => "search-subtitles", Files, once, ("線上搜尋字幕…", "Search subtitles online…");
     OpenUrl => "open-url", Files, once, ("開啟網址…", "Open URL…");
     /// 匯出視窗的「片段」（預設沒有按鍵）
     ExportClip => "export-clip", Files, once, ("儲存片段…", "Save clip…");
@@ -1451,6 +1453,8 @@ mod tests {
         "mini-player",
         // F2
         "pip",
+        // G6
+        "search-subtitles",
     ];
 
     #[test]
@@ -1589,6 +1593,7 @@ mod tests {
                 | C::ToggleSmooth
                 | C::ScreenshotAs
                 | C::LoadSubtitle
+                | C::SearchSubtitles
                 | C::OpenUrl
                 | C::ExportClip
                 | C::ExportGif

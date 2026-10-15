@@ -21655,3 +21655,1135 @@ fn online_subtitles_are_offline_by_default() {
         Err(vitascope::online_subs::http::Transport::Offline)
     );
 }
+
+// ───────────── 線上搜尋字幕（G6） ─────────────
+
+use vitascope::online_subs::OnlineEnv;
+use vitascope::online_subs::http::{FakeHttp, Method as HttpMethod, Reply};
+
+/// 繁體、簡體的字幕內容（存檔時的語言標記照內容判斷）
+const SRT_TRADITIONAL: &str = "1\n00:00:00,000 --> 00:00:09,000\n這是我們的時間，說話會讓你覺得還沒來過這裡\n";
+const SRT_SIMPLIFIED: &str = "1\n00:00:00,000 --> 00:00:09,000\n这是我们的时间，说话会让你觉得还没来过这里\n";
+
+/// OpenSubtitles 的搜尋回應：（file_id, 語言碼, 版本名稱, 跟這個檔案完全相符）
+fn os_search_json(rows: &[(u64, &str, &str, bool)]) -> String {
+    let data: Vec<String> = rows
+        .iter()
+        .map(|(id, lang, release, hash)| {
+            format!(
+                r#"{{"attributes":{{"language":"{lang}","release":"{release}","download_count":{},"moviehash_match":{hash},
+                   "uploader":{{"name":"someone"}},"files":[{{"file_id":{id},"file_name":"{release}.srt"}}]}}}}"#,
+                1000 + id
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"total_pages":1,"total_count":{},"page":1,"data":[{}]}}"#,
+        rows.len(),
+        data.join(",")
+    )
+}
+
+/// `POST /download` 的回應：檔案 `id` 的暫時連結、剩下的次數
+fn os_link_json(id: u64, remaining: i64) -> String {
+    format!(
+        r#"{{"link":"https://dl.test/f/{id}.srt","remaining":{remaining},"reset_time_utc":"2030-01-01T00:00:00.000Z","message":"ok"}}"#
+    )
+}
+
+/// 假的 OpenSubtitles：搜尋回兩個（第二個跟這個檔案完全相符，要排到前面）；下載檔案 2 的連結、內容是繁體
+fn fake_opensubtitles() -> Arc<FakeHttp> {
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/subtitles",
+        Reply::ok(os_search_json(&[
+            (1, "zh-tw", "Other.Release", false),
+            (2, "zh-tw", "Exact.Release", true),
+        ])),
+    )
+    .on(HttpMethod::Post, "/download", Reply::ok(os_link_json(2, 4)))
+    .on(HttpMethod::Get, "dl.test/f/2.srt", Reply::ok(SRT_TRADITIONAL));
+    fake
+}
+
+/// 線上字幕的介面測試：影片放在暫存資料夾（存到影片旁邊時不碰樣本資料夾），快取資料夾也在裡面，連線是假的
+fn online_case(
+    tag: &str,
+    clip: &str,
+    fake: &Arc<FakeHttp>,
+    settings: Settings,
+) -> (Harness<'static, VitascopeApp>, TempDir, PathBuf) {
+    let dir = TempDir::new(tag);
+    let video = dir.clip(clip);
+    let mut settings = settings;
+    settings.auto_next = false;
+    let mut h = harness_launch(
+        Launch {
+            files: vec![video.clone()],
+            online: OnlineEnv::testing(fake.clone(), Some(dir.0.join("cache"))),
+            ..Default::default()
+        },
+        settings,
+    );
+    settle(&mut h, clip);
+    (h, dir, video)
+}
+
+/// 打開線上搜尋字幕的視窗（快捷鍵的指令），等自動搜尋做完
+fn open_online(h: &mut Harness<'_, VitascopeApp>) {
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    h.step();
+    assert!(h.state().online_subs_open());
+    online_idle(h);
+}
+
+/// 等線上字幕的背景工作做完
+fn online_idle(h: &mut Harness<'_, VitascopeApp>) {
+    step_until_app(h, "線上字幕的背景工作做完", |app| !app.online_subs_busy());
+    h.run_steps(2);
+}
+
+/// 線上字幕視窗的按鈕（標籤一樣的有好幾個時用第 `n` 個；例如每一列的「下載並載入」）
+fn online_button<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str, n: usize) -> egui_kittest::Node<'a> {
+    h.query_all_by_label(label)
+        .filter(|node| node.accesskit_node().role() == egui::accesskit::Role::Button)
+        .nth(n)
+        .unwrap_or_else(|| panic!("找不到第 {n} 個「{label}」按鈕"))
+}
+
+/// 文字欄位（一般的、密碼的）
+fn text_field<'a>(h: &'a Harness<'_, VitascopeApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    use egui::accesskit::Role;
+    h.query_all_by_label(label)
+        .find(|n| matches!(n.accesskit_node().role(), Role::TextInput | Role::PasswordInput))
+        .unwrap_or_else(|| panic!("找不到欄位 {label}"))
+}
+
+/// 外掛的字幕軌（線上下載、載入的）
+fn external_subs(h: &Harness<'_, VitascopeApp>) -> Vec<vitascope::player::Track> {
+    h.state()
+        .player()
+        .state
+        .tracks_of(TrackKind::Sub)
+        .filter(|t| t.external)
+        .cloned()
+        .collect()
+}
+
+/// 等到外掛的字幕軌有 `n` 條（mpv 加入字幕軌是非同步的，軌道清單晚幾幀才更新）
+fn wait_external_subs(h: &mut Harness<'_, VitascopeApp>, n: usize) {
+    step_until_app(h, "字幕軌加入", |app| {
+        app.player()
+            .state
+            .tracks_of(TrackKind::Sub)
+            .filter(|t| t.external)
+            .count()
+            == n
+    });
+}
+
+/// 資料夾裡的檔名（排序）
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|r| {
+            r.filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// 字幕選單（控制列、右鍵選單共用）有「線上搜尋字幕…」，點了打開視窗，搜尋文字是整理過的檔名。
+/// 打開就自動搜尋（送出照規定排好的參數、檔案特徵碼），結果裡跟這個檔案完全相符的排在前面
+#[test]
+fn subtitle_menu_has_online_search() {
+    let fake = fake_opensubtitles();
+    let (mut h, _dir, video) = online_case("os-menu", "Movie.Name.2019.1080p.mp4", &fake, Settings::default());
+    // 右鍵選單的「字幕 ⏵」裡也有
+    hover_context_item(&mut h, "字幕 ⏵");
+    h.get_by_label("線上搜尋字幕…");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    h.get_by_label("字幕").click();
+    h.run_steps(2);
+    h.get_by_label("線上搜尋字幕…").click();
+    h.step();
+    assert!(h.state().online_subs_open());
+    h.get_by_label("線上搜尋字幕");
+    assert_eq!(h.state().online_subs_query(), "movie name 2019");
+    online_idle(&mut h);
+    assert_eq!(
+        text_field(&h, "搜尋").accesskit_node().value().as_deref(),
+        Some("movie name 2019")
+    );
+    let searches = fake.requests_to("/subtitles");
+    assert_eq!(searches.len(), 1, "打開視窗只搜尋一次");
+    let url = &searches[0].url;
+    // 檔案特徵碼只在 128 KiB 以上的檔案才有（樣本的大小依產生它的 FFmpeg 而定：R-B14）
+    let big = std::fs::metadata(&video).unwrap().len() >= 128 * 1024;
+    let hash = vitascope::filehash::moviehash(&video).unwrap();
+    assert_eq!(big, hash.is_some());
+    let want = match hash {
+        Some(h) => format!(
+            "https://os.test/api/v1/subtitles?languages=en,ze,zh-cn,zh-tw&moviehash={}&query=movie+name+2019",
+            h.hex()
+        ),
+        None => "https://os.test/api/v1/subtitles?languages=en,ze,zh-cn,zh-tw&query=movie+name+2019".to_owned(),
+    };
+    assert_eq!(url, &want);
+    assert_eq!(searches[0].header_value("Api-Key"), Some("test-key"));
+    // 兩個結果，完全相符的在前面
+    let rows: Vec<_> = h
+        .query_all_by_label_contains(".Release")
+        .map(|n| n.accesskit_node().label().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(rows, ["Exact.Release", "Other.Release"]);
+    h.get_by_label("✔");
+    h.get_by_label("找到 2 個字幕，其中 1 個跟這個檔案完全相符");
+    // OpenSubtitles 的欄：相符、下載數（射手網（偽）的字幕組、評分不是這裡的欄）
+    h.get_by_label("相符");
+    h.get_by_label("下載數");
+    h.get_by_label("1002");
+    assert!(h.query_by_label("評分").is_none() && h.query_by_label("字幕組").is_none());
+    // 出處說明（OpenSubtitles 的規定）、會送出什麼
+    h.get_by_label_contains("Subtitles provided by");
+    // 規定要連到網站：點了開啟 https://opensubtitles.com（只是文字的話不會開）
+    h.get_by_label("OpenSubtitles.com").click();
+    h.step();
+    let opened: Vec<String> = h
+        .output()
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::OpenUrl(u) => Some(u.url.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opened, ["https://opensubtitles.com"]);
+    h.get_by_label("搜尋時會把檔名和檔案特徵碼送到 OpenSubtitles.com");
+    // 伺服器還沒說剩幾次之前不顯示數字（R-C14）
+    assert!(h.query_by_label_contains("今天還能下載").is_none());
+    h.get_by_label("未登入");
+}
+
+/// 按「下載並載入」：存到快取資料夾（設定關掉「存到影片旁邊」），載入並選上，提示、剩下的次數照伺服器說的
+#[test]
+fn online_download_loads_the_subtitle() {
+    let fake = fake_opensubtitles();
+    let mut settings = Settings::default();
+    settings.online_subs.save_next_to_video = false;
+    let (mut h, dir, _video) = online_case("os-load", "Show.S01E01.mp4", &fake, settings);
+    open_online(&mut h);
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    // mpv 先報軌道清單、後報選了哪一條：兩個一起等
+    step_until_app(&mut h, "字幕軌加入並選上", |app| {
+        let s = &app.player().state;
+        s.tracks_of(TrackKind::Sub).filter(|t| t.external).count() == 1
+            && s.selected(TrackKind::Sub).is_some_and(|t| t.external)
+    });
+    assert_eq!(h.state().osd_text(), Some("已載入線上字幕：Show.S01E01.zh-TW.srt"));
+    h.get_by_label("今天還能下載 4 個");
+    h.get_by_label("已載入：Show.S01E01.zh-TW.srt");
+    assert_eq!(names_in(&dir.0.join("cache")), ["Show.S01E01.zh-TW.srt"]);
+    assert_eq!(
+        names_in(&dir.0),
+        ["Show.S01E01.mp4", "cache"],
+        "設定關掉時不寫到影片旁邊"
+    );
+    let posts = fake.requests_to("/download");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body.as_deref(), Some(r#"{"file_id":2}"#));
+}
+
+/// 下載要登入（R-A1）：未登入時伺服器拒絕 → 打開登入對話框（說明原因）；登入後接著下載剛才那一個，
+/// 之後的請求帶登入憑證；設定只記帳號名稱，不記密碼。關掉視窗不登出，只有按「登出」才登出（R-C2）
+#[test]
+fn download_needs_login_then_continues() {
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/subtitles",
+        Reply::ok(os_search_json(&[(2, "zh-tw", "Exact.Release", true)])),
+    )
+    // 未登入：伺服器說要登入；登入後給連結
+    .on(
+        HttpMethod::Post,
+        "/download",
+        Reply::new(401, r#"{"message":"You need to log in"}"#),
+    )
+    .on(HttpMethod::Post, "/download", Reply::ok(os_link_json(2, 19)))
+    .on(HttpMethod::Get, "dl.test/f/2.srt", Reply::ok(SRT_TRADITIONAL))
+    .on(
+        HttpMethod::Post,
+        "/login",
+        Reply::ok(
+            r#"{"user":{"allowed_downloads":20,"vip":false},"base_url":"api.opensubtitles.com","token":"jwt-1"}"#,
+        ),
+    )
+    .on(
+        HttpMethod::Delete,
+        "/logout",
+        Reply::ok(r#"{"message":"token successfully destroyed"}"#),
+    );
+    let mut settings = Settings::default();
+    settings.online_subs.save_next_to_video = false;
+    let (mut h, dir, _video) = online_case("os-login", "Movie.mp4", &fake, settings);
+    open_online(&mut h);
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    assert!(h.state().online_login_open(), "要登入：打開登入對話框");
+    h.get_by_label("登入 OpenSubtitles");
+    assert!(
+        h.query_all_by_label("下載 OpenSubtitles 的字幕需要登入（免費帳號）")
+            .count()
+            >= 1
+    );
+    assert!(external_subs(&h).is_empty());
+    text_field(&h, "帳號").focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("viewer".into()));
+    h.run_steps(1);
+    text_field(&h, "密碼").focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("pw-123".into()));
+    h.run_steps(1);
+    online_button(&h, "登入", 0).click();
+    h.step();
+    // 登入、接著下載
+    step_until_app(&mut h, "登入後接著下載", |app| {
+        !app.online_subs_busy()
+            && !app.online_login_open()
+            && app.osd_text().is_some_and(|t| t.contains("已載入線上字幕"))
+    });
+    wait_external_subs(&mut h, 1);
+    let posts = fake.requests_to("/download");
+    assert_eq!(posts.len(), 2, "未登入 1 次 + 登入後 1 次");
+    assert_eq!(posts[0].header_value("Authorization"), None);
+    assert_eq!(posts[1].header_value("Authorization"), Some("Bearer jwt-1"));
+    let login = &fake.requests_to("/login")[0];
+    let body: serde_json::Value = serde_json::from_str(login.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"username": "viewer", "password": "pw-123"}));
+    assert_eq!(h.state().online_account().user().as_deref(), Some("viewer"));
+    h.run_steps(2);
+    h.get_by_label("已登入：viewer");
+    h.get_by_label("今天還能下載 19 個");
+    // 設定只記帳號名稱；密碼不在任何地方
+    let settings = h.state().settings();
+    assert_eq!(settings.online_subs.opensubtitles_user, "viewer");
+    let json = serde_json::to_string(settings).unwrap();
+    assert!(!json.contains("pw-123") && !json.contains("jwt-1"), "{json}");
+
+    // 只有按「登出」才登出（R-C2）：關掉視窗、再打開還是登入的
+    for _ in 0..2 {
+        if !h.state().online_subs_open() {
+            break;
+        }
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+    assert!(!h.state().online_subs_open());
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    h.run_steps(2);
+    online_idle(&mut h);
+    h.get_by_label("已登入：viewer");
+    assert!(fake.requests_to("/logout").is_empty(), "關掉視窗不登出");
+    assert_eq!(h.state().online_account().user().as_deref(), Some("viewer"));
+    online_button(&h, "登出", 0).click();
+    h.step();
+    online_idle(&mut h);
+    let logouts = fake.requests_to("/logout");
+    assert_eq!(logouts.len(), 1);
+    assert_eq!(logouts[0].method, HttpMethod::Delete);
+    assert_eq!(logouts[0].header_value("Authorization"), Some("Bearer jwt-1"));
+    assert_eq!(h.state().online_account().user(), None);
+    h.get_by_label("未登入");
+    online_button(&h, "登入…", 0);
+    assert!(h.query_by_label("今天還能下載 19 個").is_none(), "登出後不再顯示次數");
+    drop(dir);
+}
+
+/// 結果綁在搜尋的那部影片上（R-A2）：
+/// - 自動搜尋開著：換了影片就用新的檔名再搜尋；
+/// - 關著：舊的結果灰掉、寫「影片已經換了，請重新搜尋」，不能下載；
+/// - 下載中換了影片：存在原本那部影片旁邊，不載入到新的影片
+#[test]
+fn results_follow_the_video() {
+    let fake = fake_opensubtitles();
+    let (mut h, dir, first) = online_case("os-follow", "Alpha.Movie.mp4", &fake, Settings::default());
+    let second = dir.clip("Beta.Movie.mp4");
+    open_online(&mut h);
+    assert_eq!(h.state().online_subs_query(), "alpha movie");
+    drop_file(&mut h, second.clone());
+    settle(&mut h, "Beta.Movie.mp4");
+    online_idle(&mut h);
+    let searches = fake.requests_to("/subtitles");
+    assert_eq!(searches.len(), 2, "換了影片：再搜尋一次");
+    assert!(searches[1].url.ends_with("&query=beta+movie"), "{}", searches[1].url);
+    assert_eq!(h.state().online_subs_query(), "beta movie");
+    assert!(h.query_by_label("影片已經換了，請重新搜尋").is_none());
+
+    // 自動搜尋關掉：換回第一部影片，結果灰掉
+    h.state_mut().settings_mut().online_subs.auto_search = false;
+    drop_file(&mut h, first.clone());
+    settle(&mut h, "Alpha.Movie.mp4");
+    h.run_steps(3);
+    assert_eq!(fake.requests_to("/subtitles").len(), 2, "沒有自動搜尋");
+    h.get_by_label("影片已經換了，請重新搜尋");
+    assert!(online_button(&h, "下載並載入", 0).accesskit_node().is_disabled());
+    assert_eq!(h.state().online_subs_query(), "alpha movie", "搜尋文字換成這部影片的");
+    // 按「搜尋」：結果是這部影片的，可以下載
+    online_button(&h, "搜尋", 0).click();
+    h.step();
+    online_idle(&mut h);
+    assert!(h.query_by_label("影片已經換了，請重新搜尋").is_none());
+    assert!(!online_button(&h, "下載並載入", 0).accesskit_node().is_disabled());
+
+    // 下載中換了影片：存在第一部影片旁邊（用它的檔名），第二部影片不載入
+    fake.hold("dl.test/f/2.srt");
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    assert!(h.state().online_subs_busy());
+    drop_file(&mut h, second.clone());
+    settle(&mut h, "Beta.Movie.mp4");
+    fake.release("dl.test/f/2.srt");
+    online_idle(&mut h);
+    assert!(dir.0.join("Alpha.Movie.zh-TW.srt").is_file(), "{:?}", names_in(&dir.0));
+    assert!(!dir.0.join("Beta.Movie.zh-TW.srt").exists());
+    assert!(external_subs(&h).is_empty(), "不載入到別的影片");
+    let osd = h.state().osd_text().unwrap_or_default().to_owned();
+    assert!(osd.starts_with("字幕已下載，但影片已經換了，沒有載入："), "{osd}");
+    assert!(osd.ends_with("Alpha.Movie.zh-TW.srt"), "{osd}");
+}
+
+/// 關掉視窗會取消正在進行的下載（R-B10）：不留下字幕檔、暫存檔，也不載入。
+/// 這裡在下載檔案的回應回來之前取消（還沒寫暫存檔）；寫了暫存檔之後才取消、刪掉暫存檔的那一段由核心的
+/// `cancel_is_checked_before_the_final_rename`（src/online_subs/tests.rs）測
+#[test]
+fn closing_the_window_cancels_the_download() {
+    let fake = fake_opensubtitles();
+    let (mut h, dir, _video) = online_case("os-cancel", "Cancel.Me.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    fake.hold("dl.test/f/2.srt");
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    assert!(h.state().online_subs_busy());
+    // Esc 先關線上搜尋字幕的視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().online_subs_open());
+    fake.release("dl.test/f/2.srt");
+    online_idle(&mut h);
+    assert_eq!(names_in(&dir.0), ["Cancel.Me.mp4"], "沒有字幕檔、沒有暫存檔");
+    assert!(names_in(&dir.0.join("cache")).is_empty());
+    assert!(external_subs(&h).is_empty());
+    assert!(!h.state().osd_text().unwrap_or_default().contains("已載入線上字幕"));
+}
+
+/// 下載次數省著用（R-B11）：連結失效（410）時，下一次先重試同一個連結（不再花一次 `/download`）；
+/// 同一個檔案這次已經存過、還在：直接用，不再下載，也不重複加入字幕軌
+#[test]
+fn expired_link_is_retried_before_spending_another_download() {
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/subtitles",
+        Reply::ok(os_search_json(&[(2, "zh-tw", "Only.Release", true)])),
+    )
+    .on(HttpMethod::Post, "/download", Reply::ok(os_link_json(2, 3)))
+    .on(HttpMethod::Get, "dl.test/f/2.srt", Reply::new(410, "gone"))
+    .on(HttpMethod::Get, "dl.test/f/2.srt", Reply::ok(SRT_TRADITIONAL));
+    let (mut h, dir, _video) = online_case("os-410", "Quota.Saver.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    h.get_by_label("下載連結已失效，請再按一次下載");
+    assert!(external_subs(&h).is_empty());
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    wait_external_subs(&mut h, 1);
+    assert_eq!(
+        fake.requests_to("/download").len(),
+        1,
+        "同一個連結重試，沒有再花一次下載次數"
+    );
+    assert_eq!(fake.requests_to("dl.test/f/2.srt").len(), 2);
+    assert!(dir.0.join("Quota.Saver.zh-TW.srt").is_file());
+    // 再按一次：已經存過的直接用
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    assert_eq!(fake.requests().len(), 4, "沒有新的請求：{:?}", fake.requests());
+    // 選回已經有的那一條（mpv 的 sub-add cached）：等一下也不會多出一條
+    wait_real(&mut h, 0.5);
+    assert_eq!(external_subs(&h).len(), 1, "不重複加入");
+    assert_eq!(names_in(&dir.0), ["Quota.Saver.mp4", "Quota.Saver.zh-TW.srt"]);
+}
+
+/// 存檔的語言標記照內容（R-B12）：網站標繁體、內容是簡體的檔案存成 zh-CN（下次開啟時才不會被當成繁體優先載入）
+#[test]
+fn mislabelled_simplified_file_is_saved_as_zh_cn() {
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/subtitles",
+        Reply::ok(os_search_json(&[(5, "zh-tw", "Says.Traditional", false)])),
+    )
+    .on(HttpMethod::Post, "/download", Reply::ok(os_link_json(5, 9)))
+    .on(HttpMethod::Get, "dl.test/f/5.srt", Reply::ok(SRT_SIMPLIFIED));
+    let (mut h, dir, _video) = online_case("os-label", "Labelled.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    h.get_by_label("繁體中文");
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    assert_eq!(names_in(&dir.0), ["Labelled.mp4", "Labelled.zh-CN.srt"]);
+    assert_eq!(h.state().osd_text(), Some("已載入線上字幕：Labelled.zh-CN.srt"));
+}
+
+/// 登入對話框開著時 Esc 只關對話框（R-C1），後面的線上搜尋字幕視窗照樣開著；再按 Esc 才關視窗。
+/// 對話框開著時空白鍵不會暫停（按鍵都交給對話框）
+#[test]
+fn esc_with_the_login_dialog_closes_only_the_dialog() {
+    let fake = fake_opensubtitles();
+    let (mut h, _dir, _video) = online_case("os-esc", "Esc.Test.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    online_button(&h, "登入…", 0).click();
+    h.run_steps(2);
+    assert!(h.state().online_login_open());
+    text_field(&h, "帳號").focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("someone".into()));
+    h.run_steps(1);
+    let paused = paused_now(&h);
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    assert_eq!(paused_now(&h), paused, "對話框開著：空白鍵不是暫停");
+    // 輸入框有焦點時第一下 Esc 可能只是取消焦點：最多按兩下，對話框關掉為止
+    for _ in 0..2 {
+        if !h.state().online_login_open() {
+            break;
+        }
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+    assert!(!h.state().online_login_open(), "Esc 關掉登入對話框");
+    assert!(h.state().online_subs_open(), "後面的視窗照樣開著");
+    // 沒有輸入框有焦點時也一樣（按鍵不是因為在打字才沒有往後傳）
+    online_button(&h, "登入…", 0).click();
+    h.run_steps(2);
+    assert!(h.state().online_login_open());
+    let paused = paused_now(&h);
+    h.key_press(egui::Key::Space);
+    h.run_steps(2);
+    assert_eq!(paused_now(&h), paused, "對話框開著：空白鍵不是暫停");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().online_login_open(), "Esc 關掉登入對話框");
+    assert!(h.state().online_subs_open(), "後面的視窗照樣開著");
+    h.get_by_label("線上搜尋字幕");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().online_subs_open(), "再按一次 Esc 才關視窗");
+    assert!(fake.requests_to("/login").is_empty(), "沒有登入");
+}
+
+/// 在搜尋欄打字不會觸發快捷鍵（W 是亮度 −）
+#[test]
+fn typing_in_the_search_field_is_not_a_shortcut() {
+    let fake = fake_opensubtitles();
+    let (mut h, _dir, _video) = online_case("os-typing", "Typing.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    text_field(&h, "搜尋").focus();
+    h.run_steps(2);
+    let before = h.state().adjust().brightness;
+    h.key_press(egui::Key::W);
+    h.event(egui::Event::Text("w".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().adjust().brightness, before);
+    assert_eq!(h.state().online_subs_query(), "typingw");
+    // 按 Enter：用打的文字搜尋
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    online_idle(&mut h);
+    let searches = fake.requests_to("/subtitles");
+    assert!(
+        searches.last().unwrap().url.ends_with("query=typingw"),
+        "{:?}",
+        searches.last()
+    );
+}
+
+/// 自己編譯的版本沒有 OpenSubtitles 的金鑰（介面測試的預設環境也是）：說明原因，搜尋按鈕停用，不連網
+#[test]
+fn no_api_key_disables_opensubtitles() {
+    let mut h = harness(Some(sample("common/mp4_h264_aac.mp4")));
+    settle(&mut h, "mp4_h264_aac.mp4");
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    h.run_steps(2);
+    assert!(h.state().online_subs_open());
+    assert!(!h.state().online_subs_busy(), "沒有金鑰：不搜尋");
+    assert!(
+        h.query_all_by_label_contains("這個版本沒有 OpenSubtitles 的 API 金鑰")
+            .count()
+            >= 1,
+        "說明原因"
+    );
+    assert!(online_button(&h, "搜尋", 0).accesskit_node().is_disabled());
+}
+
+/// 沒有開檔時：只提示，不打開視窗
+#[test]
+fn online_search_needs_an_open_video() {
+    let mut h = harness(None);
+    h.step();
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    h.run_steps(2);
+    assert!(!h.state().online_subs_open());
+    assert_eq!(h.state().osd_text(), Some("先開啟影片才能搜尋字幕"));
+}
+
+/// 射手網（偽）：沒有 Token 時說明怎麼取得；填了 Token 後搜尋、展開一筆字幕的檔案、下載並載入；
+/// 只有壓縮檔的字幕給網頁的連結；出處說明「字幕服務由 assrt.net 提供」。Token 放在標頭，不放進網址
+#[test]
+fn assrt_needs_token_then_expands_files() {
+    let token = "0123456789abcdefABCDEF0123456789";
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/sub/search",
+        Reply::ok(
+            r#"{"status":0,"sub":{"subs":[
+                {"id":602333,"native_name":"某部電影","videoname":"Some.Movie.2019","subtype":"Subrip(srt)",
+                 "lang":{"desc":"繁 英","langlist":{"langcht":true,"langeng":true}},"release_site":"某某字幕組",
+                 "vote_score":7.5},
+                {"id":602334,"native_name":"只有圖片字幕","subtype":"VobSub","lang":{"desc":"简"}}
+            ]}}"#,
+        ),
+    )
+    .on(
+        HttpMethod::Get,
+        "/sub/detail",
+        Reply::ok(
+            r#"{"status":0,"sub":{"subs":[{"id":602333,"subtype":"Subrip(srt)","lang":{"desc":"繁 英"},
+                "filelist":[{"f":"Some.Movie.2019.cht.srt","s":"48KB","url":"https://file0.assrt.test/onthefly/602333/1/a.srt"},
+                            {"f":"cover.jpg","s":"1KB","url":"https://file0.assrt.test/onthefly/602333/2/cover.jpg"}]}]}}"#,
+        ),
+    )
+    .on(HttpMethod::Get, "onthefly/602333/1", Reply::ok(SRT_TRADITIONAL));
+    let mut settings = Settings::default();
+    settings.online_subs.provider = vitascope::online_subs::Provider::Assrt;
+    let (mut h, dir, _video) = online_case("assrt", "Some.Movie.2019.mp4", &fake, settings);
+    open_online(&mut h);
+    assert!(fake.requests().is_empty(), "沒有 Token：不搜尋");
+    assert!(
+        h.query_all_by_label_contains("射手網（偽）需要你自己的 API Token")
+            .count()
+            >= 1,
+        "說明怎麼取得"
+    );
+    h.get_by_label_contains("字幕服務由");
+    h.get_by_label("assrt.net");
+    h.state_mut().settings_mut().online_subs.assrt_token = format!(" {token} ");
+    h.run_steps(2);
+    online_button(&h, "搜尋", 0).click();
+    h.step();
+    online_idle(&mut h);
+    let search = &fake.requests_to("/sub/search")[0];
+    assert_eq!(
+        search.url,
+        "https://assrt.test/v1/sub/search?q=some%20movie%202019&cnt=15&pos=0"
+    );
+    assert_eq!(
+        search.header_value("Authorization"),
+        Some(format!("Bearer {token}").as_str())
+    );
+    assert!(!search.url.contains(token));
+    h.get_by_label("某部電影 / Some.Movie.2019");
+    // 射手網（偽）的欄：字幕組、評分（不是下載數；沒有檔案特徵碼，沒有「相符」）
+    h.get_by_label("字幕組");
+    h.get_by_label("評分");
+    h.get_by_label("某某字幕組");
+    h.get_by_label("7.5");
+    assert!(h.query_by_label("下載數").is_none() && h.query_by_label("相符").is_none());
+    // 只有圖片字幕（VobSub）：到網頁下載
+    h.get_by_label("開啟網頁");
+    online_button(&h, "展開", 0).click();
+    h.step();
+    online_idle(&mut h);
+    // 字幕檔才列出來（圖片不是）
+    h.get_by_label_contains("Some.Movie.2019.cht.srt");
+    assert!(h.query_by_label_contains("cover.jpg").is_none());
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    wait_external_subs(&mut h, 1);
+    // 檔名的語言標記照內容（R-B12）：網站的檔名寫 cht、內容是繁體
+    assert!(
+        dir.0.join("Some.Movie.2019.zh-TW.srt").is_file(),
+        "{:?}",
+        names_in(&dir.0)
+    );
+    online_button(&h, "收起", 0).click();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Some.Movie.2019.cht.srt").is_none());
+}
+
+/// 「設定 → 字幕」的「線上字幕」：勾選存進設定（R-C13：會存檔）；Token 欄位遮起來，格式不對時說明；
+/// 沒有金鑰的版本說明原因
+#[test]
+fn online_settings_section() {
+    let dir = TempDir::new("online-settings");
+    let path = dir.0.join("settings.json");
+    let settings = Settings::load_from(path.clone());
+    let mut h = harness_launch(Launch::default(), settings);
+    h.step();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    // 控制列也有「字幕」選單：設定視窗的分頁在上面
+    h.query_all_by_label("字幕")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .unwrap()
+        .click();
+    h.run_steps(2);
+    h.get_by_label("線上字幕");
+    click_in_view(&mut h, "下載的字幕存到影片旁邊（下次開啟會自動載入）");
+    assert!(!h.state().settings().online_subs.save_next_to_video);
+    let saved = std::fs::read_to_string(&path).expect("改了就存檔");
+    assert!(saved.contains(r#""save_next_to_video": false"#), "{saved}");
+    click_in_view(&mut h, "日文");
+    assert_eq!(
+        h.state().settings().online_subs.languages,
+        ["zh-tw", "zh-cn", "ze", "en", "ja"],
+        "第一次勾：依介面語言的預設寫成清單"
+    );
+    // Token：遮起來；格式不對時說明（照打的保存）
+    text_field(&h, "射手網（偽）Token").scroll_to_me();
+    h.run_steps(5);
+    text_field(&h, "射手網（偽）Token").focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("short-token".into()));
+    h.run_steps(2);
+    assert_eq!(h.state().settings().online_subs.assrt_token, "short-token");
+    let shown = text_field(&h, "射手網（偽）Token")
+        .accesskit_node()
+        .value()
+        .unwrap_or_default();
+    assert!(!shown.contains("short"), "遮起來：{shown}");
+    h.get_by_label("射手網（偽）的 Token 不正確（應該是 32 個英文字母和數字）");
+    h.get_by_label("這個版本沒有 OpenSubtitles 的 API 金鑰（自行編譯的版本）");
+}
+
+/// 英文介面
+#[test]
+fn english_ui_online_subs() {
+    let fake = fake_opensubtitles();
+    let mut settings = Settings::default();
+    settings.language = vitascope::i18n::Lang::En;
+    let (mut h, _dir, _video) = online_case("os-english", "English.mp4", &fake, settings);
+    h.get_by_label("Subtitles").click();
+    h.run_steps(2);
+    h.get_by_label("Search subtitles online…").click();
+    h.step();
+    online_idle(&mut h);
+    h.get_by_label("Search subtitles online");
+    online_button(&h, "Download & load", 0);
+    h.get_by_label("Not signed in");
+    h.get_by_label_contains("Subtitles provided by");
+    h.get_by_label("2 subtitles found, 1 made for this exact file");
+    online_button(&h, "Sign in…", 0).click();
+    h.run_steps(2);
+    h.get_by_label("Sign in to OpenSubtitles");
+    h.get_by_label("Create a free account");
+}
+
+/// 迷你播放器、子母畫面裡不畫線上搜尋字幕的視窗（狀態保留）；在迷你播放器裡打開它會回到一般視窗（§9.1 From F1）
+#[test]
+fn online_window_is_hidden_in_the_mini_player_and_keeps_its_state() {
+    let fake = fake_opensubtitles();
+    let dir = TempDir::new("os-mini");
+    let launch = Launch {
+        online: OnlineEnv::testing(fake.clone(), Some(dir.0.join("cache"))),
+        ..Default::default()
+    };
+    let mut h = mini_case_with(sample("common/mkv_multitrack.mkv"), Settings::default(), launch);
+    open_online(&mut h);
+    text_field(&h, "搜尋").focus();
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.event(egui::Event::Text("kept text".into()));
+    h.run_steps(2);
+    // 輸入框的焦點拿掉（不然 Ctrl+Shift+M 也不是快捷鍵）
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().online_subs_open());
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    assert!(h.query_by_label("線上搜尋字幕").is_none(), "藏起來");
+    assert!(h.state().online_subs_open(), "狀態保留");
+    // 回到一般視窗：照原樣出現
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.get_by_label("線上搜尋字幕");
+    assert_eq!(h.state().online_subs_query(), "kept text", "回來時照原樣");
+    // 迷你播放器裡再打開開著（藏起來）的視窗：回到一般視窗
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label("線上搜尋字幕");
+    assert_eq!(fake.requests_to("/subtitles").len(), 1, "同一部影片：不重新搜尋");
+    // 子母畫面裡也藏起來（狀態保留），回到一般視窗時照原樣出現
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Pip);
+    assert!(h.query_by_label("線上搜尋字幕").is_none(), "子母畫面裡藏起來");
+    assert!(h.state().online_subs_open(), "狀態保留");
+    toggle_pip_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label("線上搜尋字幕");
+    assert_eq!(h.state().online_subs_query(), "kept text");
+    // 關著時在迷你播放器裡打開：也回到一般視窗
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().online_subs_open());
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label("線上搜尋字幕");
+}
+
+/// 結果是上一部影片的（自動搜尋關著、換了影片）：「上一頁 / 下一頁」也停用。不然會用上一部的搜尋文字配上
+/// 這部影片搜尋，結果被當成這部影片的（R-A2）
+#[test]
+fn stale_results_cannot_change_page() {
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/subtitles",
+        Reply::ok(
+            os_search_json(&[(1, "zh-tw", "Page.One", false)]).replace(r#""total_pages":1"#, r#""total_pages":2"#),
+        ),
+    );
+    let mut settings = Settings::default();
+    settings.online_subs.auto_search = true;
+    let (mut h, dir, _first) = online_case("os-pager", "Alpha.Movie.mp4", &fake, settings);
+    let second = dir.clip("Beta.Movie.mp4");
+    open_online(&mut h);
+    h.get_by_label("第 1 / 2 頁");
+    assert!(!online_button(&h, "下一頁", 0).accesskit_node().is_disabled());
+    h.state_mut().settings_mut().online_subs.auto_search = false;
+    drop_file(&mut h, second);
+    settle(&mut h, "Beta.Movie.mp4");
+    h.run_steps(3);
+    h.get_by_label("影片已經換了，請重新搜尋");
+    assert!(
+        online_button(&h, "下一頁", 0).accesskit_node().is_disabled(),
+        "上一部影片的結果不能換頁"
+    );
+    online_button(&h, "下一頁", 0).click();
+    h.run_steps(3);
+    assert!(!h.state().online_subs_busy());
+    assert_eq!(
+        fake.requests_to("/subtitles").len(),
+        1,
+        "沒有用舊的搜尋文字搜尋這部影片"
+    );
+}
+
+/// 下載中換了影片、自動搜尋開著：下載完再用新影片的檔名搜尋（同時只做一個工作）
+#[test]
+fn a_video_change_during_a_download_searches_afterwards() {
+    let fake = fake_opensubtitles();
+    let (mut h, dir, _first) = online_case("os-queued", "Alpha.Movie.mp4", &fake, Settings::default());
+    let second = dir.clip("Beta.Movie.mp4");
+    open_online(&mut h);
+    fake.hold("dl.test/f/2.srt");
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    assert!(h.state().online_subs_busy());
+    drop_file(&mut h, second);
+    settle(&mut h, "Beta.Movie.mp4");
+    h.run_steps(3);
+    assert_eq!(fake.requests_to("/subtitles").len(), 1, "下載還沒做完：先不搜尋");
+    assert_eq!(h.state().online_subs_query(), "beta movie");
+    fake.release("dl.test/f/2.srt");
+    online_idle(&mut h);
+    assert!(dir.0.join("Alpha.Movie.zh-TW.srt").is_file(), "{:?}", names_in(&dir.0));
+    let searches = fake.requests_to("/subtitles");
+    assert_eq!(searches.len(), 2, "下載完接著搜尋新的影片");
+    assert!(searches[1].url.ends_with("&query=beta+movie"), "{}", searches[1].url);
+    assert!(h.query_by_label("影片已經換了，請重新搜尋").is_none());
+    assert!(!online_button(&h, "下載並載入", 0).accesskit_node().is_disabled());
+}
+
+/// 取消了的下載不跳出登入對話框：關掉視窗時請求已經送出、伺服器之後回「要登入」也一樣。
+/// 迷你播放器、子母畫面裡下載要登入：對話框先等著（不蓋在小視窗上），回到一般視窗才出現
+#[test]
+fn login_is_not_offered_for_a_cancelled_download_or_over_the_mini_player() {
+    let fake = FakeHttp::new();
+    fake.on(
+        HttpMethod::Get,
+        "/subtitles",
+        Reply::ok(os_search_json(&[(2, "zh-tw", "Exact.Release", true)])),
+    )
+    .on(
+        HttpMethod::Post,
+        "/download",
+        Reply::new(401, r#"{"message":"You need to log in"}"#),
+    );
+    let dir = TempDir::new("os-login-later");
+    let mut settings = Settings::default();
+    settings.online_subs.save_next_to_video = false;
+    let launch = Launch {
+        online: OnlineEnv::testing(fake.clone(), Some(dir.0.join("cache"))),
+        ..Default::default()
+    };
+    let mut h = mini_case_with(sample("common/mkv_multitrack.mkv"), settings, launch);
+    open_online(&mut h);
+    // 送出 /download 之後才關掉視窗
+    fake.hold("/download");
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    assert!(h.state().online_subs_busy());
+    // 背景的下載要真的送出 /download（在 hold 那裡等著）才按 Esc：不然取消得太早，請求根本沒送出
+    // （慢的電腦上會這樣），這個測試就測不到「請求送出之後才取消」
+    step_until_app(&mut h, "/download 已經送出", |_| {
+        fake.requests_to("/download").len() == 1
+    });
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().online_subs_open());
+    fake.release("/download");
+    online_idle(&mut h);
+    h.run_steps(2);
+    assert_eq!(fake.requests_to("/download").len(), 1);
+    assert!(!h.state().online_login_open(), "取消了的下載：不跳出登入對話框");
+    assert!(h.query_by_label("登入 OpenSubtitles").is_none());
+
+    // 迷你播放器裡才回來的「要登入」：對話框等到回到一般視窗
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    h.run_steps(2);
+    online_idle(&mut h);
+    fake.hold("/download");
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    assert!(h.state().online_subs_busy());
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    fake.release("/download");
+    online_idle(&mut h);
+    h.run_steps(2);
+    assert!(h.state().online_login_open(), "登入對話框等著");
+    assert!(
+        h.query_by_label("登入 OpenSubtitles").is_none(),
+        "迷你播放器裡不畫登入對話框"
+    );
+    assert_eq!(h.state().window_mode(), WindowMode::Mini);
+    toggle_mini_key(&mut h);
+    window_settled(&mut h);
+    assert_eq!(h.state().window_mode(), WindowMode::Normal);
+    h.get_by_label("登入 OpenSubtitles");
+    h.get_by_label("線上搜尋字幕");
+}
+
+/// Esc 的順序：線上搜尋字幕的視窗比設定視窗先關。從「設定 → 字幕」打開的登入對話框：Esc 只關對話框，設定視窗照樣開著
+#[test]
+fn esc_closes_the_online_window_before_settings() {
+    let fake = fake_opensubtitles();
+    let (mut h, _dir, _video) = online_case("os-esc-order", "Esc.Order.mp4", &fake, Settings::default());
+    let settings = |h: &Harness<'_, VitascopeApp>| h.query_by_label("一般").is_some();
+    open_online(&mut h);
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    assert!(settings(&h) && h.state().online_subs_open());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().online_subs_open(), "線上搜尋字幕的視窗先關");
+    assert!(settings(&h), "設定視窗還開著");
+    // 設定 → 字幕：登入…
+    h.query_all_by_label("字幕")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .unwrap()
+        .click();
+    h.run_steps(2);
+    let sign_in = h
+        .query_all_by_label("登入…")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .expect("設定頁的「登入…」");
+    sign_in.scroll_to_me();
+    h.run_steps(15);
+    online_button(&h, "登入…", 0).click();
+    h.run_steps(2);
+    assert!(h.state().online_login_open());
+    h.get_by_label("登入 OpenSubtitles");
+    for _ in 0..2 {
+        if !h.state().online_login_open() {
+            break;
+        }
+        h.key_press(egui::Key::Escape);
+        h.run_steps(2);
+    }
+    assert!(!h.state().online_login_open(), "Esc 關掉登入對話框");
+    assert!(settings(&h), "設定視窗照樣開著");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(!settings(&h));
+}
+
+/// 視窗的語言選單：「其他…」打開「設定 → 字幕」，焦點在「其他語言」的欄位
+#[test]
+fn other_languages_jump_to_the_settings_field() {
+    let fake = fake_opensubtitles();
+    let (mut h, _dir, _video) = online_case("os-other", "Other.Lang.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    h.get_by_label("繁體中文、簡體中文、中英雙語、英文").click();
+    h.run_steps(2);
+    h.get_by_label("其他…").click();
+    h.run_steps(4);
+    h.get_by_label("線上字幕");
+    let field = egui::Id::new("online_other_languages");
+    assert!(h.ctx.memory(|m| m.has_focus(field)), "焦點在「其他語言」");
+    h.event(egui::Event::Text("fr".into()));
+    h.run_steps(2);
+    // 離開欄位才寫回設定
+    text_field(&h, "射手網（偽）Token").focus();
+    h.run_steps(2);
+    assert_eq!(
+        h.state().settings().online_subs.languages,
+        ["zh-tw", "zh-cn", "ze", "en", "fr"]
+    );
+}
+
+/// 搜尋語言不能全部取消：只剩一種時那個勾選框停用（空的清單 = 依介面語言，取消最後一個反而變成好幾種）；
+/// 「其他語言」清空、又沒有勾別的時也不改
+#[test]
+fn the_last_search_language_cannot_be_unchecked() {
+    let dir = TempDir::new("online-last-lang");
+    let mut settings = Settings::load_from(dir.0.join("settings.json"));
+    settings.online_subs.languages = vec!["ja".into()];
+    let mut h = harness_launch(Launch::default(), settings);
+    h.step();
+    h.key_press(egui::Key::F5);
+    h.run_steps(2);
+    h.query_all_by_label("字幕")
+        .min_by(|a, b| a.rect().top().total_cmp(&b.rect().top()))
+        .unwrap()
+        .click();
+    h.run_steps(2);
+    h.get_by_label("日文").scroll_to_me();
+    h.run_steps(15);
+    assert!(
+        h.get_by_label("日文").accesskit_node().is_disabled(),
+        "只剩一種：不能取消"
+    );
+    h.get_by_label("日文").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().online_subs.languages, ["ja"]);
+    // 其他語言加 fr：日文可以取消了
+    let other = "其他語言（OpenSubtitles 的語言碼，以逗號分隔）";
+    text_field(&h, other).focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("fr".into()));
+    h.run_steps(1);
+    text_field(&h, "射手網（偽）Token").focus();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().online_subs.languages, ["ja", "fr"]);
+    // 寫回設定的那一幀，勾選框已經畫過了：再畫一幀
+    h.run_steps(2);
+    assert!(!h.get_by_label("日文").accesskit_node().is_disabled());
+    h.get_by_label("日文").click();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().online_subs.languages, ["fr"]);
+    // 把 fr 也清掉：不改（不會變回依介面語言的四種）
+    text_field(&h, other).focus();
+    h.run_steps(1);
+    h.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    h.key_press(egui::Key::Backspace);
+    h.run_steps(1);
+    assert_eq!(text_field(&h, other).accesskit_node().value().as_deref(), Some(""));
+    text_field(&h, "射手網（偽）Token").focus();
+    h.run_steps(2);
+    assert_eq!(h.state().settings().online_subs.languages, ["fr"]);
+}
+
+/// 剩下的下載次數只照伺服器說的（R-C14）：只登入、還沒下載時不顯示數字（登入回應的「每天能下載幾個」不是剩下的次數）
+#[test]
+fn quota_waits_for_the_server_after_sign_in() {
+    let fake = fake_opensubtitles();
+    fake.on(
+        HttpMethod::Post,
+        "/login",
+        Reply::ok(
+            r#"{"user":{"allowed_downloads":20,"vip":false},"base_url":"api.opensubtitles.com","token":"jwt-1"}"#,
+        ),
+    );
+    let (mut h, _dir, _video) = online_case("os-quota", "Quota.Wait.mp4", &fake, Settings::default());
+    open_online(&mut h);
+    online_button(&h, "登入…", 0).click();
+    h.step();
+    h.run_steps(2);
+    assert!(h.state().online_login_open());
+    text_field(&h, "帳號").focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("viewer".into()));
+    h.run_steps(1);
+    text_field(&h, "密碼").focus();
+    h.run_steps(1);
+    h.event(egui::Event::Text("pw-123".into()));
+    h.run_steps(1);
+    online_button(&h, "登入", 0).click();
+    h.step();
+    step_until_app(&mut h, "登入完成", |app| {
+        app.online_account().user().is_some() && !app.online_login_open()
+    });
+    h.run_steps(2);
+    h.get_by_label("已登入：viewer");
+    assert!(
+        h.query_by_label_contains("今天還能下載").is_none(),
+        "還沒下載：伺服器還沒說剩幾次"
+    );
+    assert!(fake.requests_to("/download").is_empty());
+    // 下載之後才照伺服器的 remaining 顯示
+    online_button(&h, "下載並載入", 0).click();
+    h.step();
+    online_idle(&mut h);
+    h.get_by_label("今天還能下載 4 個");
+}
+
+/// 搜尋還沒回來就換了影片（自動搜尋關著）：回來的結果是上一部影片的，灰掉、不能下載（R-A2）
+#[test]
+fn a_search_that_ends_after_the_video_changed_is_greyed() {
+    let fake = fake_opensubtitles();
+    let (mut h, dir, _first) = online_case("os-late", "Alpha.Movie.mp4", &fake, Settings::default());
+    let second = dir.clip("Beta.Movie.mp4");
+    fake.hold("/subtitles");
+    h.state_mut().run_command(vitascope::keymap::Command::SearchSubtitles);
+    h.step();
+    assert!(h.state().online_subs_open());
+    step_until_app(&mut h, "搜尋送出", |_| fake.requests_to("/subtitles").len() == 1);
+    h.state_mut().settings_mut().online_subs.auto_search = false;
+    drop_file(&mut h, second);
+    settle(&mut h, "Beta.Movie.mp4");
+    h.run_steps(3);
+    assert_eq!(h.state().online_subs_query(), "beta movie");
+    fake.release("/subtitles");
+    online_idle(&mut h);
+    assert_eq!(fake.requests_to("/subtitles").len(), 1, "沒有自動搜尋");
+    assert!(fake.requests_to("/subtitles")[0].url.ends_with("&query=alpha+movie"));
+    h.get_by_label("影片已經換了，請重新搜尋");
+    assert!(online_button(&h, "下載並載入", 0).accesskit_node().is_disabled());
+}

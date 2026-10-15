@@ -44,13 +44,14 @@ pub(super) enum Then {
     Side(SideTab),
 }
 
-/// 迷你播放器、子母畫面裡藏起來的視窗：進入時開著的（設定、控制面板、字幕外觀、匯出；子母畫面還有媒體資訊）
+/// 迷你播放器、子母畫面裡藏起來的視窗：進入時開著的（設定、控制面板、字幕外觀、匯出、線上搜尋字幕；子母畫面還有媒體資訊）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct BigWindows {
     settings: bool,
     panel: bool,
     sub_style: bool,
     export: bool,
+    online_subs: bool,
     about: bool,
     /// 媒體資訊（蓋在影片上）：迷你播放器看得到，子母畫面太小，算大視窗
     info: bool,
@@ -63,6 +64,7 @@ impl BigWindows {
             || (self.panel && !before.panel)
             || (self.sub_style && !before.sub_style)
             || (self.export && !before.export)
+            || (self.online_subs && !before.online_subs)
             || (self.about && !before.about)
             || (self.info && !before.info)
     }
@@ -787,12 +789,13 @@ impl VitascopeApp {
             panel: self.panel_open,
             sub_style: self.sub_style_open,
             export: self.export.open,
+            online_subs: self.online_subs.open,
             about: self.about_open,
             info: self.info_open && self.pip(),
         }
     }
 
-    /// 迷你播放器、子母畫面裡打開了大視窗（設定、控制面板、字幕外觀、匯出、關於；子母畫面裡還有媒體資訊；
+    /// 迷你播放器、子母畫面裡打開了大視窗（設定、控制面板、字幕外觀、匯出、線上搜尋字幕、關於；子母畫面裡還有媒體資訊；
     /// 從哪裡打開的都一樣）：回到一般視窗。
     /// 進入時就開著的（藏起來的）不算；關掉的就不再藏
     pub(super) fn compact_window_check(&mut self, ctx: &egui::Context) {
