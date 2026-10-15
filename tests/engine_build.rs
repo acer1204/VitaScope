@@ -133,6 +133,48 @@ fn decoders_demuxers_protocols_filters() {
         "缺少 png 編碼器（截圖）"
     );
 }
+/// 罕見格式裡 FFmpeg 沒有編碼器、產生不了樣本的（Bink、Smacker、RealVideo 4、Cook、APE、Musepack、TAK、VP6、
+/// Indeo、Lagarith、ATRAC）：至少確認播放引擎有它們的解碼器與分離器（ROADMAP 第 2 節；實際的檔案靠影片庫普查）。
+/// 系統的 libmpv（Linux tar.gz，FFmpeg 6.1）也都有
+#[test]
+fn rare_formats_without_samples() {
+    let p = engine();
+    let codecs = list(&p, "decoder-list", "codec");
+    let missing: Vec<&str> = [
+        "binkvideo",
+        "binkaudio_rdft",
+        "binkaudio_dct",
+        "smackvideo",
+        "smackaudio",
+        "rv30",
+        "rv40",
+        "cook",
+        "ape",
+        "musepack7",
+        "musepack8",
+        "tak",
+        "vp6",
+        "vp6f",
+        "indeo3",
+        "indeo5",
+        "lagarith",
+        "atrac3",
+        "atrac3p",
+    ]
+    .into_iter()
+    .filter(|c| !codecs.iter().any(|x| x == c))
+    .collect();
+    assert!(missing.is_empty(), "缺少這些解碼器：{missing:?}");
+    let demux = p.get_string("demuxer-lavf-list").unwrap();
+    let demuxers: Vec<&str> = demux.split(',').map(str::trim).collect();
+    // AMV 走 avi 分離器；DSDIFF（.dff）是 iff
+    let missing: Vec<&str> = ["bink", "smk", "rm", "ape", "mpc", "mpc8", "tak", "dsf", "iff"]
+        .into_iter()
+        .filter(|d| !demuxers.contains(d))
+        .collect();
+    assert!(missing.is_empty(), "缺少這些分離器：{missing:?}（{demux}）");
+}
+
 /// 本專案建置的 libmpv（Windows、macOS、AppImage 的那一份）：版本與建置選項要跟它的 components.json 一致
 #[test]
 fn vendored_libmpv_matches_its_manifest() {

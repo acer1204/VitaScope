@@ -109,7 +109,20 @@ jobs:
         timeout-minutes: 10
         run: sudo apt-get install -y desktop-file-utils appstream
 
+      # OpenSubtitles 的 API 金鑰（線上搜尋字幕）：只在這裡從 repo 的 secret 放進正式版（build.rs 寫進執行檔，不在原始碼裡）。
+      # 沒有設定時照樣編譯（手動的試跑也要能跑），只是這個版本不能用 OpenSubtitles。金鑰本身不印出來
+      - name: 檢查 OpenSubtitles 的金鑰
+        shell: bash
+        env:
+          OPENSUBTITLES_KEY_SET: ${{ secrets.OPENSUBTITLES_API_KEY != '' }}
+        run: |
+          if [[ "$OPENSUBTITLES_KEY_SET" != "true" ]]; then
+            echo "::warning::沒有 OPENSUBTITLES_API_KEY，這次的發佈版不能用 OpenSubtitles"
+          fi
+
       - name: 編譯
+        env:
+          VITASCOPE_OPENSUBTITLES_KEY: ${{ secrets.OPENSUBTITLES_API_KEY }}
         run: cargo build --release
 
       - name: 授權聲明

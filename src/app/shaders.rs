@@ -8,13 +8,11 @@ use super::{Action, DialogKind, Pick, VitascopeApp, mpv_opts_override};
 use crate::picture::shader::{self, ShaderApply, ShaderInfo, ShaderProblem, Verdict};
 use crate::picture::{ShaderPreset, new_preset_id};
 use crate::player::AsyncKey;
+use crate::theme::Palette;
 use crate::{tf, tr};
-use eframe::egui::{self, Color32};
+use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-
-/// 有問題的檔案的顏色
-const PROBLEM: Color32 = Color32::from_rgb(0xff, 0x8a, 0x80);
 
 /// 設定頁的組合編輯（每一幀收集，畫完再做）
 enum Edit {
@@ -387,12 +385,15 @@ impl VitascopeApp {
                                 ui.weak(d);
                             }
                             Some(Err(problem)) => {
-                                ui.colored_label(PROBLEM, format!("⚠ {}", problem.message()));
+                                ui.colored_label(Palette::of(ui.visuals()).problem, format!("⚠ {}", problem.message()));
                             }
                             _ => {}
                         }
                         if let Some(reason) = self.shader_failures.get(f) {
-                            ui.colored_label(PROBLEM, tf!("⚠ 無法使用：{reason}", "⚠ Couldn't be used: {reason}"));
+                            ui.colored_label(
+                                Palette::of(ui.visuals()).problem,
+                                tf!("⚠ 無法使用：{reason}", "⚠ Couldn't be used: {reason}"),
+                            );
                         }
                         let last = j + 1 == p.files.len();
                         if ui
@@ -427,7 +428,7 @@ impl VitascopeApp {
             });
         }
         if let Some((name, why)) = &self.shader_rejected {
-            ui.colored_label(PROBLEM, tf!("{name}：{why}", "{name}: {why}"));
+            ui.colored_label(Palette::of(ui.visuals()).problem, tf!("{name}：{why}", "{name}: {why}"));
         }
         if ui.button(tr!("新增組合", "New preset")).clicked() {
             edit = Some(Edit::NewPreset);

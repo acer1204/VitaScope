@@ -1,6 +1,6 @@
 [package]
 name = "vitascope"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "影戲 — 跨平台影片播放器：libmpv 引擎 + egui 介面"
 authors = ["acer1204"]
@@ -34,13 +34,26 @@ raw-window-handle = "0.6"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# TTML / DFXP 字幕轉成 SRT（FFmpeg 讀不了 TTML）。本來就在相依樹裡（Linux 的 wayland-scanner 建置時用的），
+# 現在程式本身也用；不展開 DTD、外部實體
+quick-xml = "0.41"
 # 檢查更新（查詢 GitHub Releases）
 ureq = "3"
+# 網址的解析（主機名稱、帳號密碼、查詢參數）；本來就在相依樹裡（webbrowser 用的）
+url = "2.5.8"
+# 按需求下載的 yt-dlp、deno：核對 SHA-256（ring，rustls 本來就用它）、解開 deno 的 zip（flate2，ureq 本來就用它）
+ring = "0.17.14"
+flate2 = "1.1.10"
+# 縮圖總覽圖存成 JPEG（image 本來就在相依樹裡：arboard 用的）。jpeg 用的 zune-jpeg、zune-core：macOS 上 arboard 的 tiff 已經用到，
+# Windows、Linux 是新加的（MIT / Apache-2.0 / Zlib）
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 # Windows：系統的「圖片」資料夾（可能被 OneDrive 搬走，要問系統）
 [target.'cfg(windows)'.dependencies]
 # 單一執行個體：具名管道、使用者 SID（只讓同一個使用者連線）、把前景交給已開啟的視窗
 # 流暢播放：螢幕的精確更新率（QueryDisplayConfig）、電源（GetSystemPowerStatus）
+# 網站影片：yt-dlp 放進 Job Object（取消、結束影戲時連它開的子程序一起結束）
+# 播完後：睡眠 / 休眠（SetSuspendState）、關機（ExitWindowsEx）、整個系統多久沒有輸入（GetLastInputInfo、GetTickCount）
 windows-sys = { version = "0.61", features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
@@ -51,16 +64,30 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_Performance",
     "Win32_System_Pipes",
     "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
+    "Win32_System_Shutdown",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# 系統媒體控制：Windows 的 SMTC（音量浮動視窗、鎖定畫面、媒體鍵）與封面的記憶體資料流。
+# 本來就在相依樹裡（accesskit_windows 用的），只多開幾個功能，沒有新套件
+windows = { version = "0.62", default-features = false, features = [
+    "Media",
+    "Storage_Streams",
+    "Win32_Foundation",
+    "Win32_System_WinRT",
+] }
+# 視窗在最前面時的媒體鍵：winit 的訊息掛鉤（eframe 只轉出 EventLoopBuilder）；本來就在相依樹裡（同一個版本）
+winit = { version = "0.30", default-features = false }
 
 # macOS：Finder 開檔送來的 Apple Event（winit 沒有提供）
 [target.'cfg(unix)'.dependencies]
@@ -70,13 +97,20 @@ libc = "0.2"
 # Linux（X11）：啟動時查有哪些螢幕（上次的視窗位置在拔掉的螢幕上時不還原）；winit 本來就用它
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11-dl = "2.21"
+# 播完後的睡眠、休眠、關機：systemd-logind（D-Bus 系統匯流排）；跟隨系統的深淺色：桌面的設定 portal。
+# 本來就在相依樹裡（accesskit_unix、atspi 用的），只用同步的 zbus::blocking（blocking-api 只是多編譯一些 zbus 的程式碼，沒有新套件）
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-# 啟動時查有哪些螢幕（NSScreen）；視窗所在螢幕的編號（NSView → NSWindow → NSScreen.deviceDescription）
+# 啟動時查有哪些螢幕（NSScreen）；視窗所在螢幕的編號（NSView → NSWindow → NSScreen.deviceDescription）；
+# 播完後倒數時取消隱藏（NSApplication）；換回跟隨系統時讀系統現在的外觀（NSApplication.effectiveAppearance）
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
+    "NSAppearance",
+    "NSApplication",
     "NSGraphics",
+    "NSImage",
     "NSResponder",
     "NSScreen",
     "NSView",
@@ -86,13 +120,34 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSAppleEventDescriptor",
     "NSAppleEventManager",
+    "NSArray",
+    "NSData",
     "NSDictionary",
     "NSEnumerator",
+    "NSGeometry",
     "NSNotification",
+    "NSObject",
     "NSString",
     "NSURL",
     "NSValue",
 ] }
+# 系統媒體控制：「正在播放」（MPNowPlayingInfoCenter）與遠端指令（MPRemoteCommandCenter：媒體鍵 F7–F9、AirPods、
+# 控制中心）。不開預設功能（不會帶進 AVFoundation）；MPRemoteControlTypes 是隨機、重複的型別（S-A5）。
+# 封面（MPMediaItemArtwork）要 block2、objc2-app-kit（NSImage）、objc2-core-foundation（CGSize）
+objc2-media-player = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "MPMediaItem",
+    "MPNowPlayingInfoCenter",
+    "MPRemoteCommand",
+    "MPRemoteCommandCenter",
+    "MPRemoteCommandEvent",
+    "MPRemoteControlTypes",
+] }
+# 遠端指令的處理、封面的請求（Objective-C 的 block）；本來就在相依樹裡
+block2 = "0.6"
 
 [profile.release]
 opt-level = 3
@@ -106,3 +161,21 @@ opt-level = 2
 
 [dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe"] }
+
+# Windows：SMTC 的實機測試（#[ignore]）從系統那一端找到影戲的工作階段、按它的按鈕
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", default-features = false, features = ["Media_Control"] }
+
+# macOS：「正在播放」的測試在主執行緒上自己轉 run loop（等系統的值）
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSDate", "NSRunLoop"] }
+
+# macOS 的「正在播放」只能在主執行緒用：這個測試程式不用 libtest（libtest 在別的執行緒跑測試），自己的 main 就在主執行緒
+[[test]]
+name = "now_playing"
+harness = false
+
+# macOS 的子母畫面（AppKit 的 NSWindow）也只能在主執行緒用：同上，自己的 main
+[[test]]
+name = "pip_mac"
+harness = false

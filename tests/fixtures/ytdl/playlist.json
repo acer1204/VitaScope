@@ -1,0 +1,44 @@
+{
+ "_type": "playlist",
+ "id": "PL1",
+ "title": "List",
+ "extractor": "youtube:tab",
+ "extractor_key": "YoutubeTab",
+ "webpage_url": "https://www.youtube.com/playlist?list=PL1",
+ "entries": [
+  {
+   "_type": "url",
+   "ie_key": "Youtube",
+   "id": "aaaaaaaaaaa",
+   "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+   "title": "First one",
+   "duration": 61
+  },
+  {
+   "_type": "url",
+   "ie_key": "Youtube",
+   "id": "bbbbbbbbbbb",
+   "url": "bbbbbbbbbbb",
+   "title": "Second\ntwo"
+  },
+  {
+   "_type": "url",
+   "ie_key": "Generic",
+   "url": "file:///etc/passwd",
+   "title": "bad"
+  },
+  {
+   "_type": "url",
+   "ie_key": "Niconico",
+   "id": "sm9",
+   "url": "sm9",
+   "title": "no url"
+  },
+  {
+   "_type": "url",
+   "ie_key": "Vimeo",
+   "url": "https://vimeo.com/123",
+   "title": "  "
+  }
+ ]
+}

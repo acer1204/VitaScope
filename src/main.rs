@@ -71,8 +71,10 @@ fn parse_args() -> (Launch, bool) {
     // 流暢播放的實機測試：VITASCOPE_TEST_MINIMIZE=3,6 截圖前縮到最小再還原；
     // VITASCOPE_TEST_BUSY_UI=1 介面一直重畫（模擬滑鼠在視窗上移動）；VITASCOPE_TEST_STALL=3,10 第 3 秒讓介面停 10 秒
     //（像開著檔案對話框）。只跟 --shot 一起用
+    // VITASCOPE_TEST_WINDOW_MODE=pip@3,normal@9：第 3 秒進入子母畫面、第 9 秒回到一般視窗（子母畫面的實機測試）
     let minimize = std::env::var("VITASCOPE_TEST_MINIMIZE").unwrap_or_default();
     let busy_ui = std::env::var_os("VITASCOPE_TEST_BUSY_UI").is_some_and(|v| v == "1");
+    let modes = std::env::var("VITASCOPE_TEST_WINDOW_MODE").unwrap_or_default();
     launch.autoshot = shot.map(|p| {
         AutoShot::new(p, Duration::from_secs_f64(delay))
             .minimize_at(vitascope::autoshot::parse_minimize(&minimize))
@@ -80,16 +82,49 @@ fn parse_args() -> (Launch, bool) {
             .stall_at(vitascope::autoshot::parse_stall(
                 &std::env::var("VITASCOPE_TEST_STALL").unwrap_or_default(),
             ))
+            .window_modes_at(vitascope::window_mode::parse_test_modes(&modes))
     });
     // 流暢播放出問題時回到以前的做法：VITASCOPE_PACING=off（只在啟動時讀一次）
     launch.pacing = vitascope::pacing::Overrides::from_env();
-    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
+    // 自動截圖（開發、CI 用）不讀也不寫播放紀錄、書籤、播放清單：畫面才固定，也不會混進使用者的最近開啟清單
     if launch.autoshot.is_none() {
         launch.history = History::load();
+        launch.bookmarks = vitascope::bookmarks::Bookmarks::load();
+        // 影戲下載的 yt-dlp、deno 放的地方（自動截圖不找）
+        launch.tools_dir = vitascope::paths::tools_dir();
+        // 匯出的磁碟快取；啟動時清掉上次留下的暫存檔（自動截圖不清）
+        launch.cache_root = Some(vitascope::paths::cache_root());
+        // 線上搜尋字幕：真的連線、正式版的 API 金鑰、登入狀態與字幕的快取（只在使用者用到時才連網；自動截圖不連）
+        launch.online = vitascope::online_subs::OnlineEnv::real(&vitascope::paths::cache_root());
         launch.persist_playlist = true;
+        // 播完後的倒數：視窗還原、叫到前面、暫時置頂（自動截圖不動視窗）
+        launch.countdown_raise = true;
+        // 播完後的睡眠、休眠、關機：真的系統只在這裡接上（自動截圖、自動測試都沒有，選單也就不列出）
+        launch.system = Some(Arc::new(vitascope::system_power::RealPower::new()));
+        // 系統的媒體控制（媒體鍵…）：真的系統只在這裡接上（自動截圖、自動測試都沒有）
+        launch.media = vitascope::media_keys::MediaBackend::System;
+        // 播放影片時螢幕不關閉（mpv 的 stop-screensaver 對嵌入的畫面無效）：真的系統只在這裡接上
+        launch.inhibitor = Some(Arc::new(vitascope::inhibit::RealInhibitor::new()));
+        // Linux：winit 不回報系統的深淺色，跟隨系統時問桌面的設定 portal（第一次選跟隨系統時才連；自動截圖不連）
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            launch.theme_source = Some(Box::new(vitascope::theme::portal::Portal::session()));
+        }
         // 沒有指定要開的檔案：還原上次手動整理的清單（不自動播）
-        if launch.files.is_empty() {
-            launch.playlist = vitascope::m3u::load_session().map(|(items, current)| Playlist::restored(items, current));
+        if launch.files.is_empty()
+            && let Some((entries, current)) = vitascope::m3u::load_session_entries()
+        {
+            // 網址的標題（#EXTINF）：清單上照樣顯示標題，不是網址的最後一段
+            launch.titles = entries
+                .iter()
+                .filter_map(|e| {
+                    let url = e.path.to_string_lossy();
+                    let title = vitascope::net::useful_title(&url, e.title.as_deref()?)?;
+                    vitascope::m3u::is_url(&url).then(|| (url.into_owned(), title))
+                })
+                .collect();
+            let items = entries.into_iter().map(|e| e.path).collect();
+            launch.playlist = Some(Playlist::restored(items, current));
         }
     }
     (launch, new_window)
@@ -143,6 +178,20 @@ fn main() -> eframe::Result {
             Err(e) => eprintln!("[vitascope] 不使用單一執行個體：{e}"),
         }
     }
+    // 網站影片：用 yt-dlp 解析（第一次需要時才在背景找 yt-dlp；自動截圖不用，網站的網址說明要 yt-dlp）。
+    // 播放器和介面（「設定 → 網路」的狀態）用同一個尋找的結果
+    let net_resolver: Option<Arc<dyn vitascope::ytdl::Resolve>> = if launch.autoshot.is_none() {
+        let locator = vitascope::ytdl::Locator::new(launch.tools_dir.clone());
+        launch.ytdl = Some(locator.clone());
+        // 使用者按下「下載」「更新」時才從官方的 GitHub 下載到工具資料夾（不在背景自動連網）
+        launch.installer = launch
+            .tools_dir
+            .clone()
+            .map(|dir| Arc::new(vitascope::ytdl::install::Installer::github(dir)));
+        Some(Arc::new(vitascope::ytdl::ProcessResolver::new(locator)))
+    } else {
+        None
+    };
     let wake = egui_ctx.clone();
     let pace = !launch.pacing.block;
     let player = match Player::new(Options {
@@ -158,6 +207,7 @@ fn main() -> eframe::Result {
             }
         })),
         hwdec: if settings.hwdec { "auto-safe" } else { "no" }.into(),
+        net_resolver,
         ..Options::default()
     }) {
         Ok(p) => p,
@@ -172,7 +222,7 @@ fn main() -> eframe::Result {
         // Linux：Wayland 用它找 .desktop 檔與圖示，X11 是 WM_CLASS
         .with_app_id("io.github.acer1204.vitascope")
         .with_inner_size([960.0, 600.0])
-        .with_min_inner_size([vitascope::app::MIN_WINDOW_WIDTH, 300.0])
+        .with_min_inner_size(vitascope::window_mode::NORMAL_MIN)
         .with_drag_and_drop(true);
     if let Some(icon) = vitascope::icon::window_icon() {
         viewport = viewport.with_icon(icon);
@@ -192,11 +242,14 @@ fn main() -> eframe::Result {
             _ => viewport = viewport.with_position(g.pos),
         }
     }
-    if settings.always_on_top {
+    // 只有「永遠置頂」一開始就置頂；「播放時置頂」由 App 在開始播放時才設（App 記的初始層級也用 `at_launch`）
+    if settings.on_top.at_launch() {
         viewport = viewport.with_always_on_top();
     }
     let options = eframe::NativeOptions {
         viewport,
+        // 自動截圖不裝（跟其他真的系統功能一樣）
+        event_loop_builder: media_key_hook(launch.autoshot.is_none()),
         // mpv 的 render API 只支援 OpenGL
         renderer: eframe::Renderer::Glow,
         // 顯示器同步靠 swap 等垂直同步；不能關
@@ -238,6 +291,20 @@ fn main() -> eframe::Result {
         ));
     }
     result
+}
+
+/// Windows：視窗在最前面時按的媒體鍵交給系統（winit 會把它吃掉；見 `media_keys::windows::msg_hook`）。
+/// `install` = false（自動截圖）時不裝；其他系統沒有
+fn media_key_hook(install: bool) -> Option<eframe::EventLoopBuilderHook> {
+    #[cfg(windows)]
+    if install {
+        return Some(Box::new(|builder| {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_msg_hook(vitascope::media_keys::windows::msg_hook);
+        }));
+    }
+    let _ = install;
+    None
 }
 
 /// 檔案關聯的設定跟登錄檔對齊（見 `assoc::on_startup`）：安裝程式勾了檔案關聯時設定跟著打開；

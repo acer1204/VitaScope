@@ -8,26 +8,59 @@ use std::path::{Path, PathBuf};
 
 /// 預設的截圖資料夾：系統的「圖片」資料夾裡的 VitaScope
 pub fn default_dir() -> PathBuf {
-    pictures_dir()
+    known_dir(KnownDir::Pictures)
         .or_else(|| home().map(|h| h.join("Pictures")))
         .unwrap_or_else(std::env::temp_dir)
         .join("VitaScope")
 }
 
-fn home() -> Option<PathBuf> {
+/// 系統的使用者資料夾
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnownDir {
+    /// 「圖片」（截圖、GIF、縮圖總覽圖）
+    Pictures,
+    /// 「影片」（匯出的片段；macOS 是「影片」= ~/Movies）
+    Videos,
+}
+
+impl KnownDir {
+    /// 問不到系統時用的家目錄底下的名稱
+    pub fn fallback_name(self) -> &'static str {
+        match self {
+            KnownDir::Pictures => "Pictures",
+            KnownDir::Videos if cfg!(target_os = "macos") => "Movies",
+            KnownDir::Videos => "Videos",
+        }
+    }
+
+    /// XDG 使用者資料夾設定（`user-dirs.dirs`）裡的名稱
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    fn xdg_key(self) -> &'static str {
+        match self {
+            KnownDir::Pictures => "XDG_PICTURES_DIR",
+            KnownDir::Videos => "XDG_VIDEOS_DIR",
+        }
+    }
+}
+
+pub(crate) fn home() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
 
-/// Windows：已知資料夾 API（「圖片」可能被 OneDrive 或使用者搬到別的地方）
+/// Windows：已知資料夾 API（「圖片」「影片」可能被 OneDrive 或使用者搬到別的地方）
 #[cfg(windows)]
-fn pictures_dir() -> Option<PathBuf> {
+pub fn known_dir(which: KnownDir) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath};
+    let id = match which {
+        KnownDir::Pictures => &FOLDERID_Pictures,
+        KnownDir::Videos => &FOLDERID_Videos,
+    };
     let mut raw: *mut u16 = std::ptr::null_mut();
     // SAFETY: 成功時 raw 是系統配置、以 0 結尾的字串，用完要 CoTaskMemFree（失敗時也要）
     unsafe {
-        let hr = SHGetKnownFolderPath(&FOLDERID_Pictures, 0, std::ptr::null_mut(), &mut raw);
+        let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
         let path = (hr >= 0 && !raw.is_null()).then(|| {
             let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
             PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len)))
@@ -37,28 +70,29 @@ fn pictures_dir() -> Option<PathBuf> {
     }
 }
 
-/// Linux：XDG 的使用者資料夾設定（中文系統常是「~/圖片」）
+/// Linux：XDG 的使用者資料夾設定（中文系統常是「~/圖片」「~/影片」）
 #[cfg(all(unix, not(target_os = "macos")))]
-fn pictures_dir() -> Option<PathBuf> {
+pub fn known_dir(which: KnownDir) -> Option<PathBuf> {
     let home = home()?;
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".config"));
     let text = std::fs::read_to_string(config.join("user-dirs.dirs")).ok()?;
-    parse_xdg_pictures(&text, &home)
+    parse_xdg_dir(&text, which.xdg_key(), &home)
 }
 
+/// macOS：家目錄底下固定的「圖片」「影片」（Movies）
 #[cfg(target_os = "macos")]
-fn pictures_dir() -> Option<PathBuf> {
-    home().map(|h| h.join("Pictures"))
+pub fn known_dir(which: KnownDir) -> Option<PathBuf> {
+    home().map(|h| h.join(which.fallback_name()))
 }
 
-/// `XDG_PICTURES_DIR="$HOME/圖片"` → `/home/me/圖片`
+/// `XDG_PICTURES_DIR="$HOME/圖片"` → `/home/me/圖片`（`key` 是要找的名稱）
 #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
-fn parse_xdg_pictures(text: &str, home: &Path) -> Option<PathBuf> {
+fn parse_xdg_dir(text: &str, key: &str, home: &Path) -> Option<PathBuf> {
     let value = text
         .lines()
-        .find_map(|l| l.trim().strip_prefix("XDG_PICTURES_DIR="))?
+        .find_map(|l| l.trim().strip_prefix(key)?.strip_prefix('='))?
         .trim()
         .trim_matches('"');
     let path = match value.strip_prefix("$HOME") {
@@ -67,6 +101,11 @@ fn parse_xdg_pictures(text: &str, home: &Path) -> Option<PathBuf> {
     };
     // 設成家目錄本身 = 沒有設定
     (path.has_root() && path != home).then_some(path)
+}
+
+#[cfg(test)]
+fn parse_xdg_pictures(text: &str, home: &Path) -> Option<PathBuf> {
+    parse_xdg_dir(text, "XDG_PICTURES_DIR", home)
 }
 
 /// 檔名不能用的字元換成「_」（各系統都一樣處理，存到網路磁碟、隨身碟也不會出問題）
@@ -106,9 +145,21 @@ pub fn sanitize_stem(s: &str) -> String {
     }
 }
 
-/// 截圖檔名：「影片名稱 01.23.45.678.png」
-pub fn file_name(source: &str, time: f64) -> String {
-    let stem = if crate::m3u::is_url(source) {
+/// 截圖檔名：「影片名稱 01.23.45.678.png」。網路串流知道標題（`title`：m3u 的 `#EXTINF`、影片本身的標題）時用標題，
+/// 不然用網址的最後一段；本機檔案一律用檔名
+pub fn file_name(source: &str, title: Option<&str>, time: f64) -> String {
+    let ms = (time.max(0.0) * 1000.0).round() as u64;
+    let (h, m, s, ms) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
+    format!("{} {h:02}.{m:02}.{s:02}.{ms:03}.png", source_stem(source, title))
+}
+
+/// 存檔用的名稱（不含副檔名，已經換掉不能用的字元）：網路串流有標題時用標題，不然用網址的最後一段；
+/// 本機檔案一律用檔名。截圖、匯出共用
+pub fn source_stem(source: &str, title: Option<&str>) -> String {
+    let title = title.map(str::trim).filter(|t| !t.is_empty());
+    let stem = if let Some(t) = title.filter(|_| crate::net::is_network(source)) {
+        t.to_owned()
+    } else if crate::m3u::is_url(source) {
         source
             .rsplit('/')
             .find(|s| !s.is_empty())
@@ -119,9 +170,7 @@ pub fn file_name(source: &str, time: f64) -> String {
             .file_stem()
             .map_or_else(|| "VitaScope".to_owned(), |s| s.to_string_lossy().into_owned())
     };
-    let ms = (time.max(0.0) * 1000.0).round() as u64;
-    let (h, m, s, ms) = (ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000);
-    format!("{} {h:02}.{m:02}.{s:02}.{ms:03}.png", sanitize_stem(&stem))
+    sanitize_stem(&stem)
 }
 
 /// 不覆蓋已有的檔案：「名稱 (2).png」「名稱 (3).png」…
@@ -343,14 +392,88 @@ pub fn temp_path(n: u64) -> PathBuf {
 /// 用系統的檔案管理員打開資料夾
 pub fn open_folder(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let program = if cfg!(windows) {
-        "explorer"
-    } else if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    crate::syscmd::command(program).arg(dir).spawn().map(|_| ())
+    open_with_system(dir)
+}
+
+/// 用系統預設的程式打開檔案（匯出完成時的「開啟檔案」）
+pub fn open_path(path: &Path) -> std::io::Result<()> {
+    open_with_system(path)
+}
+
+/// 在檔案管理員裡顯示這個檔案（「在資料夾中顯示」）：Windows、macOS 會選取它；
+/// Linux 打開所在的資料夾（選取要 D-Bus 的 FileManager1，之後再做）
+pub fn reveal(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        crate::syscmd::command(opener())
+            .raw_arg(reveal_arg(path))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::syscmd::command(opener()).arg("-R").arg(path).spawn().map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        open_folder(path.parent().unwrap_or(path))
+    }
+}
+
+/// 用系統的程式（Windows 的 explorer、macOS 的 open、Linux 的 xdg-open）打開檔案或資料夾。不經過 shell
+fn open_with_system(path: &Path) -> std::io::Result<()> {
+    let mut cmd = crate::syscmd::command(opener());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // explorer 自己解析命令列、把逗號當成參數的分隔：路徑一定要加引號。
+        // Rust 只在有空白時才加引號（「D:\Clips\a,b.mkv」會被拆開），所以自己加、原樣傳過去
+        cmd.raw_arg(quoted(path));
+    }
+    #[cfg(not(windows))]
+    cmd.arg(path);
+    cmd.spawn().map(|_| ())
+}
+
+/// 打開檔案、資料夾用的系統程式，用絕對路徑（不從 PATH 找，§1.10）。
+/// Linux 的 xdg-open 沒有固定的位置（各發行版、Flatpak 不一樣），只能從 PATH 找
+fn opener() -> PathBuf {
+    #[cfg(windows)]
+    {
+        windows_dir().join("explorer.exe")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/usr/bin/open")
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        PathBuf::from("xdg-open")
+    }
+}
+
+/// Windows 資料夾（`%SystemRoot%`，沒有或不是絕對路徑時用 `%windir%`、再來是 C:\Windows）
+#[cfg(windows)]
+fn windows_dir() -> PathBuf {
+    ["SystemRoot", "windir"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|p| p.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+/// 加上引號的路徑（Windows 的檔名不能有 `"`，不用跳脫）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quoted(path: &Path) -> String {
+    format!("\"{}\"", path.display())
+}
+
+/// explorer 的「選取這個檔案」參數：`/select,"C:\…\名稱.mkv"`
+#[cfg_attr(not(windows), allow(dead_code))]
+fn reveal_arg(path: &Path) -> String {
+    format!("/select,{}", quoted(path))
 }
 
 #[cfg(test)]
@@ -421,10 +544,28 @@ mod tests {
 
     #[test]
     fn file_names_are_safe_and_unique() {
-        assert_eq!(file_name("C:/影片/第1集.mkv", 3723.456), "第1集 01.02.03.456.png");
+        assert_eq!(file_name("C:/影片/第1集.mkv", None, 3723.456), "第1集 01.02.03.456.png");
         assert_eq!(
-            file_name("https://x.com/live/stream.m3u8", 0.0),
+            file_name("https://x.com/live/stream.m3u8", None, 0.0),
             "stream.m3u8 00.00.00.000.png"
+        );
+        // 網路串流有標題時用標題（檔名不能用的字元換掉）；本機檔案照樣用檔名
+        assert_eq!(
+            file_name("https://x.com/live/stream.m3u8", Some(" 新聞台: 直播 "), 61.0),
+            "新聞台_ 直播 00.01.01.000.png"
+        );
+        assert_eq!(
+            file_name("https://x.com/live/stream.m3u8", Some("  "), 0.0),
+            "stream.m3u8 00.00.00.000.png"
+        );
+        assert_eq!(
+            file_name("C:/影片/第1集.mkv", Some("標題"), 0.0),
+            "第1集 00.00.00.000.png"
+        );
+        assert_eq!(
+            file_name("av://lavfi:testsrc", Some("標題"), 0.0),
+            "lavfi_testsrc 00.00.00.000.png",
+            "mpv 自己的網址不是網路串流"
         );
         assert_eq!(sanitize_stem("a:b?c*"), "a_b_c_");
         assert_eq!(sanitize_stem("CON"), "_CON");
@@ -450,5 +591,69 @@ mod tests {
             parse_xdg_pictures("XDG_PICTURES_DIR=\"/data/pics\"\n", home),
             Some(PathBuf::from("/data/pics"))
         );
+    }
+
+    #[test]
+    fn xdg_videos_dir() {
+        let home = Path::new("/home/me");
+        let text = "XDG_PICTURES_DIR=\"$HOME/圖片\"\nXDG_VIDEOS_DIR=\"$HOME/影片\"\n";
+        assert_eq!(
+            parse_xdg_dir(text, KnownDir::Videos.xdg_key(), home),
+            Some(PathBuf::from("/home/me/影片"))
+        );
+        assert_eq!(
+            parse_xdg_dir(text, KnownDir::Pictures.xdg_key(), home),
+            Some(PathBuf::from("/home/me/圖片")),
+            "同一個檔案裡各找各的"
+        );
+        // 沒有這一行、設成家目錄本身：沒有設定（退回家目錄底下的 Videos）
+        assert_eq!(
+            parse_xdg_dir("XDG_PICTURES_DIR=\"$HOME/圖片\"\n", "XDG_VIDEOS_DIR", home),
+            None
+        );
+        assert_eq!(
+            parse_xdg_dir("XDG_VIDEOS_DIR=\"$HOME\"\n", "XDG_VIDEOS_DIR", home),
+            None
+        );
+        // 名稱是另一個名稱的開頭時不能認錯（XDG_VIDEOS_DIR_OLD 不是 XDG_VIDEOS_DIR）
+        assert_eq!(
+            parse_xdg_dir("XDG_VIDEOS_DIR_OLD=\"/old\"\n", "XDG_VIDEOS_DIR", home),
+            None
+        );
+        assert_eq!(
+            KnownDir::Videos.fallback_name(),
+            if cfg!(target_os = "macos") { "Movies" } else { "Videos" }
+        );
+    }
+
+    #[test]
+    fn source_stems() {
+        assert_eq!(source_stem("C:/影片/第1集.mkv", None), "第1集");
+        assert_eq!(
+            source_stem("https://x.com/live/stream.m3u8", Some("新聞台: 直播")),
+            "新聞台_ 直播"
+        );
+        assert_eq!(source_stem("https://x.com/v/", None), "v");
+        assert_eq!(source_stem("", None), "VitaScope");
+    }
+
+    #[test]
+    fn reveal_selects_the_file_with_the_path_quoted() {
+        // 路徑有空白、逗號也不會被 explorer 拆開
+        assert_eq!(
+            reveal_arg(Path::new(r"C:\影片\a, b 00.00.01-00.00.02.mkv")),
+            r#"/select,"C:\影片\a, b 00.00.01-00.00.02.mkv""#
+        );
+        // 沒有空白、有逗號（使用者自己取的檔名）：「開啟檔案」一樣加引號
+        assert_eq!(quoted(Path::new(r"D:\Clips\a,b.mkv")), r#""D:\Clips\a,b.mkv""#);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn system_programs_use_absolute_paths() {
+        let explorer = opener();
+        assert!(explorer.is_absolute(), "{}", explorer.display());
+        assert!(explorer.ends_with("explorer.exe"), "{}", explorer.display());
+        assert!(explorer.exists(), "{}", explorer.display());
     }
 }

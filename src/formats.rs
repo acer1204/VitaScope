@@ -11,7 +11,7 @@ pub const VIDEO: &[&str] = &[
 
 /// 影片：罕見（能播，但不預設關聯）
 pub const VIDEO_RARE: &[&str] = &[
-    "rm", "rmvb", "mxf", "dv", "ogm", "nut", "ivf", "y4m", "divx", "wtv", "dvr-ms",
+    "rm", "rmvb", "mxf", "dv", "ogm", "nut", "ivf", "y4m", "divx", "wtv", "dvr-ms", "amv", "bik", "smk",
 ];
 
 /// 純音訊
@@ -20,8 +20,23 @@ pub const AUDIO: &[&str] = &[
     "amr", "spx", "dsf", "dff",
 ];
 
-/// 字幕（拖放字幕檔到播放中的影片 = 載入外掛字幕）
-pub const SUBTITLE: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "sami", "txt"];
+/// 純音訊：罕見（能播，但不預設關聯，跟 `VIDEO_RARE` 一樣；ROADMAP 第 2 節「罕見不關聯」）。
+/// 不放進 `AUDIO`：檔案關聯（`assoc.rs`）、安裝程式、Linux 的 .desktop、macOS 的 Info.plist 都照 `AUDIO` 列
+pub const AUDIO_RARE: &[&str] = &["aif", "aiff", "aifc", "caf", "ra"];
+
+/// 字幕（拖放字幕檔到播放中的影片 = 載入外掛字幕）。
+/// 不收 `stl`：同一個副檔名也是二進位的 EBU-STL，FFmpeg 讀不了
+pub const SUBTITLE: &[&str] = &[
+    "srt", "ass", "ssa", "vtt", "sub", "idx", "sup", "smi", "sami", "txt", //
+    // 罕見的文字字幕、歌詞（TTML / DFXP 要轉成 SRT 才能交給 mpv）
+    "lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp",
+];
+
+/// 「載入字幕檔…」的篩選：字幕的副檔名，加上 TTML 也常用的 `xml`。
+/// `xml` 不放進 `SUBTITLE`：大部分的 .xml 不是字幕，拖放時要看內容（[`is_subtitle_path`]）
+pub fn subtitle_dialog_exts() -> Vec<&'static str> {
+    SUBTITLE.iter().copied().chain(["xml"]).collect()
+}
 
 /// 播放清單檔（開啟 = 載入清單，見 `m3u.rs`）
 pub const PLAYLIST: &[&str] = &["m3u", "m3u8"];
@@ -34,13 +49,33 @@ pub fn is_subtitle(path: &std::path::Path) -> bool {
     ext_of(path).is_some_and(|e| SUBTITLE.contains(&e.as_str()))
 }
 
+/// 拖放、貼上的檔案是不是字幕：字幕的副檔名，或內容是 TTML 的 `.xml`
+/// （讀檔案開頭的 2 KiB 判斷；只有 .xml 才讀，網址不讀）
+pub fn is_subtitle_path(path: &std::path::Path) -> bool {
+    is_subtitle(path)
+        || (ext_of(path).as_deref() == Some("xml")
+            && !path.to_string_lossy().contains("://")
+            && crate::subs::is_ttml_file(path))
+}
+
 pub fn is_playlist(path: &std::path::Path) -> bool {
     ext_of(path).is_some_and(|e| PLAYLIST.contains(&e.as_str()))
 }
 
 /// 開檔對話框用：所有能播的副檔名
 pub fn all_media() -> Vec<&'static str> {
-    VIDEO.iter().chain(VIDEO_RARE).chain(AUDIO).copied().collect()
+    VIDEO
+        .iter()
+        .chain(VIDEO_RARE)
+        .chain(AUDIO)
+        .chain(AUDIO_RARE)
+        .copied()
+        .collect()
+}
+
+/// 選單「載入音軌檔…」用：所有純音訊的副檔名（常見 + 罕見）
+pub fn all_audio() -> Vec<&'static str> {
+    AUDIO.iter().chain(AUDIO_RARE).copied().collect()
 }
 
 /// 影片旁邊同名的外掛音軌（字幕組常附的 `.mka`：評論音軌、5.1、其他語言的配音）。
@@ -85,7 +120,7 @@ pub fn media_kind(path: &std::path::Path) -> Option<MediaKind> {
     let ext = ext_of(path)?;
     if VIDEO.contains(&ext.as_str()) || VIDEO_RARE.contains(&ext.as_str()) {
         Some(MediaKind::Video)
-    } else if AUDIO.contains(&ext.as_str()) {
+    } else if AUDIO.contains(&ext.as_str()) || AUDIO_RARE.contains(&ext.as_str()) {
         Some(MediaKind::Audio)
     } else {
         None
@@ -120,5 +155,90 @@ mod tests {
         // 直接開 .mka 時，不會把自己當成外掛音軌
         assert!(find_external_audio(&dir.join("S01E02.mka")).is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rare_audio_plays_but_is_not_associated() {
+        for ext in ["aif", "AIFF", "aifc", "caf", "ra"] {
+            let path = std::path::PathBuf::from(format!("歌.{ext}"));
+            assert_eq!(media_kind(&path), Some(MediaKind::Audio), "{ext}");
+            let lower = ext.to_ascii_lowercase();
+            assert!(all_media().contains(&lower.as_str()), "開檔對話框要列出 {ext}");
+            assert!(all_audio().contains(&lower.as_str()), "載入音軌檔要列出 {ext}");
+            // 檔案關聯照 AUDIO 列（assoc.rs、安裝程式）：罕見的不關聯
+            assert!(!AUDIO.contains(&lower.as_str()), "{ext} 不能加進要關聯的 AUDIO");
+        }
+        for ext in ["amv", "bik", "smk"] {
+            assert_eq!(
+                media_kind(std::path::Path::new(&format!("片.{ext}"))),
+                Some(MediaKind::Video),
+                "{ext}"
+            );
+            assert!(!VIDEO.contains(&ext), "{ext} 是罕見格式，不關聯");
+        }
+    }
+
+    #[test]
+    fn rare_text_subtitles_are_subtitles() {
+        for ext in ["lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp", "LRC"] {
+            let path = std::path::PathBuf::from(format!("歌.{ext}"));
+            assert!(is_subtitle(&path), "{ext}");
+            assert_eq!(media_kind(&path), None, "{ext}");
+        }
+        // 二進位的 EBU-STL 也用 .stl，FFmpeg 讀不了
+        assert!(!is_subtitle(std::path::Path::new("片.stl")));
+    }
+
+    #[test]
+    fn ttml_xml_files_are_subtitles_by_content() {
+        let dir = std::env::temp_dir().join(format!("vitascope-formats-xml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ttml = dir.join("字幕.xml");
+        std::fs::write(
+            &ttml,
+            "<?xml version=\"1.0\"?>
+<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"1s\" end=\"2s\">a</p></body></tt>",
+        )
+        .unwrap();
+        let other = dir.join("feed.XML");
+        std::fs::write(&other, "<?xml version=\"1.0\"?><rss><channel/></rss>").unwrap();
+        // 副檔名的判斷（清單、網址）不看內容：.xml 不算字幕
+        assert!(!is_subtitle(&ttml));
+        assert!(!SUBTITLE.contains(&"xml"));
+        // 拖放、貼上：看內容
+        assert!(is_subtitle_path(&ttml));
+        assert!(!is_subtitle_path(&other));
+        assert!(!is_subtitle_path(&dir.join("不存在.xml")));
+        assert!(!is_subtitle_path(std::path::Path::new("https://example.com/字幕.xml")));
+        assert!(is_subtitle_path(std::path::Path::new("片.srt")), "其他字幕照副檔名");
+        assert_eq!(media_kind(&ttml), None);
+        // 「載入字幕檔…」列出 TTML、DFXP，也列出 .xml
+        let exts = subtitle_dialog_exts();
+        for ext in ["ttml", "dfxp", "xml", "srt", "lrc"] {
+            assert!(exts.contains(&ext), "{ext}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extension_lists_do_not_overlap() {
+        let lists: [(&str, Vec<&str>); 6] = [
+            ("VIDEO", VIDEO.to_vec()),
+            ("VIDEO_RARE", VIDEO_RARE.to_vec()),
+            ("AUDIO", AUDIO.to_vec()),
+            ("AUDIO_RARE", AUDIO_RARE.to_vec()),
+            ("SUBTITLE", SUBTITLE.to_vec()),
+            ("PLAYLIST", PLAYLIST.to_vec()),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, list) in &lists {
+            for ext in list {
+                assert_eq!(*ext, ext.to_ascii_lowercase(), "{name} 的 {ext} 要是小寫");
+                if let Some(other) = seen.insert(*ext, *name) {
+                    panic!("{ext} 同時在 {other} 和 {name}");
+                }
+            }
+        }
     }
 }

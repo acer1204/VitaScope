@@ -3,9 +3,10 @@
 目標：跨平台（Windows / macOS / Linux）、功能看齊 PotPlayer 的影片播放器。
 先做出能用的基本版，再依等級逐步補完；每完成一項就測一項。
 
-**目前進度（2026-10-09）**：L1、L2 完成（v0.2.0）。Windows 本機、macOS / Linux（GitHub Actions）自動測試通過；
-另用實際影片庫（約 1.4 萬部）抽樣 626 個檔案實測，全部能播放。L3 進階調校進行中：第一批（流暢播放、畫面輸出不卡住介面、
-影像與音訊的調校）已完成並在 v0.3.0 發佈，還需要人實際確認的項目列在各項底下的「手動確認」。
+**目前進度（2026-10-15）**：L1、L2 完成（v0.2.0），L3 進階調校完成：第一批（流暢播放、畫面輸出不卡住介面、影像與音訊的調校）
+在 v0.3.0 發佈，第二批（快捷鍵與滑鼠、書籤、網路與網站影片、匯出、播放順序與播完後、系統媒體整合、迷你播放器與子母畫面、
+罕見格式、線上字幕）在 v0.3.1 發佈。Windows 本機、macOS / Linux（GitHub Actions）自動測試通過；另用實際影片庫（約 1.4 萬部）
+抽樣 626 個檔案實測，全部能播放。還需要人實際確認的項目列在各項底下的「手動確認」。
 
 ---
 
@@ -42,13 +43,30 @@ mpv 是 IINA（macOS）、mpv.net（Windows）、Celluloid / Haruna（Linux）�
 ### 程式架構
 
 目前的實際結構見 [README](README.md#程式架構)（L2 的播放清單、播放紀錄是 `playlist.rs`、`m3u.rs`、`history.rs`，
-檔案關聯、單一執行個體是 `assoc.rs`、`instance.rs`、`macos_open.rs`）。L3 預計新增：
+檔案關聯、單一執行個體是 `assoc.rs`、`instance.rs`、`macos_open.rs`）。L3 第二批新增的模組（介面的部分在 `app/` 底下同名或註明的檔案）：
 
 ```
 src/
-├─ bookmarks.rs     書籤（L3）
-├─ keymap.rs        自訂快捷鍵（L3）
-└─ media_keys.rs    系統媒體鍵、SMTC / 正在播放 / MPRIS（L3）
+├─ keymap.rs        所有指令的唯一清單（編號存進設定檔、發佈後不改名）、影戲與 PotPlayer 風格兩組預設按鍵、滑鼠按鍵（設定頁 app/shortcuts_page.rs）
+├─ theme.rs         深色 / 淺色 / 跟隨系統與介面自己畫的顏色（app/appearance.rs：Linux 的設定 portal、標題列）
+├─ bookmarks.rs     書籤（bookmarks.json、背景的寫入執行緒）；bookmarks/recover.rs 找回搬家、改名的影片的書籤（app/bookmarks_panel.rs）
+├─ net.rs           開啟網址：網路設定 → mpv 選項、網址的檢查與顯示、能不能記、失敗的說明（app/network.rs）
+├─ ytdl/            網站影片：找 yt-dlp / deno、執行與取消、JSON → mpv 要開什麼、錯誤與提醒、接上播放器的 hook、
+│                   下載 / 更新 / 移除（install.rs；介面 app/install.rs）
+├─ web.rs           下載檔案（yt-dlp、deno；使用者按下時才連網）
+├─ export.rs        匯出的共用基礎（設定、背景工作、檢查結果、清理暫存檔）；export/clip.rs 片段、gif.rs GIF、
+│                   grab.rs + sheet.rs + text.rs 縮圖總覽圖（app/export_panel.rs）
+├─ save.rs          存新檔：先寫暫存檔、絕不覆蓋已經有的檔案
+├─ approx_seek.rs   跳轉不準的格式（TS、M2TS、MPEG-PS）在主播放器裡的跳轉
+├─ playlist.rs      （原有）多了播放順序：隨機的排列、重複（app/play_order.rs）
+├─ system_power.rs  播完後的動作；system_power/{windows,macos,linux}.rs 睡眠、休眠、關機（app/after_playback.rs 倒數）
+├─ media_keys/      系統媒體控制：mod.rs 共用，windows.rs（SMTC）、macos.rs（正在播放）、mpris.rs（Linux MPRIS）（app/media.rs）
+├─ inhibit.rs       播放時螢幕不關閉、只播聲音時電腦不睡眠（Linux 只管螢幕）
+├─ window_mode.rs   迷你播放器、子母畫面的大小與位置（app/window_modes.rs）
+├─ online_subs/     線上搜尋字幕：OpenSubtitles.com、射手網（偽）、連線、存檔（app/online_subs.rs）
+├─ filehash.rs      檔案特徵碼（OpenSubtitles 的 moviehash；書籤找回搬家的影片也用）
+├─ ttml.rs          TTML / DFXP 字幕轉成 SRT
+└─ paths.rs         快取資料夾、工具資料夾
 ```
 
 ### 各平台的 libmpv 來源
@@ -98,10 +116,10 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | Flash Video | `.flv` `.f4v` | 早期網路影片、直播錄影 |
 | 通用 | 3GPP | `.3gp` `.3g2` | 舊手機 |
 | 通用 | Ogg | `.ogv` `.ogg` | 開源專案 |
-| 罕見 | RealMedia | `.rm` `.rmvb` | 2000 年代下載 |
+| 罕見 | RealMedia | `.rm` `.rmvb` `.ra` | 2000 年代下載 |
 | 罕見 | MXF | `.mxf` | 廣播、專業攝影機 |
 | 罕見 | DV | `.dv` | MiniDV 攝影機 |
-| 罕見 | 其他 | `.ogm` `.nut` `.ivf` `.y4m` `.bik` `.smk` `.amv` `.wtv` `.dvr-ms` | 特殊工具、遊戲、錄影系統 |
+| 罕見 | 其他 | `.ogm` `.nut` `.ivf` `.y4m` `.bik` `.smk` `.amv` `.wtv` `.dvr-ms` | 特殊工具、遊戲、錄影系統（AMV、WTV 有樣本；AMV 的檔頭沒有正確的長度，只測播到結尾。Bink、Smacker、DVR-MS 做不出樣本） |
 
 ### 2.2 影像編碼
 
@@ -120,10 +138,10 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | H.263 / Theora | 舊手機、Ogg |
 | 罕見 | H.266 / VVC | 新標準，目前很少見 |
 | 罕見 | RealVideo（RV30 / RV40） | `.rmvb` |
-| 罕見 | DNxHD / DNxHR、CineForm | 專業剪輯中介檔 |
-| 罕見 | 無損編碼：FFV1、HuffYUV、Lagarith、UtVideo | 錄影、保存 |
-| 罕見 | 舊式：Sorenson、VP6、Cinepak、Indeo、MS Video 1 | 1990–2000 年代 |
-| 罕見 | AVS2 / AVS3、Bink | 中國標準、遊戲影片（AVS2 / AVS3 目前不支援：要 davs2 / uavs3d，自建的 libmpv 不含） |
+| 罕見 | DNxHD / DNxHR、CineForm、Hap、APV、JPEG 2000（MXF） | 專業剪輯中介檔、即時影像、廣播與數位電影（APV 要 FFmpeg 8：Linux tar.gz 的系統 libmpv 較舊時解不了） |
+| 罕見 | 無損編碼：FFV1、HuffYUV、Lagarith、UtVideo、MagicYUV | 錄影、保存 |
+| 罕見 | 舊式：Sorenson、VP6、Cinepak、Indeo、MS Video 1、MS-MPEG4 v2 / v3、WMV 7、RealVideo 1 / 2、Apple Video（RPZA）、ZMBV | 1990–2000 年代、DOSBox 錄影 |
+| 罕見 | AVS2 / AVS3、MPEG-5 EVC、Bink、Smacker | 中國標準、遊戲影片（AVS2 / AVS3 / EVC 不支援，開檔時提示：要 davs2 / uavs3d / xevd，自建的 libmpv 不含；聲音照常播） |
 
 ### 2.3 音訊編碼
 
@@ -138,8 +156,8 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | DTS（核心） | 電影重製 |
 | 通用 | Vorbis、ALAC、PCM / WAV、WMA、MP2 | |
 | 罕見 | TrueHD / Dolby Atmos、DTS-HD MA / DTS:X | 會解成 PCM 播放；直通到擴大機屬於 L3 功能 |
-| 罕見 | APE、WavPack、TTA、Musepack、DSD（DSF / DFF） | 發燒友音樂格式 |
-| 罕見 | RealAudio（cook）、AMR、Speex、ATRAC | |
+| 罕見 | APE、WavPack、TTA、Musepack、DSD（DSF / DFF）、AIFF / AIFF-C、Apple Lossless 的 CAF | 發燒友音樂格式（DSD 的樣本由產生程式自己寫） |
+| 罕見 | RealAudio（cook、14.4）、AMR-NB / WB、Speex、ATRAC、MS ADPCM、AC-3 / DTS 原始串流 | FFmpeg 寫的 `.ra` 沒有長度，只測播到結尾 |
 
 ### 2.4 字幕
 
@@ -153,8 +171,9 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 通用 | VobSub（`.idx` + `.sub`） | DVD 圖形字幕 |
 | 通用 | WebVTT（`.vtt`） | 網頁、串流 |
 | 通用 | SAMI（`.smi`） | 韓國、舊台灣下載常見 |
-| 罕見 | MicroDVD（影格制 `.sub`）、SubViewer、MPL2、TTML / DFXP、LRC | |
-| 罕見 | DVB 字幕、Teletext、EIA-608 / 708 隱藏字幕 | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含） |
+| 罕見 | MicroDVD（影格制 `.sub`）、SubViewer、MPL2、JACOsub、RealText、PJS、AQTitle、VPlayer、LRC | 轉成 UTF-8（不加 BOM）再載入；LRC 在音樂檔顯示在歌名下面 |
+| 罕見 | TTML / DFXP（`.ttml` `.dfxp`、內容是 TTML 的 `.xml`） | FFmpeg 讀不了，影戲轉成 SRT 再載入（MP4 裡的 TTML 字幕軌不支援，開檔時跳過） |
+| 罕見 | DVB 字幕、Teletext、ARIB、EIA-608 / 708 隱藏字幕（含 SCC 檔、MOV 的 608 軌） | 電視錄影、美國串流內嵌（Teletext 不支援：需要的 libzvbi 含 GPL-2.0-only 的程式碼，跟 GPL-3.0 不相容，自建的 libmpv 不含；ARIB 要 libaribcaption，這兩種都不支援，選到時提示；708 FFmpeg 沒有解碼器，mpv 不會列出這種軌道，只顯示同一份資料裡的 608） |
 
 ### 2.5 畫面特性
 
@@ -171,6 +190,31 @@ Linux r3）：libxml2（DASH）、片段輸出與轉 GIF 的封裝格式與編�
 | 罕見 | HDR 直通到 HDR 螢幕 | ⚠ 見風險 R3 |
 | 罕見 | 8K、12-bit、4:4:4 | |
 | 罕見 | 3D（左右 / 上下）、360° 全景 | |
+
+### 2.6 已知的缺口
+
+罕見的格式「有樣本就測」：樣本由 `scripts/gen_samples.py` 產生（見 4.1），FFmpeg 做不出的靠影片庫普查與播放引擎的解碼器清單（`tests/engine_build.rs`）。
+下面這些目前播不了或只能部分支援：
+
+| 項目 | 原因 | 之後 |
+|---|---|---|
+| AVS2 | 解碼器 libdavs2 是 GPL，播放引擎只用 LGPL 的元件 | 不做；開檔時說明「不支援的編碼：AVS2」，聲音照常播 |
+| AVS3、MPEG-5 EVC | 自建的 libmpv 沒有 libuavs3d、libxevd（BSD-3-Clause） | 下次重建播放引擎時可以加；本機的 FFmpeg 也做不出樣本 |
+| Teletext | libzvbi 含 GPL-2.0-only 的程式碼 | 不做；選到時說明 |
+| ARIB 字幕（日本的電視錄影） | 自建的 libmpv 沒有 libaribcaption（MIT） | 下次重建播放引擎時可以加 |
+| CEA-708 | FFmpeg 沒有解碼器（608 可以） | 無 |
+| MP4 / MKV 裡的 TTML 字幕軌 | FFmpeg 只有 TTML 的封裝、沒有解碼器 | 只支援外掛的 `.ttml` / `.dfxp`（影戲轉成 SRT） |
+| VobSub（`.idx` + `.sub`）的樣本 | FFmpeg 沒有 VobSub 的封裝 | 同一個解碼器由 MKV 裡的 DVD 字幕樣本測；實際檔案靠普查 |
+| APE、Musepack、TAK、VP6、Indeo、RealVideo 4、Cook、Bink、Smacker、ATRAC、Lagarith 的樣本 | FFmpeg 沒有編碼器 | 只確認播放引擎有解碼器與分離器；真實檔案放 `samples/external/`（不進版控）、靠普查 |
+
+**Linux tar.gz 用的系統 libmpv**（例如 Ubuntu 24.04 的 mpv 0.37 / FFmpeg 6.1）比本專案建置的播放引擎舊，CI 的 ubuntu-latest 工作測的就是它：
+
+- SubViewer 2 字幕只顯示第一句：FFmpeg 的 SubViewer 分離器給每一句的檔案位置都是 0，mpv 0.37 只看位置判斷重複，把後面的都丟掉（新版也比對時間）。
+  之後可以像 TTML 一樣由影戲轉成 SRT 再載入。
+- MKV 容器裡的旋轉（Matroska 的 `ProjectionPoseRoll`，例如直拍影片轉存的 MKV）方向相反，畫面上下顛倒：mpv 0.37 沒有把角度反過來
+  （本專案建置的播放引擎、MP4 / MOV 的旋轉都正常）。格式矩陣的 `mkv_hevc_aac_rot90` 在這裡讀到 270 度。
+- H.266 / VVC、APV：FFmpeg 6.1 還沒有解碼器（開檔時說明不支援）。
+- 去交錯沒有「自動」（見 L3 的去交錯）。
 
 ---
 
@@ -245,7 +289,12 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 - [x] 長寬比：原始 / 16:9 / 4:3 / 16:10 / 1.85:1 / 2.35:1（A、Ctrl（macOS：⌘）+ F6、右鍵選單；自訂比例未做）（自動）
 - [x] 裁切（裁成指定比例、填滿視窗）、縮放、平移、旋轉 90°、左右 / 上下翻轉；換檔時由 mpv 的 reset-on-next-file 還原。
   翻轉用 GLSL 著色器（硬體解碼也能用、字幕不會鏡像），軟體繪圖時改用濾鏡（自動、截圖）
-- [x] 視窗置頂：右鍵選單，設定會記住（自動）
+- [x] 視窗置頂：右鍵選單，設定會記住（自動）。批次二改成三種模式（比照 PotPlayer）：不置頂 / 永遠置頂 / 播放時置頂，
+  右鍵選單「視窗置頂 ▸」、「設定 → 一般」、Ctrl+T 依序切換；舊的設定（開 / 關）讀成永遠置頂 / 不置頂。播放時置頂在暫停、停止、
+  播完停在最後一格時回到一般視窗，實際要不要置頂變了才通知視窗；Wayland 兩種置頂都不支援（自動：設定檔讀寫與舊設定轉換、
+  kittest 選單、Ctrl+T、設定頁、播放 / 暫停 / 逐格 / 播完 / 停止、換檔與自動播下一個不閃、不重複通知、Wayland）
+  - [ ] 手動確認：播放時置頂在實際視窗上（暫停時別的視窗可以蓋過、繼續播放又回到最上面；全螢幕進出；換檔、自動播下一個時不會掉到後面）
+  - [ ] 手動確認（macOS）：播放時置頂在原生全螢幕裡暫停 / 繼續（會改視窗層級）沒有異狀；暫停中離開全螢幕、一秒內繼續播放，動畫結束後仍在最上面
 
 操作體驗
 - [x] 滑鼠滾輪調音量、右鍵選單（自動）
@@ -426,17 +475,331 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
   - [ ] 手動確認：接 AV 擴大機／電視實際直通 AC-3、DTS、TrueHD（擴大機顯示格式）、直通時其他程式沒有聲音
 
 功能
-- [ ] 自訂快捷鍵（提供 PotPlayer 風格的預設組）
-- [ ] 書籤：在檔案中標記時間點並命名
-- [ ] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；播放引擎已含 libxml2，本機的 DASH 有自動測試）
-- [ ] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
-- [ ] 線上搜尋字幕（OpenSubtitles API）
-- [ ] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF
-- [ ] 縮圖總覽圖匯出（thumbnail sheet）
-- [ ] 播放清單：隨機、單一 / 全部重複、播完後動作（關閉、休眠、關機）
-- [ ] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
-- [ ] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
-- [ ] ✅ 「罕見」格式盡力支援，有樣本的納入測試
+- [x] 自訂快捷鍵（提供 PotPlayer 風格的預設組）：所有指令在 `keymap.rs` 一張表（編號存進設定檔，發佈後不改名），
+  「設定 → 快捷鍵」錄按鍵（Esc 取消；Ctrl+V、Ctrl+X 這類 egui 變成貼上 / 剪下的按鍵、Esc、Alt+F4、macOS 的 ⌘Q / ⌘H 是保留的）、
+  衝突時「改到這裡 / 取消」、一項一項還原或「還原成預設組…」（確認對話框開著時按鍵都交給它）。預設組「影戲」跟 v0.3.0 一樣，
+  「PotPlayer 風格」換了 Backspace、F / D、Enter / Alt+Enter、F3、`[` `]` `\`、`<` `>` `/`。新增可以指定的指令：A-B 起點 / 終點 / 取消、
+  延遲歸零、下一條音軌 / 字幕、Gamma、填滿視窗、流暢播放、等化器、另存截圖、載入字幕檔。開關類的指令不跟著自動重複。
+  兩個視窗同時改：各改各的指令都留下，還原的不會從檔案回來
+  （自動：keymap 單元測試（v0.3.0 按鍵逐一比對、兩個預設組、保留按鍵、衝突、Shift 符號鍵）、設定檔合併；kittest 錄按鍵、
+  衝突、保留按鍵（照 egui-winit 送貼上 / 剪下事件）、錄的時候 Esc、PotPlayer 預設組（逐格、全螢幕、從頭播放、A-B、字幕同步）、
+  還原對話框擋住空白鍵與 Esc、按住不放不重複、選單與按鈕提示跟著改、英文介面）
+  - [ ] 手動確認：實際鍵盤錄按鍵（Ctrl+V 在剪貼簿有、沒有文字時都顯示說明；Shift+= 記成 +，先放開 Shift 再放開 = 之後再按一次照樣有作用；
+    Windows 的 Ctrl+Insert / Shift+Insert / Shift+Delete 錄成 Ctrl+C / V / X）；macOS 的 ⌘ 組合鍵；
+    macOS 用 PotPlayer 風格時 Backspace 是從頭播放（固定按鍵清單不寫 Backspace）
+  - [ ] 手動確認：主人對照 PotPlayer 的按鍵（Backspace、F / D、`[` `]` `\`、`<` `>` `/` 與每次幾秒、F3、Alt+Enter、Ctrl+T（是不是依序切換三種置頂模式）、P、H、A；
+    Home 與 L 在 PotPlayer 有沒有作用：現在照設計的對照表，這組的 Home、L 沒有按鍵）
+  - [ ] 手動確認：A-B 重播播放中按 `]` 設定終點，播到終點會繞回起點
+  - [x] 滑鼠按鍵的自訂（「設定 → 快捷鍵 → 滑鼠」）：單擊（播放／暫停、靜音、不動作）、雙擊（全螢幕、不動作）、中鍵與側鍵（任何指令）、
+    滾輪（音量、跳轉、不動作）；存的是指令編號（`keys.mouse`），兩個預設組一樣，「還原成預設組…」一起還原。
+    雙擊時把第一下單擊的開關切回來（暫停、靜音；靜音照第一下之前的值設回去，不看可能還沒更新的狀態）；雙擊不動作時第二下就是單擊
+    （自動：keymap、設定檔的單元測試（預設值、寬鬆讀取、兩個視窗合併、還原）；kittest 中鍵、側鍵、滾輪跳轉 / 不動作、單擊不動作、
+    雙擊不暫停、單擊靜音時雙擊不改變靜音、雙擊不動作（單擊靜音時點兩下 = 靜音再取消）、設定頁改中鍵 / 單擊 / 滾輪並存檔、還原、英文介面）
+    - [ ] 手動確認：實體滑鼠的中鍵、側鍵（上一頁 / 下一頁）在 Windows、macOS、Linux 都收得到；觸控板的捲動改成跳轉時不會跳太快
+- [x] 書籤：在檔案中標記時間點並命名。P 在目前的位置新增（時間是按下那一刻問 mpv 的，跳轉剛送出時用它的目標）、Shift+PgUp / PgDn 精準跳到上一個 / 下一個；
+  進度條上的標記（停在上面顯示名稱、點標記附近跳到書籤）；右鍵選單「書籤 ▸」（新增、目前位置附近的 20 個、書籤清單）。
+  側邊面板分成「播放清單」（F6）與「書籤」（H）兩個分頁：按另一個分頁的鍵換過去（視窗大小不變）、按目前分頁的鍵關掉面板，記得上次的分頁（`side_tab`）。
+  書籤分頁：點一下跳過去、雙擊改名（Enter 或點別的地方改好，Esc 不改；打字時按鍵不是快捷鍵）、右鍵選單（跳到這裡、改名、複製時間、刪除）、
+  Delete 刪除（選取移到下一個）、「全部刪除…」先問（對話框開著時按鍵都交給它）、沒有名稱時淡淡地寫所在的章節。書籤存在 `bookmarks.json`，
+  由背景的寫入執行緒存檔（每次先讀回磁碟上的版本：兩個視窗同時改不會互相蓋掉；壞掉的檔案改名成 `.bad`）。macOS 的 Backspace 只在滑鼠在面板上或最後點的是面板、
+  而且快捷鍵沒用到 Backspace 時才是移除（不然選過清單的一列之後，滑鼠在畫面上誤按 Backspace 也會移除清單裡的項目）。
+  影片搬家或改名後找回書籤（`src/bookmarks/recover.rs`）：新增書籤後在背景記下大小與 moviehash；開了沒有書籤的本機檔案時，
+  在背景執行緒 `vitascope-bookmark-lookup` 先比大小（只看檔案資訊；大小不同就不讀特徵碼），再比特徵碼；原檔不在了就搬過去、還在就複製（新的編號），
+  外接硬碟、網路磁碟連不上時當作還在（Windows 的磁碟機與網路分享、macOS 的 `/Volumes`、Linux 的 `/media`、`/run/media`、`/mnt`、`/net` 要真的掛著、
+  GNOME 的網路分享）；使用者自己刪光書籤的檔案在 `bookmarks.json` 留一個沒有書籤的項目，不再找回；同一個檔案的別的路徑（捷徑、硬連結）不算另一份；
+  搬家時磁碟上原檔的書籤（別的視窗加的）一起搬；換了檔案之後才找到的不套用；結果交給寫入執行緒存檔（只有一個寫入的地方），還開著那個檔案時提示
+  （自動：bookmarks 單元測試（排序、去重、上限、上一個 / 下一個的容許範圍、背景存檔與讀回、兩個視窗、存檔失敗重試、壞檔、網址一字不差、
+  找回搬家的檔案：複製、搬家、大小不同不讀特徵碼、舊項目補記特徵碼、別的視窗已經加的書籤優先、網址不找、磁碟連不上不搬、
+  刪光的不再找回（這次、下次執行、別的視窗刪的）、搬家帶走別的視窗加的書籤、換了檔案不套用、最近加過書籤的那份優先、合併剛加的書籤、硬連結不複製、
+  5000 個檔案時新增書籤的介面執行緒成本低於 2 ms）；kittest P、Shift+PgUp / PgDn 精準跳轉、進度條標記、子選單、分頁切換與視窗寬度、改名（打字、Enter、Esc、
+  點別的地方（另一列、新增、分頁、×，點的那一下照做）、換分頁、捲到看不見、換了檔案；Delete / Backspace 是編輯文字）、右鍵選單、Delete、全部刪除的確認對話框（開著時換了檔案也刪對的檔案）、空的時候與不能跳轉的說明、章節名稱、拖放到書籤分頁、PotPlayer 風格的 Backspace 從頭播放且清單不變、
+  macOS 的 Backspace 規則（每個平台都檢查）、複製與搬家的檔案找回書籤（提示、存檔、大小不同不讀特徵碼、網址不找）、英文介面）
+  - [ ] 手動確認：網路磁碟上的影片加書籤不卡畫面；兩個影戲同時開著加書籤，兩邊的都留下
+  - [ ] 手動確認：NAS 上加過書籤的影片複製到本機再開，書籤複製過來；拔掉外接硬碟後開它的備份，原本的書籤沒有被搬走
+  - [ ] 手動確認：macOS 的 Backspace（滑鼠在清單上才移除；在畫面上不移除；PotPlayer 風格是從頭播放）
+- [x] 開啟網址：HTTP、HLS（`.m3u8`）、DASH（`.mpd`；播放引擎已含 libxml2，本機的 DASH 有自動測試）。
+  入口：Ctrl（⌘）+ U 的「開啟網址」對話框、在播放器上貼上、🗁 按右鍵、命令列、本機的 .m3u（`#EXTINF` 標題）。
+  網路設定（`net`）：HLS / DASH 起始畫質、重新連線（不含 `reconnect_on_network_error`：連不上的網址不重試）、快取、逾時、憑證檢查
+  （系統的 libmpv 也明確打開）、記住網址、User-Agent / Referer / 標頭（換行不能進標頭）/ proxy，在「設定 → 網路」改，
+  `VITASCOPE_MPV_OPTS` 指定的停用。播放時：300 毫秒後才出現的「正在連線：主機…」（Esc 只在一般視窗取消，全螢幕時 Esc 照樣離開全螢幕；
+  「取消」、停止也可以）、「緩衝中… N%」（`paused-for-cache`、`cache-buffering-state`），都畫成深色；直播（載入時沒有總長度，或是不能跳轉的 HLS / DASH / RTSP 之類：
+  直播的 HLS 也有 FFmpeg 估的很短的總長度；伺服器不支援 Range 的一般檔案不能跳轉但不是直播）顯示「直播」、播完提示。續播與書籤用同一個代號（網址去掉 `#` 之後的部分；網站影片是
+  `ytdl://擷取器/代號`），只記能跳轉、一分鐘以上、記得住的網址（含帳號密碼、token 的不記）。網路上的播放清單（IPTV 的 .m3u 網址）：
+  mpv 結束這個網址（redirect）時讀出它展開的項目（清單的網址看 `playlist-path`），只留網路串流，換成影戲的播放清單、照一般的開檔重新開，
+  mpv 自己的清單又只有一個。媒體資訊的「來源」（標題、網址、串流種類、預先讀了幾秒、下載速度、緩衝中），截圖檔名用標題。
+  Linux tar.gz（系統的 FFmpeg 6.1）的 DASH 只能盡力：載入中停止、換檔時可能卡住，只有影戲自己建置的引擎修正了（DASH 的測試只在這個引擎跑）
+  （自動：net 單元測試（網址的檢查與補全、各來源能開的網址、能不能記、續播的代號、展開的清單、標頭、失敗的說明）；
+  headless 播 HTTP / HLS / DASH、標頭送到伺服器、設定讀回、網路上的清單拿掉 `file:///`、取消連線；FFmpeg 記錄的說明（404 / 403 / 逾時 /
+  找不到伺服器，起始畫面寫出原因）一次只有一個播放器；kittest 對話框、貼上、連線中與 Esc / 取消 / 停止、全螢幕的 Esc、緩衝中（伺服器送到 5% 就停）、
+  直播（沒有結尾標記的 HLS）、不支援 Range 的伺服器上的檔案不是直播、續播與書籤的代號（不記網址、有 token 的網址、不能跳轉的不續播）、網路上的清單、「設定 → 網路」、`VITASCOPE_MPV_OPTS` 停用、英文介面）
+  - [ ] 手動確認：真的網路上的 HLS 直播、DASH、IPTV 的 m3u 網址（Windows、macOS、Linux AppImage 與 tar.gz 各一次）；
+    Windows 上網路擋住憑證撤銷檢查時的說明與「檢查網站憑證」開關；HTTP proxy；從瀏覽器拖曳連結沒有反應、Ctrl（⌘）+ V 可以
+- [x] 網站影片（透過 yt-dlp），可選畫質（本專案建置的 libmpv 沒有 Lua，不能用 mpv 內建的 ytdl_hook，要由影戲自己呼叫 yt-dlp）
+  - 找 yt-dlp / deno、執行與取消（Windows Job Object、Unix 程序群組）、讀 JSON、錯誤與警告（C5）；
+    接上播放器：`on_load` hook 在背景問 yt-dlp（影片網站先問，其他網頁 mpv 讀到內容卻認不出時才問；連線失敗不問），
+    合成 EDL、這個檔案專用的標頭 / Cookie（`file-local-options`）、網站字幕（選到才下載）、章節（載入後設定）、
+    網站的播放清單交給影戲的播放清單、20 分鐘的結果快取（用快取的網址開不起來時丟掉、重新問 yt-dlp 重開一次）、看門狗、換檔 / 取消時一定放行 hook、mpv 拿掉 hook 時重新註冊；
+    介面：「正在取得網站影片」／「正在讀取播放清單」、播不了時的原因與提醒（每次畫的時候才產生文字，換語言跟著換）、
+    續播與書籤用 `ytdl://擷取器/代號`；沒找到 yt-dlp / deno 時過一陣子再開就重新找（裝好不用重開）（C6）
+    （自動：hook 的路線、快取、看門狗、取消的單元測試；headless 用假的 yt-dlp 播本機伺服器上的影音合成、標頭與 Cookie 送到伺服器、
+    不會漏到下一個網址、播放中改 User-Agent 下一個網址照新的、開始時間與換畫質不再問、換檔 / 停止 / 取消不等、錯誤與看門狗、
+    不安全的網址、播放清單、只有認不出內容才問（錯誤記錄比 hook 晚到也一樣）、hook 被拿掉後重新註冊、裝好 yt-dlp 後重新找、
+    快取的網址失效（403）時重新問一次（每次開檔只一次，新的也不行就照原本的說明；換畫質照樣接著播；其他網頁照原本的順序；
+    重新問的時候取消、換檔照常；載入後才失敗的不重新問）；
+    kittest 正在取得、Esc 取消、標題、續播與書籤的代號、網址指定的開始位置不續播、提醒只出現一次、原因與英文介面、沒有 yt-dlp、
+    播放清單與 200 個的上限、「設定 → 網路」改的設定下一次解析就用）
+  - 「網站影片 ▸」選單：選擇畫質（用 20 分鐘內的格式清單重開、接著現在的位置播，保留暫停、字幕延遲、A-B、字幕〔依語言與標題〕、
+    畫面的調整，不續播、不調整視窗大小；只重開這部影片，不管播放清單的設定；載入中按了播放就照使用者的）、
+    預設畫質（正在播「自動」時從格式清單挑，之後還是「自動」）、只播聲音、載入整個播放清單、複製網址、在瀏覽器開啟；
+    「設定 → 網路」的網站影片：yt-dlp 的版本與來源（背景尋找中顯示「搜尋中…」；自動測試、`--shot` 不找）、deno、
+    「選擇檔案…」（Windows 只收 .exe，只看路徑，在不在由背景確認；設定檔裡的路徑背景尋找時也照同樣的規則，不能用就照常找）、
+    預設畫質、編碼、字幕、瀏覽器的 Cookie、播放清單、關掉 yt-dlp；播不了而原因在設定裡時（包括其他網頁要 yt-dlp 才能播）
+    起始畫面有「網路設定…」；`Player::net_stream()`（解析出來的網址或 EDL 與連線的選項，
+    給之後的匯出用另一個 mpv 開）；網址含登入資訊的書籤只放在記憶體（C7）
+    （自動：快取不看畫質偏好、預設畫質的挑選、選的 yt-dlp 路徑、只在記憶體的書籤、設定的讀寫與合併的單元測試；
+    headless 另一個 mpv 照 `net_stream` 開得起來（伺服器收到網站的標頭與 Cookie）、選單選的畫質不再問 yt-dlp、關掉 yt-dlp 不問；
+    kittest 換畫質保留狀態、預設畫質 / 只播聲音 / 複製 / 瀏覽器、載入整個播放清單、選單只在網站影片出現、「網路設定…」按鈕、
+    設定頁的搜尋中、選擇檔案、指定的檔案不能用、很久沒更新、deno 太舊、偏好送到 yt-dlp、含 token 的書籤不存檔、英文介面）
+  - 取得 yt-dlp 與 deno（主人的決定 Q2 (a)）：只在使用者按下時才連網、不在背景自動更新。起始畫面（網站影片播不了時）有
+    「下載 yt-dlp…」「下載 deno…」「更新 yt-dlp 再試一次」，「設定 → 網路」有下載、「立即更新」、「移除…」，播放中「網站影片 ▸ 更新 yt-dlp」
+    （只有影戲下載的那一份；自己安裝的照它的方式更新）。下載前先問（來源、大小，deno 寫下載約 40 MB、解開後約 100 MB，放在哪裡）；
+    從官方的 GitHub 發佈下載：`releases/latest` 轉去的標籤（不用 API），檢查碼與檔案都從同一個標籤取，核對 SHA-256（ring；
+    yt-dlp 的 `SHA2-256SUMS`、deno 的 `.sha256sum`，Windows 版是 PowerShell 的格式）；deno 的 zip 自己讀（flate2、CRC、
+    有不安全檔名的整個拒絕、解開後最多 300 MB），Unix 設成 0755。下載用自己的 ureq 設定（`web.rs`：連線 10 秒、等回應的標頭 20 秒、
+    沒有整體的時間限制，60 秒沒有資料才放棄，隨時可以取消；proxy 只看環境變數，設定頁的 Proxy 欄有說明）；先寫暫存檔，核對後才換上，
+    換檔案、移除時等正在用它的 yt-dlp（包括取消後還在跑的）結束，deno 也等會用到它的 yt-dlp，等的時候也能取消。「更新」先看最新的標籤，已經是最新版就不下載（不用 `yt-dlp -U`）；影戲下載的版本超過 30 天、
+    而且這段時間沒檢查過更新時，網站影片播不了時與設定頁提醒（不自動連網）。做完了提示結果，從起始畫面按的再開一次那個網址。
+    `THIRD-PARTY-NOTICES.md` 說明這兩個按需求下載、不隨影戲散布的程式（C8）
+    （自動：web / install 單元測試（檢查碼的兩種格式、標籤、zip 的不壓縮與 deflate、CRC 錯、截斷、不安全的檔名、大小上限、暫存檔清理、
+    多久沒更新的提醒、壓縮檔說的大小比實際小、yt-dlp 執行中也能更新檔案時間）；headless 從本機測試伺服器上的假 GitHub 發佈下載 yt-dlp 與 deno、
+    檢查碼不符時原本的檔案不動、沒有檢查碼不下載、找不到發佈與 HTTP 錯誤、已經是最新版不下載、進度與取消、沒有進度時放棄、
+    等正在解析的 yt-dlp（換 deno 時也等，等的時候取消）、執行 yt-dlp 時拿著它會用的 deno 的鎖、這個系統沒有版本時不連網、
+    大小上限（伺服器說的大小與沒說大小時）；kittest 沒有 yt-dlp 時先問再下載、Esc 不下載也不連網、下載後再開一次就播、
+    起始畫面的進度、取消與失敗原因（開了別的網址就不寫）、等的時候開了別的檔案就不搶、太舊時（包括只有警告說太舊）更新再試一次、選單的更新、
+    自己安裝的 yt-dlp 不更新也不移除、缺 deno 時起始畫面的「下載 deno…」（設定頁在下載時照舊寫說明）、
+    很久沒更新的提醒（有、沒有下載的方法）與「立即更新」之後不再提醒、設定頁下載 deno 的進度、取消、檢查碼不符、移除、英文介面）
+  - [ ] 手動確認：YouTube 1080p / 4K（有、沒有 deno 各一次；AV1 在 RTX 3090 上用 nvdec）、Bilibili、直播
+  - [ ] 手動確認：在影戲裡下載 yt-dlp 與 deno（Windows、macOS、Linux 各一次），Windows Defender 會不會擋下、執行時不閃黑色視窗（yt-dlp 與 deno）
+  - [ ] 手動確認：「更新 yt-dlp 再試一次」「立即更新」「移除…」在真的 GitHub 上；`VITASCOPE_ONLINE_TESTS=1 cargo test --test install -- --ignored`
+- [x] 線上搜尋字幕（OpenSubtitles API、射手網（偽）assrt.net）
+  - 核心（G5）：`src/online_subs/`（OpenSubtitles.com 與射手網（偽）assrt.net 的搜尋、展開、下載、登入、登出）、
+    `src/filehash.rs`（OpenSubtitles 的 moviehash，128 KiB 以下不算）。OpenSubtitles 的金鑰在建置時從 `VITASCOPE_OPENSUBTITLES_KEY` 放進執行檔
+    （`build.rs`，XOR 混淆、沒設定時是空的：自己編譯的版本不能用 OpenSubtitles）；搜尋不用登入，伺服器要求登入時才請使用者登入，
+    登入憑證（24 小時，不是密碼）存在快取資料夾的 `online/opensubtitles-session.json`。下載的字幕先檢查內容（網頁、壓縮檔、VobSub 不收），
+    語言標記照內容判斷，存成 `影片名.zh-TW.srt`（同名時 `.2`、內容一樣直接用），寫不進去時放快取資料夾的 `subs/online`（30 天後清掉），
+    絕不覆蓋。連線的共同設定（連線逾時、https、proxy）跟下載 yt-dlp 共用 `web::agent_base`。
+    自動測試一律離線（`Launch.online` 的預設），只用假的連線與本機的測試伺服器
+    （自動：online_subs / filehash 單元測試（參數的寫法、結果的排序與每片一列、錯誤對照、登入過期就登出不改用未登入、下載次數、
+    之前的連結與存過的檔案不再花下載次數、410 的連結先重試同一個、晚到的過期不清掉剛重新登入的狀態、請求的間隔、取消（下載中、
+    暫存檔寫好之後）、存檔的編號與退回快取資料夾、影片旁邊用影片原本的檔名、日文不會被標成繁體、`.txt` 說明檔不收、
+    射手網（偽）的 Token 只放標頭與換網域、建置時的金鑰還原得出來）；
+    `tests/online_subs.rs` 真的 HTTP 連到本機：4xx 帶著內容、大小上限、同一個來源的轉址才保留登入憑證、轉址次數上限、User-Agent、
+    只能 https、兩種連線各自的逾時；
+    kittest 預設離線）
+  - 介面（G6）：字幕選單（控制列、右鍵選單）「線上搜尋字幕…」與可以指定按鍵的 `search-subtitles`（預設沒有按鍵）打開不擋住播放的視窗：
+    來源、語言（跟「設定 → 字幕」同一份）、帳號（已登入 / 未登入、伺服器說了才顯示剩下的次數）、搜尋文字（整理過的檔名，打開時自動搜尋，
+    設定可以關）、結果表格（OpenSubtitles：完全相符 ✔、語言、名稱、格式、下載數、標記；射手網（偽）：語言、名稱、格式、字幕組、評分、標記；
+    點名稱選取、雙擊下載；射手網（偽）可以展開檔案、只有壓縮檔的給網頁連結）、頁數（結果是上一部影片的時候停用）、狀態、規定的出處說明（「Subtitles provided by OpenSubtitles.com」、「字幕服務由 assrt.net 提供」，都連到網站）與會送出什麼。
+    結果綁在搜尋的那部影片上（路徑 + 特徵碼）：換了影片時自動搜尋，或把舊的結果灰掉（「影片已經換了，請重新搜尋」）；
+    下載到一半換了影片，存在原本那部影片旁邊、不載入。關掉視窗（✕、Esc）就取消下載（換成正式名稱之前停下、刪掉暫存檔）。
+    下載要登入時打開登入對話框（說明原因），登入後接著下載剛才那一個（已經取消的下載不跳出對話框；迷你播放器、子母畫面裡
+    先等著，回到一般視窗才出現）；對話框開著時 Esc 只關對話框；只有按「登出」才登出。語言選單的「其他…」跳到設定頁的「其他語言」，
+    最後一種語言不能取消。
+    「設定 → 字幕」的「線上字幕」：語言、其他語言碼、存到影片旁邊、自動搜尋、聽障、機器翻譯、OpenSubtitles 帳號、射手網（偽）Token（遮起來）。
+    迷你播放器、子母畫面裡不畫（狀態保留），在那裡打開會回到一般視窗。
+    連線自己跟轉址：影戲的 API 金鑰、登入憑證、射手網（偽）的 Token 只送到原本的來源（https、主機、埠都一樣），
+    轉到別的地方（包括再轉回來）一律不送；307 / 308 要照原本的內容再送一次時（登入的帳號密碼）只在同一個來源裡跟。正式版的金鑰由 `release.yml` 從 secret `OPENSUBTITLES_API_KEY` 放進去，沒有設定時只警告
+    （自動：kittest 字幕選單與打開時的自動搜尋（照規定的參數、特徵碼只在 128 KiB 以上的檔案）、下載並載入與剩下的次數（只登入、還沒下載時不顯示）、出處的連結、要登入時打開登入
+    對話框、登入後接著下載、設定只記帳號名稱、結果跟著影片（自動搜尋、灰掉、下載中換了影片、搜尋回來之前換了影片）、關掉視窗取消下載、410 先重試同一個連結、
+    已經存過的不再下載、網站標錯繁簡時照內容存成 zh-CN、登入對話框的 Esc、搜尋欄打字不是快捷鍵、沒有金鑰、沒開檔、射手網（偽）的 Token、
+    展開與下載、兩個來源各自的欄、設定頁、英文介面、迷你播放器與子母畫面裡藏起來、上一部影片的結果不能換頁、下載中換了影片下載完再搜尋、
+    取消了的下載不跳出登入對話框、迷你播放器裡登入對話框等到回到一般視窗、Esc 先關這個視窗再關設定、從設定頁打開的登入對話框的 Esc、
+    「其他…」、最後一種語言、關掉視窗不登出與「登出」；`tests/online_subs.rs` 轉到另一個埠時金鑰與登入憑證都不送、POST 經過 302 變成 GET、
+    307 照原本的方法、有內容的 307 / 308 與 DELETE 不跟到別的來源、303、轉址共用一個時間限制、下載連結的轉址次數、
+    轉回原本的主機也不加回來、OpenSubtitles 的搜尋被轉到別的主機時金鑰不跟過去）
+  - [ ] 手動確認：正式版登入 OpenSubtitles 後真的搜尋、下載（含次數用完的提示），以及未登入時的下載
+  - [ ] 手動確認：射手網（偽）用真的 Token 搜尋、展開、下載一個繁體字幕
+  - [ ] 手動確認：存到 NAS 上的影片旁邊（主人的影片庫），重新開啟那部影片時自動載入下載的字幕
+  - [ ] 手動確認：關掉影戲再開仍是登入狀態（24 小時內）、「登出」之後要重新登入
+  - [ ] SR0 實測（還沒做）：主人的金鑰只在 GitHub 的 secret，開發的電腦上沒有，所以連到真網站的測試還沒跑過。有金鑰時執行
+    `VITASCOPE_ONLINE_TESTS=1 cargo test --test online_subs -- --ignored --nocapture`（開發版另外設 `VITASCOPE_OPENSUBTITLES_KEY`），
+    確認未登入能不能下載、`ratelimit-*` 標頭、參數沒排好時會不會轉址，結果寫進第 7 節。次數用完（406）的內容只有次數真的用完時才看得到：
+    另外設 `VITASCOPE_SR0_EXHAUST=1` 再跑一次（會一直未登入下載到不是 200 為止，用完這個 IP 今天的免登入次數）
+- [x] 片段輸出：把 A-B 段落存成檔案（不重新編碼）、轉成 GIF。右鍵選單「匯出 ▸ 儲存片段… / 轉成 GIF…」打開不擋住播放的匯出視窗，
+  範圍就是 A-B 重播；一次只做一個，關掉視窗不中斷，結束影戲時清掉暫存檔；從不覆蓋已經有的檔案（`save.rs`），
+  換不成正式名稱的完整檔案登記在 `kept.json`，啟動時的清理不刪。
+  - 片段（D1–D3）：另開一個 mpv 讀需要的段落、`dump-cache` 寫檔，起點、終點對齊關鍵影格（聲音跟影像一起結束），
+    格式照來源或指定，只有影像與一條音軌（不含字幕、不保留語言標籤：主人的決定 Q4 (a)），能跳轉的網路影片另外再下載那一段，
+    寫完重新打開檢查。預設存在「影片」資料夾裡的 VitaScope。
+  - GIF（D4，最長 30 秒）：另開一個編碼模式的 mpv，來源是只有 A-B 這一段的 EDL（`--end` 在濾鏡之後才檢查，整段一個色盤會一路解到檔尾）；
+    長邊 320–800 px、10–25 fps（記住上次的選擇）；色盤整段一個，畫面太大、太長時每格一個；旋轉、翻轉在色盤之前自己做（`video-rotate=no`，
+    跟 Ctrl+E 截圖一樣是畫面上的方向）；HDR 用 zscale + tonemap 轉成一般畫面，目標亮度、曲線照「畫質 → HDR」（自動、BT.2390 改用 Hable；杜比視界 Profile 5 不轉、
+    沒有濾鏡的引擎不轉，都附說明）；勾選時把目前顯示的主字幕燒進畫面（在縮放、轉正之後畫；外掛字幕的延遲減掉 EDL 的 0 秒：通常是 A，從 A 前面讀時跟著往前）；
+    TS、M2TS、MPEG-PS 跳轉不準（FFmpeg 用時間戳搜尋，常落在 A 之後的關鍵影格或檔尾）：先另開一個 mpv 試跳，EDL 從 A 前面 5 秒、30 秒或檔案開頭讀，
+    再精確跳到 A（`hr-seek`）；A 之前多讀的畫面在 fps 濾鏡就丟掉（`start_time`，不進色盤、不佔記憶體），格線從 A 算起，
+    格率取那一刻畫面上的那一格（`round=up`），第一格就是 A 那一格（燒進的字幕跟著格線對齊）；影像比 A 晚開始時第一格補到 A；
+    mpv 停用失敗的濾鏡時（「Disabling filter」）停下來算失敗，寫好之後核對 GIF 的大小與長度（照影片的格率，開頭晚了算失敗）。預設跟截圖放在一起，可以另外指定 GIF 資料夾
+  （自動：export / gif 單元測試（檔名、時間欄位、大小與偶數、轉正的濾鏡、HDR 的計畫、色盤的上限、EDL 的跳脫、外掛字幕的延遲、GIF 的檔頭與長度、
+  濾鏡失敗的記錄、往前讀的每一步、從 A 前面讀時的進度）；headless `tests/export.rs` 的片段與 GIF（EDL 的長度、大小與格數、直拍與使用者的旋轉翻轉的方向、HDR 的亮度與目標亮度、
+  燒進內嵌與外掛的字幕、字幕編號重開、主播放器選的影像、TS／M2TS（只有一個關鍵影格、每 10 秒、每 0.5 秒一個）與 MPG、VOB 的第一格就是主播放器在 A 的畫面（A 在 GIF 格線的各種位置、在兩格之間）、TS 從 A 前面讀時字幕跟格線對齊、TS 影像比聲音晚開始、開頭晚了的 GIF 算太短、容器標示的像素比例、第一格解出來之前不能開始、故意失敗的濾鏡（包括 Shutdown 之後才收到的記錄）不留檔案、出錯時馬上結束、取消（暫存檔寫了一部分之後）、本機伺服器上的網路影片與網站影片）；
+  kittest 匯出視窗、選單停用的原因、GIF 的選擇記住、畫面的旋轉與「畫質 → HDR」的設定傳到 GIF、30 秒上限、一次只做一個、取消、關閉時不留檔案、GIF 資料夾的設定、快捷鍵、英文介面）
+  - [ ] 手動確認：片段在 VLC、Windows 的媒體播放器、QuickTime（MP4 H.264）打得開；關鍵影格的說明看得懂
+  - [ ] 手動確認：GIF 在 Chrome、Firefox、Edge、Safari 的循環與速度；字幕、直拍影片、旋轉後的方向
+  - [ ] 手動確認：真的 4K HDR、杜比視界 P8、ASS 字幕的動畫轉 GIF；邊播 4K 邊轉 GIF 時主畫面不掉格（RTX 3090、120 Hz 電視）
+  - [ ] 手動確認：網路影片（HLS、DASH、網站影片）存片段、轉 GIF
+- [x] 縮圖總覽圖匯出（thumbnail sheet，D5）：右鍵選單「匯出 ▸ 縮圖總覽圖…」（匯出視窗的「縮圖總覽圖」分頁）。另開一個軟體繪圖的 mpv
+  （`export/grab.rs`）一格一格取：範圍（整部或 A-B）分成 n + 1 段取中間的 n 個點，先跳到關鍵影格，離目標超過半個間隔才精確跳轉；
+  精確跳轉落在目標之後（TS、M2TS、MPEG-PS 沒有索引）時 `hr-seek-demuxer-offset` 往前 5 秒、30 秒、檔案開頭（跟 GIF 往前讀的一樣），
+  時間標記寫實際取到的那一格的時間（收到這次跳轉的 `seek` 之後的「跳轉完成」才算，圖與時間是同一格；跳轉落在檔尾、沒有新的影格時
+  （`eof-reached`）不算一格，不拿上一格的畫面配檔尾的時間）。擷取用的 mpv 開好後跟主播放器比總長度（章節連結之類的時間線不做）。畫面在 lavfi 縮成格子大小（lanczos），
+  HDR 用跟 GIF 一樣的 zscale + tonemap（杜比視界 Profile 5、沒有濾鏡的引擎不轉，附說明），`keepaspect=no`、自己轉正；
+  「Disabling filter」算失敗（取完之後收完記錄再看一次）。版面有上限（整張最高 16384、最多 6 千萬像素、每格長邊 1280；放不下時列數變少，
+  視窗即時顯示大小）；文字用介面同一套字型在 epaint 排版、從字型圖集貼字（`export/text.rs`，`fonts::definitions()` 共用一份字型），
+  沒有中文字型時標頭用英文；JPEG 用 `image`（本來就在相依樹裡）、PNG 用 `png`，寫好讀回檔頭核對大小。跟 GIF 存在同一個資料夾
+  （介面沿用「GIF 資料夾」的名稱）。一格 10 秒取不到畫灰色「—」，連續兩格取不到算讀取逾時
+  （自動：sheet / text 單元測試（版面、上限：一欄二十列 3840 的橫的與直的、總像素、時間點、精確跳轉的規則、時間標記的文字、標頭（中英）、
+  JPEG / PNG 的大小、合成：標頭、格子、時間標記、取不到的格子；寫字：只畫在量出來的方塊裡、截斷、中文字）；headless `tests/export.rs`
+  （格線與大小、標頭、時間標記只在右下角且寫實際取到的那一格的時間、TS（每 10 秒、每 0.5 秒、只有一個關鍵影格）、M2TS 的每一格就是主播放器在標記的時間的那一格、
+  DVD 的 VOB（變形寬螢幕）的格子是 16:9、每一格是標記的時間的那一格、跳到檔尾不算一格、總長度對不上不做、只取 A-B、
+  直拍與使用者的旋轉翻轉的方向、HDR、濾鏡失敗、取消、逾時、影片檔不見、網路影片的連線設定、沒有影像與直播不能做）；
+  kittest 縮圖總覽圖分頁（預設值與實際大小、選擇記住、只取 A-B（傳到背景工作、換檔後取消勾選）、HDR 曲線的說明、不覆蓋、太大時列數變少、沒有影像時停用、一次只做一個、取消、關閉時不留檔案、快捷鍵、英文介面））
+  - [ ] 手動確認：真的 4K HDR、杜比視界 P8、長片（2 小時）的總覽圖：時間、顏色、花多久；中日韓檔名的標頭
+  - [ ] 手動確認：電視錄影的 TS / M2TS 的總覽圖每張跟時間標記對得上
+  - [ ] 手動確認：3840 寬、10 欄 × 20 列的 JPEG 在看圖軟體開得了；邊播 4K 邊做總覽圖時主畫面不掉格
+- [x] 播放清單：隨機、單一 / 全部重複、播完後動作（關閉、睡眠、休眠、關機）
+  - 播放順序（E1–E3）：隨機播放這一輪每個檔案播一次（SplitMix64 洗牌，PgUp 沿著播過的順序往回），重複單一檔案用 mpv 的 `loop-file`
+    （不能跳轉的來源自己重播），重複全部播完從頭（重新洗牌）；自動播下一個時跳過開不起來的檔案，整輪都開不起來就停。
+    右鍵選單「播放順序 ▸」、播放清單的 🔀 / 🔁、「設定 → 播放」、控制列的 🔀 / 🔂。隨機的順序不記（下次開啟時重新洗牌）。
+  - 播完後（E4–E5）：只對這次有效（`AfterPlayback` 刻意不能存檔）；播放結束時先倒數（`egui::Modal`：關閉 10 秒、睡眠 / 休眠 30 秒、關機 60 秒），
+    視窗還原、叫到前面、暫時置頂；任何按鍵（`handle_keys` 的最前面，按鍵被吃掉）、點擊、滾輪、移動滑鼠、開檔、停止、開了檔案對話框都取消，
+    整個系統的輸入也算（Windows `GetLastInputInfo`、macOS `CGEventSourceSecondsSinceLastEventType`、X11 的 XScreenSaver；
+    叫視窗時 winit 模擬的 Alt 不算：叫視窗後 0.4 秒內的不看，目前只有單元測試，見下面的手動確認）。正在匯出時等匯出做完。執行前先存檔。
+    真的睡眠、關機只在 main.rs 接上（`Launch.system` = `RealPower`；自動測試、`--shot` 沒有，選單不列出）：
+    Windows `SetSuspendState` / `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG)`（先打開 SeShutdownPrivilege，不加 `EWX_FORCE`），
+    新式待命（AoAc）的電腦睡眠停用、沒開休眠不列出休眠；macOS `/usr/bin/pmset sleepnow`、請 loginwindow 關機（`/usr/bin/osascript`），
+    選「關機」時先用 `AEDeterminePermissionToAutomateTarget` 問「自動化」權限（詢問視窗在人還在時出現；`Info.plist` 的 `NSAppleEventsUsageDescription`）；
+    Linux 透過 zbus 問 logind 的 `CanSuspend` / `CanHibernate` / `CanPowerOff`，"challenge"（要密碼）停用並說明，執行時 `interactive = false`。
+    啟動時、打開「播完後」的選單、選了動作時都在背景再問一次系統（S-B6）；Wayland 沒有整個系統的閒置時間，只看影戲視窗裡的動作
+  （自動：system_power 單元測試（倒數、長度、不能存檔、Windows 的新式待命 / 休眠 / 權限錯誤 / 閒置時間繞回 / 關機不加 `EWX_FORCE`、logind 的回答與 D-Bus 錯誤、
+  osascript 的參數與 -1743、「自動化」權限、中英文的原因、只有 main.rs 建立 `RealPower`；Windows 真的問一次能做哪些事、Linux 沒有 logind 時不當掉，**只問、不執行**）；
+  after_playback 單元測試（滑鼠的門檻與抖動、叫視窗時的 Alt 與系統輸入）；headless / kittest `tests/play_order.rs`（洗牌、重複、跳過開不起來的檔案、
+  倒數後只執行一次、各種取消、等匯出、關閉影戲、倒數中權限才被拒時停掉、改選之後才回來的被拒不影響新選的）；kittest `tests/ui.rs`（選單、設定頁、⏳、快捷鍵、系統支援哪些、打開選單時再問、選了先取得權限、
+  權限被拒與再問後不能做時回到不做任何事、沒有系統或沒有休眠時快捷鍵說明原因並再問一次、英文介面）；任何測試都只用假的 `SystemPower`）
+  - [ ] 手動確認：在自己的電腦真的試一次睡眠、休眠、關機（主人的電腦是新式待命、沒開休眠：只有關機能選，睡眠顯示停用與原因；
+    有沒存檔案的記事本時 Windows 顯示「這個 App 正在阻止關機」）
+  - [ ] 手動確認（Windows）：別的程式在前面時播完，倒數視窗叫到最上層後不會自己取消（winit 模擬的 Alt、真的 `GetLastInputInfo` 都不算）；
+    之後在別的程式裡打字、移動滑鼠會取消；原本在前面的程式的選單列可能閃一下
+  - [ ] 手動確認（macOS）：第一次選「關機」時跳出「自動化」的詢問，允許後真的關機、不允許時說明原因；⌘H 隱藏、縮到 Dock 時播完會叫出來
+  - [ ] 手動確認（Linux）：GNOME、KDE 上的睡眠與關機（logind），要密碼時停用；X11 在別的程式裡打字會取消倒數（Wayland 不會）
+- [x] 系統媒體整合：媒體鍵、Windows SMTC、macOS「正在播放」、Linux MPRIS
+  - 共用核心（E6，`media_keys/mod.rs`、`app/media.rs`）：`SessionSync` 決定送什麼（換檔、標籤變了才送檔案資訊；播放狀態變了才送，
+    播放中每 5 秒更新進度，跳轉時標出來；等快取時位置不動不算跳轉）；系統的指令走跟按鍵一樣的 `Command` → `Action`，
+    停止後按播放開停止的那個檔案、任何指令都取消播完後的倒數；第一個檔案載入時才建立工作階段，「設定 → 系統」可以關掉或隱藏片名與封面；
+    音訊檔的封面由 mpv 存成 PNG（快取資料夾的 `covers/`，換檔、關閉時刪掉）。真的系統只在 main.rs 接上（`Launch.media`），測試都用假的。
+  - Windows（E7，`media_keys/windows.rs`）：SMTC 在介面執行緒用主視窗建立、交給背景執行緒更新；換標題的 `ClearAll` 之後把封面放回去（S-B12）；
+    系統那一端斷線（檔案總管重開）時下一個檔案重新建立；影戲在最前面時，winit 吃掉的媒體鍵經訊息掛鉤交給 `DefWindowProcW`（S-B1）。
+  - Linux（E8，`media_keys/mpris.rs`）：zbus 的工作階段匯流排；名稱只帶 `DoNotQueue`，第二個影戲拿 `vitascope.instance<pid>`，不搶第一個的（S-A1）；
+    `OpenUri` 開 `file://`、`http(s)://`；可寫的屬性先顯示要的值、影戲沒照做時改回來。
+  - macOS（E9，`media_keys/macos.rs`）：`MPNowPlayingInfoCenter` 與 `MPRemoteCommandCenter`（objc2-media-player，含 `MPRemoteControlTypes`，S-A5）；
+    全部在主執行緒（建立時檢查），每次重建的 `nowPlayingInfo` 都放封面（S-B12），一定設 `playbackState`；
+    「往前 / 往後跳」的秒數跟著「設定 → 播放」的「← / → 跳轉」（`seek_short`）。
+  （自動：`media_keys` 單元測試（`SessionSync`、指令對應、`file://` 網址、封面檔案、SMTC 的重複模式與時間軸、MPRIS 的屬性與 Metadata、
+  macOS 的字典內容、按鈕與遠端指令，三個系統都跑）；kittest `tests/media_keys.rs`（假的系統：檔案資訊與狀態、指令控制播放器、
+  取消倒數、封面、隱藏片名、不重複送、斷線重建、跳的秒數跟著設定）；Linux 在私人的 D-Bus 匯流排上的 MPRIS 往返（CI 一定要有 dbus-daemon）；
+  macOS CI 的 `tests/now_playing.rs`（`now_playing_info_round_trip`：真的設定 `nowPlayingInfo` 讀回來比對、按鈕的狀態、遠端指令的處理；
+  主執行緒才能用，所以不用 libtest，只在 CI 跑）；Windows `smtc_session_round_trip`（`#[ignore]`，在開發機上手動跑：從系統那一端按影戲的按鈕））
+  - [ ] 手動確認（Windows）：鍵盤的媒體鍵在影戲在最前面、在後面、縮到最小時都能用；Windows 11 的音量浮動視窗與鎖定畫面顯示片名、封面、進度；
+    藍牙耳機的按鍵；同時開兩個影戲（等主人確認）
+  - [ ] 手動確認（Linux）：GNOME、KDE 的媒體控制與鎖定畫面（X11、Wayland），桌面環境的媒體鍵，`playerctl` 的播放、暫停、跳轉、開網址
+  - [ ] 手動確認（macOS）：F7–F9 在影戲在前面、在後面時都能用；控制中心的「正在播放」顯示片名、封面、進度，拖動進度、
+    按鈕是上一個 / 下一個檔案（不是往前 / 往後跳幾秒）；AirPods 的按鍵（這裡沒有 Mac，目前只有 CI 的自動測試）
+  - 播放時螢幕不關閉（E10，`inhibit.rs`）：嵌入用的 `vo=libmpv` 不處理 mpv 的 `stop-screensaver`，影戲照 mpv 讀到的值自己做
+    （`Player::stop_screensaver`；`VITASCOPE_MPV_OPTS` 可以改成 no / always）。純函式 `inhibit::want`：播放中的影片 → 螢幕不關，
+    只有聲音（或關掉了影像軌）→ 電腦不睡眠，暫停、停止、播完、播完後的倒數與動作 → 都不要（睡眠、關機之前先放掉並等它做完）。
+    Windows `PowerCreateRequest` / `PowerSetRequest`、macOS `IOPMAssertionCreateWithName`、Linux 工作階段匯流排的
+    `org.freedesktop.ScreenSaver.Inhibit`（沒有時只記錄一次；只管螢幕，只有聲音時不做）；在自己的執行緒上做，真的只在 main.rs 接上（`Launch.inhibitor`）
+  （自動：`inhibit` 單元測試（`want` 的每一種組合、背景執行緒只做最後一個要求、等它做完、結束時放掉、失敗只記錄一次、被收回時再要、
+  只有 main.rs 在不是 `--shot` 時建立 `RealInhibitor`；真的系統只在 CI 上測（開發機跳過，手動 `CI=1 cargo test --lib inhibit::tests::`）：
+  Windows 設一次再清掉、用 `CallNtPowerInformation` 確認，macOS 拿一次再放掉、用 `pmset -g assertions` 確認）；
+  kittest `tests/inhibit.rs`（假的 `Inhibitor`：影片、只有聲音、關掉影像軌、暫停、播完、結束、`stop-screensaver=no` / `always`、
+  倒數開始的那一幀就放掉、關機之前已經放掉）；Linux 在私人的 D-Bus 匯流排（自己的設定，不會啟動電腦上的服務）上用假的 ScreenSaver
+  測 Inhibit / UnInhibit、放不掉時關掉連線、沒有服務、匯流排不見了、影戲結束時放掉（CI 一定要有 dbus-daemon））
+  - [ ] 手動確認（Windows）：播放影片時以系統管理員執行 `powercfg /requests`，DISPLAY 底下有影戲；暫停後消失；
+    把「關閉螢幕」設成 1 分鐘、播一部 15 分鐘以上的影片不碰電腦，螢幕不會關；只播音樂時 SYSTEM 底下有影戲、螢幕照常關
+  - [ ] 手動確認（macOS）：播放時 `pmset -g assertions` 有影戲的 PreventUserIdleDisplaySleep，暫停後消失
+  - [ ] 手動確認（Linux）：GNOME、KDE 播放影片時螢幕不會變暗、不會鎖定，暫停後照設定的時間關閉
+- [x] 外觀：深色 / 淺色主題、迷你播放器、子母畫面（PiP）
+  - 深色 / 淺色 / 跟隨系統（A1、F4，`theme.rs`、`app/appearance.rs`）：「設定 → 一般 → 外觀」，預設深色。啟動時兩種主題都放 egui 的
+    標準樣式、明確設定主題偏好（v0.3.0 只設了深色樣式，系統是淺色的 Windows、macOS 第一幀就換成 egui 的淺色樣式）。
+    自己畫的顏色從 `Palette` 拿；影片畫面和蓋在影片上的東西（`dark_overlay`）兩種主題都是深色。跟隨系統：Windows、macOS 由 winit 回報；
+    Linux 的 winit 不回報，問桌面的設定 portal（`org.freedesktop.portal.Settings` 的 `org.freedesktop.appearance` / `color-scheme`，
+    zbus 的背景執行緒：先訂閱 `SettingChanged` 再 `ReadOne`，舊的 portal 用 `Read`；1 深色，0 / 2 淺色），回答放在 egui 的
+    `fallback_theme`；第一次選跟隨系統時才連（真的只在 main.rs 接上，`Launch.theme_source`），斷線時保留最後的值、30 秒後再連，
+    問不到時用深色並在設定頁說明。標題列：Windows 選了深色或淺色時，視窗重新取得焦點就再送一次（winit 沒記下來，系統的設定廣播會改回系統的顏色）；
+    Linux 由 App 自己送看到的深淺色、關掉 egui 的同步（egui 的「系統預設」在 X11 一律是深色）；macOS 換回跟隨系統時 winit 回報的可能是舊的，
+    讀 NSApp 的外觀在 `raw_input_hook` 蓋掉，直到 winit 回報的變了
+  - 迷你播放器（F1，`window_mode.rs`、`app/window_modes.rs`）：480 寬的小視窗、預設置頂（「迷你播放器置頂」），只留播放、進度、時間、音量、⏳、▣、🗖；
+    進入前記下一般視窗（含最大化），全螢幕、最大化時先離開再縮小（macOS 等視窗大小穩定 300 ms），系統把它變成全螢幕或最大化時回到一般視窗；
+    位置與寬度記在 `compact`（用之前檢查還在螢幕上）；要大視窗的功能先回到一般視窗
+  - 子母畫面（Windows、Linux，F2）：沒有邊框、一律置頂、比例跟影片一樣；拖曳畫面移動（`StartDrag`）、邊緣 8 點拉大小（`BeginResize`），
+    系統的拖曳結束時沒送「放開」就在 `raw_input_hook` 補一個，大小穩定 150 ms 後比例改回影片的；單擊不暫停，滑鼠移上去才有控制項；
+    右鍵選單只有幾項；純音訊不能用
+  - 子母畫面（macOS，F3）：系統的邊緣改大小，視窗的內容比例鎖在影片的比例（`contentAspectRatio`），換檔、長寬比、旋轉、裁切
+    （mpv 重新設定畫面）之後換成新的；Spaces 行為（每個桌面都有、可以放在別的全螢幕旁邊）盡力而為。回到一般視窗、換成迷你播放器的那一刻
+    就解除、還原，所以全螢幕之前一定是原本的行為（`FullScreenAuxiliary` 的視窗自己不能全螢幕）
+    （自動：`window_mode` 單元測試（比例鎖跟著模式與影片的形狀、Spaces 的位元，macOS 上對過 AppKit 的定義）；kittest 用假的視窗記下 app 對視窗做了什麼
+    （旋轉、裁切、換檔途中不解除、比例鎖被清掉後大小一變就再設、全螢幕之前已經還原成原本的、換成迷你播放器、被系統最大化）；
+    macOS CI 的 `tests/pip_mac.rs`（真的 `NSWindow`：設比例、`contentResizeIncrements` 設回 1×1 之後再設、解除後 AppKit 的狀態真的變了、
+    Spaces 行為的設定與還原、別的執行緒不碰視窗；主執行緒才能用，所以不用 libtest））
+  （外觀自動：theme 單元測試（兩種樣式、主題偏好與 portal 的回答、`color-scheme` 的值、標題列什麼時候送、macOS 的舊值什麼時候蓋掉、
+  portal 回覆的 `v` 與 `v(v)` 和 `SettingChanged` 用真的 D-Bus 訊息編碼再解開、只有 main.rs 連使用者的 portal）；kittest（像 eframe 一樣
+  系統是淺色時選深色不會被改掉、跟隨系統、設定頁的提示、切換與存檔、淺色主題的控制列與播放清單、蓋在影片上的一律深色、英文介面；
+  假的 portal：回答、改變、問不到、標題列送看到的深淺色、只在選了跟隨系統時才問；重新取得焦點時再送（Windows）；macOS 的舊值）；
+  Linux 在私人的 D-Bus 匯流排上用假的 portal（新的、只有 `Read` 的舊的、別的設定不理、沒有 portal、匯流排不見了保留最後的值、
+  匯流排回來後再連（重新讀、重新訂閱）、連續兩次問不到就放棄、結束時關掉連線、整個 App 接起來跟著換；CI 一定要有 dbus-daemon）；
+  `tests/theme_shot.rs`（`#[ignore]`，真的視窗截圖：淺色主題的控制列、
+  黑的影片畫面）。迷你播放器、子母畫面自動：`window_mode` 單元測試（大小、位置、比例、拉邊緣、補「放開」）；kittest（進入與回到一般視窗、
+  最大化與全螢幕、記住位置、第二個螢幕、Wayland、快捷鍵與選單、子母畫面的拖曳與比例）；實機 `tests/pacing_window.rs`（`#[ignore]`，
+  RTX 3090 + 120 Hz 電視：子母畫面的顯示器同步每格 5 次更新、視窗樣式、回到一般視窗的位置大小））
+  - [ ] 手動確認（Windows）：選深色、系統是淺色時，改一下系統設定（例如強調色、桌布）再回到影戲，標題列仍是深色；淺色、系統是深色也一樣
+  - [ ] 手動確認（Windows）：子母畫面在不同 DPI 的螢幕之間拖曳（225% 電視 ↔ 100% 螢幕），放開後保持影片的比例；Aero Snap 子母畫面之後比例改回來；
+    子母畫面在 120 Hz 電視上開「流暢播放」
+  - [ ] 手動確認（Linux）：GNOME、KDE 選「跟隨系統」時跟著系統的深淺色（改了系統設定馬上換），X11 的標題列也跟著；
+    沒有 portal 的視窗管理員是深色、設定頁有說明
+  - [ ] 手動確認（Linux）：X11 的迷你播放器、子母畫面置頂、拖曳移動、拉邊緣改大小；Wayland 只能改大小（不能置頂、不能指定位置），進入時提示一次
+  - [ ] 手動確認（macOS）：子母畫面用觸控板拖曳移動；拉邊緣改大小時一直保持影片的比例（旋轉、裁切之後也是）；全螢幕時進入子母畫面，
+    大小對、沒有標題列；回到一般視窗後綠色按鈕照樣能全螢幕；子母畫面在別的桌面、別的程式的全螢幕上看不看得到（盡力而為，不保證）；
+    選「跟隨系統」時系統改深淺色馬上跟著換；淺色啟動 → 選深色 → 系統改成深色 → 選「跟隨系統」，是深色
+    （這裡沒有 Mac，目前只有 CI 的自動測試）
+- [x] ✅ 「罕見」格式盡力支援，有樣本的納入測試（格式矩陣在本機 144 個樣本：常見 35、通用 46、罕見 63，全數通過；各平台 CI 的數字見 4.4）
+  - 副檔名（G1）：開啟檔案、拖放、資料夾的播放清單認得 `.aif` `.aiff` `.aifc` `.caf` `.ra`（`formats::AUDIO_RARE`）與 `.amv` `.bik` `.smk`，
+    跟其他罕見格式一樣不加入檔案關聯；字幕多了 `.lrc` `.mpl` `.jss` `.rt` `.pjs` `.aqt` `.scc` `.ttml` `.dfxp`（不含 `.stl`：也可能是 FFmpeg 讀不了的 EBU STL）。
+    外掛文字字幕轉成 UTF-8 的暫存檔不再加 BOM（FFmpeg 認 AQTitle、PJS、VPlayer 時從第一個位元組比對，有 BOM 就載入失敗）。
+    音樂檔的 LRC 歌詞：只在純音訊時觀察 mpv 的 `sub-text`，影戲畫在歌名下面，mpv 畫的那份藏起來
+  - TTML / DFXP（G2，`ttml.rs`）：FFmpeg 只有 TTML 的封裝、沒有分離器，影戲用 quick-xml 轉成 SRT（斜體、粗體、顏色、上方的區域、tick 時間）再交給 mpv；
+    `.xml` 看開頭 2 KiB 像 TTML 才當字幕
+  - 不支援的編碼（G3）：從 mpv 的記錄認出開不起來的解碼器，照播放引擎的 `decoder-list` 分成「不支援的編碼」與「無法解碼」，提示一次、媒體資訊標出那條軌道，
+    其他的照常播；整個檔案都解不了時錯誤畫面寫是哪個編碼；自動選字幕時跳過解不了的
+  - 樣本（G4，`scripts/gen_samples.py`）：FFmpeg 內建的編碼器做得出的（CineForm、MagicYUV、MS-MPEG4 v2、WMV 7、RealVideo 1 + RealAudio 14.4 的 `.rmvb` 與 `.ra`、
+    AMV、WTV、MXF 的 JPEG 2000、ZMBV、RPZA、AC-3 / DTS 原始串流、MS ADPCM）三個平台的 CI 都產生得出；要外部函式庫的（libvvenc、liboapv、libxavs2、
+    libvo_amrwbenc、libopencore_amrnb、libspeex、Hap 的 libsnappy）標在 `needs`，那個平台的 FFmpeg 沒有時略過並說明（不算失敗）。
+    FFmpeg 沒有編碼器的 DSD（DSF / DFF）、藍光 PGS（`.sup`）、SCC、TTML / DFXP 與罕見的文字字幕由產生程式自己寫；PGS 再由 FFmpeg 放進 MKV、
+    轉成 DVD（VobSub）與 DVB 字幕（`-fix_sub_duration`：FFmpeg 解 PGS 時每句的長度是「不知道」）。PGS 的兩個樣本先放「罕見」，
+    在 Docker 裡用 Ubuntu 24.04 的系統 libmpv 0.37 通過之後才改成「通用」（失敗會擋下）
+  - 格式矩陣（`tests/formats.rs`）的新欄位：`duration: null`（AMV、FFmpeg 寫的 `.ra` 檔頭沒有正確的長度：不比長度、不跳轉，直接播到結尾）、
+    `sub_bitmap`（圖形字幕：0.5 倍速從頭播，每換一句就暫停、比較含字幕與不含字幕的截圖，有畫出東西才算）、
+    `missing`（AVS2：播放器要記下解不了的編碼，聲音照常播到結尾）
+  - FFmpeg 做不出樣本的（Bink、Smacker、RealVideo 4、Cook、APE、Musepack、TAK、VP6、Indeo、Lagarith、ATRAC）：確認播放引擎與系統的 libmpv 都有解碼器、分離器；
+    真實檔案靠影片庫普查。還播不了的與 Linux tar.gz 的差異見 2.6
+  （自動：格式矩陣在本機 Windows（144 個）與 Linux 的 Docker（本專案的播放引擎）全數通過；三個平台的 CI 常見、通用全數通過
+  （Windows 143、macOS 132、Linux 139 個樣本，CI 執行 38670739113；各平台的 FFmpeg 編碼器不同，產生的樣本數不同；罕見失敗只列在報告裡）；Linux 的系統 libmpv 0.37 在 Docker 跑過
+  （SubViewer 只有第一句、MKV 的旋轉方向相反，其他都通過）；`tests/subs_formats.rs`（每種文字字幕在 2 秒的那一句、暫存檔沒有 BOM、TTML / DFXP 與 `.xml`、
+  轉不了的說明原因、音樂檔的 LRC 歌詞、影片旁邊的 `.sup` 照原路徑交給 mpv、每一句的時間、截圖裡真的有那個白色的長方形）；
+  `tests/decoders.rs`（`vd=-` 的「無法解碼」、AVS2 的「不支援」、MP4 裡的 TTML 跳過）；`ttml`、`formats` 與播放器的解碼器記錄單元測試；
+  `tests/engine_build.rs` 的解碼器、分離器清單；kittest 的歌詞與不支援的提示；`tests/lyrics_shot.rs`（`#[ignore]`，真的視窗截圖：有封面、沒有封面的歌詞））
+  - [ ] 手動確認：真的 LRC 歌詞配音樂；串流網站下載的 TTML / DFXP
+  - [ ] 手動確認：真的藍光 PGS、DVD 的 VobSub（`.idx` + `.sub`）、電視錄影的 DVB 字幕與 CEA-608 隱藏字幕
+  - [ ] 手動確認：Bink（`.bik`）、Smacker（`.smk`）、DSD 音樂、RMVB（RealVideo 4 + Cook）、AMV 的真實檔案
 
 ### L4 擴充與專業
 
@@ -501,12 +864,19 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 
 1. **產生樣本**：`python scripts/gen_samples.py` 用本機 FFmpeg 產生每個等級的測試檔（3 秒彩條 + 測試音，每種容器 × 編碼的組合各一個）。
    已確認本機 FFmpeg 8.1 具備 x264、x265、VP8/9、AV1、MPEG-1/2/4、WMV2、ProRes、MJPEG、Theora、FLV、RV20、FFV1、DNxHD、
-   AAC、MP3、Opus、AC-3、E-AC-3、DTS、Vorbis、FLAC、ALAC、WMA、TrueHD、Speex，以及 SRT / ASS / WebVTT / VobSub / mov_text 編碼器。
-   無法用 FFmpeg 產生的（VC-1、RV40、PGS、Dolby Vision、Atmos 等）改用公開樣本，放在 `samples/external/`（不進版控）。
+   AAC、MP3、Opus、AC-3、E-AC-3、DTS、Vorbis、FLAC、ALAC、WMA、TrueHD、Speex，以及 SRT / ASS / WebVTT / VobSub / mov_text 編碼器；
+   罕見的樣本另外用到 FFmpeg 內建的 CineForm、MagicYUV、MS-MPEG4 v2、WMV 7 / WMA 1、RealVideo 1 + RealAudio 14.4、AMV（含 AMV 的 IMA ADPCM）、
+   JPEG 2000、ZMBV、RPZA、MS ADPCM 與 DVB 字幕編碼器。
+   FFmpeg 沒有編碼器的 DSD（DSF / DFF）、PGS 圖形字幕（`.sup`）、SCC、TTML / DFXP 與罕見的文字字幕由產生程式自己寫；
+   要外部函式庫的編碼器（libvvenc、liboapv、libxavs2、libvo_amrwbenc、libopencore_amrnb、libspeex、Hap 用的 libsnappy）本機都有，
+   但各平台的 FFmpeg 不一定有，沒有時略過那個樣本並說明（不算失敗）。
+   無法產生的（VC-1、RV40、Bink、Smacker、Dolby Vision、Atmos 等）改用公開樣本，放在 `samples/external/`（不進版控）。
 2. **自動測試**：`cargo test --test formats` 以 headless 模式執行 libmpv（`vo=null`、`ao=null`），每個樣本檢查：
    - 能開啟，偵測到的編碼與預期一致
    - 能播到 1 秒、跳到中間、播到結尾，過程中沒有錯誤事件
    - 字幕軌數量與內容正確（包含 Big5 編碼的 SRT）
+   - 圖形字幕（PGS、DVD、DVB）播放中真的畫出來；解不了的編碼（AVS2）有記下來、其他的照常播；
+     檔頭沒有正確長度的（`duration: null`，AMV、`.ra`）不比長度、直接播到結尾
 3. **硬體解碼**：用 `hwdec=auto-copy` 播放，讀取 `hwdec-current` 確認真的走了 GPU（CI 主機沒有 GPU，所以在本機測）。
 4. **依等級判定**：常見、通用失敗 → 測試失敗；罕見失敗 → 只列在報告中。
 
@@ -522,7 +892,7 @@ README 的「功能清單」是給使用者看的精簡版，打勾時兩邊一�
 ### 4.3 CI
 
 GitHub Actions 在 Windows / macOS / Ubuntu 三平台建置，並跑格式測試（軟解）與單元測試；Ubuntu 跑兩次，
-分別用系統的 libmpv（tar.gz）與 AppImage 內含的 libmpv。三個平台的 libmpv 各有自己的建置流程（`libmpv-*.yml`）：
+分別用系統的 libmpv（tar.gz）與 AppImage 內含的 libmpv；Ubuntu 一定要有 dbus-daemon（MPRIS、螢幕保護程式、設定 portal 的測試在測試自己開的匯流排上跑，沒有就失敗），macOS 另外跑主執行緒才能用的 `tests/now_playing.rs`、`tests/pip_mac.rs`。三個平台的 libmpv 各有自己的建置流程（`libmpv-*.yml`）：
 用新建置的 libmpv 跑完整的測試（macOS、Linux 另外實際開視窗截圖），發佈時一定要同時建置兩次、確認逐位元相同（`repro_check`），
 比對通過才發佈成 prerelease。
 發佈流程另外在三平台打包、實際執行 `--version`，並在 macOS / Linux 用自動截圖確認影片畫面畫得出來
@@ -532,17 +902,33 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 
 ### 4.4 目前的測試數量
 
+數字是 2026-10-15（v0.3.1 發佈前，`cargo test --all-targets`）在 Windows 本機與 Linux 的 Docker（Ubuntu 24.04、本專案建置的引擎）跑出來的；
+「+ n」是預設略過的測試（`#[ignore]`，加上只在 macOS 跑、其他平台顯示略過的 `now_playing`、`pip_mac`）。合計 Windows 1630 + 35、Linux 1641 + 32。
+
 | 測試 | 數量 | 平台 |
 |---|---|---|
-| 格式矩陣 `tests/formats.rs` | 98 個樣本（常見 35、通用 37、罕見 26；CI 上 Linux、macOS 的 FFmpeg 少幾個編碼器，產生的樣本比較少） | Windows、macOS、Linux |
-| 介面 `tests/ui.rs` | 171 | Windows、macOS、Linux |
+| 格式矩陣 `tests/formats.rs` | 本機 144 個樣本（常見 35、通用 46、罕見 63）全數通過。CI（執行 38670739113）上各平台的 FFmpeg 編碼器不同，產生的樣本數不同：Windows 143、macOS 132（35 / 41 / 56）、Linux 139（AppImage 的引擎 35 / 46 / 58 全數通過；系統的 libmpv 0.37 常見、通用全數通過，罕見 58 個通過 56 個，SubViewer 與 MKV 的旋轉只列在報告，見 2.6） | Windows、macOS、Linux |
+| 單元測試（`src/` 裡的測試） | 797 + 2（1 個需要網路、1 個只印出 Windows 偵測更新率的各種方法）；Linux 786 + 1（有些只在特定平台編譯） | Windows、macOS、Linux |
+| 介面 `tests/ui.rs` | 500 + 1（`real_hdr_clips`，要真正的 HDR 影片）；Linux 501 + 1 | Windows、macOS、Linux |
+| 播放核心 `tests/smoke.rs` | 4（Linux 5：執行檔不直接需要新版 libmpv 才有的函式） | Windows、macOS、Linux |
 | 媒體資訊 `tests/mediainfo.rs`、預覽縮圖 `tests/thumbs.rs` | 4、5 | Windows、macOS、Linux |
 | 單一執行個體 `tests/instance.rs`（實際啟動好幾個程式、強制結束主視窗） | 6 | Windows、macOS、Linux |
-| 播放核心 `tests/smoke.rs` + 單元測試 | 4 + 248（smoke 在 Linux 多 1 個：執行檔引用的 libmpv 函式；其中 2 個預設略過：1 個需要網路、1 個只印出 Windows 偵測更新率的各種方法；單元測試有些只在特定平台編譯，數字是 Windows 的） | Windows、macOS、Linux |
-| 畫質 `tests/picture.rs`、音效 `tests/sound.rs`、非同步設定與引擎功能 `tests/async_opts.rs`、流暢播放 `tests/pacing.rs` | 10、14、8、2 | Windows、macOS、Linux |
-| 播放引擎的建置內容 `tests/engine_build.rs` | 7（舊的引擎、系統的 libmpv 略過 L3 元件的部分） | Windows、macOS、Linux |
-| 截圖檢查 `tests/picture_shot.rs`（會開視窗） | 6 + 2 個不開視窗的輔助測試 | Windows 本機（RTX 3090）、Linux 的 CI（虛擬螢幕）、macOS 的 libmpv 建置流程 |
-| 實機節奏 `tests/pacing_window.rs`（會開全螢幕視窗，手動跑） | 4 + 1 個不開視窗的輔助測試 | Windows 本機（RTX 3090 + 120 Hz 電視） |
+| 畫質 `tests/picture.rs`、音效 `tests/sound.rs`、非同步設定與引擎功能 `tests/async_opts.rs`、流暢播放 `tests/pacing.rs` | 11、14、10、2 | Windows、macOS、Linux |
+| 播放引擎的建置內容 `tests/engine_build.rs` | 8（舊的引擎、系統的 libmpv 略過 L3 元件的部分） | Windows、macOS、Linux |
+| 罕見格式 `tests/subs_formats.rs`、`tests/decoders.rs` | 7、13 | Windows、macOS、Linux |
+| TS / M2TS / MPEG-PS 的跳轉 `tests/seek.rs` | 9 | Windows、macOS、Linux |
+| 網路 `tests/net.rs`、`tests/net_errors.rs`（自己一個測試程式：FFmpeg 的記錄只送到第一個 mpv） | 36、4 | Windows、macOS、Linux |
+| 網站影片 `tests/ytdl.rs`、取得 yt-dlp / deno `tests/install.rs` | 13 + 1、13 + 1（略過的連到真的網站：`VITASCOPE_ONLINE_TESTS=1`）；Linux 的 ytdl 16 + 1 | Windows、macOS、Linux |
+| 線上搜尋字幕 `tests/online_subs.rs` | 14 + 2（略過的連到真的 OpenSubtitles、射手網（偽）：`VITASCOPE_ONLINE_TESTS=1`） | Windows、macOS、Linux |
+| 匯出 `tests/export.rs`（片段、GIF、縮圖總覽圖） | 70 | Windows、macOS、Linux |
+| 播放順序與播完後 `tests/play_order.rs` | 49 | Windows、macOS、Linux |
+| 系統媒體控制 `tests/media_keys.rs` | 29 + 1（`smtc_session_round_trip`：真的 SMTC，在開發機上手動跑）；Linux 33（私人的 D-Bus 匯流排上的 MPRIS） | Windows、macOS、Linux |
+| 螢幕不關閉 `tests/inhibit.rs` | 8；Linux 13（私人的 D-Bus 匯流排上的假 ScreenSaver） | Windows、macOS、Linux |
+| 跟隨系統的深淺色 `tests/theme_portal.rs` | Linux 8（私人的 D-Bus 匯流排上的假 portal；其他平台沒有） | Linux |
+| macOS「正在播放」`tests/now_playing.rs`、子母畫面 `tests/pip_mac.rs`（主執行緒才能用，不用 libtest） | 1、1 | macOS 的 CI（其他平台顯示略過，算在「+ n」裡） |
+| 截圖檢查 `tests/picture_shot.rs`（會開視窗） | 10 + 2 個不開視窗的輔助測試 | Windows 本機（RTX 3090）、Linux 的 CI（虛擬螢幕）、macOS 的 libmpv 建置流程 |
+| 淺色主題 `tests/theme_shot.rs`、歌詞 `tests/lyrics_shot.rs`（會開視窗，手動跑） | 2、2 | Windows 本機 |
+| 實機節奏 `tests/pacing_window.rs`（會開全螢幕視窗，手動跑） | 10 + 1 個不開視窗的輔助測試（子母畫面的 1 個只有 Windows） | Windows 本機（RTX 3090 + 120 Hz 電視） |
 | 硬體解碼 `tests/hwdec.rs`（需要 GPU） | 8 種編碼 | RTX 3090 通過 |
 
 ### 4.5 真實影片庫普查（`examples/media_survey.rs`）
@@ -596,8 +982,35 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 | R13 | 等化器預設、夜間模式、人聲平衡、音量平均的參數是照一般播放器的值和耳朵調的，沒有客觀標準 | ao=pcm 的量測只確認濾鏡有作用、不會破音；實際聽感列入手動確認，依回饋調整 |
 | R14 | mpv 的 `tone-mapping=gamma` 著色器在 OpenGL 上編譯不過（對純量做 swizzle），畫面變成整片藍 | HDR 曲線不列 Gamma；之後可以在自建的 libmpv 加修正檔再開放 |
 | R15 | 音訊直通在檔案一開始就被輸出拒絕時，這個引擎改回 PCM 之後會停住，跳轉一下才繼續播（第十批測試時發現，見第 7 節） | 測試用 `ao-null-format=float` 模擬並確認濾鏡鏈會設回；停住的部分要在引擎裡查，實機（擴大機、電視）確認時一起看 |
+| R16 | 網站影片的 `on_load` hook 沒有放行，mpv 一直停在載入中 | 只有播放器一個地方放行 hook，每條路（解析完成、失敗、取消、看門狗逾時、換檔、停止）都剛好放行一次；已經換掉的檔案的 hook 認得出來、直接放行；mpv 拿掉 hook 時重新註冊（C6，每條路都有測試） |
+| R17 | YouTube 之類的網站常改版（JavaScript 驗證、確認不是機器人） | deno、從 yt-dlp 的警告看出原因與建議、「更新 yt-dlp 再試一次」、瀏覽器的 Cookie、清楚的錯誤說明（C5–C8）；影戲下載的 yt-dlp 超過 30 天沒更新時提醒 |
+| R18 | yt-dlp 的單一執行檔是 PyInstaller 打包的：啟動慢、只結束外層會留下 `_MEI*` 暫存資料夾、防毒軟體可能誤判 | 20 分鐘的結果快取；取消時不等它，Windows 用 Job Object 連子程序一起結束；被 Windows 擋下時有專門的說明。Defender 實際會不會擋列入手動確認 |
+| R19 | 打開「檢查網站憑證」之後，網路擋住憑證撤銷清單時 Windows（Schannel）開不了 HTTPS 網址 | 專門的說明，「設定 → 網路」可以暫時關掉（C2、C4） |
+| R20 | Linux tar.gz 用的系統 FFmpeg 6.1 播 DASH 可能卡住（本專案引擎的修正檔 `ffmpeg-0002` 它沒有） | DASH 的測試只在本專案建置的引擎跑；README、CHANGELOG 寫明 |
+| R21 | FFmpeg 的記錄只送到行程裡第一個建立的 mpv | 看 FFmpeg 記錄的測試自己一個測試程式（`tests/net_errors.rs`）；匯出、縮圖用的 mpv 只看 mpv 自己的記錄（第 7 節） |
+| R22 | 片段輸出用的 `dump-cache` 是 mpv 的實驗功能：沒寫出東西也回報成功、不保留語言與標題、選了字幕時開頭多出空白 | 寫完重新打開核對長度與軌道、`ab-loop-align-cache` 對齊、保守的容器表（拿不準的存 MKV）、不放字幕軌（主人的決定 Q4 (a)；引擎的修正檔排到下次重建） |
+| R23 | 轉 GIF 的記憶體用量、濾鏡失敗 | 來源是只有 A-B 的 EDL、最長 30 秒、畫面太大太長時改成每格一個色盤；「Disabling filter」算失敗；寫好之後核對大小與長度（D4） |
+| R24 | 播完後的動作在人不在時造成實際損失（例如關機時別的程式還沒存檔） | 真的睡眠、關機只在 main.rs 接上（自動測試只有假的）；一定先倒數、任何操作都取消、倒數時置頂、只對這次有效、執行前先存檔、關機不加 `EWX_FORCE`；新式待命的 Windows 電腦不提供睡眠（E4、E5） |
+| R25 | Windows：影戲在最前面時，winit 吃掉鍵盤的媒體鍵 | 訊息掛鉤把媒體鍵交給 `DefWindowProcW`（E7b）；實體按鍵會不會變成系統的媒體指令只能手動確認（`VITASCOPE_DEBUG_MEDIA=1` 的記錄） |
+| R26 | 只有 macOS 用的程式碼（睡眠關機、正在播放、子母畫面、外觀）這裡編譯不了、也沒有 Mac 實機 | 把模組複製到另一個 crate，用 `cargo check --target aarch64-apple-darwin` 做型別檢查（本專案的 build.rs 沒有 macOS 的播放引擎時不能直接檢查）、拆成小的子批次（E5、E9、F3、F4）、macOS CI 的 `tests/now_playing.rs`、`tests/pip_mac.rs`；macOS 的手動確認保留 |
+| R27 | Wayland 不能置頂、不能指定視窗位置、查不到整個系統的閒置時間 | 進入迷你播放器、子母畫面時提示；倒數只看影戲視窗裡的動作；文件寫明 |
+| R28 | OpenSubtitles 的規定與次數，金鑰可能被從執行檔取出 | 金鑰只在 CI 的 secret（建置時放進正式版、XOR 混淆、只送到官方主機）；搜尋不用登入，下載先不登入（免費金鑰每個 IP 每天 5 次），伺服器拒絕或次數用完時才登入；同一個字幕不重複花次數；用真的金鑰實測（SR0）還沒做；發佈後看金鑰的使用統計 |
+| R29 | 射手網（偽）只有一個人維護、每分鐘最多 20 次 | 選用的來源（使用者自己的 Token）、規定的出處說明、錯誤對照 |
+| R30 | 下載的字幕寫進使用者的影片資料夾（例如 NAS） | 絕不覆蓋、先寫暫存檔再用硬連結換成正式名稱、寫不進去時放快取資料夾、「設定 → 字幕」可以關掉（Q6） |
+| R31 | PotPlayer 風格的按鍵不一定準確；鍵盤配置（AltGr、數字鍵盤、AZERTY）不同 | 主人對照 PotPlayer（手動確認）；要改只動 `keymap.rs` 的資料表 |
+| R32 | Windows 的系統設定廣播會把標題列改回系統的深淺色 | 重新取得焦點時再送一次（F4） |
+| R33 | 下載 yt-dlp、deno、線上字幕與檢查更新的連線（ureq）用跟著影戲編譯的根憑證，不看系統的憑證庫：公司的 TLS 檢查會連不上。這些連線的 proxy 只看環境變數，不用「設定 → 網路」的 Proxy（那一欄只給播放引擎與 yt-dlp），也不用系統設定裡的 proxy | 已知的缺口（延後，L3.5 候選）；proxy 可以用環境變數 `HTTPS_PROXY`、`HTTP_PROXY`。開網址播放用系統的憑證與「設定 → 網路」的 Proxy |
 
 ## 7. 開發中學到的事
+
+- **OpenSubtitles 的整合規定**（「Terms of use for integrators」，2026-10-13 版，G5 時讀的）：一個程式只能有一把金鑰，
+  不能要使用者自己申請金鑰，也不能把開發者的帳號密碼放進程式；免費金鑰每個 IP 每天 5 個免登入下載（金鑰的設定可以關掉），
+  之後要用使用者自己的帳號與額度；搜尋、選字幕的地方要顯示「Subtitles provided by OpenSubtitles.com」並連到網站；
+  下載的字幕可以存在使用者的電腦（例如影片旁邊），暫時的下載連結不能存。實際的 API 行為（SR0）還沒用真的金鑰測過，見第 3 節。
+- **ureq 跟轉址時只拿掉 `Authorization`（和 Cookie）**：自己加的標頭（例如 OpenSubtitles 的 `Api-Key`）會跟著送到別的主機。
+  線上字幕的連線因此不讓 ureq 跟轉址（`max_redirects(0)`），自己跟：換了來源（協定、主機、埠）就只留 `Accept`；
+  307 / 308 會照原本的內容再送一次，所以有內容的請求（登入的帳號密碼）、DELETE 不跟到別的來源（G6）。
+- **ureq 的回應大小上限是「讀到這麼多就算超過」**：內容剛好等於上限時，讀到結尾的那一次也會失敗。要多給一個位元組再自己比。
 
 - **mpv 的記錄訊息比一般事件晚送達**：`mpv_wait_event` 會先把一般事件取完才送記錄訊息，
   所以開檔失敗時，詳細原因會比 `END_FILE` 晚到，要在收到後補進錯誤說明。
@@ -632,7 +1045,7 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **libmpv 的截圖走軟體路徑**：沒開 advanced control（開了跟我們的單執行緒繪圖會死結）時，截圖不含畫面輸出做的旋轉、
   也不含 GLSL 著色器（翻轉）；`screenshot-raw` 還會忽略裁切。要自己轉正。沒有畫面（vo=null）時 mpv 用濾鏡旋轉，
   截圖本來就是轉好的，所以要看 `video-out-params` 的 `rotate`（畫面輸出還要轉多少）。
-- **Ctrl+C 不會變成按鍵事件**：egui 把它轉成 `Event::Copy`，要監聽那個事件。
+- **Ctrl+C 不會變成按鍵事件**：egui 把它轉成 `Event::Copy`，要監聽那個事件。同樣的還有 Ctrl+X / Ctrl+V（`Event::Cut` / `Paste`），Windows 的 Ctrl+Insert、Shift+Insert、Shift+Delete，以及 Ctrl+Shift+C 之類多加修飾鍵的（一樣變成「複製」，分不出來）：自訂快捷鍵時這些是保留的按鍵，錄按鍵時從這些事件反推是哪一組。
 - **`Ui::dnd_drag_source` 一按下就算開始拖**，裡面的按鈕收不到點擊；清單的每一列要用同時能點、能拖的元件
   （`Sense::click_and_drag()`），移動超過幾個像素才算拖曳。
 - **右鍵選單比視窗高時，下面的項目點不到**（egui 不會自己捲動），要放進可以捲動的區域。
@@ -703,6 +1116,19 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
   （`handle_display_sync_frame` 的 `drop_repeat`），實測停 0.3～10 秒之後，1080p 約 0.15 秒、4K 軟體解碼 1 秒內就追上，剩 15 ms 左右再由聲音的速度慢慢修正。
   `VITASCOPE_DEBUG=pacing` 10 秒一次的 avsync 平均會把停住剛結束時讀到的那一筆（好幾秒）算進去，看起來像要十幾秒才追上；
   要看每秒的值（現在每秒印一筆）。保險起見（較舊的 mpv、解碼跟不上）停過之後 0.5 秒還差 50 ms 以上才暫時改用一般播放追上。
+- **電腦慢的時候，mpv 的事件會一大批一起處理**：介面處理某個事件時看到的狀態，可能已經被同一批後面的事件改過了
+  （舊檔案收尾的 VideoReconfig 晚於送出開新檔），
+  背景的尋找也可能在一幀畫到一半時做完。要在處理那個事件的當下記下來、一幀只讀一次背景的結果。
+  屬性的變化不跟事件排順序（mpv 先送完排著的事件才送變了的屬性，屬性的值每輪播放迴圈才取一次）：上一個檔案的變化
+  可能在新檔案的 StartFile 之後好幾批才收到，不能靠分在哪一批猜是誰的。要知道換檔前的狀態，就在送出 loadfile 之前
+  直接問 mpv（音訊輸出是不是改用的 null：那時新檔案還沒開始；處理 StartFile 的當下記下觀察到的值也不夠：
+  那時看到的可能已經是新檔案的，或還沒收到上一個的。mpv 自己開始的清單項目沒有 loadfile，處理它的 StartFile 時問）。
+  介面測試在 CI 上時好時壞的，大多是同一類：限制成 2～4 個 CPU、同時跑整組測試就重現得出來。
+  測試裡「沒有發生」直接問 mpv 同步指令的結果（暫停、靜音、音量），不靠等一段時間；提示只顯示 1.5 秒，
+  等得久的地方每一幀記下來；子選單、背景的結果都等條件成立，不數幀數。
+  開檔後視窗配合影片調整：載入好了、影片尺寸還沒回報時也還沒調整，要等調整完才打開選單（不然選單打開後視窗才變小，
+  項目跑到視窗外，滑鼠一直移到外面）。記下每一幀送出的視窗大小時，按下去的那一幀不算：同一幀先處理 mpv 的事件、調整視窗，最後才處理點擊。
+  按鍵要看播放狀態做決定時（例如停在結尾按空白鍵 = 從頭播放）直接問 mpv：介面記下的狀態靠屬性通知，逐格到結尾後可能還沒更新。
 - **libmpv 預設的 BLOCK_FOR_TARGET_TIME 會卡住介面**：`mpv_render_context_render` 在介面的執行緒上等到影格的預定時間，
   每格約 39 ms，介面每秒只能更新 24 次左右。改成影格快到時間（大約一次螢幕更新內）才取，再讓 mpv 精準等待。
 - **egui 的 `request_repaint_after` 會扣掉 `predicted_dt`**（eframe 沒有設定，固定 1/60 秒）：要等 38 ms 會提早約 17 ms 醒來，
@@ -715,6 +1141,28 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **同步的 `set_property` 會插隊到還沒執行的非同步指令前面**（同步呼叫直接鎖住核心，非同步的是排隊）；非同步指令彼此之間照順序。
   同一個選項同時用兩種方式設定時，要想清楚最後是誰。
 - **字串清單選項設成 `""` 會變成有一個空項目的清單 `[""]`**，不是空清單；要清空用 `change-list <選項> clr ""`。
+- **FFmpeg 的記錄只送到行程裡第一個建立、還在的 mpv**（mpv 的 `common/av_log.c`：FFmpeg 的記錄函式整個程式只有一個）。
+  開網址失敗的原因（找不到伺服器、HTTP 404…）只出現在 FFmpeg 的記錄，介面的播放器是第一個建立的，所以收得到；
+  之後另外開的 mpv（匯出、縮圖之類）收不到 FFmpeg 的錯誤，要看 mpv 自己的記錄判斷。自動測試平行建立很多播放器，
+  看 FFmpeg 記錄的測試要放在自己的測試程式（`tests/net_errors.rs`），一次只建立一個播放器。
+  另外 HTTP 的錯誤碼（`HTTP error 404 Not Found`）是警告，不是錯誤：播放器要向 mpv 要警告等級的記錄才收得到。
+  FFmpeg 7 以前（Ubuntu 24.04 系統的 libmpv 0.37 用的 FFmpeg 6.1）伺服器不回應、讀取逾時時什麼都不記錄，
+  只有 mpv 的「Failed to open」：看不出原因、但花滿了 `network-timeout` 才失敗的，就當成逾時說明。
+- **mpv 開不起來時的錯誤記錄跟 `on_load_fail` hook 的先後**：連線失敗時「Failed to open <網址>」在 hook 之前就記了，
+  但記錄要等事件佇列空了才送：處理到 hook 事件時記錄可能還沒收到（實際上常常先到：還沒送出的屬性通知會讓 hook 晚一點送，
+  記錄趁機先到，但 API 沒有保證）。要看記錄決定的事，等 `wait_event(0)` 回傳沒有事件之後再決定。
+  另外「Failed to recognize file format」是檔案結束（`END_FILE`）之後才記的，「No video or audio streams」是載入成功之後，
+  兩個在 `on_load_fail` 的時候都還沒有：判斷「讀到了內容、只是認不出」只能反過來看有沒有連線失敗的記錄。
+- **FFmpeg 比對 Cookie 的網域時，新版用含埠號的主機、6.1 用不含的**（libavformat/http.c `get_cookies` 比字尾）：
+  網址寫了埠號時，我們的引擎（FFmpeg 9）要 Cookie 檔的網域寫 `主機:埠` 才送得出去，系統的 FFmpeg 6.1 要寫 `主機`。
+  網站影片沒寫網域的 Cookie 兩種都寫一份（各版本只對得上其中一個，不會送兩次）。
+  另外 mpv 0.37 的 Cookie 檔只讀本機檔案（0.38 起才讀得了 `memory://`）：系統的 libmpv 改用 `Cookie:` 標頭
+  （只放網域對得上影片主機的；標頭會送到這個檔案的每一個網址）。
+- **`file-local-options` 在檔案結束時還原成「設定之前」的值**（`END_FILE` 之前就還原了）：這段期間改的全域設定也會被蓋回去。
+  網站影片結束時，播放器把那段期間改過的網路設定再同步送一次。
+- **mpv 的事件佇列滿了（1000 個）時，送不出的 hook 會被拿掉**（警告「Failed sending hook command main/on_load. Removing hook.」；
+  0.37 是「Sending hook command failed. Removing hook.」，沒寫是哪一個）：之後的檔案都不會再停在 hook。
+  播放器看到這筆記錄就重新註冊（0.37 兩個都註冊，重複收到的 hook 認得出來）。
 - **Windows：觀察 `audio-device-list` 要讓程式一直有多執行緒 COM（MTA）**：mpv 在自己的執行緒初始化 MTA、關閉時拆掉，
   那是程式裡唯一的 MTA 時，系統的裝置通知還在用，關閉播放器時存取違規。啟動時先 `CoIncrementMTAUsage`，不再減回去。
 - **Linux 直接連結新版 libmpv 才有的函式，舊的 libmpv 在程式開始之前就被載入器擋掉**：Rust 預設 `-z now`（完整 RELRO），
@@ -742,3 +1190,72 @@ tar.gz 的 `install.sh` 裝到暫時的家目錄檢查選單項目。
 - **產生的正弦波 WAV 可能被當成 MPEG-TS**：48 kHz 的 1 kHz 浮點正弦波每 192 位元組重複一次，剛好是 M2TS 的封包長度，
   FFmpeg 的偵測給 MPEG-TS 滿分、開不起來。測試指定 `demuxer-lavf-format=wav`。本專案建置的引擎也沒有 FFmpeg 的 `sine` 來源，
   測試用的聲音都在測試裡產生。
+- **直播的 HLS 也有「總長度」**：沒有結尾標記（`#EXT-X-ENDLIST`）的 HLS，FFmpeg 用開頭讀到的那一段估了一個總長度（不到一秒），
+  mpv 之後跟著已經讀到的長度變長；用「沒有總長度」判斷直播不準。改看載入時能不能跳轉（直播的 HLS、RTSP、RTMP 都不能）。
+  但只看「不能跳轉」也不對：伺服器不支援 Range（沒有 `Accept-Ranges`，很多小型伺服器、NAS）的一般檔案，FFmpeg 當成串流、mpv 也說不能跳轉，
+  總長度卻是真的。所以有總長度又不能跳轉時，只有 HLS / DASH 與 RTSP、RTMP 之類算直播（`net::is_live`）。
+- **網路上的播放清單讀完後，mpv 馬上就開第一個項目**：結束那個網址（redirect）的事件處理到的時候，`path` 可能已經是第一個項目；
+  清單本身的網址要看項目的 `playlist-path`（mpv 0.37 起）。mpv 也會把清單裡的 `file://` 換成本機路徑（Windows 是 `\etc\passwd`），
+  篩選時本機路徑一樣拿掉。
+- **沒有索引的格式（MPEG-TS、MPEG-PS），mpv 的精確跳轉常落在目標之後，甚至一格都沒有**：FFmpeg 用時間戳找位置，
+  落點之後要等下一個關鍵影格才解得出畫面，而 mpv 的 `hr-seek-demuxer-offset` 預設是 0。實測藍光的 m2ts 每一次都晚 0.1～1 秒，
+  關鍵影格隔很久的檔案讀到檔尾都沒有新的畫面（聲音照樣跳過去）。修正是開檔時把這個選項設成 1 秒（file-local，換檔時 mpv 還原），
+  每次跳轉之後看 mpv 的記錄核對：「first video frame after restart shown」（有沒有新的畫面）、「playback restart complete @ 時間, … video=…」（停在哪），
+  晚了或沒有畫面就加倍再跳。注意：跳過檔尾時 mpv 用最後一格，記錄卻寫 `video=eof`，有沒有畫面要看前一筆；
+  記錄跟事件之間沒有順序，上一次跳轉的記錄也可能在送出這次之後才到（mpv 等上一次的第一格出來才做下一次），
+  所以標記（`print-text`）和跳轉放在同一個指令清單送出（`mpv_command_string`，「;」分開），只認 mpv 開始做這次跳轉之後的記錄：
+  精確跳轉看 cplayer 的「hr-seek, skipping to 目標」（只有真的跳轉才有），不能看分離器的「queuing seek to」——外掛字幕預先讀取時
+  分離器也會跳到 0。mpv 自己做的精確跳轉（A-B 重播繞回、逐格往回的「(backstep)」、章節）也從這一筆開始核對。
+  加大往前多跳的秒數之後還停在同一格，不一定是「加大沒用」：關鍵影格隔 10 秒時，往前 1、2、4 秒都落在目標之後同一個關鍵影格；
+  只有晚一兩格以內才當成影像本身缺格。加大的秒數只在它真的讓跳轉停對時才留給之後的跳轉。
+  關鍵影格跳轉送出的是「目標 − 往前多跳的秒數」，mpv 在停住之前的 time-pos 也是這個數字：連按往回時要從目標算。
+  自己產生的樣本只有開頭一個關鍵影格時，問題看起來是「沒有畫面」；真實的電視錄影、藍光則是「晚一點」，兩種都要測。
+- **嵌入用的 `vo=libmpv` 不處理 `stop-screensaver`**：mpv 預設播放時不讓螢幕關閉，但那是畫面輸出（`VOCTRL_KILL_SCREENSAVER`）做的，
+  `vo_libmpv.c` 的 `control()` 沒有這一項，所以嵌入 mpv 的程式播影片時螢幕照樣會關。要自己向系統要求
+  （Windows 的電源要求、macOS 的 IOPM assertion、Linux 的 `org.freedesktop.ScreenSaver`），也要記得在睡眠、關機之前放掉。
+- **winit 在 macOS 每次開始、結束改大小都把 `contentResizeIncrements` 設回 1×1**（`windowWillStartLiveResize:` /
+  `windowDidEndLiveResize:`），AppKit 的 `contentAspectRatio` 跟它互斥，設了就清掉。子母畫面的比例鎖只設一次會在使用者第一次拉邊緣時就不見，
+  所以大小一變就再設一次（改大小的途中程式照樣在畫）。`collectionBehavior` 的互斥位元（`CanJoinAllSpaces` 與 `MoveToActiveSpace`、
+  `FullScreenPrimary` / `Auxiliary` / `None`）同時設時 AppKit 丟例外，要先拿掉。
+- **egui 的 `set_visuals` 只改「目前」那個主題的樣式，而 eframe 預設跟隨系統**：建立 App 時還沒有任何一幀，系統的深淺色還不知道，
+  深色樣式放進本來就是深色的那一份；第一幀 Windows、macOS 回報淺色，egui 就換成它自己的淺色樣式，蓋在寫死的深色面板上
+  （v0.3.0 在淺色系統上的問題）。兩種樣式都要設、主題偏好要明確設。kittest 的 Harness 建立前會自己設成深色，測不出來，
+  測試要像 eframe 一樣把偏好改回跟隨系統、自己給 `system_theme`。
+- **winit 在 Linux 不回報系統的深淺色**（X11、Wayland 都沒有 ThemeChanged），egui 跟隨系統時用 `fallback_theme`：要自己問桌面的設定 portal。
+  portal 的 `Read` 回覆的值多包一層 variant（`v(v)`，舊的 portal 只有它），`ReadOne`（第 2 版起）才是 `v`。另外 X11 的
+  `set_theme(None)`（egui 跟隨系統送的「系統預設」）寫的是 `_GTK_THEME_VARIANT = dark`，所以 Linux 由 App 自己送看到的深淺色。
+- **winit 在 Windows 設標題列的深淺色時沒有記下來**：系統每次廣播設定變更（`WM_SETTINGCHANGE`，常常發生）就照系統的設定改回去，
+  egui 只在主題偏好變了時送一次。重新取得焦點時自己再送（繞過 egui 的快取）。
+- **macOS 的視窗強制外觀時，winit 不理系統的外觀變化**，換回跟隨系統時只在它的說法有變（舊值 ≠ 新值）才通知，
+  所以 egui 的 `system_theme` 可能一直是舊的；系統改回那個舊值時 winit 也會通知，但值一樣看不出來。換回跟隨系統時讀 NSApp 的外觀蓋掉，
+  蓋掉的期間每一批輸入都再讀，winit 回報的值變了才交還給它。kittest 會把 `raw_input_hook` 改過的 `system_theme` 留到下一幀（eframe 不會），
+  測試要自己改回 winit 的值。
+- **mpv 的 hook 一定要放行，而且只能放行一次**：忘了 `hook_continue`，mpv 永遠停在載入中；網站影片的每一條路
+  （解析完成、失敗、取消、看門狗逾時、換檔、停止）都要放行。處理到 hook 時可能已經換檔了，要先看 mpv 正在載入的還在不在清單上。
+- **mpv 的 `end` 在濾鏡之後才檢查**：編碼模式用 `start` / `end` 加上整段一個色盤的 GIF 濾鏡，色盤要等輸入結束才輸出，
+  於是一路解碼、存著畫面到檔尾。改用只有那一段的 EDL（`edl://…,start=A,length=B−A`），讀到 B 就真的結束。
+  另外 mpv 的自動旋轉接在使用者的 `vf` 之後（色盤之後再轉會變回 RGB），要 `video-rotate=no` 自己轉；
+  編碼模式的 `vo_lavc` 會把字幕畫在每一格上，不要字幕時 `sid=no`，要燒進字幕時放 `vf=sub`；
+  `sub-files-append` 之類的 `-append` 經過 `mpv_set_option` 不認得，開檔前用 `change-list sub-files append`；
+  `idle=once` 讓編碼的 mpv 做完一個檔案就結束，等 `Shutdown` 事件才算寫完。
+- **`dump-cache` 每一條軌道各自在「B 之後的第一個關鍵影格」停**：聲音的每個封包都是關鍵影格，所以聲音停在 B、影像一直寫到下一個關鍵影格，
+  片段結尾多一段沒有聲音的畫面。先 `ab-loop-align-cache` 把 A、B 換成快取裡真正寫得出來的範圍，再用那個範圍 `dump-cache`。
+  寫檔的 recorder 只寫**選中的**軌道（外掛的音軌、字幕不算），不寫語言、標題、預設的標記；選中的軌道在範圍裡沒有封包時什麼都不寫，
+  指令卻回報成功，所以寫完一定要重新打開核對。選了字幕時，時間零點是範圍裡最早的那句字幕，影像、聲音晚開始（片段開頭多出空白），
+  所以片段不放字幕（引擎的修正檔排到下次重建）。
+- **zbus 的 `request_name` 預設旗標是 AllowReplacement | ReplaceExisting | DoNotQueue**：第二個影戲會把第一個的 MPRIS 名稱搶走。
+  只帶 `DoNotQueue`，名稱被拿走時改用 `vitascope.instance<pid>`。
+- **winit 的無邊框視窗**（子母畫面）：Windows 沒有邊框就沒有系統的拉邊緣改大小，要自己在邊緣送 `BeginResize`；
+  egui-winit 只在視窗有焦點時送 `StartDrag`；X11、macOS 系統的拖曳結束時沒送「放開」，egui 會一直以為滑鼠按著（控制項不消失、下一下點擊被吃掉），
+  要在 `raw_input_hook` 補一個。
+- **winit 在 Windows 叫視窗到前面時會模擬按一下 Alt**（`SendInput`，讓系統允許搶前景）：`GetLastInputInfo` 算它是輸入，
+  影戲自己也可能收到 Alt 的修飾鍵變化。播完後的倒數叫視窗之後 0.4 秒內的輸入不算取消（實體的情況列入手動確認）。
+- **winit 吃掉 Windows 的媒體鍵**：視窗在最前面時 `WM_KEYDOWN` / `WM_KEYUP` 不交給 `DefWindowProcW`，系統的媒體控制收不到。
+  winit 的訊息掛鉤只看得到 post 的訊息，在那裡把四個媒體鍵交給 `DefWindowProcW`（跟一般的 Win32 視窗一樣）。
+- **新式待命（Modern Standby、AoAc）的 Windows 電腦不能靠 `SetSuspendState` 睡眠**（主人的桌機就是）：選單上停用並說明原因；
+  沒開休眠時不列出休眠。macOS 的關機請 loginwindow 做（`osascript`），要使用者在「自動化」允許，被拒時是 -1743：
+  選「關機」的當下先用 `AEDeterminePermissionToAutomateTarget` 問，詢問視窗在人還在時出現，不要等到播完。
+- **FFmpeg 認某些字幕格式時從第一個位元組比對**：VPlayer、AQTitle、PJS 的檔案開頭有 UTF-8 BOM 就認不出來、載入失敗。
+  轉成 UTF-8 的暫存字幕檔不加 BOM（合法的 UTF-8 mpv 本來就當 UTF-8 讀）。
+- **OpenSubtitles 的 moviehash 是「檔案大小 + 開頭與結尾各 64 KB」**：小於 128 KiB 的檔案兩段會重疊、各家的實作算法不一致，這種檔案不算特徵碼
+  （書籤找回搬家的檔案也跳過它們；真的影片不會這麼小）。

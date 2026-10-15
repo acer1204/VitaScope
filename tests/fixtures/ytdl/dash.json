@@ -1,0 +1,26 @@
+{
+  "title": "Dash",
+  "is_live": false,
+  "requested_formats": [
+    {
+      "format_id": "v1",
+      "protocol": "http_dash_segments",
+      "vcodec": "avc1.4d401f",
+      "acodec": "none",
+      "height": 720,
+      "fragment_base_url": "https://dash.test/base/",
+      "fragments": [
+        {"path": "init.mp4"},
+        {"path": "seg-1.m4s", "duration": 4.004},
+        {"url": "https://cdn2.test/abs/seg-2.m4s", "duration": 2.5}
+      ]
+    },
+    {
+      "format_id": "a1",
+      "protocol": "https",
+      "url": "https://dash.test/audio.m4a",
+      "vcodec": "none",
+      "acodec": "mp4a.40.2"
+    }
+  ]
+}

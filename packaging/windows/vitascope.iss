@@ -161,7 +161,8 @@ Filename: "{app}\{#ExeName}"; Parameters: "--unregister-associations"; Flags: ru
 Type: filesandordirs; Name: "{app}\licenses"
 
 [UninstallDelete]
-; %LOCALAPPDATA%\VitaScope 都是暫存（轉碼後的字幕、翻轉用的著色器、單一執行個體的鎖定檔）；
+; %LOCALAPPDATA%\VitaScope 都是暫存（轉碼後的字幕、翻轉用的著色器、單一執行個體的鎖定檔）
+; 與影戲按需求下載的 yt-dlp、deno（tools\）；
 ; 設定與播放紀錄（%APPDATA%\Vitascope）保留給重新安裝
 Type: filesandordirs; Name: "{localappdata}\VitaScope"
 

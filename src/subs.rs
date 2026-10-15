@@ -7,11 +7,21 @@
 //!
 //! 這裡的做法：檔名標記 + 內容判斷（數「這／这」「們／们」之類的繁簡字）決定語言，
 //! 文字字幕轉成 UTF-8 用 `memory://` 交給 mpv；圖形字幕（PGS、VobSub）照原路徑載入。
+//! TTML / DFXP（FFmpeg 讀不了）先轉成 SRT（[`crate::ttml`]）。
 
 use std::path::{Path, PathBuf};
 
-/// 文字字幕：讀進來轉碼
-pub const TEXT_EXTS: &[&str] = &["srt", "ass", "ssa", "vtt", "smi", "sami", "sub", "txt"];
+/// 文字字幕：讀進來轉碼。後面一列是罕見的格式（MPL2、JACOsub、RealText、PJS、AQTitle、SCC、LRC 歌詞…）；
+/// `stl` 不收（也是二進位的 EBU-STL）
+pub const TEXT_EXTS: &[&str] = &[
+    "srt", "ass", "ssa", "vtt", "smi", "sami", "sub", "txt", //
+    "lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp",
+];
+/// TTML / DFXP：轉成 SRT 再交給 mpv。內容是 TTML 的 `.xml` 也是（看開頭判斷，見 [`is_ttml_file`]）
+const TTML_EXTS: &[&str] = &["ttml", "dfxp"];
+/// 暫存檔名的版本：暫存檔的格式改了就換（舊版留下、內容一樣的暫存檔不能再用）。
+/// v2：不再加 UTF-8 BOM
+const CACHE_VERSION: &str = "v2";
 /// 圖形字幕或二進位容器：照原路徑交給 mpv
 pub const BINARY_EXTS: &[&str] = &["idx", "sup", "mks"];
 /// 字幕常放的子資料夾
@@ -191,6 +201,8 @@ pub struct ExternalSub {
     pub text: Option<String>,
     /// 原始編碼（文字字幕）
     pub encoding: Option<&'static str>,
+    /// 轉換過格式的字幕交給 mpv 的格式（暫存檔的副檔名），例如 TTML → `srt`；None = 原本的格式
+    pub load_ext: Option<&'static str>,
 }
 
 impl ExternalSub {
@@ -198,70 +210,70 @@ impl ExternalSub {
     ///
     /// 不用 `memory://`：那樣整份字幕內容會變成 track-list 裡的檔名，每次軌道變化都要複製好幾 MB。
     pub fn load_path(&self) -> std::io::Result<PathBuf> {
+        if self.text.is_none() {
+            return Ok(self.path.clone());
+        }
+        self.write_into(&cache_dir())
+    }
+
+    /// 文字字幕寫到 `dir`（檔名是內容的雜湊，內容一樣就不再寫）；圖形字幕回傳原路徑
+    fn write_into(&self, dir: &Path) -> std::io::Result<PathBuf> {
         let Some(text) = &self.text else {
             return Ok(self.path.clone());
         };
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        self.path.hash(&mut h);
-        text.hash(&mut h);
-        let ext = self
-            .path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        let dir = cache_dir();
-        std::fs::create_dir_all(&dir)?;
-        let out = dir.join(format!("{:016x}.{ext}", h.finish()));
+        std::fs::create_dir_all(dir)?;
+        let out = dir.join(self.cache_name(text));
         if !out.exists() {
-            // 加上 UTF-8 BOM，mpv 就不會再自己猜編碼
-            let mut data = vec![0xef, 0xbb, 0xbf];
-            data.extend_from_slice(text.as_bytes());
-            std::fs::write(&out, data)?;
+            // 不加 BOM：合法的 UTF-8 mpv 一定當成 UTF-8 讀（不用 BOM 提示）；有 BOM 時，
+            // FFmpeg 的 AQTitle、PJS、VPlayer 格式偵測從第一個位元組開始比對，認不出來、載入失敗
+            std::fs::write(&out, text.as_bytes())?;
         }
         Ok(out)
     }
+
+    /// 暫存檔名：版本、原檔路徑、內容的雜湊，加上原本的副檔名（mpv 靠副檔名幫忙判斷格式；
+    /// 轉換過格式的用轉換後的，例如 TTML 轉成的 `.srt`）
+    fn cache_name(&self, text: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        CACHE_VERSION.hash(&mut h);
+        self.path.hash(&mut h);
+        text.hash(&mut h);
+        let ext = match self.load_ext {
+            Some(ext) => ext.to_owned(),
+            None => self
+                .path
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default(),
+        };
+        format!("{:016x}.{ext}", h.finish())
+    }
 }
 
-/// 轉碼後字幕的暫存資料夾。放在使用者自己的快取資料夾，不放共用的 /tmp：
-/// 多使用者的電腦上，別人無法搶先建立同名資料夾、也無法放入假字幕
+/// 轉碼後字幕的暫存資料夾：快取資料夾（[`crate::paths::cache_root`]）底下的 `subs`
 /// - Windows：`%LOCALAPPDATA%\VitaScope\subs`
 /// - macOS：`~/Library/Caches/VitaScope/subs`
 /// - Linux：`$XDG_CACHE_HOME/vitascope/subs`（預設 `~/.cache/vitascope/subs`）
 pub fn cache_dir() -> PathBuf {
-    let home = || std::env::var_os("HOME").map(PathBuf::from);
-    let base = if cfg!(target_os = "windows") {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("VitaScope"))
-    } else if cfg!(target_os = "macos") {
-        home().map(|h| h.join("Library/Caches/VitaScope"))
-    } else {
-        std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home().map(|h| h.join(".cache")))
-            .map(|d| d.join("vitascope"))
-    };
-    // 找不到使用者資料夾時才退回系統暫存資料夾，仍放在自己的子資料夾裡（clean_cache 只清這裡）
-    base.unwrap_or_else(|| std::env::temp_dir().join("vitascope"))
-        .join("subs")
+    crate::paths::cache_root().join("subs")
 }
 
-/// 清掉超過一天的暫存字幕
+/// 線上下載、影片資料夾寫不進去（或設定不存到影片旁邊）時放的地方：暫存資料夾的 `online`
+pub fn online_cache_dir() -> PathBuf {
+    cache_dir().join("online")
+}
+
+/// 清掉超過一天的暫存字幕，與超過 30 天的線上下載字幕（`online` 資料夾：下次開同一部影片時還用得到）
 pub fn clean_cache() {
-    let Ok(entries) = std::fs::read_dir(cache_dir()) else {
-        return;
-    };
+    clean_cache_in(&cache_dir());
+}
+
+fn clean_cache_in(dir: &Path) {
     let day = std::time::Duration::from_secs(24 * 3600);
-    for e in entries.flatten() {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > day);
-        if old {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
+    // 只刪檔案（`online` 資料夾本身不刪）
+    crate::save::sweep_matching(dir, |_| true, day);
+    crate::save::sweep_matching(&dir.join("online"), |_| true, 30 * day);
 }
 
 /// 找出影片的外掛字幕：同資料夾（以及 Subs 之類的子資料夾）裡，檔名以影片名稱開頭的字幕檔
@@ -289,7 +301,10 @@ pub fn find_external(video: &Path) -> Vec<PathBuf> {
             .filter(|e| {
                 let name = e.file_name().to_string_lossy().to_lowercase();
                 let ext = name.rsplit('.').next().unwrap_or_default();
-                belongs_to(&name, &stem) && (TEXT_EXTS.contains(&ext) || BINARY_EXTS.contains(&ext) || ext == "sub")
+                // 影戲還在寫（或當掉時留下）的暫存檔不載入
+                belongs_to(&name, &stem)
+                    && !crate::save::is_part(&name)
+                    && (TEXT_EXTS.contains(&ext) || BINARY_EXTS.contains(&ext) || ext == "sub")
             })
             .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()))
             .map(|e| e.path())
@@ -364,6 +379,56 @@ pub const ENCODINGS: &[(&str, &str, &encoding_rs::Encoding)] = &[
     ),
 ];
 
+/// 檔案的內容是 TTML（給 `.xml` 用：副檔名看不出是不是字幕）。只讀開頭 [`crate::ttml::SNIFF_LEN`] 位元組；
+/// 讀不了回傳 false
+pub fn is_ttml_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(crate::ttml::SNIFF_LEN);
+    if file.take(crate::ttml::SNIFF_LEN as u64).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    crate::ttml::looks_like_ttml(&decode_head(head))
+}
+
+/// 檔案開頭一段的文字。截在多位元組字元的中間時拿掉最後那個不完整的字元：
+/// 不然整段不是合法的 UTF-8，會被當成別的編碼（變成亂碼）
+fn decode_head(mut head: Vec<u8>) -> String {
+    if let Err(e) = std::str::from_utf8(&head)
+        && e.error_len().is_none()
+    {
+        head.truncate(e.valid_up_to());
+    }
+    decode(&head).0
+}
+
+/// XML 宣告寫的編碼（`<?xml version="1.0" encoding="ISO-8859-1"?>`）。
+/// 寫 UTF-8、UTF-16 的不算：只在檔案沒有 BOM、又不是合法的 UTF-8 時才用，這時宣告一定是錯的
+/// （常見的是範本的 `encoding="UTF-8"` 沒改、檔案存成 Big5），交給自動判斷
+fn xml_declared_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
+    let head = &bytes[..bytes.len().min(256)];
+    let head = std::str::from_utf8(head).unwrap_or_else(|e| {
+        // 宣告本身是 ASCII：只看前面合法的部分
+        std::str::from_utf8(&head[..e.valid_up_to()]).unwrap_or_default()
+    });
+    let decl = head.strip_prefix("<?xml")?;
+    let decl = &decl[..decl.find("?>")?];
+    let rest = decl[decl.find("encoding")? + "encoding".len()..].trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+    let label = &rest[1..];
+    let label = &label[..label.find(quote)?];
+    encoding_rs::Encoding::for_label(label.trim().as_bytes())
+        .filter(|enc| ![encoding_rs::UTF_8, encoding_rs::UTF_16LE, encoding_rs::UTF_16BE].contains(enc))
+}
+
+/// TTML / DFXP 的字幕轉換失敗（[`load_as`] 回傳的這種錯誤不用再把原檔交給 mpv 試：mpv 讀不了 TTML）
+pub fn is_conversion_error(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData
+}
+
 /// 讀取並分析一個外掛字幕檔（自動判斷編碼）
 pub fn load(path: &Path, video: &Path) -> std::io::Result<ExternalSub> {
     load_as(path, video, None)
@@ -398,13 +463,16 @@ pub fn load_as(
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     let label_lang = classify_label(&suffix);
-    if !TEXT_EXTS.contains(&ext.as_str()) {
+    // `.xml` 不一定是字幕：內容是 TTML 才當成文字字幕轉換，其他的照原檔交給 mpv
+    let xml_ttml = ext == "xml" && is_ttml_file(path);
+    if !TEXT_EXTS.contains(&ext.as_str()) && !xml_ttml {
         return Ok(ExternalSub {
             path: path.to_path_buf(),
             title,
             lang: label_lang.unwrap_or(SubLang::Unknown),
             text: None,
             encoding: None,
+            load_ext: None,
         });
     }
 
@@ -421,17 +489,47 @@ pub fn load_as(
             let (text, used, _) = enc.decode(&bytes);
             (text.into_owned(), used.name())
         }
-        None => decode(&bytes),
+        None => {
+            // XML（TTML）：沒有 BOM、又不是 UTF-8 時，照 XML 宣告寫的編碼
+            let declared = (xml_ttml || TTML_EXTS.contains(&ext.as_str()))
+                .then(|| xml_declared_encoding(&bytes))
+                .flatten()
+                .filter(|_| encoding_rs::Encoding::for_bom(&bytes).is_none() && std::str::from_utf8(&bytes).is_err());
+            match declared {
+                Some(enc) => {
+                    let (text, _) = enc.decode_without_bom_handling(&bytes);
+                    (text.into_owned(), enc.name())
+                }
+                None => decode(&bytes),
+            }
+        }
     };
     let text = repair(&ext, text);
-    // 內容判斷優先：實際影片庫裡有「檔名標 zh-TW、內容是簡體」的字幕
-    let lang = classify_content(&text).or(label_lang).unwrap_or(SubLang::Unknown);
+    // TTML / DFXP 轉成 SRT（FFmpeg 讀不了 TTML）；副檔名是別的、內容是 TTML 的也轉
+    let ttml = xml_ttml || TTML_EXTS.contains(&ext.as_str()) || crate::ttml::looks_like_ttml(&text);
+    let (text, load_ext, doc_lang) = if ttml {
+        let converted = crate::ttml::convert(&text).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                crate::tf!("無法轉換 TTML 字幕：{e}", "Cannot convert the TTML subtitle: {e}"),
+            )
+        })?;
+        (converted.srt, Some("srt"), converted.lang)
+    } else {
+        (text, None, None)
+    };
+    // 內容判斷優先：實際影片庫裡有「檔名標 zh-TW、內容是簡體」的字幕；TTML 最後看文件寫的 xml:lang
+    let lang = classify_content(&text)
+        .or(label_lang)
+        .or_else(|| doc_lang.as_deref().and_then(classify_label))
+        .unwrap_or(SubLang::Unknown);
     Ok(ExternalSub {
         path: path.to_path_buf(),
         title,
         lang,
         text: Some(text),
         encoding: Some(encoding),
+        load_ext,
     })
 }
 
@@ -602,6 +700,8 @@ mod tests {
             "[Group] Show - 02.tc.ass",
             "[Group] Show - 01.nfo",
             "Subs/[Group] Show - 01.eng.srt",
+            // 影戲下載字幕時還在寫的暫存檔（副檔名是真的）：不能載入
+            "[Group] Show - 01.123-4.vitascope-part.srt",
         ] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
@@ -622,5 +722,331 @@ mod tests {
         let sub = load(&dir.join("[Group] Show - 01.tc.ass"), &video).unwrap();
         assert_eq!(sub.title, "tc.ass");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_cleanup_keeps_online_downloads_for_30_days() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("online")).unwrap();
+        let age = |p: &Path, days: u64| {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(days * 24 * 3600 + 60))
+                .unwrap();
+        };
+        let files = [
+            ("old.srt", 2, false),
+            ("new.srt", 0, true),
+            ("online/a.zh-TW.srt", 2, true),
+            ("online/b.zh-TW.srt", 31, false),
+        ];
+        for (name, days, _) in files {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            age(&p, days);
+        }
+        clean_cache_in(&dir);
+        for (name, _, kept) in files {
+            assert_eq!(dir.join(name).exists(), kept, "{name}");
+        }
+        assert!(dir.join("online").is_dir(), "線上字幕的資料夾本身不刪");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn text_sub(path: &str, text: &str) -> ExternalSub {
+        ExternalSub {
+            path: PathBuf::from(path),
+            title: String::new(),
+            lang: SubLang::Unknown,
+            text: Some(text.to_owned()),
+            encoding: Some("UTF-8"),
+            load_ext: None,
+        }
+    }
+
+    #[test]
+    fn converted_subtitles_have_no_bom() {
+        // FFmpeg 的 AQTitle、PJS、VPlayer 偵測從第一個位元組開始比對：有 BOM 就載入失敗
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-bom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (name, text) in [
+            ("歌.pjs", "20,26,\"VITASCOPE TEST\"\n"),
+            ("歌.aqt", "-->> 38\nVITASCOPE TEST\n\n"),
+            ("歌.txt", "00:00:01.50:影戲播放器測試\n"),
+        ] {
+            let sub = text_sub(&dir.join(name).to_string_lossy(), text);
+            let out = sub.write_into(&dir).unwrap();
+            assert_eq!(std::fs::read(&out).unwrap(), text.as_bytes(), "{name}");
+            assert_eq!(out.extension(), Path::new(name).extension(), "{name}：保留副檔名");
+        }
+        // 圖形字幕照原路徑
+        let mut sup = text_sub("片.sup", "");
+        sup.text = None;
+        assert_eq!(sup.write_into(&dir).unwrap(), PathBuf::from("片.sup"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rare_text_subtitles_are_converted_and_found() {
+        // 罕見的文字字幕（LRC、PJS、AQTitle…）也跟 SRT 一樣轉成 UTF-8（Big5、GBK 的歌詞不會變亂碼），
+        // 也會自動找到影片旁邊同名的
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-rare-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("影片.mkv");
+        std::fs::write(&video, b"").unwrap();
+        let rare = ["lrc", "mpl", "jss", "rt", "pjs", "aqt", "scc", "ttml", "dfxp"];
+        let (big5, _, _) = encoding_rs::BIG5.encode("[00:01.00]測試字幕\n");
+        // TTML、DFXP 要是真的 TTML（會轉成 SRT）
+        let (big5_ttml, _, _) = encoding_rs::BIG5.encode(
+            "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"1s\" end=\"2s\">測試字幕</p></body></tt>",
+        );
+        for ext in rare {
+            let path = dir.join(format!("影片.{ext}"));
+            let bytes = if TTML_EXTS.contains(&ext) { &big5_ttml } else { &big5 };
+            std::fs::write(&path, bytes).unwrap();
+            let sub = load_as(&path, &video, Some(encoding_rs::BIG5)).unwrap();
+            assert!(
+                sub.text.as_deref().is_some_and(|t| t.contains("測試字幕")),
+                "{ext}：要轉成 UTF-8"
+            );
+            assert_eq!(sub.encoding, Some("Big5"), "{ext}");
+        }
+        let found: Vec<String> = find_external(&video)
+            .iter()
+            .filter_map(|p| p.extension().map(|e| e.to_string_lossy().into_owned()))
+            .collect();
+        for ext in rare {
+            assert!(found.iter().any(|e| e == ext), "{ext}：自動找到同名的字幕（{found:?}）");
+        }
+        // 能拖放、選取的字幕副檔名（formats::SUBTITLE）不是轉碼的文字字幕，就是照原檔交給 mpv 的
+        for ext in crate::formats::SUBTITLE {
+            assert!(
+                TEXT_EXTS.contains(ext) || BINARY_EXTS.contains(ext),
+                "{ext} 不在 TEXT_EXTS / BINARY_EXTS"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 一份 TTML：一句 1～2 秒的字幕
+    fn ttml_doc(lang: &str, text: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tt xmlns=\"http://www.w3.org/ns/ttml\" xml:lang=\"{lang}\">\
+             <body><div><p begin=\"00:00:01.000\" end=\"00:00:02.000\">{text}</p></div></body></tt>\n"
+        )
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("vitascope-subs-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ttml_is_converted_to_srt() {
+        // TTML / DFXP 轉成 SRT 再交給 mpv：暫存檔是 .srt，標題還是原本的檔名，語言照 xml:lang
+        let dir = temp_dir("ttml");
+        let video = dir.join("影片.mkv");
+        for name in ["影片.ttml", "影片.DFXP"] {
+            let path = dir.join(name);
+            std::fs::write(&path, ttml_doc("ja", "VITASCOPE &amp; TEST")).unwrap();
+            let sub = load(&path, &video).unwrap();
+            assert_eq!(sub.load_ext, Some("srt"), "{name}");
+            assert_eq!(
+                sub.text.as_deref(),
+                Some("1\n00:00:01,000 --> 00:00:02,000\nVITASCOPE & TEST\n\n"),
+                "{name}"
+            );
+            assert_eq!(sub.title, Path::new(name).extension().unwrap().to_string_lossy());
+            assert_eq!(sub.lang, SubLang::Japanese, "{name}：內容、檔名判斷不出來時照 xml:lang");
+            assert_eq!(sub.encoding, Some("UTF-8"));
+            let out = sub.write_into(&dir.join("cache")).unwrap();
+            assert_eq!(out.extension().unwrap(), "srt", "{name}");
+            assert_eq!(std::fs::read_to_string(&out).unwrap(), sub.text.unwrap());
+        }
+        // 檔名的語言標記比 xml:lang 優先（跟其他字幕一樣）
+        let tagged = dir.join("影片.tc.ttml");
+        std::fs::write(&tagged, ttml_doc("en", "VITASCOPE TEST")).unwrap();
+        let sub = load(&tagged, &video).unwrap();
+        assert_eq!((sub.title.as_str(), sub.lang), ("tc.ttml", SubLang::Traditional));
+        // 用別的編碼重新載入（「字幕編碼」選單）也照樣轉換
+        let doc = ttml_doc("zh-TW", "這是我們的字幕，你說對不對？他們會來這裡嗎");
+        let (big5, _, _) = encoding_rs::BIG5.encode(&doc);
+        let big5_path = dir.join("影片.big5.ttml");
+        std::fs::write(&big5_path, &big5).unwrap();
+        let sub = load_as(&big5_path, &video, Some(encoding_rs::BIG5)).unwrap();
+        assert!(sub.text.as_deref().unwrap().contains("這是我們的字幕"));
+        assert_eq!((sub.load_ext, sub.lang), (Some("srt"), SubLang::Traditional));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn xml_is_converted_only_when_it_is_ttml() {
+        let dir = temp_dir("xml");
+        let video = dir.join("影片.mkv");
+        let ttml = dir.join("影片.en.xml");
+        std::fs::write(&ttml, ttml_doc("en", "VITASCOPE TEST")).unwrap();
+        assert!(is_ttml_file(&ttml));
+        let sub = load(&ttml, &video).unwrap();
+        assert_eq!(sub.load_ext, Some("srt"));
+        assert!(sub.text.as_deref().unwrap().contains("VITASCOPE TEST"));
+        assert_eq!((sub.title.as_str(), sub.lang), ("en.xml", SubLang::English));
+        // 不是 TTML 的 .xml：照原檔交給 mpv（不讀進來）
+        let other = dir.join("影片.xml");
+        std::fs::write(&other, "<?xml version=\"1.0\"?><rss><channel/></rss>").unwrap();
+        assert!(!is_ttml_file(&other));
+        let sub = load(&other, &video).unwrap();
+        assert_eq!((sub.text, sub.load_ext), (None, None));
+        assert!(!is_ttml_file(&dir.join("不存在.xml")));
+        // .xml 不會被自動找到（大部分的 .xml 不是字幕）
+        assert!(find_external(&video).is_empty());
+        // 開頭的 2 KiB 截在中文字的中間也認得
+        let long_path = dir.join("long.xml");
+        let mut long = format!(
+            "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p begin=\"1s\" end=\"2s\">{}</p></body></tt>",
+            "字".repeat(1000)
+        );
+        while long.is_char_boundary(crate::ttml::SNIFF_LEN) {
+            long.insert(0, ' ');
+        }
+        std::fs::write(&long_path, &long).unwrap();
+        assert!(is_ttml_file(&long_path));
+        // 截斷的那個字拿掉、前面的照 UTF-8 解（整段不是合法的 UTF-8，自動判斷會把中文變成亂碼）
+        let head = long.as_bytes()[..crate::ttml::SNIFF_LEN].to_vec();
+        let valid = std::str::from_utf8(&head).unwrap_err().valid_up_to();
+        assert_eq!(decode_head(head), long[..valid]);
+        // 不是截斷的（真的不是 UTF-8）照舊自動判斷
+        let (big5, _, _) = encoding_rs::BIG5.encode("這是我們的字幕，你說對不對？他們會來這裡嗎");
+        assert_eq!(decode_head(big5.to_vec()), decode(&big5).0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ttml_with_another_extension_is_converted() {
+        // 下載工具存錯副檔名的 TTML（例如 .srt）：看內容，一樣轉成 SRT
+        let dir = temp_dir("ttml-srt");
+        let video = dir.join("影片.mkv");
+        for name in ["影片.en.srt", "影片.txt"] {
+            let path = dir.join(name);
+            std::fs::write(&path, ttml_doc("en", "VITASCOPE TEST")).unwrap();
+            let sub = load(&path, &video).unwrap();
+            assert_eq!(sub.load_ext, Some("srt"), "{name}");
+            assert_eq!(
+                sub.text.as_deref(),
+                Some(
+                    "1
+00:00:01,000 --> 00:00:02,000
+VITASCOPE TEST
+
+"
+                ),
+                "{name}"
+            );
+        }
+        // 真的 SRT 照原本的格式
+        let srt = dir.join("影片.tc.srt");
+        std::fs::write(
+            &srt,
+            "1
+00:00:01,000 --> 00:00:02,000
+字幕
+",
+        )
+        .unwrap();
+        assert_eq!(load(&srt, &video).unwrap().load_ext, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn broken_ttml_is_a_conversion_error() {
+        // 轉不了的 TTML：說明原因（不再把原檔交給 mpv，mpv 讀不了 TTML）
+        let dir = temp_dir("ttml-broken");
+        let video = dir.join("影片.mkv");
+        let cases = [
+            (
+                "壞掉.ttml",
+                "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body><p>a</span></body></tt>",
+            ),
+            ("空的.dfxp", "<tt xmlns=\"http://www.w3.org/ns/ttml\"><body/></tt>"),
+            ("其實是 SRT.ttml", "1\n00:00:01,000 --> 00:00:02,000\nhi\n"),
+        ];
+        for (name, text) in cases {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let err = load(&path, &video).unwrap_err();
+            assert!(is_conversion_error(&err), "{name}：{err:?}");
+            assert!(err.to_string().starts_with("無法轉換 TTML 字幕："), "{name}：{err}");
+        }
+        // 其他錯誤（檔案不存在之類）不是轉換錯誤：照舊交給 mpv 試試看
+        let missing = load(&dir.join("不存在.ttml"), &video).unwrap_err();
+        assert!(!is_conversion_error(&missing), "{missing:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ttml_uses_the_encoding_in_the_xml_declaration() {
+        let dir = temp_dir("ttml-enc");
+        let path = dir.join("影片.dfxp");
+        let words = "Caf\u{e9} cr\u{e8}me br\u{fb}l\u{e9}e";
+        let doc = ttml_doc("fr", words).replace("UTF-8", "ISO-8859-1");
+        let (latin1, _, _) = encoding_rs::WINDOWS_1252.encode(&doc);
+        assert!(std::str::from_utf8(&latin1).is_err());
+        std::fs::write(&path, &latin1).unwrap();
+        let sub = load(&path, &dir.join("影片.mkv")).unwrap();
+        assert!(sub.text.as_deref().unwrap().contains(words), "{:?}", sub.text);
+        assert_eq!(sub.encoding, Some("windows-1252"));
+        // 很短的 GBK 自動判斷會猜成 EUC-KR（變成亂碼）：照宣告的就對
+        let gbk_path = dir.join("影片.zh.ttml");
+        let doc = ttml_doc("zh", "你好吗").replace("UTF-8", "GBK");
+        let (gbk, _, _) = encoding_rs::GBK.encode(&doc);
+        assert_ne!(decode(&gbk).0, doc, "這個例子自動判斷要猜錯，才測得到宣告的編碼");
+        std::fs::write(&gbk_path, &gbk).unwrap();
+        let sub = load(&gbk_path, &dir.join("影片.mkv")).unwrap();
+        assert!(sub.text.as_deref().unwrap().contains("你好吗"), "{:?}", sub.text);
+        assert_eq!(sub.encoding, Some("GBK"));
+        // 宣告寫 UTF-8、檔案其實是 Big5（範本的宣告沒改）：宣告一定是錯的，照自動判斷
+        let big5_path = dir.join("影片.tc.ttml");
+        let words = "這是我們的字幕，你說對不對？他們會來這裡嗎";
+        let doc = ttml_doc("zh-TW", words);
+        let (big5, _, _) = encoding_rs::BIG5.encode(&doc);
+        assert!(std::str::from_utf8(&big5).is_err());
+        std::fs::write(&big5_path, &big5).unwrap();
+        let sub = load(&big5_path, &dir.join("影片.mkv")).unwrap();
+        assert!(sub.text.as_deref().unwrap().contains(words), "{:?}", sub.text);
+        assert_eq!(sub.encoding, Some("Big5"));
+        for label in ["UTF-8", "utf-16", "UTF-16LE", "UTF-16BE"] {
+            let decl = format!("<?xml version=\"1.0\" encoding=\"{label}\"?><tt/>");
+            assert_eq!(xml_declared_encoding(decl.as_bytes()), None, "{label}");
+        }
+        assert_eq!(
+            xml_declared_encoding(b"<?xml version='1.0' encoding='Shift_JIS'?><tt/>"),
+            Some(encoding_rs::SHIFT_JIS)
+        );
+        assert_eq!(xml_declared_encoding(b"<?xml version=\"1.0\"?><tt/>"), None);
+        assert_eq!(xml_declared_encoding(b"<tt encoding=\"Big5\"/>"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cache_name_has_a_version() {
+        // 舊版留下的暫存檔（檔名是同樣的路徑和內容，但開頭有 BOM）不能再用：雜湊要包含版本
+        let text = "20,26,\"VITASCOPE TEST\"\n";
+        let sub = text_sub("字幕/影片.pjs", text);
+        use std::hash::{Hash, Hasher};
+        let mut old = std::collections::hash_map::DefaultHasher::new();
+        sub.path.hash(&mut old);
+        text.to_owned().hash(&mut old);
+        let name = sub.cache_name(text);
+        assert_ne!(name, format!("{:016x}.pjs", old.finish()));
+        assert!(name.ends_with(".pjs"), "{name}");
+        // 同樣的檔案、內容 → 同一個暫存檔；內容不同 → 不同的暫存檔
+        assert_eq!(name, sub.cache_name(text));
+        assert_ne!(name, sub.cache_name("20,26,\"OTHER\"\n"));
     }
 }

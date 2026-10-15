@@ -1510,6 +1510,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2085,6 +2087,20 @@ dependencies = [
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
+]
+
+[[package]]
+name = "objc2-media-player"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85f2a98483f6e76313cb85a5a185eaa3cda86a177b13a8852d56cbd0085bf635"
+dependencies = [
+ "bitflags 2.13.2",
+ "block2 0.6.2",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
 ]
 
 [[package]]
@@ -3260,25 +3276,35 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vitascope"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
+ "block2 0.6.2",
  "chardetng",
  "eframe",
  "egui_kittest",
  "encoding_rs",
+ "flate2",
+ "image",
  "libc",
  "libmpv2-sys",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
+ "objc2-media-player",
  "png",
+ "quick-xml",
  "raw-window-handle",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "ureq",
+ "url",
+ "windows",
  "windows-sys 0.61.2",
+ "winit",
  "x11-dl",
+ "zbus",
 ]
 
 [[package]]

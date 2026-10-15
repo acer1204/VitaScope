@@ -4,6 +4,7 @@
 
 use super::quality::combo;
 use super::{Action, VitascopeApp, mpv_opts_override};
+use crate::keymap::Command;
 use crate::picture::{Adjust, AdjustKind, Deinterlace, Strength, fmt_signed};
 use crate::player::AsyncKey;
 use crate::sound::{EQ_BAND_LABELS, EQ_MAX_GAIN, EqPreset};
@@ -169,7 +170,7 @@ impl VitascopeApp {
         if ui
             .add_enabled(
                 !self.adjust_is_neutral(),
-                egui::Button::new(tr!("全部還原（Q）", "Reset all (Q)")),
+                egui::Button::new(self.keymap.labeled(tr!("全部還原", "Reset all"), Command::AdjustReset)),
             )
             .clicked()
         {
@@ -180,10 +181,10 @@ impl VitascopeApp {
         if ui.checkbox(&mut keep, keep_adjust_label()).changed() {
             self.set_keep_adjust(keep);
         }
-        ui.weak(tr!(
-            "W/E 亮度・R/T 對比・Y/U 飽和度・I/O 色相",
-            "W/E brightness · R/T contrast · Y/U saturation · I/O hue"
-        ));
+        let keys = self.keymap.adjust_keys();
+        if !keys.is_empty() {
+            ui.weak(keys);
+        }
         // 沒勾「下次開啟時沿用」時不用存（存檔也不會寫影像調整）
         if save && self.settings.video.keep_adjust {
             self.save_settings();
@@ -418,10 +419,7 @@ impl VitascopeApp {
             .get_string("current-tracks/video/albumart")
             .is_ok_and(|v| v == "no");
         if has_video {
-            self.osd(tf!(
-                "影像調整中：{summary}（Q 還原）",
-                "Image adjusted: {summary} (Q to reset)"
-            ));
+            self.osd(self.keymap.adjust_osd(&summary));
         }
     }
 }
